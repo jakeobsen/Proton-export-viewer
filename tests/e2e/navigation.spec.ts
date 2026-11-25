@@ -8,6 +8,13 @@ async function dialogs(pev: PevApp): Promise<Array<{ windowId: number; url: stri
   return pev.main('linkDialogs');
 }
 
+/** Polls `check` every 100 ms for up to `ms`; returns its last result. */
+async function waitFor(check: () => boolean, ms: number): Promise<boolean> {
+  const end = Date.now() + ms;
+  while (!check() && Date.now() < end) await new Promise((r) => setTimeout(r, 100));
+  return check();
+}
+
 async function bodyRequests(pev: PevApp, url: string): Promise<number> {
   const r = await pev.main<{ body: string[] }>('requests', 1);
   return r.body.filter((u) => u === url).length;
@@ -70,20 +77,34 @@ for (const id of ['#link-self', '#link-plain']) {
     const opened = await pev.open('links');
     const frame = await pev.bodyFrame(opened.url as string);
     await pev.main('clearRequests');
-    await frame.click(id);
     // The shell CSP (frame-src mail-body:) stops the frame navigation before any request.
-    await expect
-      .poll(() =>
-        pev.consoleMessages.some(
-          (m) => m.text.includes('frame-src mail-body:') && m.text.includes('https://example.org/'),
-        ),
-      )
-      .toBe(true);
-    expect(pev.page.frames().some((f) => f.url().startsWith('https:'))).toBe(false);
-    const seen = await pev.main<{ blocked: string[] }>('requests', 1);
-    expect(seen.blocked).toEqual([]);
-    expect(await dialogs(pev)).toEqual([]);
-    expect(pev.page.url()).toBe('app://shell/index.html');
+    const stoppedByCsp = () =>
+      pev.consoleMessages.some(
+        (m) => m.text.includes('frame-src mail-body:') && m.text.includes('https://example.org/'),
+      );
+    // Nothing may leave, navigate or open the dialog, after any click.
+    const nothingHappened = async () => {
+      expect(pev.page.frames().some((f) => f.url().startsWith('https:'))).toBe(false);
+      const seen = await pev.main<{ blocked: string[] }>('requests', 1);
+      expect(seen.blocked).toEqual([]);
+      expect(await dialogs(pev)).toEqual([]);
+      expect(pev.page.url()).toBe('app://shell/index.html');
+    };
+    // A click into the body frame of a window that was never shown can be lost
+    // while the frame is not yet ready for input, so click again until the CSP
+    // stops one. Every attempt is checked in full; a failed check is not retried.
+    let stopped = false;
+    for (let attempt = 1; attempt <= 5 && !stopped; attempt += 1) {
+      await frame.click(id);
+      stopped = await waitFor(stoppedByCsp, 2_000);
+      await nothingHappened();
+    }
+    if (!stopped) {
+      console.log('console:', JSON.stringify(pev.consoleMessages.slice(-10)));
+      console.log('main log:', JSON.stringify(pev.logs('main').slice(-10)));
+    }
+    expect(stopped).toBe(true);
+    await nothingHappened();
   });
 }
 

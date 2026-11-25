@@ -191,7 +191,13 @@ export async function install(ctx: AppContext): Promise<boolean> {
       };
     },
     download: (windowId: number, url: string) => byId(windowId).win.webContents.downloadURL(url),
-    crashRenderer: (windowId: number) => byId(windowId).win.webContents.forcefullyCrashRenderer(),
+    crashRenderer: (windowId: number) => {
+      const contents = byId(windowId).win.webContents;
+      // On Linux, forcefullyCrashRenderer() asks the renderer to crash itself
+      // instead of ending it from main, so end the process directly there.
+      if (process.platform === 'linux') process.kill(contents.getOSProcessId(), 'SIGKILL');
+      else contents.forcefullyCrashRenderer();
+    },
     core,
     corePid: () => ctx.core.pid,
     mainLog: (markers: string) =>

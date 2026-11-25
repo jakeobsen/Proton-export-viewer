@@ -65,7 +65,21 @@ test('no marker reaches a log file through any path', async ({ pev }) => {
     document.title = m;
   }, M);
   await pev.main('crashRenderer', 1);
-  await expect.poll(() => pev.hasLog('renderer.gone', { proc: 'main' })).toBe(true);
+  await expect
+    .poll(() => pev.hasLog('renderer.gone', { proc: 'main' }))
+    .toBe(true)
+    .catch((err: unknown) => {
+      console.log(
+        'main log:',
+        JSON.stringify(
+          pev
+            .logs('main')
+            .slice(-10)
+            .map((l) => l.code),
+        ),
+      );
+      throw err;
+    });
   await pev.main('core', 'exit');
   await expect.poll(() => pev.hasLog('core.exit', { exitCode: 3 })).toBe(true);
   await expect.poll(() => pev.hasLog('child.gone', { processType: 'Utility' })).toBe(true);
