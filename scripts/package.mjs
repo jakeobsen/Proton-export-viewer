@@ -9,9 +9,10 @@ import { existsSync, readdirSync, rmSync, rmdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { Arch, Platform, build } from 'electron-builder';
 import { signAdHoc } from './sign-adhoc.mjs';
+import { appName } from './vite-plugins.mjs';
 
 export const APP_ID = 'com.example.pev';
-export const PRODUCT_NAME = 'Proton Export Viewer';
+export const PRODUCT_NAME = appName();
 
 export const FUSES = {
   runAsNode: false,

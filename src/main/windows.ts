@@ -53,7 +53,7 @@ export function createAppWindow(ctx: AppContext, options: WindowOptions = {}): A
     // Shown on ready-to-show. Builds with test hooks never show a window.
     show: false,
     paintWhenInitiallyHidden: true,
-    title: 'Proton Export Viewer',
+    title: __PEV_APP_NAME__,
     webPreferences: {
       session: ses,
       preload: ctx.paths.preloadPath,

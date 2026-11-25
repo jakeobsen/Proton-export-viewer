@@ -3,6 +3,22 @@
 import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { dirname, join, relative, sep } from 'node:path';
 
+/** The app's display name: `productName` in package.json, the one place it is set. */
+export function appName(root = process.cwd()) {
+  const name = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).productName;
+  if (typeof name !== 'string' || name.length === 0) throw new Error('package.json: productName');
+  return name;
+}
+
+/** Puts the app name into index.html wherever it says %PEV_APP_NAME%. */
+export function htmlAppName(name) {
+  const escaped = name.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+  return {
+    name: 'pev-html-app-name',
+    transformIndexHtml: (html) => html.replaceAll('%PEV_APP_NAME%', escaped),
+  };
+}
+
 /** Returns the package directory for a module id inside node_modules, or null. */
 export function packageDirOf(id) {
   const clean = id.replace(/^\0/, '').split('?')[0];

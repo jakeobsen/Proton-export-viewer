@@ -12,7 +12,7 @@ export function App() {
   return (
     <div className="shell">
       <header className="bar">
-        <span className="bar-title">Proton Export Viewer</span>
+        <span className="bar-title">{__PEV_APP_NAME__}</span>
       </header>
       <main className="content">
         <nav className="list" aria-label="Messages">

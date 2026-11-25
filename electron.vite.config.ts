@@ -2,7 +2,12 @@
 import { resolve } from 'node:path';
 import { defineConfig } from 'electron-vite';
 import react from '@vitejs/plugin-react';
-import { bundledPackages, writeAppManifest } from './scripts/vite-plugins.mjs';
+import {
+  appName,
+  bundledPackages,
+  htmlAppName,
+  writeAppManifest,
+} from './scripts/vite-plugins.mjs';
 
 // PEV_TEST_HOOKS=1 compiles the test hooks in and writes to out-test/.
 // Without it the hooks are removed at build time and the output goes to out/.
@@ -10,9 +15,11 @@ const testHooks = process.env.PEV_TEST_HOOKS === '1';
 const outRoot = testHooks ? 'out-test' : 'out';
 
 export default defineConfig(({ command }) => {
+  const name = appName();
   const define = {
     __PEV_TEST_HOOKS__: JSON.stringify(testHooks),
     __PEV_DEV__: JSON.stringify(command === 'serve'),
+    __PEV_APP_NAME__: JSON.stringify(name),
   };
   return {
     main: {
@@ -50,7 +57,11 @@ export default defineConfig(({ command }) => {
       define,
       root: resolve('src/renderer'),
       base: './',
-      plugins: [react(), bundledPackages(resolve(outRoot, 'bundled-renderer.json'))],
+      plugins: [
+        react(),
+        htmlAppName(name),
+        bundledPackages(resolve(outRoot, 'bundled-renderer.json')),
+      ],
       build: {
         outDir: resolve(outRoot, 'renderer'),
         emptyOutDir: true,
