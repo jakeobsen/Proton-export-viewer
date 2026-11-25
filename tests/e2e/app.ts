@@ -139,6 +139,8 @@ export async function launch(name: string): Promise<PevApp> {
   const app = await electron.launch({
     args: [join(REPO_ROOT, 'out-test'), `--pev-user-data=${userData}`],
     cwd: REPO_ROOT,
+    // Without this, Playwright turns Chromium's sandbox off on Linux.
+    chromiumSandbox: true,
   });
   const page = await app.firstWindow();
   await page.waitForLoadState('load');

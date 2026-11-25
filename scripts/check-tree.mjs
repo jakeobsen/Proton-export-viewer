@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Fails if any tracked path breaks the repository rules, so a skipped hook
-// cannot publish real mail or large files.
+// cannot publish real mail or large files, and if any tracked text file turns
+// the Chromium sandbox off.
 
 import { execFileSync } from 'node:child_process';
-import { pathProblem, sizeProblem } from './repo-rules.mjs';
+import { existsSync, readFileSync } from 'node:fs';
+import { contentProblem, pathProblem, sizeProblem } from './repo-rules.mjs';
 
 // Each line: <mode> <type> <object> <size>\t<path>
 const listing = execFileSync('git', ['ls-tree', '-r', '-l', '-z', 'HEAD'], {
@@ -26,6 +28,11 @@ for (const entry of listing.split('\0').filter(Boolean)) {
 for (const path of tracked) {
   const byPath = pathProblem(path);
   if (byPath) problems.push(`${path}: ${byPath}`);
+  if (!existsSync(path)) continue;
+  const content = readFileSync(path);
+  if (content.includes(0)) continue; // binary
+  const byContent = contentProblem(content.toString('utf8'));
+  if (byContent) problems.push(`${path}: ${byContent}`);
 }
 
 if (problems.length > 0) {

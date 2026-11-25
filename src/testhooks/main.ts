@@ -3,6 +3,7 @@
 // them through globalThis.__pevTest from the main-process evaluation channel.
 
 import { once } from 'node:events';
+import { readFileSync } from 'node:fs';
 import { BrowserWindow, app, dialog } from 'electron';
 import { bumpGeneration, type AppContext } from '../main/context';
 import type { PolicyObserver } from '../main/harden';
@@ -45,6 +46,15 @@ function stubDialogs(calls: string[]): void {
         : Promise.resolve({ response: 0, canceled: true, filePaths: [], checkboxChecked: false });
     };
     Object.defineProperty(dialog, name, { value: stub, configurable: true, writable: true });
+  }
+}
+
+/** The seccomp mode of a Linux process ('2' when a filter is active), or null. */
+function seccompMode(pid: number): string | null {
+  try {
+    return /^Seccomp:\s*(\d+)$/m.exec(readFileSync(`/proc/${pid}/status`, 'utf8'))?.[1] ?? null;
+  } catch {
+    return null;
   }
 }
 
@@ -132,6 +142,26 @@ export async function install(ctx: AppContext): Promise<boolean> {
     liveViews: (windowId: number) => byId(windowId).views.liveCount,
     authorizedUrl: (windowId: number) => byId(windowId).views.authorizedUrl(),
     spellcheck: (windowId: number) => byId(windowId).session.isSpellCheckerEnabled(),
+    /**
+     * The OS-level sandbox evidence for every renderer process, and for the
+     * main process as the unsandboxed control: the process metric on macOS and
+     * Windows, the seccomp mode on Linux.
+     */
+    rendererSandbox: () => {
+      const evidence = (m: Electron.ProcessMetric) => ({
+        pid: m.pid,
+        sandboxed: m.sandboxed ?? null,
+        seccomp: process.platform === 'linux' ? seccompMode(m.pid) : null,
+      });
+      const metrics = app.getAppMetrics();
+      const main = metrics.find((m) => m.pid === process.pid);
+      return {
+        platform: process.platform,
+        windowPids: [...ctx.windows.values()].map((w) => w.win.webContents.getOSProcessId()),
+        main: main ? evidence(main) : null,
+        renderers: metrics.filter((m) => m.type === 'Tab').map(evidence),
+      };
+    },
     openWindow: async (kind: 'shell' | 'subframe' | 'script-control' | 'fetch') => {
       const appWin =
         kind === 'shell'

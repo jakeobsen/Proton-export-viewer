@@ -5,6 +5,43 @@ import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { expect, test } from './app';
 
+interface SandboxEvidence {
+  pid: number;
+  sandboxed: boolean | null;
+  seccomp: string | null;
+}
+
+interface SandboxState {
+  platform: string;
+  windowPids: number[];
+  main: SandboxEvidence | null;
+  renderers: SandboxEvidence[];
+}
+
+test('every renderer runs in the OS sandbox', async ({ pev }) => {
+  // A second window and an open body, so every kind of renderer process exists.
+  await pev.openWindow('shell');
+  const opened = await pev.open('sample');
+  await pev.bodyFrame(opened.url as string);
+
+  const state = await pev.main<SandboxState>('rendererSandbox');
+  // Chromium's Linux sandbox installs a seccomp-bpf filter (mode 2) in each
+  // renderer; on macOS and Windows the process metric reports the OS sandbox.
+  const sandboxed = (e: SandboxEvidence) =>
+    state.platform === 'linux' ? e.seccomp === '2' : e.sandboxed === true;
+
+  // Control: the main process is not sandboxed, so the evidence can say no.
+  expect(state.main).not.toBeNull();
+  expect(sandboxed(state.main as SandboxEvidence)).toBe(false);
+
+  expect(state.windowPids).toHaveLength(2);
+  const pids = state.renderers.map((r) => r.pid);
+  for (const pid of state.windowPids) expect(pids).toContain(pid);
+  for (const renderer of state.renderers) {
+    expect(sandboxed(renderer), `renderer ${JSON.stringify(renderer)}`).toBe(true);
+  }
+});
+
 test('a second window gets the same session policy', async ({ pev }) => {
   const second = await pev.openWindow('shell');
   const page = second.page;
