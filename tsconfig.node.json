@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023"],
+    "types": ["node"]
+  },
+  "include": [
+    "src/main/**/*.ts",
+    "src/preload/**/*.ts",
+    "src/core/**/*.ts",
+    "src/shared/**/*.ts",
+    "src/testhooks/main.ts",
+    "src/testhooks/core.ts",
+    "src/testhooks/worker.ts",
+    "src/testhooks/selftest.ts",
+    "src/testhooks/stubs.ts",
+    "src/testhooks/pages.ts",
+    "electron.vite.config.ts",
+    "vitest.config.ts"
+  ]
+}

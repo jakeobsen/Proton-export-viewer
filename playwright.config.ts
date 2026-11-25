@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+import { defineConfig } from '@playwright/test';
+
+export default defineConfig({
+  testDir: 'tests/e2e',
+  timeout: 90_000,
+  expect: { timeout: 10_000 },
+  workers: 1,
+  fullyParallel: false,
+  retries: 0,
+  reporter: [['list']],
+  outputDir: 'test-output/playwright',
+});

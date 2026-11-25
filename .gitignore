@@ -155,3 +155,12 @@ vite.config.ts.timestamp-*
 .nx/cache
 .nx/workspace-data
 .nx/migrate-runs
+
+# Build and test output
+out/
+dist/
+out-test/
+test-output/
+*.sqlite*
+.DS_Store
+data-sample/
