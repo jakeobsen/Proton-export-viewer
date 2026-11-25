@@ -5,7 +5,7 @@
 //   mas-release   Mac App Store flavor, sandboxed, no test hooks       (from out/)
 //   mas-selftest  Mac App Store flavor, sandboxed, with test hooks     (from out-test/)
 
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync, rmSync, rmdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { Arch, Platform, build } from 'electron-builder';
 import { signAdHoc } from './sign-adhoc.mjs';
@@ -35,6 +35,18 @@ export function appPath(flavor) {
   return join('dist', flavor, dir, `${PRODUCT_NAME}.app`);
 }
 
+/**
+ * Electron's Mac App Store build includes a login-item helper app, used only by
+ * app.setLoginItemSettings. This app registers no login items, so the helper is
+ * removed instead of shipping an executable it never runs.
+ */
+function removeLoginHelper(app) {
+  const library = join(app, 'Contents', 'Library');
+  const loginItems = join(library, 'LoginItems');
+  if (existsSync(loginItems)) rmSync(loginItems, { recursive: true });
+  if (existsSync(library) && readdirSync(library).length === 0) rmdirSync(library);
+}
+
 export async function packageFlavor(flavor) {
   const spec = FLAVORS[flavor];
   if (!spec) throw new Error(`unknown flavor ${flavor}`);
@@ -60,6 +72,7 @@ export async function packageFlavor(flavor) {
   });
   const app = appPath(flavor);
   if (!existsSync(app)) throw new Error(`expected ${app}`);
+  if (spec.mas) removeLoginHelper(app);
   signAdHoc(
     app,
     spec.mas

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Sandboxed-build checks (no debugging port):
-// 1. the app and every helper carry exactly the expected entitlements, in the
-//    sandboxed self-test build and in the MAS release build;
+// 1. in the sandboxed self-test build and in the MAS release build, every
+//    nested bundle and every Mach-O file is listed; the app's executable and
+//    every other executable carry exactly the expected entitlements, and no
+//    login-item helper is shipped;
 // 2. the in-app self-test passes in the sandbox: core and its worker answer,
 //    the protocols serve, and both a write outside the container and a
 //    loopback connect fail with a sandbox denial;
@@ -16,7 +18,7 @@ import { createConnection, createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { APP_ID, PRODUCT_NAME, appPath } from './package.mjs';
-import { helperApps } from './sign-adhoc.mjs';
+import { bundleContents } from './bundle-contents.mjs';
 
 const require = createRequire(join(process.cwd(), 'package.json'));
 
@@ -47,6 +49,7 @@ export function entitlementsOf(bundle) {
   const xml = execFileSync('codesign', ['-d', '--entitlements', '-', '--xml', bundle], {
     stdio: ['ignore', 'pipe', 'ignore'],
   });
+  if (xml.length === 0) return {};
   const json = execFileSync('plutil', ['-convert', 'json', '-o', '-', '-'], { input: xml });
   return JSON.parse(json.toString('utf8'));
 }
@@ -57,16 +60,42 @@ function canonical(value) {
 
 function checkEntitlements(flavor) {
   const app = appPath(flavor);
-  const own = entitlementsOf(app);
+  const { bundles, machO } = bundleContents(app);
+  const mainExecutable = `Contents/MacOS/${PRODUCT_NAME}`;
+  const executables = machO.filter((m) => m.executable).map((m) => m.path);
+  const libraries = machO.filter((m) => !m.executable).map((m) => m.path);
+  console.log(`     ${flavor}: nested bundles ${JSON.stringify(bundles)}`);
+  console.log(`     ${flavor}: Mach-O executables ${JSON.stringify(executables)}`);
+  console.log(`     ${flavor}: Mach-O libraries ${JSON.stringify(libraries)}`);
+
   check(
-    canonical(own) === canonical(APP_ENTITLEMENTS),
-    `${flavor}: app entitlements ${canonical(own)}`,
+    !existsSync(join(app, 'Contents', 'Library', 'LoginItems')),
+    `${flavor}: no login-item helper`,
   );
-  for (const helper of helperApps(app)) {
-    const e = entitlementsOf(helper);
+  // Nested code is only helper apps and frameworks directly in Contents/Frameworks.
+  for (const bundle of bundles) {
     check(
-      canonical(e) === canonical(HELPER_ENTITLEMENTS),
-      `${flavor}: ${helper.split('/').pop()} entitlements ${canonical(e)}`,
+      /^Contents\/Frameworks\/[^/]+\.(app|framework)$/.test(bundle),
+      `${flavor}: nested bundle ${bundle} is a helper app or a framework`,
+    );
+  }
+  // Every app bundle's own executable was found by the Mach-O scan.
+  for (const bundle of bundles.filter((b) => b.endsWith('.app'))) {
+    const name = bundle.slice(bundle.lastIndexOf('/') + 1, -'.app'.length);
+    check(
+      executables.includes(`${bundle}/Contents/MacOS/${name}`),
+      `${flavor}: ${bundle} has its executable in the scan`,
+    );
+  }
+  check(executables.includes(mainExecutable), `${flavor}: the app executable is in the scan`);
+  check(executables.length >= 2, `${flavor}: ${executables.length} executables found`);
+
+  for (const executable of executables) {
+    const expected = executable === mainExecutable ? APP_ENTITLEMENTS : HELPER_ENTITLEMENTS;
+    const actual = entitlementsOf(join(app, executable));
+    check(
+      canonical(actual) === canonical(expected),
+      `${flavor}: ${executable} entitlements ${canonical(actual)}`,
     );
   }
 }
@@ -139,7 +168,7 @@ async function main() {
     'Library',
     'Application Support',
     PRODUCT_NAME,
-    'selftest-result.json',
+    `selftest-result-${sandboxNonce}.json`,
   );
   const sandboxed = readResult(sandboxResultFile, sandboxNonce);
   check(
@@ -183,7 +212,7 @@ async function main() {
     `--pev-selftest-port=${listener.port}`,
     `--pev-selftest-nonce=${controlNonce}`,
   ]);
-  const control = readResult(join(userData, 'selftest-result.json'), controlNonce);
+  const control = readResult(join(userData, `selftest-result-${controlNonce}.json`), controlNonce);
   check(
     !controlRun.timedOut && controlRun.code === 0,
     `control self-test exited 0 (${JSON.stringify(controlRun)})`,

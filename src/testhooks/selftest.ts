@@ -3,7 +3,9 @@
 // its checks, writes the result into userData and quits.
 //
 // Arguments: --pev-selftest --pev-selftest-write=<file> --pev-selftest-port=<port>
-//            --pev-selftest-nonce=<value echoed into the result>
+//            --pev-selftest-nonce=<hex value echoed into the result>
+// The result goes to selftest-result-<nonce>.json, so concurrent runs that share
+// a sandbox container never overwrite each other's result.
 
 import { once } from 'node:events';
 import { writeFileSync } from 'node:fs';
@@ -53,6 +55,13 @@ function tryConnect(port: number): Promise<Outcome> {
   });
 }
 
+/** The result file for a run; a nonce that isn't plain hex is not used in the name. */
+export function resultFileName(nonce: string | null): string {
+  return nonce !== null && /^[0-9a-f]{8,64}$/.test(nonce)
+    ? `selftest-result-${nonce}.json`
+    : 'selftest-result.json';
+}
+
 export async function runSelfTest(ctx: AppContext, argv: string[]): Promise<void> {
   const result = {
     nonce: argValue(argv, 'pev-selftest-nonce') ?? null,
@@ -97,7 +106,7 @@ export async function runSelfTest(ctx: AppContext, argv: string[]): Promise<void
     (w) => w.isVisible() || w.isFocused(),
   ).length;
   writeFileSync(
-    join(app.getPath('userData'), 'selftest-result.json'),
+    join(app.getPath('userData'), resultFileName(result.nonce)),
     JSON.stringify(result, null, 2),
   );
   ctx.log.info('test.selftest');
