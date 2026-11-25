@@ -49,7 +49,12 @@ test('target=_blank links go to the dialog', async ({ pev }) => {
   const opened = await pev.open('links');
   const frame = await pev.bodyFrame(opened.url as string);
   await frame.click('#link-blank');
+  // The link dialog covers the body; cancel it like a user before the next link.
+  await expect(pev.page.locator('.dialog-url')).toHaveText('https://example.org/blank');
+  await pev.page.click('.dialog-button');
+  await expect(pev.page.locator('.dialog')).toHaveCount(0);
   await frame.click('#link-mailto');
+  await expect(pev.page.locator('.dialog-url')).toHaveText('mailto:someone@example.org');
   await expect
     .poll(() => dialogs(pev))
     .toEqual([
