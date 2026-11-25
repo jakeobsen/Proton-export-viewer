@@ -27,7 +27,8 @@
     "package:sandbox": "npm run build:test && node scripts/package.mjs mas-selftest && npm run build && node scripts/package.mjs mas-release",
     "check:release": "node scripts/check-release.mjs",
     "check:sandbox": "node scripts/check-sandbox.mjs",
-    "ci": "node scripts/ci.mjs"
+    "ci": "node scripts/ci.mjs",
+    "ci:linux": "node scripts/ci.mjs linux"
   },
   "devDependencies": {
     "@electron/asar": "3.4.1",
