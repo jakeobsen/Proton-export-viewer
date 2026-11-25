@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // IPC from the shell. Every handler checks that the sender is the main frame of
-// an app window with the app://shell origin, validates its arguments, and
-// rejects a stale generation.
+// an app window with the app://shell origin and validates its whole argument
+// list. Every request carries the generation it was made for, and a stale one is
+// rejected. The one exception is `state`, the bootstrap call: it takes no
+// arguments and returns the current generation.
 
 import { ipcMain, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
 import { z } from 'zod';
@@ -26,24 +28,32 @@ const Generation = z
   .int()
   .nonnegative()
   .max(2 ** 31);
-const PingArgs = z.object({ generation: Generation }).strict();
-const OpenArgs = z
-  .object({ id: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/), generation: Generation })
-  .strict();
-const LogArgs = z
-  .object({
-    level: z.enum(['error', 'warn', 'info']),
-    code: z.string().max(64),
-    data: z.record(z.string().max(32), z.unknown()).optional(),
-  })
-  .strict();
-const ReportArgs = z
-  .object({
-    kind: z.enum(['uncaught', 'rejection', 'error']),
-    errorClass: z.string().max(64),
-    frames: z.array(z.string().max(200)).max(12),
-  })
-  .strict();
+// Each schema covers the full argument list, so extra arguments are rejected too.
+const StateArgs = z.tuple([]);
+const PingArgs = z.tuple([z.object({ generation: Generation }).strict()]);
+const OpenArgs = z.tuple([
+  z.object({ id: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/), generation: Generation }).strict(),
+]);
+const LogArgs = z.tuple([
+  z
+    .object({
+      generation: Generation,
+      level: z.enum(['error', 'warn', 'info']),
+      code: z.string().max(64),
+      data: z.record(z.string().max(32), z.unknown()).optional(),
+    })
+    .strict(),
+]);
+const ReportArgs = z.tuple([
+  z
+    .object({
+      generation: Generation,
+      kind: z.enum(['uncaught', 'rejection', 'error']),
+      errorClass: z.string().max(64),
+      frames: z.array(z.string().max(200)).max(12),
+    })
+    .strict(),
+]);
 
 const REPORT_CODES: Record<ErrorKind, string> = {
   uncaught: 'renderer.uncaught',
@@ -75,28 +85,31 @@ export function registerIpc(ctx: AppContext): void {
 
   const guarded = <T>(
     channel: string,
-    run: (appWin: AppWindow, args: unknown) => Promise<T | Rejected> | T | Rejected,
+    run: (appWin: AppWindow, args: unknown[]) => Promise<T | Rejected> | T | Rejected,
   ) => {
-    ipcMain.handle(channel, async (event, args: unknown) => {
+    ipcMain.handle(channel, async (event, ...args: unknown[]) => {
       const sender = checkSender(ctx, event);
       if (typeof sender === 'string') return reject(sender);
       return run(sender, args);
     });
   };
 
-  guarded<StateResult>(IPC.state, () => ({ ok: true, generation: ctx.generation }));
+  guarded<StateResult>(IPC.state, (appWin, raw) => {
+    if (!StateArgs.safeParse(raw).success) return reject('invalid', appWin);
+    return { ok: true, generation: ctx.generation };
+  });
 
   guarded<PingResult>(IPC.ping, (appWin, raw) => {
     const args = PingArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
-    if (args.data.generation !== ctx.generation) return reject('stale_generation', appWin);
+    if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
     return { ok: true, generation: ctx.generation };
   });
 
   guarded<OpenResult>(IPC.openStub, async (appWin, raw) => {
     const args = OpenArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
-    const { id, generation } = args.data;
+    const [{ id, generation }] = args.data;
     if (generation !== ctx.generation) return reject('stale_generation', appWin);
 
     const { openId, token, revoked } = appWin.views.accept();
@@ -124,36 +137,40 @@ export function registerIpc(ctx: AppContext): void {
     return { ok: true, openId, url: bodyUrl(token) };
   });
 
-  const guardedSend = (channel: string, run: (appWin: AppWindow, args: unknown) => void) => {
-    ipcMain.on(channel, (event, args: unknown) => {
+  /** Like `guarded`, for one-way sends; also drops a send made for a stale generation. */
+  const guardedSend = <A extends { generation: number }>(
+    channel: string,
+    schema: z.ZodType<[A]>,
+    run: (appWin: AppWindow, args: A) => void,
+  ) => {
+    ipcMain.on(channel, (event, ...raw: unknown[]) => {
       const sender = checkSender(ctx, event);
       if (typeof sender === 'string') {
         reject(sender);
         return;
       }
-      run(sender, args);
+      const args = schema.safeParse(raw);
+      if (!args.success) {
+        reject('invalid', sender);
+        return;
+      }
+      if (args.data[0].generation !== ctx.generation) {
+        reject('stale_generation', sender);
+        return;
+      }
+      run(sender, args.data[0]);
     });
   };
 
-  guardedSend(IPC.log, (appWin, raw) => {
-    const args = LogArgs.safeParse(raw);
-    if (!args.success || !isRendererLogCode(args.data.code)) {
+  guardedSend(IPC.log, LogArgs, (appWin, { level, code, data }) => {
+    if (!isRendererLogCode(code)) {
       reject('invalid', appWin);
       return;
     }
-    ctx.rendererLog.log(args.data.level, args.data.code, {
-      ...args.data.data,
-      windowId: appWin.id,
-    });
+    ctx.rendererLog.log(level, code, { ...data, windowId: appWin.id });
   });
 
-  guardedSend(IPC.report, (appWin, raw) => {
-    const args = ReportArgs.safeParse(raw);
-    if (!args.success) {
-      reject('invalid', appWin);
-      return;
-    }
-    const { kind, errorClass, frames } = args.data;
+  guardedSend(IPC.report, ReportArgs, (appWin, { kind, errorClass, frames }) => {
     ctx.rendererLog.error(REPORT_CODES[kind], { errorClass, frames, windowId: appWin.id });
   });
 }

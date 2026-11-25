@@ -28,8 +28,15 @@ export function install(): void {
     navigateMain: (url: string) => {
       window.location.href = url;
     },
-    log: (markers: string) =>
-      window.pev.log('info', 'test.log', { subject: markers, path: markers, reason: markers }),
+    log: async (markers: string) => {
+      const generation = getShellState().generation ?? (await refreshGeneration());
+      if (generation === null) throw new Error('no generation');
+      window.pev.log('info', 'test.log', generation, {
+        subject: markers,
+        path: markers,
+        reason: markers,
+      });
+    },
     error: (markers: string) => reportError('error', new Error(markers)),
     throwUncaught: (markers: string) => {
       setTimeout(() => {
