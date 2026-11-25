@@ -166,6 +166,7 @@ async function main() {
       `sandboxed: connect denied (${sandboxed.connect.code})`,
     );
     check(sandboxed.error === null, `sandboxed: no self-test error (${sandboxed.error})`);
+    check(sandboxed.shownWindows === 0, 'sandboxed: no window was shown or focused');
   }
   check(!existsSync(sandboxTarget), 'sandboxed: the write target does not exist');
   check(listener.count() === 0, `sandboxed: the listener saw ${listener.count()} connections`);
@@ -194,6 +195,7 @@ async function main() {
     check(control.body === 200 && control.asset === 200, 'control: protocols serve');
     check(control.write.ok === true, 'control: write succeeds');
     check(control.connect.ok === true, 'control: connect succeeds');
+    check(control.shownWindows === 0, 'control: no window was shown or focused');
   }
   check(existsSync(controlTarget), 'control: the write target exists');
   check(listener.count() >= 1, `control: the listener saw ${listener.count()} connection(s)`);

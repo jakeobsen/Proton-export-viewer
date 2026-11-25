@@ -122,11 +122,16 @@ export class PevApp {
 }
 
 async function waitForShell(page: Page): Promise<void> {
-  await page.waitForFunction(() => {
-    const api = (window as unknown as { __pevTest?: { state(): { generation: number | null } } })
-      .__pevTest;
-    return !!api && api.state().generation !== null;
-  });
+  // Hidden windows get no animation frames, so poll on a timer.
+  await page.waitForFunction(
+    () => {
+      const api = (window as unknown as { __pevTest?: { state(): { generation: number | null } } })
+        .__pevTest;
+      return !!api && api.state().generation !== null;
+    },
+    undefined,
+    { polling: 100 },
+  );
 }
 
 export async function launch(name: string): Promise<PevApp> {
@@ -146,7 +151,17 @@ export const test = base.extend<{ pev: PevApp }>({
   // eslint-disable-next-line no-empty-pattern
   pev: async ({}, use, testInfo) => {
     const pev = await launch(testInfo.title.replace(/[^a-z0-9]+/gi, '-').slice(0, 40));
+    expect(await pev.main('dialogsStubbed')).toBe(true);
     await use(pev);
+    // Test runs stay in the background: no window was ever shown or focused,
+    // and no native dialog was opened.
+    if (testInfo.status === testInfo.expectedStatus) {
+      const windows = await pev.main<Array<{ visible: boolean; focused: boolean }>>('windowState');
+      expect(windows.length).toBeGreaterThan(0);
+      expect(windows.filter((w) => w.visible || w.focused)).toEqual([]);
+      expect(await pev.main('windowEvents')).toEqual([]);
+      expect(await pev.main('dialogCalls')).toEqual([]);
+    }
     await pev.close();
   },
 });

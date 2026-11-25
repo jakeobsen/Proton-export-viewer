@@ -50,7 +50,9 @@ export function createAppWindow(ctx: AppContext, options: WindowOptions = {}): A
   const win = new BrowserWindow({
     width: 1100,
     height: 720,
-    show: options.show ?? true,
+    // Shown on ready-to-show. Builds with test hooks never show a window.
+    show: false,
+    paintWhenInitiallyHidden: true,
     title: 'Proton Export Viewer',
     webPreferences: {
       session: ses,
@@ -69,6 +71,9 @@ export function createAppWindow(ctx: AppContext, options: WindowOptions = {}): A
       devTools: __PEV_TEST_HOOKS__ || __PEV_DEV__,
     },
   });
+  if (!__PEV_TEST_HOOKS__ && (options.show ?? true)) {
+    win.once('ready-to-show', () => win.show());
+  }
   const contents = win.webContents;
   const contentsId = contents.id;
   const appWin: AppWindow = { id: windowId, win, views, session: ses };

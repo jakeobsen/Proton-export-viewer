@@ -15,6 +15,11 @@ import { createAppWindow } from './windows';
 
 process.umask(0o077);
 
+if (__PEV_TEST_HOOKS__ && process.platform === 'darwin') {
+  // Test runs stay in the background: no Dock icon and no activation.
+  app.setActivationPolicy('accessory');
+}
+
 const mainDir = import.meta.dirname;
 const outRoot = dirname(mainDir);
 const paths: Paths = {

@@ -3,7 +3,7 @@
 // them through globalThis.__pevTest from the main-process evaluation channel.
 
 import { once } from 'node:events';
-import { app } from 'electron';
+import { BrowserWindow, app, dialog } from 'electron';
 import { bumpGeneration, type AppContext } from '../main/context';
 import type { PolicyObserver } from '../main/harden';
 import { PROD_SWITCHES } from '../main/switches';
@@ -23,7 +23,40 @@ interface WindowRequests {
   blocked: string[];
 }
 
+const DIALOG_METHODS = [
+  'showOpenDialog',
+  'showOpenDialogSync',
+  'showSaveDialog',
+  'showSaveDialogSync',
+  'showMessageBox',
+  'showMessageBoxSync',
+  'showErrorBox',
+  'showCertificateTrustDialog',
+] as const;
+
+/** Replaces every native dialog with a recorder, so no dialog can appear during tests. */
+function stubDialogs(calls: string[]): void {
+  for (const name of DIALOG_METHODS) {
+    const stub = () => {
+      calls.push(name);
+      if (name.endsWith('Sync')) return name === 'showMessageBoxSync' ? 0 : undefined;
+      return name === 'showErrorBox'
+        ? undefined
+        : Promise.resolve({ response: 0, canceled: true, filePaths: [], checkboxChecked: false });
+    };
+    Object.defineProperty(dialog, name, { value: stub, configurable: true, writable: true });
+  }
+}
+
 export async function install(ctx: AppContext): Promise<boolean> {
+  const dialogCalls: string[] = [];
+  stubDialogs(dialogCalls);
+  const windowEvents: string[] = [];
+  app.on('browser-window-created', (_event, win) => {
+    win.on('show', () => windowEvents.push('show'));
+    win.on('focus', () => windowEvents.push('focus'));
+  });
+
   const requests = new Map<number, WindowRequests>();
   let bodyCsp = true;
 
@@ -65,6 +98,15 @@ export async function install(ctx: AppContext): Promise<boolean> {
 
   const api = {
     marker: TESTHOOKS_MARKER,
+    dialogCalls: () => [...dialogCalls],
+    dialogsStubbed: () =>
+      DIALOG_METHODS.every((name) => String(dialog[name]).includes('calls.push')),
+    windowEvents: () => [...windowEvents],
+    windowState: () =>
+      BrowserWindow.getAllWindows().map((w) => ({
+        visible: w.isVisible(),
+        focused: w.isFocused(),
+      })),
     pages: TEST_PAGE,
     logsDir: () => ctx.log.fileAt(0).replace(/\/[^/]+$/, ''),
     shellCsp: () => ctx.shellCsp,

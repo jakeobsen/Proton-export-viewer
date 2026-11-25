@@ -9,7 +9,7 @@ import { once } from 'node:events';
 import { writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { join } from 'node:path';
-import { app } from 'electron';
+import { BrowserWindow, app } from 'electron';
 import type { AppContext } from '../main/context';
 import { bodyUrl } from '../main/views';
 import { createAppWindow } from '../main/windows';
@@ -64,6 +64,7 @@ export async function runSelfTest(ctx: AppContext, argv: string[]): Promise<void
     write: { ok: false, code: 'NOT_RUN' } as Outcome,
     connect: { ok: false, code: 'NOT_RUN' } as Outcome,
     error: null as string | null,
+    shownWindows: 0,
   };
   try {
     const appWin = createAppWindow(ctx, { show: false });
@@ -92,6 +93,9 @@ export async function runSelfTest(ctx: AppContext, argv: string[]): Promise<void
   } catch (err) {
     result.error = err instanceof Error ? err.constructor.name : 'NonError';
   }
+  result.shownWindows = BrowserWindow.getAllWindows().filter(
+    (w) => w.isVisible() || w.isFocused(),
+  ).length;
   writeFileSync(
     join(app.getPath('userData'), 'selftest-result.json'),
     JSON.stringify(result, null, 2),
