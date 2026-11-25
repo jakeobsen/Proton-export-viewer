@@ -1,0 +1,60 @@
+{
+  "name": "proton-export-viewer",
+  "productName": "Proton Export Viewer",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Offline viewer for Proton Mail exports",
+  "license": "AGPL-3.0-or-later",
+  "main": "./out/main/index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "prepare": "node scripts/setup-hooks.mjs",
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "build:test": "cross-env PEV_TEST_HOOKS=1 electron-vite build",
+    "lint": "eslint . --max-warnings 0 && prettier --check .",
+    "format": "prettier --write .",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "test:unit": "vitest run",
+    "test:e2e": "npm run build:test && playwright test",
+    "check:spdx": "node scripts/check-spdx.mjs",
+    "check:tree": "node scripts/check-tree.mjs",
+    "check:licenses": "node scripts/check-licenses.mjs",
+    "package:release": "npm run build && node scripts/package.mjs release",
+    "package:sandbox": "npm run build:test && node scripts/package.mjs mas-selftest && npm run build && node scripts/package.mjs mas-release",
+    "check:release": "node scripts/check-release.mjs",
+    "check:sandbox": "node scripts/check-sandbox.mjs",
+    "ci": "node scripts/ci.mjs"
+  },
+  "devDependencies": {
+    "@electron/asar": "3.4.1",
+    "@electron/fuses": "2.1.3",
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "1.65.1",
+    "@types/node": "24.19.4",
+    "@types/react": "19.3.3",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.3.0",
+    "cross-env": "10.1.0",
+    "electron": "45.5.0",
+    "electron-builder": "26.18.0",
+    "electron-vite": "6.0.0",
+    "eslint": "10.15.0",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "globals": "17.14.0",
+    "prettier": "3.10.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.74.0",
+    "vite": "8.3.8",
+    "vitest": "5.1.2",
+    "zod": "4.6.7"
+  },
+  "allowScripts": {
+    "electron-winstaller": false
+  }
+}

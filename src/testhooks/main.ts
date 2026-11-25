@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Main-process test hooks. Compiled only into builds with test hooks; tests reach
+// them through globalThis.__pevTest from the main-process evaluation channel.
+
+import { once } from 'node:events';
+import { app } from 'electron';
+import { bumpGeneration, type AppContext } from '../main/context';
+import type { PolicyObserver } from '../main/harden';
+import { PROD_SWITCHES } from '../main/switches';
+import { createAppWindow } from '../main/windows';
+import type { CoreResult } from '../shared/core-protocol';
+import { errorData } from '../shared/log/schema';
+import { TESTHOOKS_MARKER, markLoaded } from './marker';
+import { TEST_PAGE, testRoute } from './pages';
+import { runSelfTest } from './selftest';
+
+markLoaded();
+
+interface WindowRequests {
+  app: string[];
+  body: string[];
+  asset: string[];
+  blocked: string[];
+}
+
+export async function install(ctx: AppContext): Promise<boolean> {
+  const requests = new Map<number, WindowRequests>();
+  let bodyCsp = true;
+
+  const recordsFor = (windowId: number): WindowRequests => {
+    let rec = requests.get(windowId);
+    if (!rec) {
+      rec = { app: [], body: [], asset: [], blocked: [] };
+      requests.set(windowId, rec);
+    }
+    return rec;
+  };
+
+  ctx.observerFor = (windowId: number): PolicyObserver => {
+    const rec = recordsFor(windowId);
+    return {
+      onAppRequest: (url) => rec.app.push(url),
+      onBodyRequest: (url) => rec.body.push(url),
+      onAssetRequest: (url) => rec.asset.push(url),
+      onBlocked: (url) => rec.blocked.push(url),
+      bodyCspEnabled: () => bodyCsp,
+      extraAppRoute: testRoute,
+    };
+  };
+
+  const byId = (windowId: number) => {
+    for (const appWin of ctx.windows.values()) if (appWin.id === windowId) return appWin;
+    throw new Error('no such window');
+  };
+
+  const loaded = async (windowId: number) => {
+    const contents = byId(windowId).win.webContents;
+    if (contents.isLoading()) await once(contents, 'did-finish-load');
+  };
+
+  const core = (action: string, markers?: string): Promise<CoreResult> =>
+    ctx.core.request(
+      markers === undefined ? { type: 'test', action } : { type: 'test', action, markers },
+    );
+
+  const api = {
+    marker: TESTHOOKS_MARKER,
+    pages: TEST_PAGE,
+    logsDir: () => ctx.log.fileAt(0).replace(/\/[^/]+$/, ''),
+    shellCsp: () => ctx.shellCsp,
+    switches: () =>
+      PROD_SWITCHES.map(([name]) => [name, app.commandLine.getSwitchValue(name)] as const),
+    windows: () => [...ctx.windows.values()].map((w) => w.id),
+    generation: () => ctx.generation,
+    bumpGeneration: () => bumpGeneration(ctx),
+    setBodyCsp: (on: boolean) => {
+      bodyCsp = on;
+    },
+    requests: (windowId: number) => recordsFor(windowId),
+    clearRequests: () => {
+      // Each session's observer keeps its record object, so empty it in place.
+      for (const rec of requests.values()) {
+        rec.app.length = 0;
+        rec.body.length = 0;
+        rec.asset.length = 0;
+        rec.blocked.length = 0;
+      }
+    },
+    linkDialogs: () => [...ctx.linkDialog.shown],
+    liveViews: (windowId: number) => byId(windowId).views.liveCount,
+    authorizedUrl: (windowId: number) => byId(windowId).views.authorizedUrl(),
+    spellcheck: (windowId: number) => byId(windowId).session.isSpellCheckerEnabled(),
+    openWindow: async (kind: 'shell' | 'subframe' | 'script-control' | 'fetch') => {
+      const appWin =
+        kind === 'shell'
+          ? createAppWindow(ctx)
+          : kind === 'subframe'
+            ? createAppWindow(ctx, {
+                url: TEST_PAGE.subframeHost,
+                subframePreload: true,
+                allowFrameUrl: TEST_PAGE.subframe,
+              })
+            : createAppWindow(ctx, {
+                url: kind === 'fetch' ? TEST_PAGE.fetch : TEST_PAGE.scriptControl,
+              });
+      await loaded(appWin.id);
+      return appWin.id;
+    },
+    loadUrl: async (windowId: number, url: string) => {
+      await byId(windowId).win.webContents.loadURL(url);
+    },
+    fetchIn: async (windowId: number, url: string) => {
+      const response = await byId(windowId).session.fetch(url);
+      const body = new Uint8Array(await response.arrayBuffer());
+      return {
+        status: response.status,
+        headers: Object.fromEntries(response.headers.entries()),
+        length: body.length,
+      };
+    },
+    download: (windowId: number, url: string) => byId(windowId).win.webContents.downloadURL(url),
+    crashRenderer: (windowId: number) => byId(windowId).win.webContents.forcefullyCrashRenderer(),
+    core,
+    corePid: () => ctx.core.pid,
+    mainLog: (markers: string) =>
+      ctx.log.info('test.log', {
+        subject: markers,
+        path: markers,
+        reason: markers,
+        errorClass: markers,
+      }),
+    mainError: (markers: string) =>
+      ctx.log.error('test.error', errorData(new Error(markers), ctx.frameRoots)),
+    mainThrow: (markers: string) => {
+      setTimeout(() => {
+        throw new Error(markers);
+      }, 0);
+    },
+    mainReject: (markers: string) => {
+      void Promise.reject(new Error(markers));
+    },
+  };
+  (globalThis as { __pevTest?: typeof api }).__pevTest = api;
+
+  const selfTest = process.argv.includes('--pev-selftest');
+  if (selfTest) {
+    await runSelfTest(ctx, process.argv);
+    return true;
+  }
+  return false;
+}

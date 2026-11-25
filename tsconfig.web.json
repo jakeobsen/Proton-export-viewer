@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": []
+  },
+  "include": [
+    "src/renderer/**/*.ts",
+    "src/renderer/**/*.tsx",
+    "src/shared/env.d.ts",
+    "src/shared/api.ts",
+    "src/shared/log/schema.ts",
+    "src/shared/log/codes.ts",
+    "src/testhooks/renderer.ts"
+  ]
+}
