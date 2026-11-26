@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 export const INDEX_CAP: number;
-export const RESULTS_CAP: number;
+export const TRANSIENT_RESERVE: number;
 export const MIN_FREE: number;
 export function parseLarge(spec: string | undefined): Array<{ kind: string; bytes: number }>;
-export function preflight(dirs: { indexDir: string; resultsDir: string }): {
-  freeBytes: number;
-  resultsBytes: number;
-};
+export function freeSpace(dir: string): { freeBytes: number };
+export function removeContainerFile(folder: string, file: string, nonce: string): boolean;
 export function parseFootprint(
   text: string,
 ): Array<{ name: string; pid: number; bytes: number; peakBytes: number }>;
@@ -39,7 +37,8 @@ export function budgetCheck(
   measure?: (path: string) => number,
 ): {
   total: number;
-  withIndex: number;
+  reserved: number;
+  withRun: number;
   limit: number;
   parts: Array<{ path: string; bytes: number }>;
 };

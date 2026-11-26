@@ -25,8 +25,10 @@ import {
   MERGE_PAGES,
   MERGE_STEPS_PER_BATCH,
   WAL_HEADROOM,
+  WAL_STOP,
   WAL_TRUNCATE_AT,
   maxPages,
+  walGuard,
 } from './limits';
 import { checkIdentity, createSchema } from './schema';
 import { configure, engineInfo, openDb, type Db, type EngineName } from './sql';
@@ -54,6 +56,7 @@ interface WalRecord {
   merges: number;
 }
 
+let walPath: string | null = null;
 const wal: WalRecord = {
   peakWalBytes: 0,
   checkpoints: 0,
@@ -104,7 +107,17 @@ function afterCommit(dbPath: string, before: number, kind: 'write' | 'merge'): v
   else wal.maxMergeGrowth = Math.max(wal.maxMergeGrowth, growth);
   wal.peakWalBytes = Math.max(wal.peakWalBytes, size);
   if (size > WAL_HEADROOM) throw new Error('WAL_HEADROOM');
-  if (size <= WAL_TRUNCATE_AT) return;
+  truncateWal();
+}
+
+/**
+ * Checkpoints and truncates a WAL above WAL_TRUNCATE_AT. A reader holding an
+ * old snapshot makes the checkpoint report busy and leaves the WAL in place, so
+ * it is retried (each try waits up to the busy timeout); no transaction starts
+ * until it succeeds.
+ */
+function truncateWal(): void {
+  if (!walPath || fileSize(walPath) <= WAL_TRUNCATE_AT) return;
   const deadline = performance.now() + CHECKPOINT_RETRY_MS;
   for (;;) {
     const row = db!.stmt('PRAGMA wal_checkpoint(TRUNCATE)').get();
@@ -117,10 +130,12 @@ function afterCommit(dbPath: string, before: number, kind: 'write' | 'merge'): v
 
 /** One write transaction, then bounded full-text merge steps, each in its own transaction. */
 function commitBatch<T>(dbPath: string, write: () => T): T {
+  truncateWal();
   let before = fileSize(`${dbPath}-wal`);
   const stats = write();
   afterCommit(dbPath, before, 'write');
   for (let step = 0; step < MERGE_STEPS_PER_BATCH; step++) {
+    truncateWal();
     before = fileSize(`${dbPath}-wal`);
     const work = writer!.mergeStep(MERGE_PAGES);
     wal.merges += 1;
@@ -224,7 +239,13 @@ function writerOp(r: Request): unknown {
       db.exec(`PRAGMA journal_size_limit = ${WAL_TRUNCATE_AT}`);
       db.exec('PRAGMA wal_autocheckpoint = 1000');
       const uuid = createSchema(db, t.ftsPrefix);
-      writer = new IndexWriter(db);
+      walPath = `${t.dbPath}-wal`;
+      writer = new IndexWriter(
+        db,
+        walGuard(walPath, WAL_STOP, (size) => {
+          wal.peakWalBytes = Math.max(wal.peakWalBytes, size);
+        }),
+      );
       return {
         uuid,
         info: engineInfo(db),
@@ -297,6 +318,7 @@ function writerOp(r: Request): unknown {
       // Finishes the full-text merges after indexing, in bounded steps.
       let steps = 0;
       for (; steps < 10_000; steps++) {
+        truncateWal();
         const before = fileSize(`${r.dbPath as string}-wal`);
         const work = writer!.mergeStep(MERGE_PAGES);
         wal.merges += 1;
@@ -348,6 +370,12 @@ function queryOp(r: Request): unknown {
     case 'shrink':
       db?.exec('PRAGMA shrink_memory');
       return null;
+    case 'count': {
+      const n = db!
+        .stmt('SELECT count(*) AS n FROM fts WHERE fts MATCH ?')
+        .get(ftsLiteral(r.term as string))?.n;
+      return Number(n ?? 0);
+    }
     case 'close':
       db?.close();
       db = null;

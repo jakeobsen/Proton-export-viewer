@@ -11,47 +11,49 @@
 //   --opens <n>  --reopens <n>  --large kind:bytes,…  --no-window  --no-quarantine
 //   --warm-up           read every corpus file once first, so a warm run finds
 //                       them in the OS file cache
-//   --scan-data <dir>   a folder to search for generated test data (repeatable)
+//   --scan-data <dir>   a folder to search for generated test data (required, repeatable)
 //   --index-cap <bytes> a lower index cap, to test the stop
 //   --max-messages <n>  index only the first n messages (size analysis)
 //   --fts-prefix "<list>"  the full-text prefix lengths (size analysis; "" for none)
 //
-// Before the run it refuses when the index folder holds anything but the
-// bench's own index, when less than 20 GiB of disk is free, when the results
-// folder is near its 50 MB share, or when all generated test data it finds
-// (under each --scan-data folder, in the app's containers and the capture
-// folder) plus a full index would reach 1 GB. The app keeps the index (with
-// -wal and -shm) under 300 MB and empties it when it's done; this script checks
-// that it did. The frontmost app is sampled throughout, and the
-// downloaded file's quarantine attribute is read here, outside the app.
+// --out must be a new folder: the run creates it (a workspace marked with the
+// run's nonce) and writes everything inside it, and removes only things inside
+// it, never following links. Before the run it refuses when less than 20 GiB
+// of disk is free, or when all generated test data it finds (under each
+// --scan-data folder, in the app's containers and the capture folder; a folder
+// it can't read fails the check) plus a full index and 50 MB for the run's
+// other output would reach 1 GB. The app keeps the index (with -wal and -shm)
+// under 300 MB and empties it when it's done; this script checks that it did.
+// The frontmost app is sampled throughout, and the downloaded file's quarantine
+// attribute is read here, outside the app.
 
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import {
   existsSync,
-  mkdirSync,
+  lstatSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statfsSync,
-  statSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { APP_ID, PRODUCT_NAME, appPath } from '../../scripts/package.mjs';
+import { createWorkspace, removeInside } from './workspace.mjs';
 
 export const INDEX_CAP = 300 * 1000 * 1000;
-/** All generated test data on this Mac, every agent's, stays under this. */
+/** Room kept for a run's other output: results, logs and the app's profile. */
+export const TRANSIENT_RESERVE = 50 * 1000 * 1000;
+/** All generated test data on this machine stays under this. */
 export const TEST_DATA_LIMIT = 1000 * 1000 * 1000;
 /** Where the leak harness keeps its packet captures. */
 export const CAPTURE_DIR = '/usr/local/var/pev-leak/captures';
 const PRUNE = new Set(['node_modules', '.git', 'dist', 'out', 'out-test', 'build']);
-export const RESULTS_CAP = 50 * 1000 * 1000;
 export const MIN_FREE = 20 * 2 ** 30;
-const INDEX_NAME = 'pev-bench.db';
-const INDEX_FAMILY = ['', '-wal', '-shm', '-journal'].map((s) => INDEX_NAME + s);
 
 const DEFAULT_LARGE = {
   perf: 'attachment:10000000,attachment:50000000,text:200000000,html:200000000',
@@ -69,13 +71,6 @@ export function parseLarge(spec) {
   });
 }
 
-function dirBytes(path) {
-  if (!existsSync(path)) return 0;
-  const st = statSync(path);
-  if (!st.isDirectory()) return st.size;
-  return readdirSync(path).reduce((n, name) => n + dirBytes(join(path, name)), 0);
-}
-
 /**
  * Every folder of generated test data under the scan roots: generator exports
  * (the folder next to each `<name>.manifest.json`), every `test-output/` folder
@@ -91,8 +86,11 @@ export function findTestData(
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
+    } catch (err) {
+      // Fails closed: data that can't be counted could push the total over.
+      throw new Error(`can't read ${dir} to count test data (${err.code ?? err.message})`, {
+        cause: err,
+      });
     }
     if (entries.some((e) => e.isFile() && /^config-[0-9a-f]{16}\.json$/.test(e.name))) {
       found.add(dir);
@@ -125,32 +123,43 @@ export function diskBytes(path) {
   return Number(out.split('\t')[0]) * 1024;
 }
 
-/** Refuses to start unless all test data plus a full index stays under the limit. */
+/**
+ * Refuses to start unless all test data, plus a full index and the run's other
+ * output (results, logs, the app's profile), stays under the limit.
+ */
 export function budgetCheck(folders, indexCap = INDEX_CAP, measure = diskBytes) {
   const parts = folders.map((path) => ({ path, bytes: measure(path) }));
   const total = parts.reduce((n, p) => n + p.bytes, 0);
-  if (total + indexCap >= TEST_DATA_LIMIT)
+  const reserved = indexCap + TRANSIENT_RESERVE;
+  if (total + reserved >= TEST_DATA_LIMIT)
     throw new Error(
-      `test data is ${total} B; with a ${indexCap} B index it would pass ${TEST_DATA_LIMIT} B`,
+      `test data is ${total} B; with ${reserved} B reserved for this run it would pass ${TEST_DATA_LIMIT} B`,
     );
-  return { total, withIndex: total + indexCap, limit: TEST_DATA_LIMIT, parts };
+  return { total, reserved, withRun: total + reserved, limit: TEST_DATA_LIMIT, parts };
 }
 
-/** Refuses to start when the run could pass its share of the disk. */
-export function preflight({ indexDir, resultsDir }) {
-  const strangers = existsSync(indexDir)
-    ? readdirSync(indexDir).filter((name) => !INDEX_FAMILY.includes(name))
-    : [];
-  if (strangers.length > 0)
-    throw new Error(`the index folder holds other files: ${strangers.join(', ')}`);
-  const fs = statfsSync(resultsDir);
+/** Refuses to start when less than 20 GiB of disk would stay free. */
+export function freeSpace(dir) {
+  const fs = statfsSync(dir);
   const free = fs.bavail * fs.bsize;
   if (free < MIN_FREE)
     throw new Error(`only ${(free / 2 ** 30).toFixed(1)} GiB free; 20 GiB needed`);
-  const results = dirBytes(resultsDir) - dirBytes(indexDir);
-  if (results > RESULTS_CAP - 5 * 1000 * 1000)
-    throw new Error(`the results folder holds ${results} bytes, near its ${RESULTS_CAP} cap`);
-  return { freeBytes: free, resultsBytes: results };
+  return { freeBytes: free };
+}
+
+/** Removes one file of this run from the app's container: a regular file named with the nonce. */
+export function removeContainerFile(folder, file, nonce) {
+  if (dirname(file) !== folder || !basename(file).includes(nonce)) return false;
+  if (realpathSync(folder) !== folder) throw new Error(`${folder} is reached through a link`);
+  let stat;
+  try {
+    stat = lstatSync(file);
+  } catch {
+    return false;
+  }
+  if (!stat.isFile()) throw new Error(`${file} is not a regular file`);
+  rmSync(file);
+  return true;
 }
 
 function frontmost() {
@@ -319,11 +328,12 @@ async function main() {
   if (sandbox && values.engine !== 'node:sqlite')
     throw new Error('the sandboxed check runs node:sqlite');
 
-  const out = resolve(values.out);
+  const out = values.out;
+  if (resolve(out) !== out) throw new Error('--out must be a normalized absolute path');
+  if (!values['scan-data']?.length)
+    throw new Error('--scan-data is required: the folders where generated test data lives');
   const indexDir = join(out, 'index');
-  const downloadDir = join(out, 'downloads');
-  mkdirSync(indexDir, { recursive: true });
-  const disk = preflight({ indexDir, resultsDir: out });
+  const disk = freeSpace(dirname(out));
   const indexCap = values['index-cap'] ? Number(values['index-cap']) : INDEX_CAP;
   if (!Number.isSafeInteger(indexCap) || indexCap <= 0 || indexCap > INDEX_CAP)
     throw new Error(`--index-cap must be a whole number up to ${INDEX_CAP}`);
@@ -335,10 +345,7 @@ async function main() {
           join(containersRoot, name, 'Data', 'Library', 'Application Support', PRODUCT_NAME),
         )
     : [];
-  const budget = budgetCheck(
-    findTestData([...(values['scan-data'] ?? []), out], { containers }),
-    indexCap,
-  );
+  const budget = budgetCheck(findTestData(values['scan-data'], { containers }), indexCap);
 
   const build = sandbox ? 'mas-selftest' : values.build;
   const app = appPath(build);
@@ -355,6 +362,8 @@ async function main() {
   }
 
   const nonce = randomBytes(8).toString('hex');
+  // The run's own folder, made fresh: every file the run writes goes inside it.
+  createWorkspace(out, nonce);
   const userData = join(out, 'user-data');
   const resultPath = join(out, `result-${nonce}.json`);
   const config = {
@@ -377,9 +386,7 @@ async function main() {
     ...(values['max-messages'] ? { maxMessages: Number(values['max-messages']) } : {}),
     ...(values['fts-prefix'] !== undefined ? { ftsPrefix: values['fts-prefix'] } : {}),
     ...(values['hold-ms'] ? { holdMs: Number(values['hold-ms']) } : {}),
-    ...(sandbox
-      ? {}
-      : { runDir: values.corpus, dbPath: join(indexDir, INDEX_NAME), resultPath, downloadDir }),
+    ...(sandbox ? {} : { runDir: values.corpus, workspace: out }),
   };
   const args = sandbox
     ? [`--pev-bench-inline=${Buffer.from(JSON.stringify(config)).toString('base64url')}`]
@@ -426,10 +433,9 @@ async function main() {
   const appSupport = join(containerData, 'Library', 'Application Support', PRODUCT_NAME);
   const resultFile = sandbox ? join(appSupport, `bench-result-${nonce}.json`) : resultPath;
   const result = existsSync(resultFile) ? JSON.parse(readFileSync(resultFile, 'utf8')) : null;
-  const leftover = existsSync(indexDir)
-    ? readdirSync(indexDir).filter((name) => INDEX_FAMILY.includes(name))
-    : [];
-  for (const name of leftover) rmSync(join(indexDir, name), { force: true });
+  // Anything left in the run's index folder is the run's own; links are removed, never followed.
+  const leftover = sandbox ? [] : readdirSync(indexDir);
+  for (const name of leftover) removeInside(out, nonce, join(indexDir, name));
   const downloaded = result?.quarantine?.path ?? null;
   const report = {
     runner: {
@@ -471,11 +477,11 @@ async function main() {
     result: result?.nonce === nonce ? result : null,
   };
   // The app's own profile (logs, caches) isn't kept; the result holds what counts.
-  if (!sandbox) rmSync(userData, { recursive: true, force: true });
+  if (!sandbox) removeInside(out, nonce, userData);
   if (sandbox) {
-    // The result and the downloaded check file are this run's only files in the container.
-    rmSync(resultFile, { force: true });
-    if (downloaded && downloaded.startsWith(containerData)) rmSync(downloaded, { force: true });
+    // The result and the downloaded check file are this run's only files left in the container.
+    removeContainerFile(appSupport, resultFile, nonce);
+    if (downloaded) removeContainerFile(join(appSupport, 'downloads'), downloaded, nonce);
   }
   const name = `${values.label}-${scenario}-${values.engine.replace(':', '-')}-pool${config.poolSize}-${nonce}.json`;
   writeFileSync(join(out, name), JSON.stringify(report, null, 2) + '\n');

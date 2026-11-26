@@ -83,10 +83,21 @@ interface ThreadAgg {
   last_time: number;
 }
 
+/** Rows one statement may re-point when a merge moves members or keys. */
+export const REPOINT_CHUNK = 500;
+
 export class IndexWriter {
   private revSeq: number;
 
-  constructor(private readonly db: Db) {
+  /**
+   * `step` runs before every bounded unit of work inside a transaction (one
+   * message, one chunk of a merge, one body, one merge step). It throws to stop
+   * the transaction, which is then rolled back.
+   */
+  constructor(
+    private readonly db: Db,
+    private readonly step: () => void = () => {},
+  ) {
     this.revSeq = asNumber(
       db.stmt("SELECT value FROM source_meta WHERE key = 'rev_seq'").get()?.value,
     );
@@ -138,6 +149,7 @@ export class IndexWriter {
    */
   mergeStep(pages: number): number {
     return this.transaction(() => {
+      this.step();
       const before = asNumber(this.db.stmt('SELECT total_changes() AS c').get()?.c);
       this.db.stmt("INSERT INTO fts(fts, rank) VALUES ('merge', ?)").run(pages);
       return asNumber(this.db.stmt('SELECT total_changes() AS c').get()?.c) - before;
@@ -165,6 +177,7 @@ export class IndexWriter {
     };
     this.transaction(() => {
       for (const item of items) {
+        this.step();
         this.insertPair(item);
         if (item.row) {
           this.insertMessage(item.row, stats);
@@ -228,20 +241,34 @@ export class IndexWriter {
     };
   }
 
+  private repointChunks(sql: string, into: number, from: number): number {
+    let total = 0;
+    for (;;) {
+      this.step();
+      const n = asNumber(this.db.stmt(sql).run(into, from, REPOINT_CHUNK).changes);
+      total += n;
+      if (n < REPOINT_CHUNK) return total;
+    }
+  }
+
   /** Merges `from` into `into`: members, keys, aggregates and per-label rows. */
   private merge(into: number, from: number, intoSize: number, stats: Phase1Stats): void {
     const a = this.agg(from);
     stats.merges += 1;
-    const repointed = asNumber(
-      this.db.stmt('UPDATE messages SET thread_id = ? WHERE thread_id = ?').run(into, from).changes,
+    // Members and keys move in chunks, each its own bounded statement.
+    const repointed = this.repointChunks(
+      'UPDATE messages SET thread_id = ? WHERE rowid IN (SELECT rowid FROM messages WHERE thread_id = ? LIMIT ?)',
+      into,
+      from,
     );
     stats.repointedMessages += repointed;
     if (Math.max(intoSize, a.msg_count) >= BIG_MERGE && stats.bigMerges.length < 1000) {
       stats.bigMerges.push({ into, from, intoSize, fromSize: a.msg_count, repointed });
     }
-    stats.repointedKeys += asNumber(
-      this.db.stmt('UPDATE thread_keys SET thread_id = ? WHERE thread_id = ?').run(into, from)
-        .changes,
+    stats.repointedKeys += this.repointChunks(
+      'UPDATE thread_keys SET thread_id = ? WHERE key IN (SELECT key FROM thread_keys WHERE thread_id = ? LIMIT ?)',
+      into,
+      from,
     );
     this.db
       .stmt(
@@ -383,6 +410,7 @@ export class IndexWriter {
         'UPDATE pairs SET body_state = ?, error_code = ? WHERE proton_id = ? AND rev = ?',
       );
       for (const r of results) {
+        this.step();
         const hit = target.get(r.protonId, r.rev);
         if (!hit) {
           stats.dropped += 1;

@@ -1,17 +1,31 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { buildReport, markdown, metricsOf } from '../../tools/bench/report.mjs';
 import {
   TEST_DATA_LIMIT,
+  TRANSIENT_RESERVE,
   budgetCheck,
   findTestData,
   footprintByPhase,
   parseFootprint,
   parseLarge,
-  preflight,
 } from '../../tools/bench/run-bench.mjs';
+import {
+  checkEmptyFolder,
+  checkWorkspace,
+  createWorkspace,
+  removeInside,
+} from '../../tools/bench/workspace.mjs';
 import { REPO_ROOT, testDir } from '../paths';
 
 describe('the comparison engine', () => {
@@ -39,15 +53,61 @@ describe('bench runner checks', () => {
     expect(() => parseLarge('video:1')).toThrow('bad --large');
     expect(() => parseLarge('text:1e9')).toThrow('bad --large');
   });
+});
 
-  it('refuses an index folder that holds anything but the bench index', () => {
-    const root = testDir('bench-preflight');
-    const indexDir = join(root, 'index');
-    mkdirSync(indexDir, { recursive: true });
-    writeFileSync(join(indexDir, 'pev-bench.db-wal'), '');
-    expect(preflight({ indexDir, resultsDir: root }).resultsBytes).toBe(0);
-    writeFileSync(join(indexDir, 'notes.txt'), 'x');
-    expect(() => preflight({ indexDir, resultsDir: root })).toThrow('other files: notes.txt');
+describe('the run workspace', () => {
+  const nonce = '0123456789abcdef';
+
+  it('is made fresh: an existing folder or a linked parent is refused', () => {
+    const root = testDir('bench-ws-fresh');
+    const ws = join(root, 'run');
+    createWorkspace(ws, nonce);
+    expect(readdirSync(ws).sort()).toEqual([
+      '.pev-bench-workspace',
+      'downloads',
+      'index',
+      'user-data',
+    ]);
+    expect(() => createWorkspace(ws, nonce)).toThrow('already exists');
+    symlinkSync(root, join(root, 'link'));
+    expect(() => createWorkspace(join(root, 'link', 'other'), nonce)).toThrow('without links');
+    expect(() => checkWorkspace(ws, 'fedcba9876543210')).toThrow("not this run's workspace");
+  });
+
+  it('removes only what is inside, and never follows a link out', () => {
+    const root = testDir('bench-ws-outside');
+    const outside = join(root, 'outside');
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'keep.txt'), 'outside data');
+    const ws = join(root, 'run');
+    createWorkspace(ws, nonce);
+    // A link in the index folder to an outside file: removing it removes the link only.
+    symlinkSync(join(outside, 'keep.txt'), join(ws, 'index', 'pev-bench.db-wal'));
+    expect(removeInside(ws, nonce, join(ws, 'index', 'pev-bench.db-wal'))).toBe(true);
+    expect(readFileSync(join(outside, 'keep.txt'), 'utf8')).toBe('outside data');
+    // A profile folder swapped for a link to an outside folder: the link goes, the folder stays.
+    rmSync(join(ws, 'user-data'), { recursive: true });
+    symlinkSync(outside, join(ws, 'user-data'));
+    removeInside(ws, nonce, join(ws, 'user-data'));
+    expect(readFileSync(join(outside, 'keep.txt'), 'utf8')).toBe('outside data');
+    // A path through a linked folder is refused outright.
+    symlinkSync(outside, join(ws, 'via'));
+    expect(() => removeInside(ws, nonce, join(ws, 'via', 'keep.txt'))).toThrow('not a real folder');
+    expect(() => removeInside(ws, nonce, outside)).toThrow('not inside');
+    expect(readFileSync(join(outside, 'keep.txt'), 'utf8')).toBe('outside data');
+  });
+
+  it('refuses an index folder that already holds anything, or is a link', () => {
+    const root = testDir('bench-ws-index');
+    const ws = join(root, 'run');
+    createWorkspace(ws, nonce);
+    checkEmptyFolder(ws, join(ws, 'index'));
+    writeFileSync(join(ws, 'index', 'pev-bench.db'), 'not ours');
+    expect(() => checkEmptyFolder(ws, join(ws, 'index'))).toThrow('not empty');
+    rmSync(join(ws, 'index'), { recursive: true });
+    mkdirSync(join(root, 'elsewhere'));
+    symlinkSync(join(root, 'elsewhere'), join(ws, 'index'));
+    expect(() => checkEmptyFolder(ws, join(ws, 'index'))).toThrow('not a real folder');
   });
 });
 
@@ -75,11 +135,25 @@ describe('the test data budget', () => {
     ]);
   });
 
-  it('refuses when the data plus a full index would reach the limit', () => {
-    const sizes: Record<string, number> = { x: 400e6, y: 250e6 };
-    expect(budgetCheck(['x', 'y'], 300e6, (p) => sizes[p]!).withIndex).toBe(950e6);
-    sizes.y = 300e6;
+  it('refuses when the data plus a full index and the run output would reach the limit', () => {
+    const sizes: Record<string, number> = { x: 400e6, y: 200e6 };
+    const ok = budgetCheck(['x', 'y'], 300e6, (p) => sizes[p]!);
+    expect(ok.reserved).toBe(300e6 + TRANSIENT_RESERVE);
+    expect(ok.withRun).toBe(600e6 + 300e6 + TRANSIENT_RESERVE);
+    sizes.y = 250e6;
     expect(() => budgetCheck(['x', 'y'], 300e6, (p) => sizes[p]!)).toThrow(String(TEST_DATA_LIMIT));
+  });
+
+  it('fails closed on a folder it cannot read', () => {
+    const root = testDir('bench-budget-unreadable');
+    const locked = join(root, 'locked');
+    mkdirSync(locked);
+    chmodSync(locked, 0o000);
+    try {
+      expect(() => findTestData([root], { captureDir: null })).toThrow("can't read");
+    } finally {
+      chmodSync(locked, 0o700);
+    }
   });
 });
 
@@ -135,9 +209,12 @@ function fakeRun(phase1Ms: number) {
       addonSha256: null,
       frontmost: { loginwindow: 3 },
       quarantine: { present: false, value: null },
+      footprint: { peakPhase2: 800, idle: 400, idlePoolAlive: 500, idleShrunk: 300 },
+      footprintPeakByProcess: [{ name: 'Browser', peakMiB: 50 }],
     },
     result: {
       ok: true,
+      scenario: 'perf',
       label: 'warm',
       build: { electron: '45.5.0', node: '24' },
       machine: { cpuModel: 'M', cpus: 10, totalMemGb: 32 },
@@ -166,6 +243,8 @@ function fakeRun(phase1Ms: number) {
         list: summary(4),
       },
       memoryIdle: { mb: 450 },
+      totals: { size: { pages: 1, pageSize: 4096 }, wal: { peakWalBytes: 1 } },
+      termMatches: 9000,
       memoryIdlePoolAlive: { mb: 600 },
       memoryPeakPhase2: { mb: 900, byTypeMb: {} },
       quarantine: { method: 'webContents.downloadURL', state: 'completed' },
@@ -195,7 +274,19 @@ describe('bench report', () => {
     };
     expect(report.metrics.phase1Measured).toBe(4000);
     expect(report.targets.searchIdle!.verdict).toBe('OVER');
-    expect(report.targets.firstRows!.verdict).toBe('within');
+    // A warm run can't decide a cold target.
+    expect(report.targets.firstRows!.verdict).toBe('pending cold run (warm value within)');
+    expect(report.targets.memoryPeak!.verdict).toBe('within');
+    // Runs that measured something else are refused.
+    const other = join(root, 'other.json');
+    const mismatched = fakeRun(3000);
+    mismatched.result.phase1.pairs = 5000;
+    writeFileSync(other, JSON.stringify(mismatched));
+    expect(() => buildReport({ primary: [files[0]!, other] })).toThrow('5000 messages');
+    const missing = fakeRun(3000) as { result: Record<string, unknown> };
+    delete missing.result.reopen;
+    writeFileSync(other, JSON.stringify(missing));
+    expect(() => buildReport({ primary: [other] })).toThrow('reopen is missing');
     const md = markdown(report);
     expect(md).toContain('| deferred |');
     expect(md).toContain('×10 to 200k');

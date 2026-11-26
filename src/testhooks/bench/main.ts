@@ -11,7 +11,6 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
-  rmSync,
   statSync,
   utimesSync,
   writeFileSync,
@@ -21,7 +20,18 @@ import { dirname, join } from 'node:path';
 import { BrowserWindow, app, session } from 'electron';
 import type { AppContext } from '../../main/context';
 import { createAppWindow } from '../../main/windows';
+import {
+  checkEmptyFolder,
+  checkInside,
+  checkWorkspace,
+  createWorkspace,
+  removeInside,
+  removeWorkspace,
+} from '../../../tools/bench/workspace.mjs';
 import type { EngineName } from './sql';
+
+const INDEX_FILE = 'pev-bench.db';
+const INDEX_SUFFIXES = ['', '-wal', '-shm', '-journal'];
 
 export interface LargePart {
   kind: 'text' | 'html' | 'attachment';
@@ -32,10 +42,14 @@ export interface BenchConfig {
   nonce: string;
   scenario: 'perf' | 'stress' | 'sandbox';
   label: string;
+  /** The export run folder the bench reads (never written). */
   runDir?: string;
-  dbPath?: string;
-  resultPath?: string;
-  downloadDir?: string;
+  /**
+   * The run's workspace, which the runner created fresh and marked with the
+   * nonce. The index, the result and the download all go inside it. The
+   * sandboxed build makes its own inside its container instead.
+   */
+  workspace?: string;
   engine: EngineName;
   addonDir?: string;
   poolSize: number;
@@ -248,7 +262,13 @@ export async function runBench(ctx: AppContext, argv: string[]): Promise<void> {
     config: { ...config, addonDir: config.addonDir ? '(given)' : null },
   };
   const userData = app.getPath('userData');
-  const resultPath = config.resultPath ?? join(userData, `bench-result-${config.nonce}.json`);
+  // The sandboxed build can't reach the runner's folder: its workspace is a new
+  // folder in its container, and the result goes next to it.
+  const sandboxed = config.scenario === 'sandbox';
+  const workspace = sandboxed ? join(userData, `bench-${config.nonce}`) : (config.workspace ?? '');
+  const resultPath = sandboxed
+    ? join(userData, `bench-result-${config.nonce}.json`)
+    : join(workspace, `result-${config.nonce}.json`);
   const sampler = new Sampler();
   sampler.start();
   const core = async <T>(payload: Record<string, unknown>): Promise<T> => {
@@ -264,20 +284,23 @@ export async function runBench(ctx: AppContext, argv: string[]): Promise<void> {
 
   let corpusRoot: string | null = null;
   let runDir = config.runDir ?? '';
-  let dbPath = config.dbPath ?? '';
+  let dbPath = '';
+  let ownWorkspace = false;
   try {
-    if (config.scenario === 'sandbox') {
-      corpusRoot = join(userData, 'bench-corpus');
-      rmSync(corpusRoot, { recursive: true, force: true });
+    if (sandboxed) {
+      createWorkspace(workspace, config.nonce, ['index', 'corpus']);
+      ownWorkspace = true;
+      corpusRoot = join(workspace, 'corpus');
       runDir = await writeSmallCorpus(corpusRoot);
-      mkdirSync(join(userData, 'bench-index'), { recursive: true });
-      dbPath = join(userData, 'bench-index', 'pev-bench.db');
     }
+    checkWorkspace(workspace, config.nonce);
+    // A fresh, empty index folder: nothing already there is ever opened or removed.
+    checkEmptyFolder(workspace, join(workspace, 'index'));
+    dbPath = join(workspace, 'index', INDEX_FILE);
     if (config.window) {
       const win = createAppWindow(ctx);
       if (win.win.webContents.isLoading()) await once(win.win.webContents, 'did-finish-load');
     }
-    await core({ op: 'remove-index', dbPath });
     const target = {
       dbPath,
       engine: config.engine,
@@ -374,6 +397,7 @@ export async function runBench(ctx: AppContext, argv: string[]): Promise<void> {
       result.mergeAll = await timed({ op: 'merge-all' });
       result.checkpoint = await core({ op: 'checkpoint' });
       result.totals = await core({ op: 'totals' });
+      result.termMatches = await core({ op: 'search', count: true, term: config.term });
 
       sampler.phase = 'idle';
       await sleep(5000);
@@ -428,16 +452,18 @@ export async function runBench(ctx: AppContext, argv: string[]): Promise<void> {
       sampler.phase = 'large';
       const large: unknown[] = [];
       for (const part of config.large) {
-        const gen = await core({
-          op: 'large',
-          ...part,
-          mode: 'generate',
-          oldGenMb: config.oldGenMb,
-        });
+        // Extraction first, on a fresh thread: its growth includes generating the
+        // stream, with nothing measured before it in this core.
         const ext = await core({
           op: 'large',
           ...part,
           mode: 'extract',
+          oldGenMb: config.oldGenMb,
+        });
+        const gen = await core({
+          op: 'large',
+          ...part,
+          mode: 'generate',
           oldGenMb: config.oldGenMb,
         });
         large.push({ ...part, generateOnly: gen, extract: ext });
@@ -448,7 +474,7 @@ export async function runBench(ctx: AppContext, argv: string[]): Promise<void> {
       result.threads = await core({ op: 'threads' });
     }
 
-    await core({ op: 'close', deleteIndex: false });
+    await core({ op: 'close' });
     if (config.reopens > 0) {
       sampler.phase = 'reopen';
       const reopens: unknown[] = [];
@@ -463,27 +489,39 @@ export async function runBench(ctx: AppContext, argv: string[]): Promise<void> {
 
     if (config.quarantine) {
       sampler.phase = 'quarantine';
-      result.quarantine = await quarantineCheck(
-        config.downloadDir ?? join(userData, 'downloads'),
-        config.nonce,
-      );
+      // The runner reads the saved file's attribute afterwards, so it stays
+      // outside the sandboxed build's workspace, which is removed at the end.
+      const downloads = sandboxed ? join(userData, 'downloads') : join(workspace, 'downloads');
+      if (!sandboxed) checkInside(workspace, downloads);
+      result.quarantine = await quarantineCheck(downloads, config.nonce);
     }
-    await core({ op: 'remove-index', dbPath });
     result.ok = true;
   } catch (err) {
     result.ok = false;
     result.error = (err as Error).message;
   } finally {
     // An invalid or failed run leaves no index either.
-    await core({ op: 'close', deleteIndex: true }).catch(() => undefined);
-    if (dbPath) await core({ op: 'remove-index', dbPath }).catch(() => undefined);
-    result.indexRemoved =
-      dbPath !== '' && !['', '-wal', '-shm'].some((s) => existsSync(dbPath + s));
+    await core({ op: 'close' }).catch(() => undefined);
+    if (dbPath) {
+      for (const suffix of INDEX_SUFFIXES) {
+        try {
+          removeInside(workspace, config.nonce, dbPath + suffix);
+        } catch (err) {
+          result.cleanupError = (err as Error).message;
+        }
+      }
+    }
+    result.indexRemoved = dbPath !== '' && !INDEX_SUFFIXES.some((s) => existsSync(dbPath + s));
     sampler.stop();
-    if (corpusRoot) {
+    if (corpusRoot && ownWorkspace) {
       result.corpusBytes = dirBytes(corpusRoot);
-      rmSync(corpusRoot, { recursive: true, force: true });
+      try {
+        removeWorkspace(workspace, config.nonce);
+      } catch (err) {
+        result.cleanupError = (err as Error).message;
+      }
       result.corpusRemoved = !existsSync(corpusRoot);
+      result.workspaceRemoved = !existsSync(workspace);
     }
     result.memoryPeak = sampler.peak();
     result.memoryPeakPhase2 = sampler.peak(['phase2']);
@@ -496,8 +534,11 @@ export async function runBench(ctx: AppContext, argv: string[]): Promise<void> {
     result.phaseLog = sampler.phaseLog;
     result.processTypes = sampler.types;
     result.finishedAt = new Date().toISOString();
-    mkdirSync(dirname(resultPath), { recursive: true });
-    writeFileSync(resultPath, JSON.stringify(result, null, 2) + '\n');
+    try {
+      writeFileSync(resultPath, JSON.stringify(result, null, 2) + '\n', { flag: 'wx' });
+    } catch {
+      // No place for the result: the runner reports the run as failed.
+    }
     app.quit();
   }
 }

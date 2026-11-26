@@ -3,10 +3,11 @@
 // writer, one query thread, an index pool and a reader lane), with a
 // wall-clock limit on every job, and answers main's timed requests.
 
-import { lstatSync, rmSync, statSync } from 'node:fs';
+import { lstatSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { FileError, readContained, scanRun, type FileRef } from './files';
+import { TXN_INPUT_BYTES } from './limits';
 import { BODY_STATE } from './schema';
 import type { DbTarget, Role } from './worker';
 import type {
@@ -35,8 +36,32 @@ export interface InitArgs {
 
 /** Parsed batches allowed ahead of the writer, so parsed text never piles up. */
 const BATCHES_AHEAD = 2;
-/** The most body text one phase 2 write transaction carries, so its WAL growth stays bounded. */
-const PHASE2_TXN_TEXT_BYTES = 4 * 1024 * 1024;
+/**
+ * Splits items into write batches of at most `count` items and `bytes` bytes
+ * of input. An item larger than `bytes` on its own gets a batch of its own.
+ */
+export function splitBatches<T>(
+  items: T[],
+  count: number,
+  bytes: number,
+  size: (item: T) => number,
+): T[][] {
+  const out: T[][] = [];
+  let current: T[] = [];
+  let total = 0;
+  for (const item of items) {
+    const n = size(item);
+    if (current.length > 0 && (current.length >= count || total + n > bytes)) {
+      out.push(current);
+      current = [];
+      total = 0;
+    }
+    current.push(item);
+    total += n;
+  }
+  if (current.length > 0) out.push(current);
+  return out;
+}
 const WATCHDOG_MS = 20;
 
 /** The index family's size on disk: the database, its WAL and its shared-memory file. */
@@ -346,7 +371,13 @@ class Bench {
     };
 
     const inFlight = new Set<Promise<void>>();
-    for (const [i, pairs] of chunk(scan.pairs, this.args.phase1Batch).entries()) {
+    const phase1Batches = splitBatches(
+      scan.pairs,
+      this.args.phase1Batch,
+      TXN_INPUT_BYTES,
+      (p) => p.metaSize,
+    );
+    for (const [i, pairs] of phase1Batches.entries()) {
       if (this.invalid) break;
       const batch = runBatch(i, pairs).finally(() => inFlight.delete(batch));
       inFlight.add(batch);
@@ -472,10 +503,12 @@ class Bench {
           };
         }
         record.states[result.state] = (record.states[result.state] ?? 0) + 1;
+        const bytes = Buffer.byteLength(result.text);
+        if (buffer.length > 0 && bufferBytes + bytes > TXN_INPUT_BYTES) flush();
         buffer.push(result);
-        bufferBytes += Buffer.byteLength(result.text);
+        bufferBytes += bytes;
         this.phase2Done += 1;
-        if (buffer.length >= this.args.phase2Batch || bufferBytes >= PHASE2_TXN_TEXT_BYTES) flush();
+        if (buffer.length >= this.args.phase2Batch || bufferBytes >= TXN_INPUT_BYTES) flush();
       }
     };
     await Promise.all(Array.from({ length: this.pool.threads.length * 2 }, lane));
@@ -489,7 +522,7 @@ class Bench {
 
   async search(args: Record<string, unknown>): Promise<unknown> {
     await this.openQuery();
-    return this.query.call(args.list ? 'list' : 'search', args);
+    return this.query.call(args.list ? 'list' : args.count ? 'count' : 'search', args);
   }
 
   async open(protonId: string): Promise<unknown> {
@@ -554,18 +587,14 @@ class Bench {
     );
   }
 
-  async close(deleteIndex: boolean): Promise<void> {
+  /** Closes every connection and thread; main removes the index, inside the run's workspace. */
+  async close(): Promise<void> {
     await this.writer.call('close').catch(() => undefined);
     await this.query.call('close').catch(() => undefined);
     await Promise.all(
       [this.writer, this.query, this.reader, ...this.pool.threads].map((t) => t.stop()),
     );
-    if (deleteIndex) removeIndex(this.args.target.dbPath);
   }
-}
-
-export function removeIndex(dbPath: string): void {
-  for (const suffix of ['', '-wal', '-shm', '-journal']) rmSync(dbPath + suffix, { force: true });
 }
 
 /** Extraction of one streamed large part in a fresh worker, with core's RSS sampled. */
@@ -633,7 +662,7 @@ export async function handleBench(payload: unknown, dir: string): Promise<unknow
   const p = payload as { op: string } & Record<string, unknown>;
   switch (p.op) {
     case 'init': {
-      if (bench) await bench.close(false);
+      if (bench) await bench.close();
       bench = new Bench(dir, p.args as InitArgs);
       return bench.init();
     }
@@ -673,7 +702,7 @@ export async function handleBench(payload: unknown, dir: string): Promise<unknow
       await bench!.stopPool();
       return null;
     case 'close': {
-      await bench?.close(Boolean(p.deleteIndex));
+      await bench?.close();
       bench = null;
       return null;
     }
@@ -681,9 +710,6 @@ export async function handleBench(payload: unknown, dir: string): Promise<unknow
       return large(dir, p, (p.oldGenMb as number) ?? 512);
     case 'reopen':
       return reopen(dir, p);
-    case 'remove-index':
-      removeIndex(p.dbPath as string);
-      return null;
   }
   throw new Error(`unknown bench op ${p.op}`);
 }

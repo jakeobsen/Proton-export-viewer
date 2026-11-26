@@ -7,6 +7,7 @@
 import { createRequire } from 'node:module';
 import { isAbsolute } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { WRITER_CACHE_BYTES } from './limits';
 
 export type SqlValue = string | number | bigint | null | Uint8Array;
 export type Row = Record<string, unknown>;
@@ -93,7 +94,9 @@ export function configure(db: Db, role: 'writer' | 'reader'): void {
     db.exec('PRAGMA journal_mode = WAL');
     db.exec('PRAGMA synchronous = NORMAL');
   }
-  db.exec('PRAGMA cache_size = -65536');
+  // The writer's cache bounds how much one unit of work can leave unwritten
+  // (see limits.ts); readers keep a larger one for searches.
+  db.exec(`PRAGMA cache_size = ${role === 'writer' ? -WRITER_CACHE_BYTES / 1024 : -65536}`);
   db.exec('PRAGMA temp_store = MEMORY');
 }
 

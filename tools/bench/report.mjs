@@ -16,14 +16,25 @@ import { parseArgs } from 'node:util';
 
 export const TARGET_MESSAGES = 200_000;
 
-/** The performance targets, in milliseconds or megabytes. */
+/**
+ * The performance targets, in milliseconds or megabytes (MB = 10^6 bytes
+ * throughout). `cold` targets need a purged OS file cache; a run with a warm
+ * cache shows its value but leaves the verdict pending.
+ */
 export const TARGETS = {
-  firstRows: { label: 'Cold: first rows visible', limit: 3000, unit: 'ms', basis: 'measured' },
+  firstRows: {
+    label: 'Cold: first rows visible',
+    limit: 3000,
+    unit: 'ms',
+    basis: 'measured',
+    cold: true,
+  },
   phase1: {
     label: 'Cold: phase 1 complete (grouping included)',
     limit: 40_000,
     unit: 'ms',
     basis: 'extrapolated',
+    cold: true,
   },
   phase2: { label: 'Phase 2 complete', limit: 20 * 60_000, unit: 'ms', basis: 'extrapolated' },
   reopen: { label: 'Warm reopen to a usable list', limit: 2000, unit: 'ms', basis: 'measured' },
@@ -54,7 +65,7 @@ export const TARGETS = {
   },
   memoryPeak: {
     label: 'Peak memory, phase 2 + reading (all processes, summed physical footprint)',
-    limit: 1536,
+    limit: 1500,
     unit: 'MB',
     basis: 'at bench size',
   },
@@ -76,6 +87,58 @@ function load(file) {
   if (!doc.result?.ok)
     throw new Error(`${file}: the run did not finish (${doc.result?.error ?? 'no result'})`);
   return { file, ...doc };
+}
+
+const PRIMARY_FIELDS = [
+  'phase1.firstRowsMs',
+  'phase1.phase1Ms',
+  'phase2.ms',
+  'idle.dateP1',
+  'idle.relevanceP1',
+  'idle.open',
+  'duringPhase2.searchDateP1',
+  'duringPhase2.open',
+  'reopen',
+  'large',
+  'totals.size',
+  'memoryIdle',
+];
+
+const at = (obj, path) => path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
+
+/**
+ * Throws unless every run measured the same thing: the same scenario, corpus
+ * size, label and (for the primary runs) engine and pool, with every
+ * measurement the report needs present.
+ */
+export function checkCompatible(docs, { sameEngine = true, sameLabel = true } = {}) {
+  const base = docs[0].result;
+  for (const doc of docs) {
+    const r = doc.result;
+    const name = doc.file ?? 'a run';
+    if (r.scenario !== 'perf') throw new Error(`${name}: scenario ${r.scenario}, not perf`);
+    if (r.phase1?.pairs !== base.phase1?.pairs)
+      throw new Error(`${name}: ${r.phase1?.pairs} messages, not ${base.phase1?.pairs}`);
+    if (r.config?.maxMessages || r.config?.ftsPrefix !== undefined)
+      throw new Error(`${name}: a size-analysis run, not a full one`);
+    if (sameLabel && r.label !== base.label)
+      throw new Error(`${name}: label ${r.label}, not ${base.label}`);
+    if (
+      sameEngine &&
+      (r.engine?.engine !== base.engine?.engine || r.config?.poolSize !== base.config?.poolSize)
+    )
+      throw new Error(`${name}: a different engine or pool`);
+    if (!doc.runner?.footprint?.peakPhase2) throw new Error(`${name}: no memory footprint`);
+  }
+  return docs;
+}
+
+function checkComplete(docs) {
+  for (const doc of docs)
+    for (const field of PRIMARY_FIELDS)
+      if (at(doc.result, field) == null)
+        throw new Error(`${doc.file ?? 'a run'}: ${field} is missing`);
+  return docs;
 }
 
 /** The large parts' extraction time, which the phase 2 extrapolation adds once. */
@@ -185,9 +248,12 @@ function combine(list) {
   return out;
 }
 
-function verdict(value, limit) {
+function verdict(value, limit, { cold = false, label = '' } = {}) {
   if (value === null || value === undefined) return 'not measured';
-  return value <= limit ? 'within' : 'OVER';
+  const result = value <= limit ? 'within' : 'OVER';
+  // A cold target can't be decided by a warm run.
+  if (cold && label !== 'cold') return `pending cold run (warm value ${result})`;
+  return result;
 }
 
 function stressOf(doc) {
@@ -225,6 +291,7 @@ function engineRow(doc) {
     threadsafe: r.engine.compileOptions.find((o) => o.startsWith('THREADSAFE')) ?? null,
     compileOptions: r.engine.compileOptions,
     addonSha256: doc.runner.addonSha256,
+    appExecutableSha256: doc.runner.appExecutableSha256,
     phase1Ms: m.phase1Measured,
     phase2Ms: m.phase2Measured,
     writerBatchP95: r.phase2?.writerMs?.p95 ?? null,
@@ -239,6 +306,7 @@ function poolRow(doc) {
   const m = metricsOf(doc);
   return {
     pool: r.config.poolSize,
+    appExecutableSha256: doc.runner.appExecutableSha256,
     phase2Ms: m.phase2Measured,
     phase2JobP95: r.phase2?.jobMs?.p95 ?? null,
     peakMb: m.memoryPeak,
@@ -260,8 +328,9 @@ export function buildReport({
   sizeRuns,
   exportMessages,
 }) {
-  const docs = primary.map(load);
+  const docs = checkComplete(checkCompatible(primary.map(load)));
   const metrics = combine(docs.map(metricsOf));
+  const peaks = docs.map((d) => metricsOf(d).peakFamilyBytes).filter((x) => typeof x === 'number');
   const first = docs[0];
   const report = {
     label: first.result.label,
@@ -276,7 +345,11 @@ export function buildReport({
     targets: Object.fromEntries(
       Object.entries(TARGETS).map(([k, t]) => [
         k,
-        { ...t, value: metrics[k], verdict: verdict(metrics[k], t.limit) },
+        {
+          ...t,
+          value: metrics[k],
+          verdict: verdict(metrics[k], t.limit, { cold: t.cold, label: first.result.label }),
+        },
       ]),
     ),
     phase1: first.result.phase1 && { ...first.result.phase1, batches: undefined },
@@ -286,6 +359,16 @@ export function buildReport({
     threads: first.result.threads,
     quarantine: { standard: first.runner.quarantine, saved: first.result.quarantine },
     indexLimits: first.result.indexLimits,
+    peakFamily: { median: metrics.peakFamilyBytes, max: peaks.length ? Math.max(...peaks) : null },
+    peakWalMax: Math.max(...docs.map((d) => d.result.totals?.wal?.peakWalBytes ?? 0)),
+    termMatches: { term: first.result.config.term, messages: first.result.termMatches ?? null },
+    perProcessPeakSumMiB: docs.map((d) =>
+      (d.runner.footprintPeakByProcess ?? []).reduce((n, p) => n + p.peakMiB, 0),
+    ),
+    runFiles: docs.map((d) => ({
+      file: d.file,
+      appExecutableSha256: d.runner.appExecutableSha256,
+    })),
     indexSize: indexSize(first.result.totals, first.result.phase1.pairs, [
       ...(exportMessages ? [exportMessages] : []),
       TARGET_MESSAGES,
@@ -316,10 +399,20 @@ export function buildReport({
     frontmost: docs.map((d) => d.runner.frontmost),
   };
   if (stress) report.stress = stressOf(load(stress));
-  if (engine)
-    report.engines = [engineRow(engineBase ? load(engineBase) : first), engineRow(load(engine))];
-  if (pools?.length)
-    report.pools = pools.map((f) => poolRow(load(f))).sort((a, b) => a.pool - b.pool);
+  if (engine) {
+    const pair = checkCompatible([load(engineBase ?? first.file), load(engine)], {
+      sameEngine: false,
+    });
+    if (pair[0].result.config.poolSize !== pair[1].result.config.poolSize)
+      throw new Error('the engine comparison needs the same pool size on both sides');
+    report.engines = pair.map(engineRow);
+  }
+  if (pools?.length) {
+    const sweep = checkCompatible(pools.map(load), { sameEngine: false });
+    if (new Set(sweep.map((d) => d.result.engine.engine)).size !== 1)
+      throw new Error('the pool sweep needs one engine');
+    report.pools = sweep.map(poolRow).sort((a, b) => a.pool - b.pool);
+  }
   if (sandbox) {
     const s = load(sandbox);
     report.sandbox = {
@@ -373,10 +466,11 @@ export function markdown(report, deferredLabel = 'deferred') {
           ? `measured at ${m.messages.toLocaleString('en-US')}`
           : 'measured';
     if (k === 'phase2') basis += `, plus ${fmt(m.largeMs, 'ms')} for the streamed large parts`;
+    const warmOnly = t.cold && report.label !== 'cold';
     return {
       Metric: t.label,
       Target: `≤ ${t.limit.toLocaleString('en-US')} ${t.unit}`,
-      Value: fmt(t.value, t.unit),
+      Value: `${fmt(t.value, t.unit)}${warmOnly ? ` (${report.label})` : ''}`,
       Basis: basis,
       Result: t.verdict,
     };
@@ -396,6 +490,13 @@ export function markdown(report, deferredLabel = 'deferred') {
     Result: deferredLabel,
   });
   lines.push(table(rows));
+  lines.push('');
+  lines.push(
+    'MB is 10^6 bytes throughout. "First rows" runs from the start of phase 1 (the folder scan; core already started and the schema created) to the first conversation-list page with rows, read by the query thread; no UI is drawn.' +
+      (report.termMatches?.messages != null
+        ? ` The search term "${report.termMatches.term}" matches ${report.termMatches.messages.toLocaleString('en-US')} of ${m.messages.toLocaleString('en-US')} messages; every results page groups all matches, so a page's cost grows with the number of matches, and with the corpus for a term this broad.`
+        : ''),
+  );
   lines.push('');
   lines.push('## Search and open detail (p95, ms)');
   lines.push('');
@@ -468,6 +569,13 @@ export function markdown(report, deferredLabel = 'deferred') {
         .join('; ')}.`,
     );
   }
+  if (report.perProcessPeakSumMiB?.length) {
+    const sums = report.perProcessPeakSumMiB.map((v) => r1((v * 2 ** 20) / 1e6));
+    lines.push('');
+    lines.push(
+      `The peak above is the highest sum of footprints sampled every 0.5 s. Adding each process's own peak over the whole run (which may not coincide) gives an upper bound: ${sums.join(', ')} MB for the ${sums.length} runs.`,
+    );
+  }
   if (report.footprintPeakByProcess) {
     lines.push('');
     lines.push(
@@ -492,7 +600,7 @@ export function markdown(report, deferredLabel = 'deferred') {
               `${Number(n).toLocaleString('en-US')} messages ≈ ${(b / 1e9).toFixed(2)} GB`,
           )
           .join(', ')}. ` +
-        `Peak WAL ${fmt((m.peakWalBytes ?? 0) / 1e6, 'MB')}; peak index family ${fmt((m.peakFamilyBytes ?? 0) / 1e6, 'MB')} ` +
+        `Peak WAL ${fmt((report.peakWalMax ?? 0) / 1e6, 'MB')} (highest of the runs); peak index family ${fmt((report.peakFamily?.median ?? 0) / 1e6, 'MB')} (median of the runs), ${fmt((report.peakFamily?.max ?? 0) / 1e6, 'MB')} (highest) ` +
         `(cap ${fmt((report.indexLimits?.capBytes ?? 0) / 1e6, 'MB')}, main file limit ${fmt((report.indexLimits?.mainFileLimitBytes ?? 0) / 1e6, 'MB')}).`,
     );
     if (report.sizeComparison.length) {
@@ -559,7 +667,7 @@ export function markdown(report, deferredLabel = 'deferred') {
   if (report.large?.length) {
     lines.push('');
     lines.push(
-      '## Streamed large parts (measured; generation time shown separately, not subtracted)',
+      '## Streamed large parts (measured on a fresh thread; generation time shown separately, not subtracted)',
     );
     lines.push('');
     lines.push(
@@ -570,7 +678,7 @@ export function markdown(report, deferredLabel = 'deferred') {
           'Generate-only ms': r1(l.generateOnly.ms),
           body_state: l.extract.state,
           'Raw text consumed (B)': l.extract.rawTextBytes,
-          'Core RSS growth (MB)': r1(l.extract.rssGrowth / 2 ** 20),
+          'Core RSS growth, generation + extraction (MB)': r1(l.extract.rssGrowth / 1e6),
           'Worker heap peak (MB)': r1(l.extract.heapPeak / 2 ** 20),
         })),
       ),
@@ -593,11 +701,19 @@ export function markdown(report, deferredLabel = 'deferred') {
           'Search p95 idle / busy ms': `${r1(e.searchIdle)} / ${r1(e.searchBusy)}`,
           'Open p95 idle ms': r1(e.openIdle),
           'Addon SHA-256': e.addonSha256 ?? 'built in',
+          'Executable SHA-256': e.appExecutableSha256,
         })),
       ),
     );
   }
   if (report.pools) {
+    lines.push('');
+    for (const e of report.engines) {
+      lines.push(
+        `Compile options, ${e.engine} (SQLite ${e.sqlite}): ${e.compileOptions.map((o) => `\`${o}\``).join(', ')}.`,
+      );
+      lines.push('');
+    }
     lines.push('');
     lines.push('## Index pool size');
     lines.push('');
@@ -612,6 +728,7 @@ export function markdown(report, deferredLabel = 'deferred') {
           'Open p95 busy ms': r1(p.openBusy),
           'Worker heap peak MB': r1(p.workerHeapPeakMb),
           Respawns: p.respawns,
+          'Executable SHA-256': p.appExecutableSha256,
         })),
       ),
     );
