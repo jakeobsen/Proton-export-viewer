@@ -1,29 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Runs in every unit test file. When all of a file's tests passed, the
-// folders it made under test-output/ are removed; a file with a failure
-// keeps them all as evidence. The unit is the file, not the test, because
-// a file may share one folder between its tests (stand-in tools, a corpus
-// generated once in beforeAll).
+// Runs before every unit test file, in the worker. It lists each folder the
+// file makes under test-output/ in the file's task metadata. The reporter in
+// scripts/test-dirs-reporter.mjs, in the main process, removes them once the
+// file's final result is known. A hook registered here can't decide that,
+// because later hooks, the cleanups returned by beforeAll and fixture
+// teardown may still fail after it ran.
 
-import { afterAll, beforeEach } from 'vitest';
-import { removeTestDirs, takeTestDirs } from '../paths';
+import { TestRunner } from 'vitest';
+import { onTestDir } from '../paths';
 
-let failed = false;
+declare module 'vitest' {
+  interface TaskMeta {
+    /** The folders a test file made under test-output/runs/. */
+    testDirs?: string[];
+  }
+}
 
-beforeEach(({ onTestFailed }) => {
-  onTestFailed(() => {
-    failed = true;
-  });
-});
-
-// Vitest requires an object pattern as the first argument; the file's task is
-// the second.
-// eslint-disable-next-line no-empty-pattern
-afterAll(({}, suite) => {
-  const dirs = takeTestDirs();
-  // A failed beforeAll fails the file's tests without running them.
-  const anyFailure = (task: { result?: { state?: string }; tasks?: unknown[] }): boolean =>
-    task.result?.state === 'fail' ||
-    (task.tasks ?? []).some((t) => anyFailure(t as Parameters<typeof anyFailure>[0]));
-  if (!failed && !anyFailure(suite)) removeTestDirs(dirs);
-});
+const dirs: string[] = [];
+TestRunner.getCurrentSuite().file.meta.testDirs = dirs;
+onTestDir((dir) => dirs.push(dir));

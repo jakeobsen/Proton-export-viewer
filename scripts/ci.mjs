@@ -7,12 +7,7 @@
 //                                the license check, without packaging
 
 import { spawnSync } from 'node:child_process';
-import { rmSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-
-// Test output from earlier runs, kept by failed tests as evidence, goes
-// before each run, so the folder never grows from run to run.
-const TEST_OUTPUT = fileURLToPath(new URL('../test-output', import.meta.url));
+import { removeTestOutput } from './test-output.mjs';
 
 const ALL_STEPS = [
   ['lint', 'npx', ['eslint', '.', '--max-warnings', '0']],
@@ -45,7 +40,9 @@ const STEPS = linux
   ? ALL_STEPS.slice(0, ALL_STEPS.findIndex(([name]) => name === 'license check') + 1)
   : ALL_STEPS;
 
-rmSync(TEST_OUTPUT, { recursive: true, force: true });
+// Test output from earlier runs, kept by failed tests as evidence, goes
+// before each run, so the folder never grows from run to run.
+removeTestOutput();
 
 const results = [];
 for (const [name, command, args, env] of STEPS) {

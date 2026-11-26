@@ -12,13 +12,14 @@
 
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createConnection, createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { APP_ID, PRODUCT_NAME, appPath } from './package.mjs';
 import { bundleContents } from './bundle-contents.mjs';
+import { removeOutputDir, testOutputOf } from './test-output.mjs';
 
 const require = createRequire(join(process.cwd(), 'package.json'));
 
@@ -146,7 +147,8 @@ async function main() {
   checkEntitlements('mas-selftest');
   checkEntitlements('mas-release');
 
-  const outDir = resolve('test-output', 'sandbox', `${Date.now()}`);
+  const sandboxOutput = join(testOutputOf(), 'sandbox');
+  const outDir = join(sandboxOutput, `${Date.now()}`);
   mkdirSync(outDir, { recursive: true });
   const listener = await startListener();
   check(listener.accepted, `harness listener on 127.0.0.1:${listener.port} accepts connections`);
@@ -235,7 +237,7 @@ async function main() {
     process.exit(1);
   }
   // A passing run leaves nothing behind; a failing one keeps its folder.
-  rmSync(outDir, { recursive: true, force: true });
+  removeOutputDir(sandboxOutput, outDir);
   console.log('check-sandbox: ok');
 }
 
