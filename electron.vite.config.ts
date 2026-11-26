@@ -6,6 +6,7 @@ import {
   appName,
   bundledPackages,
   htmlAppName,
+  withoutSyncXhrWorker,
   writeAppManifest,
 } from './scripts/vite-plugins.mjs';
 import { expectedExports } from './scripts/folder-proof-exports.mjs';
@@ -35,7 +36,11 @@ export default defineConfig(({ command }) => {
   return {
     main: {
       define,
-      plugins: [bundledPackages(resolve(outRoot, 'bundled-main.json')), writeAppManifest(outRoot)],
+      plugins: [
+        withoutSyncXhrWorker(),
+        bundledPackages(resolve(outRoot, 'bundled-main.json')),
+        writeAppManifest(outRoot),
+      ],
       build: {
         outDir: `${outRoot}/main`,
         externalizeDeps: false,

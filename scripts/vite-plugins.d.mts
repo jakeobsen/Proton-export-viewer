@@ -6,3 +6,4 @@ export function htmlAppName(name: string): Plugin;
 export function packageDirOf(id: string): string | null;
 export function bundledPackages(outFile: string): Plugin;
 export function writeAppManifest(outRoot: string): Plugin;
+export function withoutSyncXhrWorker(): Plugin;
