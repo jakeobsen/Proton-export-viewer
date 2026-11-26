@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
+import { RemovePassedTestDirs } from './scripts/test-dirs-reporter.mjs';
 
 export default defineConfig({
   define: {
@@ -9,6 +10,8 @@ export default defineConfig({
   },
   test: {
     include: ['tests/unit/**/*.test.ts'],
+    setupFiles: ['tests/unit/setup.ts'],
+    reporters: [...configDefaults.reporters, new RemovePassedTestDirs()],
     environment: 'node',
     testTimeout: 30_000,
   },

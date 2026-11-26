@@ -19,6 +19,7 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { APP_ID, PRODUCT_NAME, appPath } from './package.mjs';
 import { bundleContents } from './bundle-contents.mjs';
+import { removeOutputDir, testOutputOf } from './test-output.mjs';
 
 const require = createRequire(join(process.cwd(), 'package.json'));
 
@@ -146,7 +147,8 @@ async function main() {
   checkEntitlements('mas-selftest');
   checkEntitlements('mas-release');
 
-  const outDir = resolve('test-output', 'sandbox', `${Date.now()}`);
+  const sandboxOutput = join(testOutputOf(), 'sandbox');
+  const outDir = join(sandboxOutput, `${Date.now()}`);
   mkdirSync(outDir, { recursive: true });
   const listener = await startListener();
   check(listener.accepted, `harness listener on 127.0.0.1:${listener.port} accepts connections`);
@@ -231,9 +233,11 @@ async function main() {
   listener.server.close();
 
   if (failures.length > 0) {
-    console.error(`check-sandbox: ${failures.length} failure(s)`);
+    console.error(`check-sandbox: ${failures.length} failure(s); evidence in ${outDir}`);
     process.exit(1);
   }
+  // A passing run leaves nothing behind; a failing one keeps its folder.
+  removeOutputDir(sandboxOutput, outDir);
   console.log('check-sandbox: ok');
 }
 
