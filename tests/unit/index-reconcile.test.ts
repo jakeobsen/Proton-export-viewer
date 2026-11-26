@@ -411,6 +411,9 @@ describe('reconcile on reopen', () => {
     expect(asNumber(pairRow(f.db, 'b')?.rev)).toBeGreaterThan(gone);
     expect(pairRow(f.db, 'b')).toMatchObject({ meta_state: META_STATE.indexed, error_code: null });
     expect(partition(f.db)).toEqual([['a', 'b']]);
+    // It comes back as a new row: no message is ever given a removed one's
+    // rowid, even the highest one's.
+    expect(rowidOf(f.db, 'b')).toBeGreaterThan(rowid);
   });
 
   it('deletes everything of a pair with neither file, and gives one found again a rev never used', () => {
