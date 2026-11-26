@@ -5,7 +5,17 @@
 // folder from it down to the one being removed must be a real folder, not a
 // symbolic link, so a removal can never reach a folder outside test-output/.
 
-import { lstatSync, realpathSync, rmSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 export const REPO_ROOT = resolve(import.meta.dirname, '..');
@@ -65,12 +75,33 @@ function checkPhysical(root, path) {
 }
 
 /**
+ * Gives the owner full access to the folder `dir` and every folder below it,
+ * so that a read-only copy a failed test left behind can be removed. Each
+ * folder is opened without following a link, and only entries that are real
+ * folders are visited: links are never followed, and files keep their modes.
+ */
+function unlockFolders(dir) {
+  const fd = openSync(dir, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
+  try {
+    fchmodSync(fd, (fstatSync(fd).mode & 0o777) | 0o700);
+  } finally {
+    closeSync(fd);
+  }
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) unlockFolders(join(dir, entry.name));
+  }
+}
+
+/**
  * Removes test-output/ with everything in it. A missing test-output/ is fine;
- * one that is a symbolic link or not a folder is refused.
+ * one that is a symbolic link or not a folder is refused. Folders inside it
+ * that a failed test left read-only get owner access first.
  */
 export function removeTestOutput(root = REPO_ROOT) {
   const output = testOutputOf(root);
-  if (checkPhysical(root, output)) rmSync(output, { recursive: true, force: true, maxRetries: 3 });
+  if (!checkPhysical(root, output)) return;
+  unlockFolders(output);
+  rmSync(output, { recursive: true, force: true, maxRetries: 3 });
 }
 
 /**

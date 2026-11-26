@@ -15,6 +15,7 @@ import {
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { expectedExports, overlaps } from '../../scripts/folder-proof-exports.mjs';
+import { removeOutputDir, removeTestOutput, testOutputOf } from '../../scripts/test-output.mjs';
 import { scanTree, walk } from '../../src/testhooks/proof/fs';
 import { copyTree, unlockFolders } from '../copy-tree';
 import { permissionDenials } from '../permission-check';
@@ -29,6 +30,14 @@ function unlock(root: string) {
   if (!existsSync(root)) return;
   chmodSync(root, 0o755);
   for (const entry of walk(root)) chmodSync(entry.full, entry.type === 'dir' ? 0o755 : 0o644);
+}
+
+/** Makes every folder and file below and including `root` read-only. */
+function lock(root: string) {
+  for (const entry of walk(root).reverse()) {
+    chmodSync(entry.full, entry.type === 'dir' ? 0o555 : 0o444);
+  }
+  chmodSync(root, 0o555);
 }
 
 /** A small export with three message pairs; returns the root and its run folder. */
@@ -240,6 +249,38 @@ describe('unlockFolders', () => {
       expect(() => unlockFolders(parent, join(parent, 'none'))).not.toThrow();
     } finally {
       chmodSync(outside, 0o755);
+    }
+  });
+});
+
+describe('a read-only scratch copy kept after a failed run', () => {
+  it.skipIf(asRoot)('is removed by the next startup cleanup; then a clean run', () => {
+    const root = realpathSync(testDir('scratch-retry'));
+    const output = testOutputOf(root);
+    const scratch = join(output, 'folder-proof-control');
+    const { root: original } = smallExport(join(root, 'original'));
+    const copy = join(scratch, '1-original');
+    lock(original);
+    try {
+      // A run fails after copying and keeps its read-only copy as evidence.
+      mkdirSync(scratch, { recursive: true });
+      copyTree(original, copy, 1_000);
+      expect(modeOf(join(copy, 'acct@example.com'))).toBe(0o555);
+      expect(walk(copy).filter((e) => e.type === 'file')).toHaveLength(6);
+
+      // The next `npm run ci` starts by removing test-output/, read-only copy included.
+      removeTestOutput(root);
+      expect(existsSync(output)).toBe(false);
+
+      // A clean run copies again and removes its scratch folder itself.
+      mkdirSync(scratch, { recursive: true });
+      copyTree(original, copy, 1_000);
+      unlockFolders(output, scratch);
+      removeOutputDir(output, scratch, root);
+      expect(existsSync(scratch)).toBe(false);
+    } finally {
+      unlock(original);
+      unlock(output);
     }
   });
 });
