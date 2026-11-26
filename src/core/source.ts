@@ -215,6 +215,7 @@ export class SourceSession {
       connections: this.connections,
       isCurrent: () => this.gate.isCurrent(stamp) && this.index === service,
       ...(setup.options ? { options: setup.options } : {}),
+      exportRoots: this.exportRoots,
       onDamage: (reason) => void this.lock.run(() => this.recover(service, stamp, reason)),
       onChecked: (result, ms) => void this.lock.run(() => this.checked(service, stamp, result, ms)),
       onChange: () => {
@@ -254,6 +255,11 @@ export class SourceSession {
           });
         } catch (err) {
           await fresh.close();
+          if (err instanceof ThreadError && err.code === 'INDEX_OVERLAP') {
+            // The writer found the overlap after the check above.
+            this.log.warn('index.open_refused', { reason: 'overlap' }, { src: stamp.sourceKey });
+            return fail('closed');
+          }
           if (err instanceof ThreadError && err.code === 'INDEX_DAMAGED') {
             const dbPath = this.dbPathOf(stamp.sourceKey);
             const reason = (dbPath && probeMismatch(dbPath, request.dbUuid)) || 'identity';

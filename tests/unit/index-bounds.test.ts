@@ -22,18 +22,26 @@ import { sanitizeEvent } from '../../src/shared/log/schema';
 import { splitBatches } from '../../src/core/index/service';
 import { asNumber, openDb } from '../../src/core/index/sql';
 import { IndexWriter } from '../../src/core/index/writer';
-import { STAMP, item, message } from '../index-helpers';
+import { STAMP, ingest, item, message, newPair, register } from '../index-helpers';
 import { testDir } from '../paths';
 
-function counted(stopAfter = Infinity) {
+function counted() {
   const db = openDb(':memory:');
   createSchema(db, STAMP.generation);
   let steps = 0;
+  let stopAfter = Infinity;
   const writer = new IndexWriter(db, STAMP, () => {
     steps += 1;
     if (steps > stopAfter) throw new WalStop();
   });
-  return { db, writer, steps: () => steps, reset: () => (steps = 0) };
+  return {
+    db,
+    writer,
+    steps: () => steps,
+    reset: () => (steps = 0),
+    /** Lets `n` more checks pass, then stops. */
+    stopIn: (n: number) => (stopAfter = steps + n),
+  };
 }
 
 describe('write batches', () => {
@@ -62,23 +70,39 @@ describe('write batches', () => {
 });
 
 describe('the check before each unit of work', () => {
-  it('runs once per message, and a stop rolls the whole batch back', () => {
+  it('runs once per pair and per message, and a stop rolls the whole batch back', () => {
     const ok = counted();
-    ok.writer.phase1Batch(STAMP, [item(message('a', ['a'])), item(message('b', ['b']))]);
+    const okRevs = register(ok.writer, ['a', 'b']);
+    expect(ok.steps()).toBe(2);
+    ok.reset();
+    ok.writer.phase1Batch(STAMP, [
+      item(message('a', ['a']), okRevs.get('a')!),
+      item(message('b', ['b']), okRevs.get('b')!),
+    ]);
     expect(ok.steps()).toBe(2);
 
-    const { db, writer } = counted(1);
+    const { db, writer, stopIn } = counted();
+    const revSeq = () =>
+      asNumber(db.stmt("SELECT value FROM source_meta WHERE key = 'rev_seq'").get()?.value);
+    const count = (sql: string) => asNumber(db.stmt(sql).get()?.n);
+    const revs = register(writer, ['c', 'd']);
+    stopIn(1);
     expect(() =>
-      writer.phase1Batch(STAMP, [item(message('c', ['c'])), item(message('d', ['d']))]),
+      writer.phase1Batch(STAMP, [
+        item(message('c', ['c']), revs.get('c')!),
+        item(message('d', ['d']), revs.get('d')!),
+      ]),
     ).toThrow(WalStop);
-    expect(asNumber(db.stmt('SELECT count(*) AS n FROM pairs').get()?.n)).toBe(0);
-    expect(asNumber(db.stmt('SELECT count(*) AS n FROM messages').get()?.n)).toBe(0);
-    expect(
-      asNumber(db.stmt("SELECT value FROM source_meta WHERE key = 'rev_seq'").get()?.value),
-    ).toBe(0);
+    expect(count('SELECT count(*) AS n FROM messages')).toBe(0);
+    // Both pairs still wait for their metadata.
+    expect(count('SELECT count(*) AS n FROM pairs WHERE meta_state = 0')).toBe(2);
+    // A stop while registering rolls the registration back, the rev sequence included.
+    stopIn(1);
+    expect(() => writer.applyChanges(STAMP, [newPair('e'), newPair('f')])).toThrow(WalStop);
+    expect(count('SELECT count(*) AS n FROM pairs')).toBe(2);
+    expect(revSeq()).toBe(2);
     // A new writer goes on with the rev sequence the database kept.
-    new IndexWriter(db, STAMP).phase1Batch(STAMP, [item(message('e', ['e']))]);
-    expect(asNumber(db.stmt("SELECT rev FROM pairs WHERE proton_id = 'e'").get()?.rev)).toBe(1);
+    expect(new IndexWriter(db, STAMP).applyChanges(STAMP, [newPair('e')]).revs).toEqual([['e', 3]]);
     db.close();
     ok.db.close();
   });
@@ -88,10 +112,11 @@ describe('the check before each unit of work', () => {
     const n = 3 * REPOINT_CHUNK + 7;
     const small = Array.from({ length: n }, (_, i) => message(`a${i}`, [`a${i}`, 'A']));
     const large = Array.from({ length: n + 1 }, (_, i) => message(`b${i}`, [`b${i}`, 'B']));
-    writer.phase1Batch(STAMP, small.map(item));
-    writer.phase1Batch(STAMP, large.map(item));
+    ingest(writer, small, n);
+    ingest(writer, large, n + 1);
+    const revs = register(writer, ['z']);
     reset();
-    const stats = writer.phase1Batch(STAMP, [item(message('z', ['z', 'A', 'B']))]);
+    const stats = writer.phase1Batch(STAMP, [item(message('z', ['z', 'A', 'B']), revs.get('z')!)]);
     expect(stats.repointedMessages).toBe(n);
     // One check for the message, then per chunk: members (4), keys (n + 1 keys: 4), labels (1),
     // and one more for the message's own rows after the merge.

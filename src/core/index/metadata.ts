@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Phase 1 parsing: one metadata file into the row the writer stores, with the
-// conversation keys taken from its raw header block.
+// fields its conversation keys come from taken from its raw header block.
 
 import { CAPPED } from './schema';
 
@@ -67,12 +67,24 @@ export function threadHeaders(block: string, externalId: string): ThreadHeaders 
   };
 }
 
-/** A message's conversation keys: its own id, its In-Reply-To ids and its last 100 References. */
-export function conversationKeys(headers: ThreadHeaders): string[] {
+/** The fields a message's conversation keys come from, as stored with it. */
+export interface KeyFields {
+  messageId: string | null;
+  inReplyTo: string[];
+  references: string[];
+}
+
+/**
+ * A message's conversation keys: its own id, its In-Reply-To ids and its last
+ * 100 References. The writer takes them from the stored fields both when it
+ * places a message and when it groups a conversation's members again, so the
+ * two always agree.
+ */
+export function conversationKeys(fields: KeyFields): string[] {
   const keys = new Set<string>();
-  if (headers.messageId !== null) keys.add(headers.messageId);
-  for (const id of headers.inReplyTo) keys.add(id);
-  for (const id of headers.references.slice(-MAX_REFERENCES)) keys.add(id);
+  if (fields.messageId !== null) keys.add(fields.messageId);
+  for (const id of fields.inReplyTo) keys.add(id);
+  for (const id of fields.references.slice(-MAX_REFERENCES)) keys.add(id);
   return [...keys];
 }
 
@@ -99,11 +111,12 @@ export interface MessageRow {
   numAttachments: number;
   mimeType: string;
   messageId: string | null;
-  inReplyTo: string | null;
+  /** Every msg-id of In-Reply-To. */
+  inReplyTo: string[];
+  /** The last 100 msg-ids of References. */
   references: string[];
   dmarc: string | null;
   labelIds: string[];
-  keys: string[];
   /** CAPPED bits of the lists that were cut to their limit. */
   capped: number;
 }
@@ -175,11 +188,10 @@ export function parseMetadata(protonId: string, text: string): MessageRow {
     numAttachments: Math.max(0, int(p.NumAttachments)),
     mimeType: str(p.MIMEType),
     messageId: headers.messageId,
-    inReplyTo: headers.inReplyTo[0] ?? null,
+    inReplyTo: headers.inReplyTo,
     references: headers.references.slice(-MAX_REFERENCES),
     dmarc: headers.dmarc,
     labelIds,
-    keys: conversationKeys(headers),
     capped,
   };
 }

@@ -8,6 +8,7 @@ import {
   readdirSync,
   realpathSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
@@ -22,6 +23,7 @@ import type {
   Sidebar,
 } from '../../src/shared/index-types';
 import type { SourcesView, Stamp } from '../../src/shared/sources';
+import { digest } from '../../tools/gen-export/tree.mjs';
 import { writeExport } from '../exports';
 import { MARKERS, MARKER_TEXT, findMarkers } from '../markers';
 import { testDir } from '../paths';
@@ -134,6 +136,64 @@ test('a reopen at launch uses the same index and indexes nothing twice', async (
     await checkHidden(again);
   } finally {
     await again.close();
+  }
+});
+
+test('a reopen brings the index in line with the files, and reads only what changed', async () => {
+  const root = realpathSync(testDir('index-reconcile'));
+  const written = writeExport(root, { seed: 5, messages: 25 });
+  const first = await launch('index-reconcile-1');
+  await first.main('queuePick', root, 'bm1');
+  await first.shell('chooseFolder', []);
+  await phase1Done(first, written.pairs);
+  await first.close();
+
+  const metas = readdirSync(written.run)
+    .filter((n) => n.endsWith('.metadata.json'))
+    .sort();
+  const [gone, changed, template] = metas as [string, string, string];
+  rmSync(join(written.run, gone));
+  const doc = JSON.parse(readFileSync(join(written.run, changed), 'utf8')) as {
+    Payload: Record<string, unknown>;
+  };
+  doc.Payload.Subject = 'Changed on disk';
+  writeFileSync(join(written.run, changed), JSON.stringify(doc));
+  const copy = JSON.parse(readFileSync(join(written.run, template), 'utf8')) as {
+    Payload: Record<string, unknown>;
+  };
+  const added = `${String(copy.Payload.ID)}Added`;
+  copy.Payload.ID = added;
+  writeFileSync(join(written.run, `${added}.metadata.json`), JSON.stringify(copy));
+  const before = digest(root);
+
+  let stamp: Stamp | undefined;
+  let indexDir: string | undefined;
+  const again = await launch('index-reconcile-2', { userData: first.userData });
+  try {
+    await phase1Done(again, written.pairs);
+    const totals = (await ask<IndexTotals>(again, { op: 'totals' }))!.answer;
+    // One message gone (its message file stays, as a pair), one added without a message file.
+    expect(totals).toMatchObject({ messages: written.pairs, pairs: written.pairs + 1 });
+    const reconciled = again.logs('core').filter((l) => l.code === 'index.reconciled');
+    expect(reconciled.map((l) => l.data.count)).toEqual([2]);
+    expect(again.logs('core').filter((l) => l.code === 'index.created')).toHaveLength(1);
+    stamp = await again.main<Stamp>('sourceStamp');
+    indexDir = await again.main<string>('indexDir');
+    await checkHidden(again);
+  } finally {
+    await again.close();
+  }
+  // The app read the folder and wrote nothing there.
+  expect(digest(root)).toBe(before);
+  const db = new DatabaseSync(join(indexDir!, `${stamp!.sourceKey}.sqlite`), { readOnly: true });
+  try {
+    const subject = (id: string) =>
+      db.prepare('SELECT subject FROM messages WHERE proton_id = ?').get(id)?.subject;
+    expect(subject(changed.slice(0, -'.metadata.json'.length))).toBe('Changed on disk');
+    expect(subject(gone.slice(0, -'.metadata.json'.length))).toBeUndefined();
+    expect(subject(added)).toBe(copy.Payload.Subject);
+  } finally {
+    db.close();
   }
 });
 

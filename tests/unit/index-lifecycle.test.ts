@@ -10,6 +10,7 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  readFileSync,
   readdirSync,
   realpathSync,
   rmSync,
@@ -113,6 +114,8 @@ interface CoreOptions {
   options?: IndexOptions;
   /** Other exports the app knows. */
   exports?: string[];
+  /** Runs as each writer operation reaches the writer thread, before it starts. */
+  atWriter?: (op: string) => void;
 }
 
 let reqSeq = 0;
@@ -139,6 +142,10 @@ function core(o: CoreOptions) {
   const thread = (role: ThreadRole): IndexThread => {
     if (role === 'verify' && o.check) return o.check;
     if (role === 'query' && o.query) return o.query;
+    if (role === 'writer' && o.atWriter) {
+      const at = o.atWriter;
+      return new InlineThread(role, (op) => (at(op), false));
+    }
     return new InlineThread(role);
   };
   const session = new SourceSession(
@@ -595,6 +602,68 @@ describe('an export that comes to overlap the index folder later', () => {
     expect(await c.forget(OTHER)).toMatchObject({ ok: true });
     expect(family(indexDir, OTHER)).toEqual([]);
   });
+
+  /** Points the link at `to` once, as the writer gets the open, after core's own check. */
+  const onceAtOpen = (point: () => void) => {
+    let done = false;
+    return (op: string) => {
+      if (op === 'open' && !done) {
+        done = true;
+        point();
+      }
+    };
+  };
+
+  it('is looked at again by the writer before it opens an index for writing', async () => {
+    const { run, indexDir, link, point, away } = linked('lc-overlap-writer-open');
+    const uuid = await built(run, indexDir);
+    const files = family(indexDir);
+    const bytes = readFileSync(join(indexDir, `${KEY}.sqlite`));
+    const c = core({
+      root: run,
+      indexDir,
+      exports: [link],
+      atWriter: onceAtOpen(() => point(dirname(indexDir))),
+    });
+    expect(await c.openIndex(uuid)).toMatchObject({ ok: false, code: 'closed' });
+    expect(c.logs.find((l) => l.code === 'index.open_refused')?.data).toEqual({
+      reason: 'overlap',
+    });
+    // Not opened for writing: no sidecar was made and the file is unchanged.
+    expect(family(indexDir)).toEqual(files);
+    expect(readFileSync(join(indexDir, `${KEY}.sqlite`)).equals(bytes)).toBe(true);
+    expect(c.session.connections.size).toBe(0);
+    away();
+    expect(await c.openIndex(uuid)).toMatchObject({ ok: true, index: { dbUuid: uuid } });
+    await c.session.index!.settled();
+  });
+
+  it('is looked at again by the writer before it replaces an index', async () => {
+    const { run, indexDir, link, point, away } = linked('lc-overlap-writer-replace');
+    mkdirSync(indexDir, { recursive: true });
+    // Not a database: the writer would delete it and make a new index there.
+    writeFileSync(join(indexDir, `${KEY}.sqlite`), 'not a database');
+    const c = core({
+      root: run,
+      indexDir,
+      exports: [link],
+      atWriter: onceAtOpen(() => point(indexDir)),
+    });
+    expect(await c.openIndex(null)).toMatchObject({ ok: false, code: 'closed' });
+    expect(c.logs.find((l) => l.code === 'index.open_refused')?.data).toEqual({
+      reason: 'overlap',
+    });
+    expect(family(indexDir)).toEqual([`${KEY}.sqlite`]);
+    expect(readFileSync(join(indexDir, `${KEY}.sqlite`), 'utf8')).toBe('not a database');
+    away();
+    expect(await c.openIndex(null)).toMatchObject({ ok: true, index: { created: true } });
+    await c.session.index!.settled();
+    expect(
+      readFileSync(join(indexDir, `${KEY}.sqlite`))
+        .subarray(0, 15)
+        .toString(),
+    ).toBe('SQLite format 3');
+  });
 });
 
 describe('Forget', () => {
@@ -647,15 +716,18 @@ describe('Forget', () => {
 describe('the writer', () => {
   it('rolls back the write in flight when the index is torn down', async () => {
     const { WriterState } = await import('../../src/core/index/ops');
-    const { item, message, STAMP } = await import('../index-helpers');
+    const { newPair, STAMP } = await import('../index-helpers');
     const dir = realpathSync(testDir('lc-cancel'));
     const cancel = new SharedArrayBuffer(4);
     const w = new WriterState();
     const dbPath = join(dir, 'x.sqlite');
     w.open({ dbPath, stamp: STAMP, expectedUuid: null, capBytes: null, cancel });
     Atomics.store(new Int32Array(cancel), 0, 1);
-    expect(() => w.phase1(STAMP, [item(message('m1', ['k1']))])).toThrow('CANCELLED');
-    expect(w.pairIds()).toEqual([]);
+    expect(() => w.apply(STAMP, [newPair('m1')])).toThrow('CANCELLED');
+    // Nothing was registered: the pair is still new to the index.
+    expect(w.plan(new Map([['m1', newPair('m1').files.meta!]]), new Map()).changes).toEqual([
+      newPair('m1').change,
+    ]);
     w.close();
     rmSync(dir, { recursive: true, force: true });
   });
