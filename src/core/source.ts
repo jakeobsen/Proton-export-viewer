@@ -107,12 +107,8 @@ export class SourceSession {
   private readonly retired = new Set<string>();
   /** Closed for good by a reset: no open, rebuild or recovery starts. */
   private admitting = true;
-  /**
-   * An export overlaps the index folder (it lies inside it, or holds it).
-   * Then no index file is opened, made or deleted, so nothing of an export
-   * can be changed.
-   */
-  private readonly overlapping: boolean;
+  /** The run folders of the exports the app knows, this one included. */
+  private readonly exportRoots: string[];
 
   constructor(
     source: CoreSource | null,
@@ -121,10 +117,7 @@ export class SourceSession {
     private readonly indexSetup: IndexSetup | null = null,
     private readonly emit: (event: CoreEvent) => void = () => {},
   ) {
-    const exports = [source?.root ?? null, ...(indexSetup?.exports ?? [])];
-    this.overlapping =
-      indexSetup !== null &&
-      exports.some((root) => root !== null && overlaps(root, indexSetup.dir));
+    this.exportRoots = [...(source?.root ? [source.root] : []), ...(indexSetup?.exports ?? [])];
     this.writer = new Writer(this.gate, (scan) => {
       this.records.scans += 1;
       this.records.rejected = scan.rejected;
@@ -182,6 +175,17 @@ export class SourceSession {
     });
   }
 
+  /**
+   * Whether an export the app knows overlaps the index folder now: lies
+   * inside it, or holds it, with links resolved at this moment. Then no index
+   * file is opened, made, replaced or deleted, so nothing of an export can be
+   * changed. Asked right before each of those, never remembered.
+   */
+  private overlapsIndex(): boolean {
+    const dir = this.indexSetup?.dir;
+    return dir !== undefined && this.exportRoots.some((root) => overlaps(root, dir));
+  }
+
   private dbPathOf(sourceKey: string): string | null {
     return this.indexSetup ? join(this.indexSetup.dir, `${sourceKey}.sqlite`) : null;
   }
@@ -233,14 +237,15 @@ export class SourceSession {
     return this.lock.run(async () => {
       const setup = this.indexSetup;
       if (!setup) return fail('invalid');
-      if (this.overlapping) {
-        this.log.warn('index.open_refused', { reason: 'overlap' }, { src: stamp.sourceKey });
-        return fail('closed');
-      }
       if (!this.admitting || this.retired.has(stamp.sourceKey)) return fail('closed');
       if (!this.gate.isCurrent(stamp)) return fail('stale');
       let service = this.index;
       if (!service) {
+        // Opening can make or replace the index's files.
+        if (this.overlapsIndex()) {
+          this.log.warn('index.open_refused', { reason: 'overlap' }, { src: stamp.sourceKey });
+          return fail('closed');
+        }
         const fresh = this.newService(setup, stamp, root);
         let opened: IndexOpened;
         try {
@@ -356,7 +361,7 @@ export class SourceSession {
       this.log.warn('index.delete_refused', { reason }, { src: sourceKey });
       return false;
     };
-    if (this.overlapping) return refuse('overlap');
+    if (this.overlapsIndex()) return refuse('overlap');
     if (this.connections.holds(dbPath) || (own && this.connections.size > 0)) return refuse();
     try {
       deleteFamily(dbPath);

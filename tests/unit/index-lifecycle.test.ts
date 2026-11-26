@@ -13,6 +13,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   truncateSync,
   writeFileSync,
   writeSync,
@@ -545,6 +546,54 @@ describe('an index folder that overlaps an export', () => {
     expect(await c.forget()).toMatchObject({ ok: false, code: 'busy' });
     expect(readdirSync(indexDir)).toEqual(['nested']);
     expect(digest(join(indexDir, 'nested'))).toBe(before);
+  });
+});
+
+describe('an export that comes to overlap the index folder later', () => {
+  /** A known export's folder, reached through a link that the test points elsewhere. */
+  function linked(name: string) {
+    const { run, indexDir } = exportAt(name);
+    mkdirSync(dirname(indexDir), { recursive: true });
+    const dir = dirname(dirname(indexDir));
+    const elsewhere = join(dir, 'elsewhere');
+    mkdirSync(elsewhere);
+    const link = join(dir, 'known');
+    symlinkSync(elsewhere, link);
+    const point = (to: string) => {
+      rmSync(link);
+      symlinkSync(to, link);
+    };
+    return { run, indexDir, link, point, away: () => point(elsewhere) };
+  }
+
+  it('is looked at again right before an open', async () => {
+    const { run, indexDir, link, point, away } = linked('lc-overlap-open');
+    const c = core({ root: run, indexDir, exports: [link] });
+    // The known export now resolves to the folder that holds the index folder.
+    point(dirname(indexDir));
+    expect(await c.openIndex(null)).toMatchObject({ ok: false, code: 'closed' });
+    expect(family(indexDir)).toEqual([]);
+    away();
+    expect(await c.openIndex(null)).toMatchObject({ ok: true });
+    await c.session.index!.settled();
+    expect(c.logs.filter((l) => l.code === 'index.open_refused')).toHaveLength(1);
+  });
+
+  it('is looked at again right before a delete', async () => {
+    const { run, indexDir, link, point, away } = linked('lc-overlap-delete');
+    const c = core({ root: run, indexDir, exports: [link] });
+    expect(await c.openIndex(null)).toMatchObject({ ok: true });
+    await c.session.index!.settled();
+    writeFileSync(join(indexDir, `${OTHER}.sqlite`), 'x');
+    point(indexDir);
+    expect(await c.forget(OTHER)).toMatchObject({ ok: false, code: 'busy' });
+    expect(c.logs.find((l) => l.code === 'index.delete_refused')?.data).toEqual({
+      reason: 'overlap',
+    });
+    expect(family(indexDir, OTHER)).toEqual([`${OTHER}.sqlite`]);
+    away();
+    expect(await c.forget(OTHER)).toMatchObject({ ok: true });
+    expect(family(indexDir, OTHER)).toEqual([]);
   });
 });
 
