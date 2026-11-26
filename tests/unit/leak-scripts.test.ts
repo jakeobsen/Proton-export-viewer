@@ -1074,7 +1074,7 @@ console.log(JSON.stringify({ input: Buffer.concat(chunks).toString('utf8'), env:
     const fake = new FakeSystem('run-term');
     writeFileSync(
       join(fake.stage, 'probe.mjs'),
-      `console.log('started');\nprocess.on('SIGTERM', () => { console.log('term'); process.exit(0); });\nsetInterval(() => {}, 1000);\n`,
+      `process.on('SIGTERM', () => { console.log('term'); process.exit(0); });\nconsole.log('started');\nsetInterval(() => {}, 1000);\n`,
     );
     writeFileSync(join(fake.stage, 'input', 'probe.json'), '{}\n');
     const running = fake.start(fake.install(RUN, 'pev-leak-run-probe'));

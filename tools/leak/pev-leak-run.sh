@@ -174,6 +174,20 @@ echo "$NAME: results $OUT"
 record() {
 	echo "$1" >>"$OUT/launch.txt"
 }
+
+# SIGTERM, SIGINT and SIGHUP (sudo passes them on) stop the program, also
+# when they arrive before it has started.
+CHILD=''
+STOP=0
+# shellcheck disable=SC2317 # runs from the signal traps
+stop_program() {
+	STOP=1
+	if [ -n "$CHILD" ]; then
+		kill -TERM "$CHILD" 2>/dev/null || true
+	fi
+}
+trap stop_program TERM INT HUP
+
 record "launcher=$NAME"
 record "user=$(/usr/bin/id -un)"
 record "started=$(stamp)"
@@ -204,12 +218,19 @@ probe | consent)
 	;;
 esac
 
+if [ "$STOP" = 1 ]; then
+	record 'stopped=before the program started'
+	exit 143
+fi
 ulimit -f "$FILE_BLOCKS"
 /usr/bin/env -i \
 	HOME="$LEAK_HOME" TMPDIR="$LEAK_HOME/tmp/" PATH="$PATH" \
 	USER="$LEAK_USER" LOGNAME="$LEAK_USER" \
 	"$PROGRAM" "$@" <"$INPUT" >"$OUT/stdout.txt" 2>"$OUT/stderr.txt" &
 CHILD=$!
+if [ "$STOP" = 1 ]; then
+	kill -TERM "$CHILD" 2>/dev/null || true
+fi
 
 # Stops the program at the time limit. It polls once a second and ends as
 # soon as the program has, so it leaves no process behind.
@@ -231,9 +252,6 @@ STARTED=$(/bin/date +%s)
 	done
 ) &
 WATCHDOG=$!
-
-# SIGTERM, SIGINT and SIGHUP (sudo passes them on) stop the program.
-trap 'kill -TERM "$CHILD" 2>/dev/null || true' TERM INT HUP
 
 # wait returns early when a trapped signal arrives; then wait again.
 STATUS=0
