@@ -1,0 +1,430 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# pev-leak-recover: undoes what pev-leak-capture left in place when it could
+# not clean up itself (SIGKILL, a crash, a restart during a phase, or test-user
+# processes that survived the phase).
+#
+#   sudo pev-leak-recover
+#
+# Root only, no arguments. It takes the capture lock: it refuses while a
+# capture or another recovery runs, and takes over a lock whose holder has
+# ended. It undoes only what the capture's records under run/ say that phase
+# changed, and removes each record only once its change is undone; if
+# something can't be undone, the record and the lock stay, so running it
+# again retries. In order it:
+#   - ends every process of the test user, while the block is still loaded;
+#   - stops every root tcpdump that writes into the phase's directory;
+#   - flushes the capture's pf anchor and releases its pf reference;
+#   - removes the test address from lo0, /etc/resolver/test (only if it still
+#     holds what the capture wrote), /etc/resolver and pflog0, each only if
+#     the capture recorded creating it;
+#   - marks the interrupted phase invalid and removes the lock.
+#
+# Exit status: 0 when everything is undone; 2 when everything is undone
+# except a pf reference it can't identify (pfctl -E was killed before it
+# printed its token), which it describes so it can be checked by hand;
+# 1 when something stays, with the lock, for another run.
+
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+IFS=$(printf ' \t\n.')
+IFS=${IFS%.}
+LC_ALL=C
+export LC_ALL
+umask 022
+
+if [ "$#" -ne 0 ]; then
+	echo 'usage: pev-leak-recover (no arguments)' >&2
+	exit 64
+fi
+
+ROOT_UID=0
+LEAK_USER=pevleak
+ANCHOR=com.apple/pev-leak
+BASE_DIR=/usr/local/var/pev-leak
+CAPTURE_DIR=/usr/local/var/pev-leak/captures
+RUN_DIR=/usr/local/var/pev-leak/run
+RESOLVER_DIR=/etc/resolver
+RESOLVER_FILE=/etc/resolver/test
+STUB_PORT=5354
+
+fail() {
+	_code=$1
+	shift
+	echo "pev-leak-recover: $*" >&2
+	exit "$_code"
+}
+
+say() {
+	echo "pev-leak-recover: $*"
+}
+
+[ "$(/usr/bin/id -u)" = "$ROOT_UID" ] || fail 77 'must run as root, through sudo'
+
+# Fails unless $1 exists as type $2 ("d" for a directory, "-" for a regular
+# file, so never a symbolic link), is owned by root, is not writable by
+# group or others, and has no access control list.
+require_root_owned() {
+	_entry=$(/bin/ls -ldn "$1" 2>/dev/null) || fail 78 "missing: $1"
+	set -f
+	# shellcheck disable=SC2086 # split the ls fields
+	set -- "$1" "$2" $_entry
+	set +f
+	case "$3" in
+	"$2"*) ;;
+	*) fail 78 "not the expected type: $1" ;;
+	esac
+	case "$3" in
+	?????w* | ????????w*) fail 78 "writable by group or others: $1" ;;
+	*+) fail 78 "has an access control list: $1" ;;
+	esac
+	[ "$5" = "$ROOT_UID" ] || fail 78 "not owned by root: $1"
+}
+
+# True while process $1 exists and is not a zombie.
+alive() {
+	_stat=$(/bin/ps -o stat= -p "$1" 2>/dev/null) || return 1
+	case "$_stat" in
+	'' | *Z*) return 1 ;;
+	esac
+	return 0
+}
+
+# True when process $1 is alive and is a capture or a recovery, so a pid
+# reused after a restart doesn't count as the lock's holder.
+holder_alive() {
+	alive "$1" || return 1
+	case "$(/bin/ps -o command= -p "$1" 2>/dev/null)" in
+	*pev-leak-capture* | *pev-leak-recover*) return 0 ;;
+	esac
+	return 1
+}
+
+leak_processes() {
+	/bin/ps -U "$LEAK_USER" -o pid=,ppid=,comm= 2>/dev/null || true
+}
+
+# Sends process $1 SIGTERM, and SIGKILL if it is still there 5 seconds later.
+# Fails if it is still there 5 seconds after that.
+end_process() {
+	kill -TERM "$1" 2>/dev/null
+	_i=0
+	while alive "$1" && [ "$_i" -lt 5 ]; do
+		/bin/sleep 1
+		_i=$((_i + 1))
+	done
+	if alive "$1"; then
+		kill -KILL "$1" 2>/dev/null
+		_i=0
+		while alive "$1" && [ "$_i" -lt 5 ]; do
+			/bin/sleep 1
+			_i=$((_i + 1))
+		done
+	fi
+	! alive "$1"
+}
+
+# Prints the pid of every root tcpdump that writes into the phase directory.
+# Fails if the process list can't be read.
+phase_tcpdumps() {
+	[ -n "$PHASE_DIR" ] || return 0
+	_list=$(/bin/ps -axww -o pid=,uid=,command=) || return 1
+	printf '%s\n' "$_list" | while read -r _pid _uid _command; do
+		[ "$_uid" = "$ROOT_UID" ] || continue
+		case "$_command" in
+		*"/usr/sbin/tcpdump "*" -w $PHASE_DIR/"*) echo "$_pid" ;;
+		esac
+	done
+}
+
+require_root_owned "${BASE_DIR%/*/*}" d
+require_root_owned "${BASE_DIR%/*}" d
+require_root_owned "$BASE_DIR" d
+require_root_owned "$CAPTURE_DIR" d
+require_root_owned "$RUN_DIR" d
+
+# The capture lock, built as lock.<pid>/lock with the pid inside and moved
+# into run/; the move is a rename, which fails while a lock holds anything,
+# so a lock always names its holder. While a capture or another recovery
+# runs, it refuses. The lock of one that has ended (or a lock left without a
+# pid, which only a removal cut short leaves) is taken over under
+# lock/takeover, which only one caller can create; that caller checks the
+# pid again before it writes its own, so two recoveries never both proceed.
+LOCK_DIR=$RUN_DIR/lock
+NEW_LOCK=$RUN_DIR/lock.$$
+/bin/rm -rf "$NEW_LOCK"
+/bin/mkdir -m 0755 "$NEW_LOCK" "$NEW_LOCK/lock"
+echo "$$" >"$NEW_LOCK/lock/pid"
+if ! /bin/mv -f "$NEW_LOCK/lock" "$RUN_DIR/" 2>/dev/null; then
+	/bin/rm -rf "$NEW_LOCK"
+	_holder=$(/bin/cat "$LOCK_DIR/pid" 2>/dev/null || true)
+	case "$_holder" in
+	'' | *[!0-9]*) _holder='' ;;
+	esac
+	if [ -n "$_holder" ] && holder_alive "$_holder"; then
+		fail 75 "a capture or recovery is running (pid $_holder); stop a capture with SIGTERM instead"
+	fi
+	if ! /bin/mkdir "$LOCK_DIR/takeover" 2>/dev/null; then
+		[ -d "$LOCK_DIR" ] || fail 75 'the lock was released meanwhile; run this again'
+		fail 75 "another recovery is taking over the lock; if none runs, remove $LOCK_DIR/takeover"
+	fi
+	if [ "$(/bin/cat "$LOCK_DIR/pid" 2>/dev/null || true)" != "$_holder" ]; then
+		/bin/rmdir "$LOCK_DIR/takeover"
+		fail 75 'another recovery took over the lock'
+	fi
+	echo "$$" >"$LOCK_DIR/pid.new"
+	/bin/mv -f "$LOCK_DIR/pid.new" "$LOCK_DIR/pid"
+	/bin/rmdir "$LOCK_DIR/takeover"
+fi
+/bin/rm -rf "$NEW_LOCK"
+
+# Lock folders a capture or recovery was building when it was killed.
+for _new in "$RUN_DIR"/lock.*; do
+	if [ ! -d "$_new" ] || [ -L "$_new" ]; then
+		continue
+	fi
+	_pid=${_new##*/lock.}
+	case "$_pid" in
+	'' | *[!0-9]*) continue ;;
+	esac
+	holder_alive "$_pid" || /bin/rm -rf "$_new"
+done
+
+set +e
+ERRORS=''
+PHASE_DIR=$(/bin/cat "$RUN_DIR/phase-dir" 2>/dev/null)
+PHASE_ID=${PHASE_DIR##*/}
+case "$PHASE_ID" in
+[0-9]*T[0-9]*Z-*) ;;
+*) PHASE_ID='' ;;
+esac
+if [ -n "$PHASE_ID" ] && [ "$PHASE_DIR" != "$CAPTURE_DIR/$PHASE_ID" ]; then
+	PHASE_ID=''
+fi
+[ -n "$PHASE_ID" ] || PHASE_DIR=''
+RESIDUAL=''
+
+# True when the record $1 exists and its first word is the recorded phase.
+# Sets VALUE to the rest of the record.
+owned() {
+	VALUE=''
+	[ -f "$RUN_DIR/$1" ] && [ -n "$PHASE_ID" ] || return 1
+	_line=$(/bin/cat "$RUN_DIR/$1")
+	[ "${_line%% *}" = "$PHASE_ID" ] || return 1
+	case "$_line" in
+	*' '*) VALUE=${_line#* } ;;
+	esac
+	return 0
+}
+
+# A record that exists but names another phase, or no phase, is left alone.
+check_scope() {
+	if [ -f "$RUN_DIR/$1" ] && ! owned "$1"; then
+		say "left $RUN_DIR/$1: it doesn't belong to the recorded phase"
+		ERRORS="$ERRORS $1"
+	fi
+}
+
+_left=$(leak_processes)
+if [ -n "$_left" ]; then
+	if [ -n "$PHASE_ID" ] && [ -d "$PHASE_DIR" ]; then
+		printf '%s\n' "$_left" >>"$PHASE_DIR/leftovers"
+	fi
+	/usr/bin/pkill -KILL -U "$LEAK_USER" 2>/dev/null
+	_i=0
+	while [ -n "$(leak_processes)" ] && [ "$_i" -lt 10 ]; do
+		/bin/sleep 1
+		_i=$((_i + 1))
+	done
+	if [ -n "$(leak_processes)" ]; then
+		fail 1 "processes of $LEAK_USER survived; the block stays. Run this again later."
+	fi
+	say "ended the processes of $LEAK_USER"
+fi
+
+# The capture's tcpdumps are found by the phase directory they write into,
+# so one started just before the capture was killed, before its pid was
+# recorded, is stopped too.
+check_scope tcpdump-pids
+if [ -n "$PHASE_ID" ]; then
+	_stopped=1
+	if _pids=$(phase_tcpdumps); then
+		set -f
+		# shellcheck disable=SC2086 # one pid per line, globbing is off
+		set -- $_pids
+		set +f
+		for _pid do
+			if end_process "$_pid"; then
+				say "stopped tcpdump (pid $_pid)"
+			else
+				_stopped=0
+			fi
+		done
+	else
+		say 'left the tcpdump record: the processes could not be listed'
+		_stopped=0
+	fi
+	if [ "$_stopped" = 0 ]; then
+		ERRORS="$ERRORS tcpdump"
+	elif owned tcpdump-pids; then
+		/bin/rm -f "$RUN_DIR/tcpdump-pids"
+	fi
+fi
+
+check_scope anchor
+if owned anchor; then
+	if /sbin/pfctl -a "$ANCHOR" -F rules >/dev/null 2>&1; then
+		say "flushed the pf anchor $ANCHOR"
+		/bin/rm -f "$RUN_DIR/anchor"
+	else
+		ERRORS="$ERRORS anchor"
+	fi
+fi
+
+check_scope pf-token
+if owned pf-token; then
+	_token=$VALUE
+	if [ -z "$_token" ]; then
+		# The capture stopped while pfctl -E ran. pfctl wrote its token, if
+		# it printed one, to pf-token.out.
+		_token=$(/usr/bin/sed -n 's/^Token *: *\([0-9][0-9]*\) *$/\1/p' "$RUN_DIR/pf-token.out" 2>/dev/null)
+		if [ -z "$_token" ]; then
+			_started=$(/usr/bin/sed -n 's/^started=//p' "$PHASE_DIR/status" 2>/dev/null)
+			say "pfctl -E was stopped before it printed its token, so pf may still hold that reference."
+			say "Check it by hand: 'sudo pfctl -s References' lists a pfctl entry from ${_started:-the phase start} if it does; release it with 'sudo pfctl -X <TOKEN>'."
+			# The record goes last, once everything else is undone, so a run
+			# that has to be repeated reports this again.
+			RESIDUAL=pf-reference
+			_token=none
+		fi
+	fi
+	case "$_token" in
+	none) ;;
+	'' | *[!0-9]*)
+		say 'left a malformed pf token record'
+		ERRORS="$ERRORS pf-token"
+		;;
+	*)
+		# A token pf no longer lists (after a restart) is gone; if pf can't
+		# be asked, the record stays.
+		if ! _references=$(/sbin/pfctl -s References 2>/dev/null); then
+			say 'left the pf token record: pf could not list its references'
+			ERRORS="$ERRORS pf-token"
+		elif ! printf '%s\n' "$_references" | /usr/bin/grep -Eq "(^|[^0-9])$_token([^0-9]|\$)"; then
+			say 'the pf reference was no longer held (expected after a restart)'
+			/bin/rm -f "$RUN_DIR/pf-token"
+		elif /sbin/pfctl -X "$_token" >/dev/null 2>&1; then
+			say 'released the pf reference'
+			/bin/rm -f "$RUN_DIR/pf-token"
+		else
+			ERRORS="$ERRORS pf-token"
+		fi
+		;;
+	esac
+fi
+# pfctl's output is kept only as long as its record.
+if [ ! -e "$RUN_DIR/pf-token" ]; then
+	/bin/rm -f "$RUN_DIR/pf-token.out"
+fi
+
+check_scope alias
+if owned alias; then
+	_address=$VALUE
+	_family=''
+	case "$_address" in
+	'' | *[!0-9a-f.:]*) ;;
+	*:*) _family=inet6 ;;
+	*) _family=inet ;;
+	esac
+	if [ -z "$_family" ]; then
+		say 'left a malformed address record'
+		ERRORS="$ERRORS alias"
+	elif ! _lo0=$(/sbin/ifconfig lo0); then
+		say 'left the address record: lo0 could not be read'
+		ERRORS="$ERRORS alias"
+	elif ! printf '%s\n' "$_lo0" | /usr/bin/grep -Fq "$_family $_address "; then
+		/bin/rm -f "$RUN_DIR/alias"
+	elif /sbin/ifconfig lo0 "$_family" "$_address" -alias; then
+		say "removed $_address from lo0"
+		/bin/rm -f "$RUN_DIR/alias"
+	else
+		ERRORS="$ERRORS alias"
+	fi
+fi
+
+check_scope created-resolver-file
+if owned created-resolver-file; then
+	_expected=$(printf 'nameserver 127.0.0.1\nport %s' "$STUB_PORT")
+	if [ ! -e "$RESOLVER_FILE" ] && [ ! -L "$RESOLVER_FILE" ]; then
+		/bin/rm -f "$RUN_DIR/created-resolver-file"
+	elif [ -f "$RESOLVER_FILE" ] && [ ! -L "$RESOLVER_FILE" ] &&
+		[ "$(/bin/cat "$RESOLVER_FILE")" = "$_expected" ]; then
+		if /bin/rm -f "$RESOLVER_FILE"; then
+			say "removed $RESOLVER_FILE"
+			/bin/rm -f "$RUN_DIR/created-resolver-file"
+		else
+			ERRORS="$ERRORS resolver-file"
+		fi
+	else
+		say "left $RESOLVER_FILE: it changed after the capture wrote it"
+		ERRORS="$ERRORS resolver-file"
+	fi
+elif [ -e "$RESOLVER_FILE" ] && [ ! -f "$RUN_DIR/created-resolver-file" ]; then
+	say "left $RESOLVER_FILE: no capture recorded creating it"
+fi
+
+check_scope created-resolver-dir
+if owned created-resolver-dir; then
+	/bin/rmdir "$RESOLVER_DIR" 2>/dev/null && say "removed $RESOLVER_DIR"
+	if [ -d "$RESOLVER_DIR" ] && [ -z "$(/bin/ls -A "$RESOLVER_DIR")" ]; then
+		ERRORS="$ERRORS resolver-dir"
+	else
+		/bin/rm -f "$RUN_DIR/created-resolver-dir"
+	fi
+fi
+
+check_scope created-pflog0
+if owned created-pflog0; then
+	if ! _interfaces=$(/sbin/ifconfig -l); then
+		say 'left the pflog0 record: the interfaces could not be listed'
+		ERRORS="$ERRORS pflog0"
+	elif ! printf ' %s \n' "$_interfaces" | /usr/bin/grep -Fq ' pflog0 '; then
+		/bin/rm -f "$RUN_DIR/created-pflog0"
+	elif /sbin/ifconfig pflog0 destroy; then
+		say 'destroyed pflog0'
+		/bin/rm -f "$RUN_DIR/created-pflog0"
+	else
+		ERRORS="$ERRORS pflog0"
+	fi
+fi
+
+if [ -n "$ERRORS" ]; then
+	echo "pev-leak-recover: not recovered:$ERRORS; the lock stays, run this again" >&2
+	exit 1
+fi
+
+if [ -n "$RESIDUAL" ]; then
+	/bin/rm -f "$RUN_DIR/pf-token" "$RUN_DIR/pf-token.out"
+fi
+if [ -n "$PHASE_ID" ] && [ -d "$PHASE_DIR" ]; then
+	{
+		echo 'result=invalid'
+		echo 'reason=the capture did not clean up itself'
+		[ -z "$RESIDUAL" ] || echo "residual=$RESIDUAL"
+		echo "recovered=$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
+	} >>"$PHASE_DIR/status"
+	/bin/chmod 0644 "$PHASE_DIR"/* 2>/dev/null
+	say "marked $PHASE_DIR invalid"
+fi
+/bin/rm -f "$RUN_DIR/phase-dir"
+if [ "$(/bin/cat "$LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ]; then
+	/bin/rm -rf "$LOCK_DIR"
+fi
+if [ -n "$RESIDUAL" ]; then
+	echo 'pev-leak-recover: finished, except the pf reference above: check it by hand' >&2
+	exit 2
+fi
+say finished
+exit 0
