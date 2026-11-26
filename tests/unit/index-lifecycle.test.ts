@@ -350,6 +350,48 @@ describe('an index found damaged by the check', () => {
     expect(c.session.connections.size).toBe(0);
   });
 
+  it('is found first by a read made while the check runs, and is still deleted and rebuilt', async () => {
+    const { run, root, indexDir, pairs } = exportAt('lc-read-first');
+    const before = digest(root);
+    const uuid = await built(run, indexDir);
+    const check = new HeldCheck();
+    const query = new CorruptingQuery();
+    const c = core({ root: run, indexDir, generation: 2, check, query });
+    expect(await c.openIndex(uuid)).toMatchObject({
+      ok: true,
+      progress: { condition: 'verifying' },
+    });
+    await until(() => check.running);
+    // The shell reads the list while the index is checked; SQLite finds the damage.
+    query.corrupt = true;
+    expect(await c.totals()).toBe('damaged');
+
+    await until(() => c.events.some((e) => e.damaged));
+    expect(check.stopped).toBe(true);
+    expect(c.events.at(-1)).toMatchObject({
+      stamp: c.stamp,
+      damaged: true,
+      progress: { condition: 'rebuilding' },
+    });
+    expect(c.logs.filter((l) => l.code === 'index.damaged').map((l) => l.data)).toEqual([
+      { reason: 'corrupt' },
+    ]);
+    expect(c.logs.some((l) => l.code === 'index.deleted')).toBe(true);
+    expect(c.logs.some((l) => l.code === 'index.delete_refused')).toBe(false);
+    expect(family(indexDir)).toEqual([]);
+    expect(c.session.connections.size).toBe(0);
+
+    const again = core({ root: run, indexDir, generation: 3 });
+    expect(await again.openIndex(null, true)).toMatchObject({
+      ok: true,
+      index: { created: true, replaced: false },
+    });
+    await again.session.index!.settled();
+    expect(await again.totals()).toMatchObject({ messages: pairs });
+    await again.session.close();
+    expect(digest(root)).toBe(before);
+  });
+
   it('is deleted while the export is unavailable, and waits for it to rebuild', async () => {
     const { run, indexDir } = exportAt('lc-offline');
     const uuid = await built(run, indexDir);
