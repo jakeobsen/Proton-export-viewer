@@ -245,14 +245,39 @@ describe('linkPrompt', () => {
     expect(first.url).toBe('mailto:%D0%B0@xn--exmple-cua.test,b@xn--pple-43d.test?subject=Hi#f');
     expect(first.url.slice(first.host!.start, first.host!.end)).toBe('xn--exmple-cua.test');
     expect(prompt('mailto:x@xn--pple-43d.test', 'аpple.test')).toMatchObject({ mismatch: false });
+    const typed = prompt('mailto:x@Shop.Example', 'shop.example');
+    expect(typed).toMatchObject({ url: 'mailto:x@Shop.Example', mismatch: false });
+    expect(typed.url.slice(typed.host!.start, typed.host!.end)).toBe('Shop.Example');
   });
 
-  it('keeps a mailto domain encoded when its decoded form is not a plain host name', () => {
-    for (const url of ['mailto:a@ex%2Cample.test', 'mailto:a@%E2%80%AEevil.test']) {
-      const p = prompt(url, 'Write');
-      expect(p.url).toBe(url);
-      expect(p.url.slice(p.host!.start, p.host!.end)).toBe(url.slice(url.indexOf('@') + 1));
+  it('keeps a mailto domain as it is, unmarked, when its decoded form is not a plain host name', () => {
+    for (const url of [
+      'mailto:a@ex%2Cample.test',
+      'mailto:a@%E2%80%AEevil.test',
+      'mailto:a@shop%E3%80%82example',
+    ]) {
+      expect(prompt(url, 'Write')).toMatchObject({ url, host: null, mismatch: false });
     }
+  });
+
+  it('shows a mailto domain with a separator in full, unmarked, and never matches it to the title', () => {
+    const urls = [
+      'mailto:a@paypal.com%2Fx.evil.test',
+      'mailto:a@paypal.com%2Fevil',
+      'mailto:a@paypal.com%3Fx',
+      'mailto:a@paypal.com%23x',
+      'mailto:a@paypal.com%3Fx.evil.test',
+      'mailto:a@paypal.com%23.evil.test',
+      'mailto:a@paypal.com%5Cevil.test',
+      'mailto:a@paypal.com/evil.test',
+      'mailto:a@p%D0%B0ypal.com%2Fevil.test',
+      'mailto:a@paypal%E2%92%88com',
+    ];
+    for (const url of urls) {
+      expect(prompt(url, 'paypal.com')).toMatchObject({ url, host: null, mismatch: true });
+    }
+    expect(prompt('mailto:a@paypal%E2%92%88com', 'paypal1.com').mismatch).toBe(true);
+    expect(prompt('mailto:a@paypal.com', 'paypal.com').mismatch).toBe(false);
   });
 
   it('warns for a look-alike host name split or dotted by invisible or compatibility characters', () => {

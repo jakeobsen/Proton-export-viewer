@@ -31,6 +31,7 @@ const HTML = [
   '<p><a id="subdomain" href="https://evil.shop.example/">shop.example</a></p>',
   '<p><a id="mailto-idn" href="mailto:help@аpple.test">Write to us</a></p>',
   '<p><a id="invisible" href="https://evil.example/">paypal&#x2060;.com</a></p>',
+  '<p><a id="mailto-separator" href="mailto:help@paypal.com%2Fx.evil.test">paypal.com</a></p>',
   '<p><a id="js" href="javascript:alert(1)">js</a> <a id="data" href="data:text/html,x">data</a></p>',
   '',
 ].join('\r\n');
@@ -135,7 +136,7 @@ test('each warning shows only when it applies, with the host marked', async ({ p
   await source(pev);
   const { frame, url } = await show(pev, 1, 'html');
   const dialog = pev.page.locator('.link-dialog');
-  const cases: Array<[string, Record<string, unknown>, string]> = [
+  const cases: Array<[string, Record<string, unknown>, string | null]> = [
     [
       '#plain',
       {
@@ -206,6 +207,16 @@ test('each warning shows only when it applies, with the host marked', async ({ p
       { title: 'paypal.com', url: 'https://evil.example/', mismatch: true, lookalike: false },
       'evil.example',
     ],
+    [
+      '#mailto-separator',
+      {
+        title: 'paypal.com',
+        url: 'mailto:help@paypal.com%2Fx.evil.test',
+        mismatch: true,
+        lookalike: false,
+      },
+      null,
+    ],
   ];
   for (const [index, [id, want, host]] of cases.entries()) {
     await click(frame, id);
@@ -214,7 +225,7 @@ test('each warning shows only when it applies, with the host marked', async ({ p
     await expect(dialog.locator('.link-label')).toHaveText(['Title', 'URL']);
     await expect(dialog.locator('.link-title')).toHaveText(want.title as string);
     await expect(dialog.locator('.link-url')).toHaveText(want.url as string);
-    await expect(dialog.locator('.link-host')).toHaveText(host);
+    await expect(dialog.locator('.link-host')).toHaveText(host === null ? [] : [host]);
     await expect(dialog.locator('.link-mismatch')).toHaveText(
       want.mismatch ? ["Title doesn't match URL"] : [],
     );

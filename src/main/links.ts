@@ -153,26 +153,33 @@ function webTarget(url: URL): Target {
 
 // A host name made only of letters, digits, hyphens and dots.
 const LDH_HOST_RE = /^[a-z0-9-]+(?:\.[a-z0-9-]+)*$/;
+// A name made only of characters that a host name's labels and dots can hold.
+const HOST_CHARS_RE = /^[\p{L}\p{N}\p{M}.-]+$/u;
 
 /**
- * An address domain as the dialog shows it: a percent-encoded name in its
- * punycode form, when that form is a plain host name. Anything else stays as
- * it is in the URL, so the shown text never gains a separator it didn't have.
+ * An address domain in ASCII form, or null when its decoded form is not a
+ * plain host name: one with a separator, a space or another character a host
+ * can't hold, or one without an ASCII form made of letters, digits and hyphens.
  */
-function shownDomain(domain: string): string {
-  if (!domain.includes('%')) return domain;
-  const ascii = asciiHost(decoded(domain));
-  return LDH_HOST_RE.test(ascii) ? ascii : domain;
+function mailDomain(domain: string): string | null {
+  const name = decoded(domain);
+  if (!HOST_CHARS_RE.test(name)) return null;
+  const ascii = asciiHost(name);
+  return LDH_HOST_RE.test(ascii) ? ascii : null;
 }
 
 function mailTarget(url: URL): Target {
   const addresses = url.pathname.split(',').map((address) => {
     const at = address.lastIndexOf('@');
     const domain = at < 0 ? '' : address.slice(at + 1);
+    const ascii = domain === '' ? null : mailDomain(domain);
     return {
       local: at < 0 ? address : address.slice(0, at + 1),
       domain,
-      shown: shownDomain(domain),
+      ascii,
+      // A percent-encoded domain shows in its ASCII form; one that has none
+      // shows as it is in the URL.
+      shown: ascii !== null && domain.includes('%') ? ascii : domain,
     };
   });
   const shown = `${url.protocol}${addresses.map((a) => a.local + a.shown).join(',')}${url.search}${url.hash}`;
@@ -183,8 +190,10 @@ function mailTarget(url: URL): Target {
   const end = start + first.shown.length;
   return {
     shown,
-    host: asciiHost(decoded(first.domain)),
-    span: shown.slice(start, end) === first.shown ? { start, end } : null,
+    // A domain without an ASCII form is not marked, and matches no host the
+    // title names.
+    host: first.ascii,
+    span: first.ascii !== null && shown.slice(start, end) === first.shown ? { start, end } : null,
     lookalike,
   };
 }
