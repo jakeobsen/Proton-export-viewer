@@ -2,6 +2,7 @@
 // Fixed placeholder bodies. They travel the same path a parsed message will:
 // main -> core -> reader worker -> main -> mail-body:/mail-asset: handlers.
 
+import type { BodyLink } from '../shared/reader-protocol';
 import { samplePng } from './png';
 
 export interface StubAsset {
@@ -13,6 +14,8 @@ export interface StubAsset {
 export interface StubBody {
   html: string;
   assets: StubAsset[];
+  /** Links by id; the body refers to each as `<assetBase>/<id>`. */
+  links?: BodyLink[];
 }
 
 /** Builds a body; `assetBase` is `mail-asset://v/<token>` for the view being opened. */
@@ -29,9 +32,10 @@ export const STUBS: Record<string, StubBuilder> = {
       '<p class="stub-title" id="stub-title">Sample message</p>',
       '<p id="stub-inline" style="color: rgb(120, 30, 60); letter-spacing: 2px">Placeholder body.</p>',
       `<img id="stub-cid" alt="" width="16" height="16" src="${assetBase}/c1">`,
-      '<p><a id="stub-link" href="https://example.com/" target="_blank" rel="noopener noreferrer">example.com</a></p>',
+      `<p><a id="stub-link" href="${assetBase}/l1" target="_blank" rel="noopener noreferrer">example.com</a></p>`,
       '</body></html>',
     ].join('\n'),
     assets: [{ id: 'c1', contentType: 'image/png', bytes: samplePng() }],
+    links: [{ id: 'l1', url: 'https://example.com/', text: 'example.com' }],
   }),
 };

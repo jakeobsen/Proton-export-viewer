@@ -5,7 +5,8 @@ import { BODY_IFRAME_SANDBOX } from '../shared/constants';
 import type { IndexCondition } from '../shared/index-types';
 import { indexChanged, syncMailbox } from './mailbox-state';
 import { ConversationList, Sidebar } from './Mailbox';
-import { closeLink, locateExport, refreshSources, showLink, useShellState } from './shell';
+import { LinkDialog } from './LinkDialog';
+import { locateExport, refreshSources, showLink, useShellState } from './shell';
 import { Welcome } from './Welcome';
 
 /** Index states shown as a banner; "Verifying index…" shows in the sidebar. */
@@ -77,15 +78,7 @@ export function App() {
           </section>
         </main>
       )}
-      {state.link !== null && (
-        <div className="dialog" role="dialog" aria-label="Open link">
-          <p className="dialog-title">Open link?</p>
-          <p className="dialog-url">{state.link}</p>
-          <button type="button" className="dialog-button" onClick={closeLink}>
-            Cancel
-          </button>
-        </div>
-      )}
+      {state.link !== null && <LinkDialog key={state.link.dialogId} prompt={state.link} />}
     </div>
   );
 }

@@ -28,6 +28,7 @@ export const LOG_CODES = [
   'nav.redirect_denied',
   'nav.window_open_denied',
   'nav.link_dialog',
+  'nav.link_action',
   'nav.webview_denied',
   'net.blocked',
   'perm.denied',
@@ -172,6 +173,10 @@ export const REASONS = [
   'in_use',
   'overlap',
   'app_data',
+  'not_link',
+  'unknown_link',
+  'unknown_dialog',
+  'open_failed',
 ] as const;
 
 /** The lists of a message whose entries can be cut to a limit when indexed. */

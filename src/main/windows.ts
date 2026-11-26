@@ -83,7 +83,7 @@ export function createAppWindow(ctx: AppContext, options: WindowOptions = {}): A
     views,
     windowId,
     log: ctx.log,
-    showLinkDialog: (url) => ctx.linkDialog.show(contents, windowId, url),
+    openLink: (url) => ctx.linkDialog.request(contents, appWin, url, ctx.generation),
     allowFrameUrl: options.allowFrameUrl,
   });
   contents.on('render-process-gone', (_event, details) => {
@@ -94,6 +94,7 @@ export function createAppWindow(ctx: AppContext, options: WindowOptions = {}): A
     });
   });
   win.on('closed', () => {
+    ctx.linkDialog.forget(windowId);
     const revoked = views.revokeAll();
     if (revoked > 0)
       ctx.log.info('view.revoked', { reason: 'window_closed', count: revoked, windowId });

@@ -37,6 +37,7 @@ function lane(
     breaches: [] as Array<[Breach, number]>,
     other: [] as Out[],
     exits: [] as number[],
+    planned: [] as number[],
     retired: [] as Out[],
   };
   const l = new ReaderLane<In, Out>({
@@ -49,7 +50,10 @@ function lane(
     },
     onBreach: (breach, ms) => events.breaches.push([breach, ms]),
     onOther: (message) => events.other.push(message),
-    onExit: (code) => events.exits.push(code),
+    onExit: (code, planned) => {
+      events.exits.push(code);
+      if (planned) events.planned.push(code);
+    },
     retire: options.retire,
     onRetire: (message) => events.retired.push(message),
   });
@@ -87,6 +91,9 @@ describe('the reader lane', () => {
     const threadOf = (o: typeof first) => (o.ok ? o.message.threadId : undefined);
     expect(threadOf(after)).not.toBe(threadOf(first));
     expect(events.spawns).toBe(2);
+    // An exit after a breach is not one the lane planned.
+    await expect.poll(() => events.exits).toHaveLength(1);
+    expect(events.planned).toEqual([]);
   });
 
   it('ends a job that runs out of heap as a limit breach, and the next job works', async () => {
@@ -100,6 +107,7 @@ describe('the reader lane', () => {
     const { lane: l, events } = lane();
     expect(await l.job(req('crash'))).toEqual({ ok: false, reason: 'crash' });
     expect(events.exits).toContain(70);
+    expect(events.planned).toEqual([]);
     expect(events.breaches).toEqual([]);
     expect((await l.job(req('echo'))).ok).toBe(true);
   });
@@ -213,6 +221,8 @@ describe('the reader lane', () => {
     const after = await l.job(req('echo'));
     expect(threadOf(after)).toBe(l.describe().threadId);
     await expect.poll(() => events.exits).toHaveLength(1);
+    // The lane ended a sound worker on purpose: a planned exit.
+    expect(events.planned).toEqual(events.exits);
     expect(events.breaches).toEqual([]);
   });
 
