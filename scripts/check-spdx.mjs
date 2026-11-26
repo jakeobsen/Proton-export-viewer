@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Every source file under src/, tests/, scripts/ and .githooks/ must start with
+// Every source file under src/, tests/, scripts/, tools/ and .githooks/ must start with
 // the license identifier (after a shebang, if any).
 
 import { execFileSync } from 'node:child_process';
@@ -7,7 +7,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { extname } from 'node:path';
 
 export const SPDX_LINE = 'SPDX-License-Identifier: AGPL-3.0-or-later';
-const ROOTS = ['src/', 'tests/', 'scripts/', '.githooks/'];
+const ROOTS = ['src/', 'tests/', 'scripts/', 'tools/', '.githooks/'];
 const SOURCE_EXT = new Set([
   '.ts',
   '.tsx',
