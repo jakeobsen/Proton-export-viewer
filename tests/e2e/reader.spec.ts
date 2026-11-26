@@ -14,7 +14,7 @@ import { hostileMessages } from '../../tools/gen-export/hostile.mjs';
 import { testDir } from '../paths';
 import { expect, test, tokenOf, type PevApp } from './app';
 
-type Entry = { file: string } | { test: TestInput };
+type Entry = ({ file: string } | { test: TestInput }) & { delayMs?: number };
 
 const PLAIN = [
   'Subject: Plain <b>subject</b>',
@@ -198,6 +198,24 @@ test('a stale openId or generation installs no view', async ({ pev }) => {
   expect(await pev.main('liveViews', 1)).toBe(0);
   expect(await pev.main('authorizedUrl', 1)).toBeNull();
   expect(pev.hasLog('open.stale', { reason: 'generation' })).toBe(true);
+});
+
+test('an older open whose lookup finishes last never drops the newer one', async ({ pev }) => {
+  await source(pev, { 'plain.eml': PLAIN }, [
+    // Keeps the worker busy while the next two opens arrive.
+    [1, { test: { kind: 'sleep', ms: 1500 } }],
+    // Found only after the newer open below is already queued.
+    [2, { file: 'plain.eml', delayMs: 600 }],
+    [3, { file: 'plain.eml' }],
+  ]);
+  await startOpen(pev, 1, '__busy');
+  await startOpen(pev, 2, '__older');
+  await startOpen(pev, 3, '__newer');
+  expect(await finishOpen(pev, '__older')).toEqual({ ok: false, code: 'superseded' });
+  expect(await finishOpen(pev, '__busy')).toEqual({ ok: false, code: 'superseded' });
+  const newer = await finishOpen(pev, '__newer');
+  expect(await pev.main('liveViews', 1)).toBe(1);
+  expect(await pev.main('authorizedUrl', 1)).toBe(viewUrl(newer));
 });
 
 test('a timeout and a heap breach each end the worker and give the fallback; the next open works', async ({

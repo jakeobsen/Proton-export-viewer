@@ -33,5 +33,13 @@ export function testStream(input: TestInput): Readable {
       });
     case 'throw':
       throw new Error(input.markers);
+    case 'sleep':
+      // Holds the job for a while without blocking the worker, then gives a small message.
+      return Readable.from(
+        (async function* () {
+          await new Promise((resolve) => setTimeout(resolve, input.ms));
+          yield Buffer.from('Subject: slept\r\n\r\nslept\r\n');
+        })(),
+      );
   }
 }

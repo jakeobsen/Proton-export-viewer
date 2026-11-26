@@ -16,18 +16,21 @@ markLoaded();
 /** The core test action that sets the source. */
 export const READER_SOURCE_ACTION = 'pev-reader-test-source';
 
-export type SourceEntry = { file: string } | { test: TestInput };
+/** A message, and how long finding it takes (to test opens whose lookups finish out of order). */
+export type SourceEntry = ({ file: string } | { test: TestInput }) & { delayMs?: number };
 
 export interface SourcePayload {
   root: string;
   entries: Array<[number, SourceEntry]>;
 }
 
-const TEST_KINDS = new Set(['generated', 'spin', 'heap', 'throw']);
+const TEST_KINDS = new Set(['generated', 'spin', 'heap', 'throw', 'sleep']);
 
 function isEntry(value: unknown): value is SourceEntry {
   if (typeof value !== 'object' || value === null) return false;
-  const entry = value as { file?: unknown; test?: { kind?: unknown } };
+  const entry = value as { file?: unknown; test?: { kind?: unknown }; delayMs?: unknown };
+  const delay = entry.delayMs;
+  if (delay !== undefined && !(Number.isSafeInteger(delay) && (delay as number) >= 0)) return false;
   if (typeof entry.file === 'string') return true;
   return typeof entry.test?.kind === 'string' && TEST_KINDS.has(entry.test.kind);
 }
@@ -102,6 +105,7 @@ export class TestReaderSource implements ReaderSource {
   async open(rowid: number): Promise<OpenedMessage | null> {
     const entry = this.entries.get(rowid);
     if (!entry) return null;
+    if (entry.delayMs) await new Promise((resolve) => setTimeout(resolve, entry.delayMs));
     if ('test' in entry) {
       return { input: { kind: 'test', input: entry.test }, close: () => Promise.resolve() };
     }

@@ -62,6 +62,8 @@ describe('plain text bodies', () => {
     // No URL or host is an attribute value anywhere in the body.
     expect(html).not.toMatch(/(?:href|src)="(?!mail-asset:\/\/v\/[0-9a-f]{32}\/l\d+")/);
     expect(html.match(/<a /g)).toHaveLength(4);
+    // The link text is escaped like the rest of the text.
+    expect(html).toContain('>https://leak-abc123.test/path?a=1&amp;b=2</a>');
     expect(html).toContain('target="_blank" rel="noopener noreferrer"');
     expect(bodyText(html)).toBe(text);
   });

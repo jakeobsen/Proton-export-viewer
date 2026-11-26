@@ -105,15 +105,39 @@ describe('the reader lane', () => {
     expect(outcomes.map((o) => o.ok)).toEqual([true, true]);
   });
 
-  it('drops queued jobs for a key when a newer job for it arrives', async () => {
+  it('drops queued jobs of a key when a newer job of it arrives', async () => {
     const { lane: l } = lane();
-    const running = l.job(req('slow', { ms: 150 }), 1);
-    const older = l.job(req('echo'), 2);
-    const other = l.job(req('echo'), 3);
-    const newer = l.job(req('echo'), 2);
+    const running = l.job(req('slow', { ms: 150 }), { key: 1, order: 1 });
+    const older = l.job(req('echo'), { key: 2, order: 1 });
+    const other = l.job(req('echo'), { key: 3, order: 1 });
+    const newer = l.job(req('echo'), { key: 2, order: 2 });
     expect(await older).toEqual({ ok: false, reason: 'superseded' });
     expect((await running).ok).toBe(true);
     expect((await other).ok).toBe(true);
+    expect((await newer).ok).toBe(true);
+  });
+
+  it('never lets an older job drop a newer one that arrived first', async () => {
+    const { lane: l } = lane();
+    // The worker is busy; the newer job queues before the older one arrives.
+    const busy = l.job(req('slow', { ms: 200 }), { key: 9, order: 1 });
+    const newer = l.job(req('echo'), { key: 1, order: 3 });
+    const older = l.job(req('echo'), { key: 1, order: 2 });
+    expect(await older).toEqual({ ok: false, reason: 'superseded' });
+    expect(l.queued).toBe(1);
+    expect((await newer).ok).toBe(true);
+    expect((await busy).ok).toBe(true);
+  });
+
+  it('drops a job older than the running one of its key, and keeps a newer one', async () => {
+    const { lane: l } = lane();
+    const running = l.job(req('slow', { ms: 200 }), { key: 1, order: 5 });
+    expect(await l.job(req('echo'), { key: 1, order: 4 })).toEqual({
+      ok: false,
+      reason: 'superseded',
+    });
+    const newer = l.job(req('echo'), { key: 1, order: 6 });
+    expect((await running).ok).toBe(true);
     expect((await newer).ok).toBe(true);
   });
 

@@ -96,6 +96,10 @@ describe('the reader test source', () => {
     const root = '/tmp/x';
     expect(parsePayload({ root, entries: [[1, { file: 'a.eml' }]] })).not.toBeNull();
     expect(parsePayload({ root, entries: [[1, { test: { kind: 'heap' } }]] })).not.toBeNull();
+    expect(parsePayload({ root, entries: [[1, { file: 'a.eml', delayMs: 500 }]] })).not.toBeNull();
+    expect(
+      parsePayload({ root, entries: [[1, { test: { kind: 'sleep', ms: 1 } }]] }),
+    ).not.toBeNull();
     for (const bad of [
       null,
       { root: 'relative', entries: [] },
@@ -103,6 +107,8 @@ describe('the reader test source', () => {
       { root, entries: [[1.5, { file: 'a' }]] },
       { root, entries: [[1, { path: 'a' }]] },
       { root, entries: [[1, { test: { kind: 'other' } }]] },
+      { root, entries: [[1, { file: 'a.eml', delayMs: -1 }]] },
+      { root, entries: [[1, { file: 'a.eml', delayMs: 0.5 }]] },
       { root, entries: [[1]] },
       { root },
     ]) {

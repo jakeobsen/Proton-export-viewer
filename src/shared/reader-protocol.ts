@@ -50,7 +50,8 @@ export type TestInput =
   | { kind: 'generated'; spec: GeneratedMessage }
   | { kind: 'spin' }
   | { kind: 'heap' }
-  | { kind: 'throw'; markers: string };
+  | { kind: 'throw'; markers: string }
+  | { kind: 'sleep'; ms: number };
 
 /**
  * Where the reader worker reads a message from: a file core opened read-only
@@ -71,7 +72,7 @@ export interface ReadRequest {
   token: string;
   rowid: number;
   mode: OpenMode;
-  /** The window the open is for. A newer open for it drops this one while it waits. */
+  /** The window the open is for. Its newer opens, by openId, drop this one while it waits. */
   lane: number;
 }
 

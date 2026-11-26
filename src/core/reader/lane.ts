@@ -35,9 +35,15 @@ export interface LaneOptions<Out extends LaneMessage> {
   onBreach?: (breach: Breach, ms: number) => void;
 }
 
+/** Whose job it is, and how new: a newer job of the same key supersedes an older one. */
+export interface JobSlot {
+  key: number;
+  order: number;
+}
+
 interface Job<In, Out> {
   message: In;
-  key: number | null;
+  slot: JobSlot | null;
   resolve: (outcome: JobOutcome<Out>) => void;
 }
 
@@ -72,25 +78,33 @@ export class ReaderLane<In extends LaneMessage, Out extends LaneMessage> {
   }
 
   /**
-   * Queues a job. A job with a key drops the queued jobs with the same key
-   * (they fail as superseded); the job already running is left to finish.
+   * Queues a job. Of the jobs with the same slot key, only the newest by order
+   * waits: a job fails as superseded at once if a newer one of its key is
+   * queued or running, and it drops the older ones still queued. A running job
+   * is left to finish.
    */
-  job(message: In, key: number | null = null): Promise<JobOutcome<Out>> {
+  job(message: In, slot: JobSlot | null = null): Promise<JobOutcome<Out>> {
     return new Promise((resolve) => {
       if (this.stopped) {
         resolve({ ok: false, reason: 'crash' });
         return;
       }
-      if (key !== null) {
+      if (slot) {
+        const newer = (job: Job<In, Out> | null) =>
+          job?.slot?.key === slot.key && job.slot.order > slot.order;
+        if (newer(this.running) || this.queue.some(newer)) {
+          resolve({ ok: false, reason: 'superseded' });
+          return;
+        }
         for (let i = this.queue.length - 1; i >= 0; i -= 1) {
           const queued = this.queue[i];
-          if (queued?.key === key) {
+          if (queued?.slot?.key === slot.key) {
             this.queue.splice(i, 1);
             queued.resolve({ ok: false, reason: 'superseded' });
           }
         }
       }
-      this.queue.push({ message, key, resolve });
+      this.queue.push({ message, slot, resolve });
       this.pump();
     });
   }

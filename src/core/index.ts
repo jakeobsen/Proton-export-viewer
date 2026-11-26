@@ -95,7 +95,7 @@ async function read(request: ReadRequest): Promise<void> {
         mode: request.mode,
         assetBase: `${ASSET_SCHEME}://${VIEW_HOST}/${request.token}`,
       },
-      request.lane,
+      { key: request.lane, order: request.openId },
     );
     if (!outcome.ok) {
       return outcome.reason === 'superseded'
