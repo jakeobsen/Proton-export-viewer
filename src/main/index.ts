@@ -119,6 +119,7 @@ async function start(): Promise<void> {
     linkDialog: new LinkDialog(log),
     shellCsp: SHELL_CSP,
   };
+  core.onEvent = (event) => sources.handleCoreEvent(event);
   app.on('will-quit', () => sources.close());
   registerIpc(ctx);
   if (__PEV_TEST_HOOKS__) {

@@ -3,8 +3,12 @@
 // steps, generations, unavailable sources and Locate. Core is a stand-in that
 // computes the real run identity.
 
+import { randomUUID } from 'node:crypto';
 import {
   cpSync,
+  existsSync,
+  readdirSync,
+  readFileSync,
   mkdirSync,
   realpathSync,
   renameSync,
@@ -17,7 +21,8 @@ import { describe, expect, it } from 'vitest';
 import { runIdentity } from '../../src/core/identity';
 import type { CoreRequest, CoreResult, CoreSource } from '../../src/shared/core-protocol';
 import type { Logger } from '../../src/shared/log/writer';
-import type { ScanSummary } from '../../src/shared/sources';
+import type { IndexCondition, IndexProgress } from '../../src/shared/index-types';
+import type { ScanSummary, Stamp } from '../../src/shared/sources';
 import {
   STALE,
   SourceManager,
@@ -48,6 +53,16 @@ const SUMMARY: ScanSummary = {
   },
 };
 
+const PROGRESS: IndexProgress = {
+  phase: 'loading',
+  loaded: 0,
+  total: 0,
+  failed: 0,
+  timeouts: 0,
+  capped: 0,
+  condition: 'ok',
+};
+
 class FakeCore implements CoreControl {
   running = false;
   next: CoreSource | null = null;
@@ -56,6 +71,15 @@ class FakeCore implements CoreControl {
   readonly calls: string[] = [];
   holdScans = false;
   readonly heldScans: Array<() => void> = [];
+  /** Index opens, with what main asked for. */
+  readonly indexCalls: Array<{ stamp: Stamp; dbUuid: string | null; rebuild: boolean }> = [];
+  readonly forgets: string[] = [];
+  /** Sources whose index core can't delete yet. */
+  readonly busy = new Set<string>();
+  resets = 0;
+  /** Called when core is asked to reset or stopped, to see what was on disk then. */
+  onReset: (() => void) | null = null;
+  onStop: (() => void) | null = null;
 
   setSource(source: CoreSource | null) {
     this.next = source && { ...source };
@@ -71,6 +95,7 @@ class FakeCore implements CoreControl {
   }
 
   stop() {
+    if (this.running) this.onStop?.();
     this.running = false;
     this.current = null;
     return Promise.resolve();
@@ -94,8 +119,32 @@ class FakeCore implements CoreControl {
       ok: false,
       code,
     });
+    if (call.type === 'forget') {
+      this.forgets.push(call.sourceKey);
+      return this.busy.has(call.sourceKey)
+        ? { type: 'result', reqId: 0, ok: false, code: 'busy' }
+        : { type: 'result', reqId: 0, ok: true };
+    }
+    if (call.type === 'reset') {
+      this.resets += 1;
+      this.onReset?.();
+      return { type: 'result', reqId: 0, ok: true };
+    }
     if (!src?.root) return fail('unavailable');
     const stamp = { sourceKey: src.sourceKey, generation: src.generation };
+    if (call.type === 'index') {
+      const rebuild = call.rebuild === true;
+      this.indexCalls.push({ stamp: call.stamp, dbUuid: call.dbUuid, rebuild });
+      const created = call.dbUuid === null;
+      return {
+        type: 'result',
+        reqId: 0,
+        ok: true,
+        stamp,
+        index: { dbUuid: call.dbUuid ?? randomUUID(), created, replaced: false },
+        progress: { ...PROGRESS, condition: rebuild ? 'rebuilding' : created ? 'ok' : 'verifying' },
+      };
+    }
     if (call.type === 'identify') {
       const identity = await runIdentity(realpathSync(src.root));
       return { type: 'result', reqId: 0, ok: true, stamp, identity };
@@ -433,7 +482,8 @@ describe('an unavailable source', () => {
       generation: t.generation(),
       root: null,
     });
-    expect(t.core.calls).toEqual([]);
+    // Without the run, only its index is asked for, to browse it.
+    expect(t.core.calls).toEqual(['index']);
     expect([...t.live.values()]).toEqual([]);
   });
 
@@ -588,5 +638,241 @@ describe('the logs', () => {
     for (const secret of ['secret.account', root, 'mail_2025', 'bm1']) {
       expect(all).not.toContain(secret);
     }
+  });
+});
+
+/** What core reports when it tore down and deleted a damaged index. */
+function damaged(stamp: Stamp, condition: IndexCondition = 'rebuilding') {
+  return {
+    type: 'event' as const,
+    event: 'index' as const,
+    stamp,
+    progress: { ...PROGRESS, condition },
+    damaged: true,
+  };
+}
+
+describe('a damaged index', () => {
+  it('is rebuilt under a new generation while its source is still known', async () => {
+    const t = setup('mgr-rebuild');
+    t.picks.push({ path: tool('mgr-rebuild-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await settle();
+    const stamp = t.manager.stamp()!;
+    const first = t.manager.registry.source(stamp.sourceKey)!.dbUuid;
+    expect(first).toEqual(expect.any(String));
+    expect(t.core.indexCalls).toEqual([{ stamp, dbUuid: null, rebuild: false }]);
+
+    t.order.length = 0;
+    t.manager.handleCoreEvent(damaged(stamp));
+    expect(t.manager.view().active?.index).toBe('rebuilding');
+    await settle();
+    // The generation moved; core was started again for the same run, and its
+    // index is made afresh, as a rebuild.
+    const now = t.manager.stamp()!;
+    expect(now).toEqual({ sourceKey: stamp.sourceKey, generation: stamp.generation + 1 });
+    expect(steps(t.order)).toEqual(['core.stop', 'scope.keep', 'core.spawn']);
+    expect(t.core.indexCalls.at(-1)).toEqual({ stamp: now, dbUuid: null, rebuild: true });
+    const second = t.manager.registry.source(stamp.sourceKey)!.dbUuid;
+    expect(second).toEqual(expect.any(String));
+    expect(second).not.toBe(first);
+    expect(t.manager.view().active?.index).toBe('rebuilding');
+    expect(t.lines.some((l) => l.includes('"index.rebuild"'))).toBe(true);
+  });
+
+  it('drops a report made for an earlier generation', async () => {
+    const t = setup('mgr-rebuild-stale');
+    const root = tool('mgr-rebuild-stale-tool');
+    t.picks.push({ path: root, bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await settle();
+    const old = t.manager.stamp()!;
+    const older = t.manager.view().active!.runs[1]!;
+    await t.manager.switchRun(older.runId, t.generation());
+    await settle();
+    const calls = t.core.indexCalls.length;
+    const view = t.manager.view();
+    t.manager.handleCoreEvent(damaged(old));
+    await settle();
+    expect(t.core.indexCalls).toHaveLength(calls);
+    expect(t.manager.view()).toEqual(view);
+    expect(t.manager.registry.source(old.sourceKey)?.dbUuid).toEqual(expect.any(String));
+    expect(t.lines.some((l) => l.includes('"source.stale_result"'))).toBe(true);
+  });
+
+  it('waits for an unavailable export to come back, then rebuilds', async () => {
+    const t = setup('mgr-rebuild-offline');
+    const root = tool('mgr-rebuild-offline-tool');
+    t.picks.push({ path: root, bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await settle();
+    const key = t.manager.stamp()!.sourceKey;
+    renameSync(join(root, 'secret.account@example.com'), join(root, 'away'));
+    expect(await t.manager.openRecent(key, t.generation())).toBe('offline');
+    await settle();
+    const stamp = t.manager.stamp()!;
+    const started = t.core.started.length;
+    t.manager.handleCoreEvent(damaged(stamp, 'damaged'));
+    await settle();
+    expect(t.core.started).toHaveLength(started);
+    expect(t.manager.view().active).toMatchObject({ status: 'offline', index: 'damaged' });
+    expect(t.manager.registry.source(key)?.dbUuid).toBeNull();
+    // Still waiting when it is opened again while it's gone.
+    expect(await t.manager.openRecent(key, t.generation())).toBe('offline');
+    expect(t.manager.view().active?.index).toBe('damaged');
+
+    renameSync(join(root, 'away'), join(root, 'secret.account@example.com'));
+    t.picks.push({ path: root, bookmark: 'bm2' });
+    expect(await t.manager.locate(null, t.generation())).toBe('opened');
+    await settle();
+    expect(t.core.indexCalls.at(-1)).toEqual({
+      stamp: t.manager.stamp(),
+      dbUuid: null,
+      rebuild: true,
+    });
+    expect(t.manager.view().active?.index).toBe('rebuilding');
+  });
+
+  it('is not rebuilt for a source forgotten first', async () => {
+    const t = setup('mgr-rebuild-forget');
+    t.picks.push({ path: tool('mgr-rebuild-forget-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await settle();
+    const stamp = t.manager.stamp()!;
+    const calls = t.core.indexCalls.length;
+    const forgetting = t.manager.forget(stamp.sourceKey, t.generation());
+    t.manager.handleCoreEvent(damaged(stamp));
+    expect(await forgetting).toBe('forgotten');
+    await settle();
+    expect(t.core.indexCalls).toHaveLength(calls);
+    expect(t.manager.registry.sources()).toEqual([]);
+    expect(t.core.running).toBe(false);
+  });
+});
+
+describe('Forget', () => {
+  it('of an export that is not open has core delete its index, and nothing else moves', async () => {
+    const t = setup('mgr-forget');
+    const root = tool('mgr-forget-tool');
+    t.picks.push({ path: root, bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    const first = t.manager.stamp()!.sourceKey;
+    await t.manager.switchRun(t.manager.view().active!.runs[1]!.runId, t.generation());
+    await settle();
+    const open = t.manager.stamp()!;
+    expect(t.manager.view().recent).toHaveLength(2);
+
+    t.order.length = 0;
+    expect(await t.manager.forget(first, t.generation())).toBe('forgotten');
+    expect(t.core.forgets).toEqual([first]);
+    expect(t.order).toEqual([]);
+    expect(t.manager.stamp()).toEqual(open);
+    expect(t.manager.view().recent.map((r) => r.sourceKey)).toEqual([open.sourceKey]);
+    expect(t.manager.registry.source(first)).toBeUndefined();
+    expect(await t.manager.forget(first, t.generation())).toBeNull();
+  });
+
+  it('of the open export tears it down first and releases its folder', async () => {
+    const t = setup('mgr-forget-open');
+    t.picks.push({ path: tool('mgr-forget-open-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await settle();
+    const stamp = t.manager.stamp()!;
+    t.order.length = 0;
+    expect(await t.manager.forget(stamp.sourceKey, t.generation())).toBe('forgotten');
+    expect(t.generation()).toBe(stamp.generation + 1);
+    expect(t.core.forgets).toEqual([stamp.sourceKey]);
+    expect(steps(t.order)).toEqual(['core.stop', 'scope.release']);
+    expect([...t.live.values()]).toEqual([]);
+    expect(t.manager.view()).toEqual({ restoring: false, active: null, recent: [] });
+    const saved = JSON.parse(readFileSync(join(t.userData, 'sources.json'), 'utf8')) as {
+      sources: unknown[];
+      picks: unknown[];
+      active: unknown;
+    };
+    expect(saved).toMatchObject({ sources: [], picks: [], active: null });
+  });
+
+  it('keeps the export when core can not delete its index yet', async () => {
+    const t = setup('mgr-forget-busy');
+    t.picks.push({ path: tool('mgr-forget-busy-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    const key = t.manager.stamp()!.sourceKey;
+    t.core.busy.add(key);
+    expect(await t.manager.forget(key, t.generation())).toBe('busy');
+    // Asked again of a core started afresh, which holds nothing of it.
+    expect(t.core.forgets).toEqual([key, key]);
+    expect(t.manager.registry.source(key)).toBeDefined();
+    expect(t.manager.view().active).toBeNull();
+    expect(t.lines.some((l) => l.includes('"source.forget_refused"'))).toBe(true);
+  });
+});
+
+describe('Reset', () => {
+  it('closes to opens queued before and after it, and deletes the data once core is down', async () => {
+    const t = setup('mgr-reset');
+    const root = tool('mgr-reset-tool');
+    t.picks.push({ path: root, bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await settle();
+    const key = t.manager.stamp()!.sourceKey;
+    mkdirSync(join(t.userData, 'index'), { recursive: true });
+    writeFileSync(join(t.userData, 'index', `${key}.sqlite`), 'x');
+    mkdirSync(join(t.userData, 'logs'), { recursive: true });
+    writeFileSync(join(t.userData, 'logs', 'main.jsonl'), '');
+    const seen: string[] = [];
+    const look = (when: string) => () =>
+      seen.push(`${when}:${existsSync(join(t.userData, 'sources.json'))}`);
+    t.core.onReset = look('reset');
+    t.core.onStop = look('stop');
+
+    // An open is under way (its dialog is up) and another is queued behind it.
+    let pick!: (p: Picked | null) => void;
+    t.manager.setAccess({ picker: () => new Promise((r) => (pick = r)) });
+    const inProgress = t.manager.chooseFolder(null, t.generation());
+    await settle();
+    const queuedBefore = t.manager.openRecent(key, t.generation());
+    const reset = t.manager.reset();
+    const queuedAfter = t.manager.chooseFolder(null, t.generation());
+    pick({ path: root, bookmark: 'bm2' });
+    expect(await inProgress).toBe('closed');
+    expect(await queuedBefore).toBe('closed');
+    await reset;
+    // Made for the generation before the reset: refused when its turn comes.
+    expect(await queuedAfter).toBe(STALE);
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('closed');
+    expect(await t.manager.openRecent(key, t.generation())).toBe('closed');
+
+    // Core was told to tear down and stopped while the data was still there.
+    expect(seen).toEqual(['reset:true', 'stop:true']);
+    expect(t.core.resets).toBe(1);
+    expect(readdirSync(t.userData).filter((n) => n !== 'session')).toEqual([]);
+    expect(t.manager.view()).toEqual({ restoring: false, active: null, recent: [] });
+    expect([...t.live.values()]).toEqual([]);
+    await settle();
+    expect(existsSync(join(t.userData, 'sources.json'))).toBe(false);
+    expect(existsSync(join(t.userData, 'index'))).toBe(false);
+  });
+
+  it('refuses a recovery queued before it and an open of another source', async () => {
+    const t = setup('mgr-reset-recovery');
+    const root = tool('mgr-reset-recovery-tool');
+    t.picks.push({ path: root, bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await settle();
+    const first = t.manager.stamp()!;
+    await t.manager.switchRun(t.manager.view().active!.runs[1]!.runId, t.generation());
+    await settle();
+    const stamp = t.manager.stamp()!;
+    const calls = t.core.indexCalls.length;
+    t.manager.handleCoreEvent(damaged(stamp));
+    const other = t.manager.openRecent(first.sourceKey, t.generation());
+    await t.manager.reset();
+    expect(await other).toBe('closed');
+    await settle();
+    expect(t.core.indexCalls).toHaveLength(calls);
+    expect(t.core.running).toBe(false);
+    expect(existsSync(join(t.userData, 'sources.json'))).toBe(false);
+    expect(existsSync(join(t.userData, 'index'))).toBe(false);
   });
 });

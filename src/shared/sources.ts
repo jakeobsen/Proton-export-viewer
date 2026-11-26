@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Types shared by main, core and the shell about export sources.
 
+import type { IndexCondition } from './index-types';
+
 /** The source and generation a piece of async work belongs to. */
 export interface Stamp {
   sourceKey: string;
@@ -65,6 +67,8 @@ export interface RunChoice {
 
 export interface ActiveExport extends ExportRow {
   status: 'online' | 'offline';
+  /** The state of its index, once known. */
+  index: IndexCondition | null;
   /** The runs found in the same picked folder; the run picker shows when there's more than one. */
   runs: RunChoice[];
 }
@@ -78,4 +82,14 @@ export interface SourcesView {
 }
 
 export type SourceOutcome =
-  'opened' | 'offline' | 'new_source' | 'canceled' | 'no_export' | 'unavailable';
+  | 'opened'
+  | 'offline'
+  | 'new_source'
+  | 'canceled'
+  | 'no_export'
+  | 'unavailable'
+  | 'forgotten'
+  /** Nothing can be opened: the app's data is being reset. */
+  | 'closed'
+  /** The index couldn't be deleted yet; nothing was changed. */
+  | 'busy';

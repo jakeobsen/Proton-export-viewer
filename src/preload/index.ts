@@ -30,6 +30,8 @@ const api: PevApi = {
     ipcRenderer.invoke(IPC.openExport, { sourceKey, generation }),
   switchRun: (runId, generation) => ipcRenderer.invoke(IPC.switchRun, { runId, generation }),
   locateExport: (generation) => ipcRenderer.invoke(IPC.locateExport, { generation }),
+  forgetExport: (sourceKey, generation) =>
+    ipcRenderer.invoke(IPC.forgetExport, { sourceKey, generation }),
   onSourcesChanged: (listener) => {
     const handler = () => listener();
     ipcRenderer.on(IPC.sourcesChanged, handler);

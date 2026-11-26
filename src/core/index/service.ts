@@ -10,16 +10,44 @@
 // hold the rows written so far. When phase 1 ends, the pool's threads end too;
 // after a while without queries or writes, both connections release their
 // caches.
+//
+// An index that was already there is checked once it is open: SQLite's quick
+// check runs on its own read-only connection in a short-lived thread, while
+// pages are read as usual. A failed check, or SQLite reporting the file as
+// corrupt at any time, is reported once, for the source's lifecycle to act on.
+// Closing is the index's part of the teardown: queued jobs are cancelled, the
+// write in flight rolls back, the check is ended and joined, and every
+// connection is closed.
 
 import { mkdirSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
-import type { IndexAnswer, IndexOpened, IndexProgress, IndexQuery } from '../../shared/index-types';
+import type {
+  IndexAnswer,
+  IndexCondition,
+  IndexOpened,
+  IndexProgress,
+  IndexQuery,
+} from '../../shared/index-types';
 import type { Logger } from '../../shared/log/writer';
 import type { Stamp } from '../../shared/sources';
 import type { FileRef, RunScan } from '../containment';
 import { TXN_INPUT_BYTES, WRITE_BATCH_PAIRS } from './limits';
-import type { LabelsJobResult, MetaJobItem, MetaJobResult, WriterOpened, BatchResult } from './ops';
-import { Pool, ThreadError, TIMEOUT, type IndexThread, type ThreadRole } from './pool';
+import type {
+  BatchResult,
+  CheckResult,
+  LabelsJobResult,
+  MetaJobItem,
+  MetaJobResult,
+  WriterOpened,
+} from './ops';
+import {
+  Pool,
+  THREAD_STOPPED,
+  ThreadError,
+  TIMEOUT,
+  type IndexThread,
+  type ThreadRole,
+} from './pool';
 import { CAPPED, CAPPED_LISTS } from './schema';
 import type { FileStat, PairFiles, Phase1Item } from './writer';
 
@@ -36,23 +64,28 @@ export const IDLE_MS = 20_000;
 
 /** One registered connection: which thread holds it, on which database. */
 export interface Connection {
-  role: 'writer' | 'query';
+  role: 'writer' | 'query' | 'verifier';
   dbPath: string;
 }
 
 /**
- * Every database connection core holds. Nothing in a database's family is
- * deleted or reopened while one is listed for it.
+ * Every database connection core holds, whichever index it belongs to.
+ * Nothing in a database's family is deleted or reopened while one is listed
+ * for it.
  */
 export class ConnectionRegistry {
-  private readonly open = new Map<Connection['role'], Connection>();
+  private seq = 0;
+  private readonly open = new Map<number, Connection>();
 
-  add(connection: Connection): void {
-    this.open.set(connection.role, { ...connection });
+  /** Lists a connection; returns its entry, for `remove`. */
+  add(connection: Connection): number {
+    this.seq += 1;
+    this.open.set(this.seq, { ...connection });
+    return this.seq;
   }
 
-  remove(role: Connection['role']): void {
-    this.open.delete(role);
+  remove(entry: number | null): void {
+    if (entry !== null) this.open.delete(entry);
   }
 
   list(): Connection[] {
@@ -89,6 +122,19 @@ export interface IndexServiceDeps {
   /** False once the source's generation has moved on. */
   isCurrent: () => boolean;
   options?: IndexOptions;
+  /** Core's registry of connections; the index's own one if none is given. */
+  connections?: ConnectionRegistry;
+  /** Called once, with the reason, when the index turns out to be damaged. */
+  onDamage?: (reason: string) => void;
+  /** Called with the outcome of the check of an existing index. */
+  onChecked?: (result: CheckResult | null, ms: number) => void;
+  /** Called when `progress.condition` changes. */
+  onChange?: () => void;
+}
+
+export interface OpenOptions {
+  /** The index is made in place of a damaged one. */
+  rebuild?: boolean;
 }
 
 const fileStat = (ref: FileRef): FileStat => ({
@@ -147,10 +193,14 @@ export function reasonOf(code: string): string {
 }
 
 export class IndexService {
-  readonly connections = new ConnectionRegistry();
+  readonly connections: ConnectionRegistry;
   readonly dbPath: string;
   private writer: IndexThread | null = null;
   private query: IndexThread | null = null;
+  private verifier: IndexThread | null = null;
+  private checking: Promise<void> | null = null;
+  private writerEntry: number | null = null;
+  private queryEntry: number | null = null;
   private queryReady: Promise<void> | null = null;
   private pool: Pool | null = null;
   private opened: WriterOpened | null = null;
@@ -159,6 +209,9 @@ export class IndexService {
   private released = false;
   private idleTimer: ReturnType<typeof setInterval> | null = null;
   private closed = false;
+  private damaged = false;
+  /** Shared with the writer thread: 1 stops the write in flight, which rolls back. */
+  private readonly cancel = new SharedArrayBuffer(4);
   readonly progress: IndexProgress = {
     phase: 'opening',
     loaded: 0,
@@ -166,6 +219,7 @@ export class IndexService {
     failed: 0,
     timeouts: 0,
     capped: 0,
+    condition: 'ok',
   };
   private readonly poolSize: number;
   private readonly jobMs: number;
@@ -175,6 +229,7 @@ export class IndexService {
 
   constructor(private readonly deps: IndexServiceDeps) {
     this.dbPath = join(deps.indexDir, `${deps.stamp.sourceKey}.sqlite`);
+    this.connections = deps.connections ?? new ConnectionRegistry();
     const o = deps.options ?? {};
     this.poolSize = o.poolSize ?? POOL_SIZE;
     this.jobMs = o.jobMs ?? INDEX_JOB_MS;
@@ -187,32 +242,85 @@ export class IndexService {
     return { src: this.deps.stamp.sourceKey };
   }
 
+  /** False once the index is closed or its source's generation has moved on. */
+  private current(): boolean {
+    return !this.closed && this.deps.isCurrent();
+  }
+
+  /** Whether the index was found damaged. */
+  get isDamaged(): boolean {
+    return this.damaged;
+  }
+
+  /** Whether the index's teardown has begun. */
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  setCondition(condition: IndexCondition): void {
+    if (this.progress.condition === condition) return;
+    this.progress.condition = condition;
+    this.deps.onChange?.();
+  }
+
+  /** Reports damage once; the source's lifecycle decides what happens next. */
+  private damage(reason: string): void {
+    if (this.damaged || this.closed) return;
+    this.damaged = true;
+    this.deps.onDamage?.(reason);
+  }
+
+  /** Reports damage found elsewhere, such as by the check. */
+  reportDamage(reason: string): void {
+    this.damage(reason);
+  }
+
+  /** Reports damage when a thread says SQLite found the file corrupt. */
+  private watch(err: unknown): void {
+    if (err instanceof ThreadError && err.code === 'INDEX_CORRUPT') this.damage('corrupt');
+  }
+
   /**
    * Opens the source's index, creating it if there's none or the one there
    * isn't usable. With `create` false (the run is unavailable), only the
    * read-only query connection opens, and only to an index with the expected
-   * identity: nothing is created, replaced or written.
+   * identity: nothing is created, replaced or written. An index that was
+   * already there is then checked in the background.
    */
-  async open(expectedUuid: string | null, create = true): Promise<IndexOpened> {
+  async open(
+    expectedUuid: string | null,
+    create = true,
+    options: OpenOptions = {},
+  ): Promise<IndexOpened> {
     if (!create) return this.openForBrowsing(expectedUuid);
     mkdirSync(this.deps.indexDir, { recursive: true, mode: 0o700 });
     chmodSync(this.deps.indexDir, 0o700);
     const writer = this.deps.thread('writer');
     this.writer = writer;
-    writer.onRespawn = () => this.connections.remove('writer');
+    writer.onRespawn = () => {
+      this.connections.remove(this.writerEntry);
+      this.writerEntry = null;
+    };
     const opened = await writer.call<WriterOpened>('open', {
       dbPath: this.dbPath,
       stamp: this.deps.stamp,
       expectedUuid,
       capBytes: this.capBytes,
+      cancel: this.cancel,
     });
-    this.connections.add({ role: 'writer', dbPath: this.dbPath });
+    this.writerEntry = this.connections.add({ role: 'writer', dbPath: this.dbPath });
     this.opened = opened;
-    if (opened.replaced) this.deps.log.warn('index.replaced', {}, this.src);
+    if (opened.replaced) this.deps.log.warn('index.damaged', { reason: 'identity' }, this.src);
     if (opened.created) this.deps.log.info('index.created', {}, this.src);
+    this.progress.condition = opened.created
+      ? options.rebuild || opened.replaced
+        ? 'rebuilding'
+        : 'ok'
+      : 'verifying';
     this.startQuery();
     await this.openQuery();
     this.startIdleWatch();
+    if (!opened.created) this.startCheck();
     return { dbUuid: opened.uuid, created: opened.created, replaced: opened.replaced };
   }
 
@@ -221,9 +329,11 @@ export class IndexService {
     if (expectedUuid === null) throw new ThreadError('NO_INDEX');
     this.opened = { uuid: expectedUuid, created: false, replaced: false, phase1Done: false };
     this.progress.phase = 'unavailable';
+    this.progress.condition = 'verifying';
     this.startQuery();
     await this.openQuery();
     this.startIdleWatch();
+    this.startCheck();
     return { dbUuid: expectedUuid, created: false, replaced: false };
   }
 
@@ -231,7 +341,8 @@ export class IndexService {
     const query = this.deps.thread('query');
     this.query = query;
     query.onRespawn = () => {
-      this.connections.remove('query');
+      this.connections.remove(this.queryEntry);
+      this.queryEntry = null;
       this.queryReady = null;
     };
   }
@@ -239,10 +350,10 @@ export class IndexService {
   private openQuery(): Promise<void> {
     const query = this.query;
     const uuid = this.opened?.uuid;
-    if (!query || !uuid) return Promise.reject(new ThreadError('NOT_OPEN'));
+    if (!query || !uuid || this.closed) return Promise.reject(new ThreadError('NOT_OPEN'));
     this.queryReady ??= query.call('open', { dbPath: this.dbPath, expectedUuid: uuid }).then(
       () => {
-        this.connections.add({ role: 'query', dbPath: this.dbPath });
+        this.queryEntry = this.connections.add({ role: 'query', dbPath: this.dbPath });
       },
       (err: unknown) => {
         this.queryReady = null;
@@ -252,11 +363,52 @@ export class IndexService {
     return this.queryReady;
   }
 
+  /**
+   * Checks the index with SQLite's quick check, on its own connection in a
+   * short-lived thread, with no time limit: it takes longer while phase 1
+   * writes. The outcome goes to `onChecked` without waiting on anything, so a
+   * teardown can always end and join the thread.
+   */
+  private startCheck(): void {
+    const uuid = this.opened?.uuid;
+    if (!uuid || this.closed || this.checking) return;
+    const thread = this.deps.thread('verify');
+    this.verifier = thread;
+    const entry = this.connections.add({ role: 'verifier', dbPath: this.dbPath });
+    const started = performance.now();
+    this.checking = (async () => {
+      let result: CheckResult | null = null;
+      try {
+        result = await thread.call<CheckResult>('check', {
+          dbPath: this.dbPath,
+          expectedUuid: uuid,
+        });
+      } catch {
+        // Ended by a teardown, or the thread failed.
+      }
+      // The thread is short-lived: its connection closes with it.
+      await thread.stop();
+      this.connections.remove(entry);
+      this.verifier = null;
+      this.deps.onChecked?.(result, Math.round(performance.now() - started));
+    })();
+  }
+
+  /** Resolves once the check of an existing index, if one started, has ended. */
+  async checkEnded(): Promise<void> {
+    await this.checking;
+  }
+
   /** Answers a query from the read-only connection. */
   async ask(call: IndexQuery): Promise<IndexAnswer> {
     this.touch();
-    await this.openQuery();
-    return this.query!.call<IndexAnswer>('query', { call });
+    try {
+      await this.openQuery();
+      return await this.query!.call<IndexAnswer>('query', { call });
+    } catch (err) {
+      this.watch(err);
+      throw err;
+    }
   }
 
   /** Starts phase 1 for the pairs the index doesn't have yet. */
@@ -320,7 +472,7 @@ export class IndexService {
       const writer = this.writer;
       if (!writer || !this.opened) throw new ThreadError('NOT_OPEN');
       const pool = this.startPool();
-      if (!this.deps.isCurrent()) {
+      if (!this.current()) {
         this.deps.log.info(
           'writer.stale_dropped',
           { generation: stamp.generation, count: scan.metadata.size },
@@ -355,7 +507,7 @@ export class IndexService {
       const inFlight = new Set<Promise<void>>();
       for (const batch of batches) {
         if (failure) break;
-        if (!this.deps.isCurrent()) {
+        if (!this.current()) {
           this.deps.log.info(
             'writer.stale_dropped',
             { generation: stamp.generation, count: batch.length },
@@ -372,7 +524,7 @@ export class IndexService {
             for (const part of parts) {
               if (failure) return;
               const items = part.map((s) => s.item);
-              if (!this.deps.isCurrent()) {
+              if (!this.current()) {
                 this.deps.log.info(
                   'writer.stale_dropped',
                   { generation: stamp.generation, count: items.length },
@@ -398,9 +550,10 @@ export class IndexService {
       await Promise.all(inFlight);
       await writes;
       if (failure) throw failure;
-      if (!this.deps.isCurrent()) throw new ThreadError('STALE');
+      if (!this.current()) throw new ThreadError('STALE');
       await writer.call('finish', { stamp });
       this.progress.phase = 'done';
+      if (this.progress.condition === 'rebuilding') this.setCondition('ok');
       this.deps.log.info(
         'index.phase1_done',
         { count: this.progress.loaded, ms: Math.round(performance.now() - started) },
@@ -408,6 +561,7 @@ export class IndexService {
       );
     } catch (err) {
       this.progress.phase = 'failed';
+      this.watch(err);
       const code = err instanceof ThreadError ? err.code : 'FAILED';
       this.deps.log.warn('index.phase1_failed', { reason: failureReason(code) }, this.src);
     } finally {
@@ -522,19 +676,31 @@ export class IndexService {
     }
   }
 
-  /** Ends phase 1 and the index's threads; their connections close with them. */
+  /**
+   * The index's part of a teardown: no new work starts, queued jobs are
+   * cancelled, the write in flight stops and rolls back, the check is ended
+   * and joined, and every connection is closed. Resolves once all of that has
+   * happened.
+   */
   async close(): Promise<void> {
     this.closed = true;
+    Atomics.store(new Int32Array(this.cancel), 0, 1);
     if (this.idleTimer) clearInterval(this.idleTimer);
     this.idleTimer = null;
     await this.stopPool();
+    await this.running;
+    await this.verifier?.stop();
+    await this.checking;
     for (const role of ['query', 'writer'] as const) {
       const thread = role === 'query' ? this.query : this.writer;
       if (!thread) continue;
       await thread.call('close').catch(() => undefined);
-      this.connections.remove(role);
       await thread.stop();
+      if (role === 'query') this.connections.remove(this.queryEntry);
+      else this.connections.remove(this.writerEntry);
     }
+    this.queryEntry = null;
+    this.writerEntry = null;
     this.query = null;
     this.writer = null;
   }
@@ -543,7 +709,11 @@ export class IndexService {
 function failureReason(code: string): string {
   switch (code) {
     case 'STALE':
+    case 'CANCELLED':
+    case THREAD_STOPPED:
       return 'stale_generation';
+    case 'INDEX_CORRUPT':
+      return 'corrupt';
     case 'INDEX_FULL':
       return 'index_full';
     case 'WAL_STOP':

@@ -3,6 +3,7 @@
 // the partition and aggregates computed from scratch, and threads that run the
 // index's operations in this process.
 
+import { closeSync, openSync, writeSync } from 'node:fs';
 import { createSchema } from '../src/core/index/schema';
 import { asNumber, openDb, type Db } from '../src/core/index/sql';
 import { IndexWriter, type Phase1Item, type Phase1Stats } from '../src/core/index/writer';
@@ -232,4 +233,34 @@ export class InlineThread implements IndexThread {
   stop(): Promise<void> {
     return Promise.resolve();
   }
+}
+
+/**
+ * Damages the b-tree page header of a table's root page, an allocated page,
+ * so SQLite's quick check reports the file. The WAL is checkpointed into the
+ * file first, so no newer copy of the page shadows the damage. Nothing may
+ * have the database open.
+ */
+export function damageTablePage(dbPath: string, table: string): number {
+  const db = openDb(dbPath);
+  let page: number;
+  let pageSize: number;
+  try {
+    db.stmt('PRAGMA wal_checkpoint(TRUNCATE)').get();
+    page = asNumber(
+      db.stmt('SELECT rootpage FROM sqlite_schema WHERE name = ?').get(table)?.rootpage,
+    );
+    pageSize = asNumber(db.stmt('PRAGMA page_size').get()?.page_size);
+  } finally {
+    db.close();
+  }
+  if (page < 2) throw new Error('no such table page');
+  // Byte 0 of a b-tree page header is its type; 0 is no valid type.
+  const fd = openSync(dbPath, 'r+');
+  try {
+    writeSync(fd, Buffer.from([0x00, 0xff, 0xff, 0xff]), 0, 4, (page - 1) * pageSize);
+  } finally {
+    closeSync(fd);
+  }
+  return page;
 }

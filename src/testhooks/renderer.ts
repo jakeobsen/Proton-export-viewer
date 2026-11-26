@@ -4,6 +4,7 @@
 import { reportError } from '../renderer/errors';
 import {
   chooseFolder,
+  forgetExport,
   getShellState,
   locateExport,
   openExport,
@@ -30,6 +31,7 @@ export function install(): void {
     openExport,
     switchRun,
     locateExport,
+    forgetExport,
     frameSrc: () => frame()?.getAttribute('src') ?? null,
     frameSandbox: () => frame()?.getAttribute('sandbox') ?? null,
     setFrameSrc: (url: string) => {

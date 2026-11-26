@@ -10,7 +10,13 @@ import {
   type MessagePortMain,
   type UtilityProcess,
 } from 'electron';
-import type { CoreInit, CoreRequest, CoreResult, CoreSource } from '../shared/core-protocol';
+import type {
+  CoreEvent,
+  CoreInit,
+  CoreRequest,
+  CoreResult,
+  CoreSource,
+} from '../shared/core-protocol';
 import type { Logger } from '../shared/log/writer';
 
 type Pending = { resolve: (r: CoreResult) => void; reject: (e: Error) => void };
@@ -38,6 +44,8 @@ export class CoreHost {
   private source: CoreSource | null = null;
   /** The source the running core was started with. */
   private childSource: CoreSource | null = null;
+  /** Receives what core reports without being asked. */
+  onEvent: ((event: CoreEvent) => void) | null = null;
 
   constructor(private readonly options: CoreHostOptions) {}
 
@@ -84,7 +92,12 @@ export class CoreHost {
       this.port = port1;
       let ready = false;
       port1.on('message', (event) => {
-        const message = event.data as CoreResult | { type: 'ready' };
+        const message = event.data as CoreResult | CoreEvent | { type: 'ready' };
+        if (message.type === 'event') {
+          // Only from the core this host is talking to.
+          if (this.child === child) this.onEvent?.(message);
+          return;
+        }
         if (message.type === 'ready') {
           ready = true;
           this.options.log.info('core.ready');

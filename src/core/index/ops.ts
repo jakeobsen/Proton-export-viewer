@@ -4,9 +4,10 @@
 // one, and the index pool's threads read and parse export files. These run in
 // worker threads (see thread.ts); tests call them directly.
 
-import { chmodSync, closeSync, openSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, closeSync, openSync, statSync } from 'node:fs';
 import type { Stamp } from '../../shared/sources';
 import { readWithRescan, type FileRef } from '../containment';
+import { FamilyInUse, deleteFamily, familyBytes } from './family';
 import { LabelsError, SYSTEM_LABELS, parseLabels, type LabelEntry } from './labels';
 import {
   CHECKPOINT_RETRY_MS,
@@ -22,24 +23,18 @@ import { MetadataError, parseMetadata, type MessageRow } from './metadata';
 import type { IndexAnswer, IndexQuery } from '../../shared/index-types';
 import { listPage, rowDetails, sidebar, threadOfMessage } from './queries';
 import { META, createSchema, metaValue, probeSame, sameIdentity } from './schema';
-import { SQLITE_FULL, configure, openDb, scalar, sqliteCode, type Db } from './sql';
+import {
+  SQLITE_CORRUPT,
+  SQLITE_FULL,
+  SQLITE_NOTADB,
+  configure,
+  openDb,
+  scalar,
+  sqliteCode,
+  type Db,
+} from './sql';
 import type { ThreadRole } from './pool';
 import { IndexWriter, StaleBatch, type Phase1Item, type Phase1Stats } from './writer';
-
-/** The database file and its sidecars. */
-export const FAMILY_SUFFIXES = ['', '-wal', '-shm', '-journal'] as const;
-
-export function familyBytes(dbPath: string): number {
-  let total = 0;
-  for (const suffix of FAMILY_SUFFIXES) {
-    try {
-      total += statSync(dbPath + suffix).size;
-    } catch {
-      // A file of the family that doesn't exist counts as empty.
-    }
-  }
-  return total;
-}
 
 function isFile(path: string): boolean {
   try {
@@ -49,9 +44,11 @@ function isFile(path: string): boolean {
   }
 }
 
-/** Deletes the database and every sidecar. Only with no connection open on it. */
-export function deleteFamily(dbPath: string): void {
-  for (const suffix of FAMILY_SUFFIXES) rmSync(dbPath + suffix, { force: true });
+/** A write stopped part-way because the index is being torn down; it was rolled back. */
+export class Cancelled extends Error {
+  constructor() {
+    super('CANCELLED');
+  }
 }
 
 /** A failure the core side reports by code. */
@@ -59,7 +56,11 @@ export function codeOf(err: unknown): string {
   if (err instanceof MetadataError || err instanceof LabelsError) return err.code;
   if (err instanceof WalStop) return 'WAL_STOP';
   if (err instanceof StaleBatch) return 'STALE';
-  if (sqliteCode(err) === SQLITE_FULL) return 'INDEX_FULL';
+  if (err instanceof Cancelled) return 'CANCELLED';
+  if (err instanceof FamilyInUse) return 'FAMILY_IN_USE';
+  const sqlite = sqliteCode(err);
+  if (sqlite === SQLITE_FULL) return 'INDEX_FULL';
+  if (sqlite === SQLITE_CORRUPT || sqlite === SQLITE_NOTADB) return 'INDEX_CORRUPT';
   const message = String((err as Error)?.message ?? '');
   if (/^[A-Z][A-Z0-9_]{1,40}$/.test(message)) return message;
   return 'FAILED';
@@ -74,6 +75,11 @@ export interface WriterOpen {
   expectedUuid: string | null;
   /** The most the index may take on disk with its WAL and shared memory; null for no cap. */
   capBytes: number | null;
+  /**
+   * Set to 1 when the index is torn down: the write in flight stops at its
+   * next unit of work and rolls back.
+   */
+  cancel?: SharedArrayBuffer;
 }
 
 export interface WriterOpened {
@@ -109,7 +115,7 @@ export class WriterState {
       const kept = this.openExisting(args, args.expectedUuid);
       if (kept) return kept;
     }
-    // No connection is open on the family here: a failed candidate was closed.
+    // A failed candidate was closed; this refuses if anything still holds the family.
     deleteFamily(args.dbPath);
     // SQLite gives the WAL and shared-memory files the database file's mode,
     // so the file is made 0600 before SQLite opens it.
@@ -175,7 +181,12 @@ export class WriterState {
     db.exec(`PRAGMA journal_size_limit = ${WAL_TRUNCATE_AT}`);
     db.exec('PRAGMA wal_autocheckpoint = 1000');
     this.db = db;
-    this.writer = new IndexWriter(db, args.stamp, walGuard(this.walPath));
+    const guard = walGuard(this.walPath);
+    const cancel = args.cancel ? new Int32Array(args.cancel) : null;
+    this.writer = new IndexWriter(db, args.stamp, () => {
+      if (cancel && Atomics.load(cancel, 0) !== 0) throw new Cancelled();
+      guard();
+    });
     return {
       uuid,
       created,
@@ -294,7 +305,9 @@ export class QueryState {
    */
   open(dbPath: string, expectedUuid: string): void {
     this.close();
-    if (!probeSame(dbPath, expectedUuid)) throw new Error('NO_INDEX');
+    // No file: there is no index. A file that isn't this index: a damaged one.
+    if (!isFile(dbPath)) throw new Error('NO_INDEX');
+    if (!probeSame(dbPath, expectedUuid)) throw new Error('INDEX_DAMAGED');
     const db = openDb(dbPath, true);
     let usable: boolean;
     try {
@@ -305,7 +318,7 @@ export class QueryState {
     }
     if (!usable) {
       db.close();
-      throw new Error('NO_INDEX');
+      throw new Error('INDEX_DAMAGED');
     }
     this.db = db;
   }
@@ -348,6 +361,42 @@ export class QueryState {
   close(): void {
     this.db?.close();
     this.db = null;
+  }
+}
+
+// --- Verifier ------------------------------------------------------------------
+
+export interface CheckResult {
+  /** True: the check passed. False: the index is damaged. Null: the check couldn't run. */
+  ok: boolean | null;
+  /** Why it is damaged: 'identity' or 'quick_check'. */
+  reason: string | null;
+}
+
+/**
+ * Runs SQLite's quick check on its own read-only connection, after the same
+ * identity check every connection makes, and closes it again.
+ */
+export function quickCheck(dbPath: string, expectedUuid: string): CheckResult {
+  if (!isFile(dbPath)) return { ok: null, reason: null };
+  let db: Db | null = null;
+  try {
+    db = openDb(dbPath, true);
+    db.exec('PRAGMA busy_timeout = 5000');
+    if (!sameIdentity(db, expectedUuid)) return { ok: false, reason: 'identity' };
+    const rows = db.stmt('PRAGMA quick_check').all();
+    const fine = rows.length === 1 && Object.values(rows[0]!)[0] === 'ok';
+    return fine ? { ok: true, reason: null } : { ok: false, reason: 'quick_check' };
+  } catch (err) {
+    return codeOf(err) === 'INDEX_CORRUPT'
+      ? { ok: false, reason: 'quick_check' }
+      : { ok: null, reason: null };
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // Already closed.
+    }
   }
 }
 
@@ -440,6 +489,13 @@ export function threadHandler(role: ThreadRole): (op: string, args: unknown) => 
           return null;
       }
       throw new Error('UNKNOWN_OP');
+    };
+  }
+  if (role === 'verify') {
+    return (op, args) => {
+      if (op !== 'check') throw new Error('UNKNOWN_OP');
+      const a = args as { dbPath: string; expectedUuid: string };
+      return quickCheck(a.dbPath, a.expectedUuid);
     };
   }
   if (role === 'query') {
