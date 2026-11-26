@@ -155,9 +155,23 @@ export class ReaderLane<In extends LaneMessage, Out extends LaneMessage> {
     };
   }
 
-  /** The current worker's heap statistics, or null when there is no worker. For measurements. */
+  /**
+   * The current worker's heap statistics, or null when there is no worker, or
+   * it has ended or ends before it answers. A worker that ran out of heap is
+   * still the current one until its exit event, and refuses the request. For
+   * measurements.
+   */
   heapStatistics(): Promise<HeapInfo | null> {
-    return this.worker ? this.worker.getHeapStatistics() : Promise.resolve(null);
+    const worker = this.worker;
+    if (!worker) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const ended = () => resolve(null);
+      worker.once('exit', ended);
+      worker
+        .getHeapStatistics()
+        .then(resolve, () => resolve(null))
+        .finally(() => worker.off('exit', ended));
+    });
   }
 
   async stop(): Promise<void> {

@@ -177,28 +177,32 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
       return;
     case 'reader-memory':
       // The reader worker's heap, and core's memory, which includes the worker's.
-      void deps.lane.heapStatistics().then((heap) => {
-        const usage = process.memoryUsage();
-        deps.reply({
-          type: 'result',
-          reqId: request.reqId,
-          ok: true,
-          data: {
-            worker: heap && {
-              used: heap.used_heap_size,
-              external: heap.external_memory,
-              total: heap.total_heap_size,
-              limit: heap.heap_size_limit,
+      // It always replies: without a worker, or with one that has ended, `worker` is null.
+      void deps.lane
+        .heapStatistics()
+        .catch(() => null)
+        .then((heap) => {
+          const usage = process.memoryUsage();
+          deps.reply({
+            type: 'result',
+            reqId: request.reqId,
+            ok: true,
+            data: {
+              worker: heap && {
+                used: heap.used_heap_size,
+                external: heap.external_memory,
+                total: heap.total_heap_size,
+                limit: heap.heap_size_limit,
+              },
+              core: {
+                rss: usage.rss,
+                heapUsed: usage.heapUsed,
+                external: usage.external,
+                arrayBuffers: usage.arrayBuffers,
+              },
             },
-            core: {
-              rss: usage.rss,
-              heapUsed: usage.heapUsed,
-              external: usage.external,
-              arrayBuffers: usage.arrayBuffers,
-            },
-          },
+          });
         });
-      });
       return;
     case 'source-records': {
       const records = deps.session?.records ?? null;

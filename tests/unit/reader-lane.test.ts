@@ -2,6 +2,7 @@
 // The reader lane: one job at a time, a wall-clock limit from dispatch, a heap
 // limit, and a new worker after a breach.
 
+import { EventEmitter } from 'node:events';
 import { Worker } from 'node:worker_threads';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ReaderLane, type Breach } from '../../src/core/reader/lane';
@@ -150,6 +151,41 @@ describe('the reader lane', () => {
     l.post({ type: 'note' });
     await expect.poll(() => events.other).toEqual([{ type: 'log' }]);
     expect((await slow).ok).toBe(true);
+  });
+
+  it('reports the heap of the current worker, and null without one', async () => {
+    const { lane: l } = lane();
+    expect(await l.heapStatistics()).toBeNull();
+    expect(await l.job(req('echo'))).toMatchObject({ ok: true });
+    expect((await l.heapStatistics())?.used_heap_size).toBeGreaterThan(0);
+  });
+
+  it('reports null for a worker that has ended, or that ends before it answers', async () => {
+    const stand = (getHeapStatistics: () => Promise<unknown>) =>
+      Object.assign(new EventEmitter(), {
+        threadId: 1,
+        postMessage: () => undefined,
+        terminate: () => Promise.resolve(1),
+        getHeapStatistics,
+      });
+    // One refuses, as a worker that ran out of heap does until its exit event;
+    // the other never answers, and then exits.
+    const refusing = stand(() =>
+      Promise.reject(Object.assign(new Error('not running'), { code: 'ERR_WORKER_NOT_RUNNING' })),
+    );
+    const silent = stand(() => new Promise(() => undefined));
+    for (const worker of [refusing, silent]) {
+      const l = new ReaderLane<In, Out>({
+        spawn: () => worker as unknown as Worker,
+        timeoutMs: 1000,
+        heapMb: 64,
+      });
+      lanes.push(l);
+      l.post(req('echo'));
+      const stats = l.heapStatistics();
+      if (worker === silent) worker.emit('exit', 1);
+      expect(await stats).toBeNull();
+    }
   });
 
   it('uses new limits from the next worker on', async () => {
