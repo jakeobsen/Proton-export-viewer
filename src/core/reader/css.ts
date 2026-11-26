@@ -10,20 +10,28 @@
 // - A declaration or rule with a backslash escape in its source, or that
 //   css-tree could only parse as raw text, goes. css-tree decodes escapes, so
 //   the source is checked, not the generated text.
-// The result is parsed again and checked, and must not contain `</`, which
-// would end a <style> element; if the check fails, nothing is kept.
+// - A declaration or rule that css-tree writes with a backslash or `</` (which
+//   would end a <style> element) goes.
+// The result is parsed again and checked as well; if that check fails,
+// nothing is kept.
+// Ids handed out for CSS that is then dropped are taken back.
 
 import type * as csstree from 'css-tree';
 import generate from 'css-tree/generator';
 import parse from 'css-tree/parser';
 import walk from 'css-tree/walker';
 
-/** Turns URLs into the view's id URLs. */
+/**
+ * Turns URLs into the view's id URLs. Ids are handed out on trial: the filter
+ * takes back, with `rollback`, every id it handed out for CSS it then drops.
+ */
 export interface UrlRewriter {
-  /** True if `url` would get an id; hands none out. */
-  accepts(url: string): boolean;
   /** The id URL for `url`, or null if it must go. */
   rewrite(url: string): string | null;
+  /** A point to go back to: how many ids are handed out now. */
+  mark(): number;
+  /** Takes back every id handed out since `mark`. */
+  rollback(mark: number): void;
 }
 
 /** Properties whose URLs are images, which become ids. */
@@ -57,6 +65,17 @@ function escaped(node: Node, text: string): boolean {
   return text.slice(node.loc.start.offset, node.loc.end.offset).includes('\\');
 }
 
+/**
+ * True if css-tree writes the node with a backslash or `</`. It escapes some
+ * characters in strings when it writes them (a quote, a tab), so this can
+ * happen with none in the source; the declaration or rule then goes on its
+ * own, instead of failing the final check for the whole style sheet.
+ */
+function writtenUnsafely(node: Node): boolean {
+  const css = generate(node);
+  return css.includes('\\') || css.includes('</');
+}
+
 function hasRaw(node: Node): boolean {
   let raw = false;
   walk(node, (n) => {
@@ -83,8 +102,8 @@ function valueUrls(
   return found;
 }
 
-/** True if a declaration may stay: nothing forbidden, and every URL in it can become an id. */
-function acceptable(decl: csstree.Declaration, urls: UrlRewriter, text: string): boolean {
+/** True if a declaration may stay, apart from its URLs: nothing forbidden in it. */
+function acceptable(decl: csstree.Declaration, text: string): boolean {
   const property = decl.property.toLowerCase();
   if (property.startsWith('--') || FORBIDDEN_PROPERTIES.has(property)) return false;
   if (decl.value.type === 'Raw' || hasRaw(decl.value)) return false;
@@ -107,7 +126,6 @@ function acceptable(decl: csstree.Declaration, urls: UrlRewriter, text: string):
   if (!ok) return false;
   const inSets = new Set<string>();
   for (const url of valueUrls(decl.value)) {
-    if (!urls.accepts(url.value)) return false;
     if (!('type' in url)) inSets.add(url.value);
   }
   // A string that reads like a URL is allowed only as an image-set() candidate.
@@ -119,16 +137,35 @@ function acceptable(decl: csstree.Declaration, urls: UrlRewriter, text: string):
   return !stray;
 }
 
-/** Filters one declaration: false if it must go; otherwise its URLs become ids. */
+/**
+ * Filters one declaration: false if it must go; otherwise its URLs become ids.
+ * If one of its URLs gets no id, or the declaration with its ids is written
+ * unsafely, the ids it got are taken back.
+ */
 function keepDeclaration(decl: csstree.Declaration, urls: UrlRewriter, text: string): boolean {
-  if (!acceptable(decl, urls, text)) return false;
+  if (!acceptable(decl, text)) return false;
+  const start = urls.mark();
   for (const url of valueUrls(decl.value)) {
     const id = urls.rewrite(url.value);
-    if (id === null) return false;
+    if (id === null) {
+      urls.rollback(start);
+      return false;
+    }
     if ('type' in url) url.value = id;
     else url.item.data = { type: 'Url', value: id } as csstree.Url;
   }
+  if (writtenUnsafely(decl)) {
+    urls.rollback(start);
+    return false;
+  }
   return true;
+}
+
+/** True if a rule's or @media's prelude must go, and the rule or @media with it. */
+function badPrelude(prelude: Node, text: string): boolean {
+  return (
+    prelude.type === 'Raw' || hasRaw(prelude) || escaped(prelude, text) || writtenUnsafely(prelude)
+  );
 }
 
 function filterBlock(block: csstree.Block, urls: UrlRewriter, text: string): void {
@@ -146,7 +183,7 @@ function filterRules(
 ): void {
   children.forEach((node, item, list) => {
     if (node.type === 'Rule') {
-      if (node.prelude.type === 'Raw' || hasRaw(node.prelude) || escaped(node.prelude, text)) {
+      if (badPrelude(node.prelude, text)) {
         list.remove(item);
         return;
       }
@@ -155,10 +192,7 @@ function filterRules(
       return;
     }
     if (node.type === 'Atrule' && !nested && node.name.toLowerCase() === 'media' && node.block) {
-      if (
-        node.prelude &&
-        (node.prelude.type === 'Raw' || hasRaw(node.prelude) || escaped(node.prelude, text))
-      ) {
+      if (node.prelude && badPrelude(node.prelude, text)) {
         list.remove(item);
         return;
       }
@@ -200,28 +234,48 @@ function finish(ast: Node, context: 'stylesheet' | 'declarationList'): string {
   return cssProblems(css, context).length === 0 ? css : '';
 }
 
+/**
+ * Runs `filter` and gives its text back. If the text is empty, or `filter`
+ * throws, every id handed out meanwhile is taken back, so the ids left are
+ * exactly those in the CSS that is kept.
+ */
+function keeping(urls: UrlRewriter, filter: () => string): string {
+  const start = urls.mark();
+  let css = '';
+  try {
+    css = filter();
+  } finally {
+    if (css === '') urls.rollback(start);
+  }
+  return css;
+}
+
 /** A style sheet's filtered text, or '' if nothing is left. */
 export function filterStyleSheet(text: string, urls: UrlRewriter): string {
-  const ast = parse(text, {
-    context: 'stylesheet',
-    parseCustomProperty: false,
-    positions: true,
+  return keeping(urls, () => {
+    const ast = parse(text, {
+      context: 'stylesheet',
+      parseCustomProperty: false,
+      positions: true,
+    });
+    if (ast.type !== 'StyleSheet') return '';
+    filterRules(ast.children, urls, text, false);
+    return ast.children.isEmpty ? '' : finish(ast, 'stylesheet');
   });
-  if (ast.type !== 'StyleSheet') return '';
-  filterRules(ast.children, urls, text, false);
-  return ast.children.isEmpty ? '' : finish(ast, 'stylesheet');
 }
 
 /** A style attribute's filtered declarations, or '' if none is left. */
 export function filterStyleAttribute(text: string, urls: UrlRewriter): string {
-  const ast = parse(text, {
-    context: 'declarationList',
-    parseCustomProperty: false,
-    positions: true,
+  return keeping(urls, () => {
+    const ast = parse(text, {
+      context: 'declarationList',
+      parseCustomProperty: false,
+      positions: true,
+    });
+    if (ast.type !== 'DeclarationList') return '';
+    ast.children.forEach((node, item, list) => {
+      if (node.type !== 'Declaration' || !keepDeclaration(node, urls, text)) list.remove(item);
+    });
+    return ast.children.isEmpty ? '' : finish(ast, 'declarationList');
   });
-  if (ast.type !== 'DeclarationList') return '';
-  ast.children.forEach((node, item, list) => {
-    if (node.type !== 'Declaration' || !keepDeclaration(node, urls, text)) list.remove(item);
-  });
-  return ast.children.isEmpty ? '' : finish(ast, 'declarationList');
 }

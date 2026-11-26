@@ -17,6 +17,7 @@ import { cssProblems } from '../../src/core/reader/css';
 import {
   DROPPED_ATTRIBUTES,
   DROPPED_ELEMENTS,
+  MAX_REFERENCES,
   parseSrcset,
   sanitizeHtml,
 } from '../../src/core/reader/sanitize';
@@ -308,6 +309,51 @@ describe('links and references', () => {
     expect(doc.querySelector('div')?.getAttribute('style')).toBe(
       `background-image:url(${BASE}/r1)`,
     );
+  });
+
+  it('counts only the ids in the CSS it keeps, near the cap', () => {
+    // All but one id go to images; the first declaration's two new URLs can't
+    // both get one, so it goes, and the next declaration gets the last id.
+    const images = Array.from(
+      { length: MAX_REFERENCES - 1 },
+      (_, i) => `<img src="https://a.test/${i}.png">`,
+    ).join('');
+    const out = sanitizeHtml(
+      [
+        "<style>a{background-image:image-set('https://b.test/1.png' 1x,'https://b.test/2.png' 2x)}",
+        'b{background:url(https://b.test/3.png)}</style>',
+        `<body>${images}</body>`,
+      ].join(''),
+      BASE,
+    );
+    expect(out.remote).toBe(MAX_REFERENCES);
+    const doc = parse(out.html);
+    expect(doc.querySelector('style')?.textContent).toBe(
+      `b{background:url(${BASE}/r${MAX_REFERENCES})}`,
+    );
+    expect(usedIds(doc, 'r')).toEqual(range('r', MAX_REFERENCES));
+  });
+
+  it('counts no ids for a declaration dropped because css-tree writes it with an escape or `</`', () => {
+    // css-tree writes the quote in the string back with an escape, and the
+    // `</` would end a style element: those declarations go, with their ids.
+    const out = sanitizeHtml(
+      [
+        `<style>p{background:url(https://a.test/1.png),'say "hi"'}q{color:red}</style>`,
+        `<p style="background:url(https://a.test/2.png),'</b>';color:blue">x</p>`,
+        '<img src="cid:part"><img src="https://a.test/3.png">',
+        '<div style="background:url(https://a.test/4.png)">y</div>',
+      ].join(''),
+      BASE,
+    );
+    const doc = parse(out.html);
+    expect(doc.querySelector('style')?.textContent).toBe('q{color:red}');
+    expect(doc.querySelector('p')?.getAttribute('style')).toBe('color:blue');
+    expect(doc.querySelector('div')?.getAttribute('style')).toBe(`background:url(${BASE}/r2)`);
+    expect(out.remote).toBe(2);
+    expect(out.cids).toBe(1);
+    expect(usedIds(doc, 'r')).toEqual(range('r', 2));
+    expect(problems(doc)).toEqual([]);
   });
 
   it('parses srcset like the HTML rules do', () => {

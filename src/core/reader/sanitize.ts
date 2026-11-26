@@ -114,6 +114,8 @@ class References {
   readonly linkNodes: Array<[Element, number]> = [];
   private readonly remote = new Map<string, string>();
   private readonly cids = new Map<string, string>();
+  /** Every id handed out, as its map and key, in order, so the latest can be taken back. */
+  private readonly handed: Array<[Map<string, string>, string]> = [];
 
   constructor(private readonly base: string) {}
 
@@ -153,12 +155,6 @@ class References {
     return { map: this.remote, key: url.href, prefix: 'r' };
   }
 
-  /** True if the reference would get an id; hands none out. */
-  accepts(value: string): boolean {
-    const found = this.key(value);
-    return found !== null && (found.map.has(found.key) || found.map.size < MAX_REFERENCES);
-  }
-
   /** The id URL an image or media reference gets, or null if it goes. */
   resource(value: string): string | null {
     const found = this.key(value);
@@ -176,12 +172,29 @@ class References {
     return kept.length > 0 ? kept.join(', ') : null;
   }
 
+  /** How many ids are handed out: a point `rollback` can go back to. */
+  mark(): number {
+    return this.handed.length;
+  }
+
+  /**
+   * Takes back every id handed out since `mark`, latest first. Each map loses
+   * only its latest entries, so its ids stay 1..size and are handed out again.
+   */
+  rollback(mark: number): void {
+    while (this.handed.length > mark) {
+      const [map, key] = this.handed.pop() as [Map<string, string>, string];
+      map.delete(key);
+    }
+  }
+
   private idFor(map: Map<string, string>, key: string, prefix: string): string | null {
     let id = map.get(key);
     if (id === undefined) {
       if (map.size >= MAX_REFERENCES) return null;
       id = `${prefix}${map.size + 1}`;
       map.set(key, id);
+      this.handed.push([map, key]);
     }
     return `${this.base}/${id}`;
   }
@@ -286,11 +299,16 @@ function linkText(node: Element): string {
   return text.length <= MAX_LINK_TEXT ? text : `${text.slice(0, MAX_LINK_TEXT - 1)}…`;
 }
 
-/** Runs every style sheet and style attribute through the CSS filter; what is left empty goes. */
+/**
+ * Runs every style sheet and style attribute through the CSS filter; what is
+ * left empty goes. The filter takes back the ids of the CSS it drops, so the
+ * counts are of ids that are in the body.
+ */
 function filterCss(root: Element, refs: References): void {
   const urls: UrlRewriter = {
-    accepts: (url) => refs.accepts(url),
     rewrite: (url) => refs.resource(url),
+    mark: () => refs.mark(),
+    rollback: (mark) => refs.rollback(mark),
   };
   const safely = (filter: () => string): string => {
     try {
