@@ -73,6 +73,8 @@ test('positive control: the script detector sees the marker where scripts run', 
   const messages: string[] = [];
   control.page.on('console', (m) => messages.push(m.text()));
   await pev.main('loadUrl', control.windowId, 'app://shell/__test/script-control.html');
-  await expect.poll(() => scriptRan(control.page)).toBe(true);
+  // The page can still be navigating when the load call returns; a check made
+  // then finds no page to run in, and is simply made again.
+  await expect.poll(() => scriptRan(control.page).catch(() => false)).toBe(true);
   await expect.poll(() => messages.includes(SCRIPT_MARKER)).toBe(true);
 });

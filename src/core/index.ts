@@ -38,7 +38,11 @@ const lane = new ReaderLane<WorkerRequest, WorkerMessage>({
       resourceLimits: { maxOldGenerationSizeMb: heapMb },
     }),
   onSpawn: () => log?.info('core.worker_spawn'),
-  onExit: (exitCode) => log?.warn('core.worker_exit', { exitCode }),
+  // Only an exit the lane didn't plan is a warning.
+  onExit: (exitCode, planned) =>
+    planned
+      ? log?.info('core.worker_exit', { exitCode })
+      : log?.warn('core.worker_exit', { exitCode }),
   onError: (err) => log?.error('core.worker_error', errorData(err, roots)),
   onBreach: (breach, ms) =>
     log?.warn(breach === 'timeout' ? 'reader.timeout' : 'reader.limit', { ms }),

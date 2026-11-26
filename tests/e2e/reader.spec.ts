@@ -165,14 +165,22 @@ test('a message opens as plain text, served by mail-body: with its body headers'
     title: '',
   });
 
-  // A click on a link opens nothing and navigates nowhere.
+  // A click on a link opens the link dialog through its id, and navigates nowhere.
   await frame.evaluate(() => (document.querySelector('a') as HTMLAnchorElement).click());
   await expect
-    .poll(() => pev.hasLog('nav.window_open_denied', { scheme: 'mail-asset' }))
-    .toBe(true);
+    .poll(() => pev.main('linkDialogs'))
+    .toMatchObject([
+      {
+        windowId: 1,
+        url: 'https://leak-reader.test/a?b=1',
+        title: 'https://leak-reader.test/a?b=1',
+        mismatch: false,
+        lookalike: false,
+      },
+    ]);
+  await expect(pev.page.locator('.link-url')).toHaveText('https://leak-reader.test/a?b=1');
   expect(pev.app.windows()).toHaveLength(1);
   expect(frame.url()).toBe(secondUrl);
-  expect(await pev.main('linkDialogs')).toEqual([]);
 });
 
 const HTML = [
@@ -462,6 +470,12 @@ test('"Show HTML anyway" near 20 MB ends in a view or the fallback, and plain te
   }
   const plain = await measured(pev, 'HTML near 20 MB', 2, 'plain');
   expect(plain.result).toMatchObject({ outcome: 'view', format: 'plain', truncated: false });
+  if (anyway.result.ok && anyway.result.outcome === 'view') {
+    // Every worker here was ended on purpose (replaced, or for new limits): no exit is a warning.
+    const exits = pev.logs('core').filter((l) => l.code === 'core.worker_exit');
+    expect(exits.length).toBeGreaterThan(0);
+    expect(exits.filter((l) => l.level !== 'info')).toEqual([]);
+  }
 });
 
 test('a body too heavy to render as HTML gives the fallback, and its plain text still opens', async ({

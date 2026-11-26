@@ -2,7 +2,23 @@
 // Preload for the shell's main frame. It exposes a small typed API and nothing else.
 
 import { contextBridge, ipcRenderer } from 'electron';
-import { IPC, type ErrorReport, type PevApi } from '../shared/api';
+import { IPC, type ErrorReport, type LinkPrompt, type PevApi } from '../shared/api';
+
+/** True for a link prompt as main sends it. */
+function isPrompt(value: unknown): value is LinkPrompt {
+  if (typeof value !== 'object' || value === null) return false;
+  const p = value as Record<string, unknown>;
+  const host = p.host as Record<string, unknown> | null;
+  return (
+    typeof p.dialogId === 'string' &&
+    typeof p.title === 'string' &&
+    typeof p.url === 'string' &&
+    typeof p.mismatch === 'boolean' &&
+    typeof p.lookalike === 'boolean' &&
+    (host === null ||
+      (typeof host === 'object' && typeof host.start === 'number' && typeof host.end === 'number'))
+  );
+}
 
 const api: PevApi = {
   state: () => ipcRenderer.invoke(IPC.state),
@@ -16,14 +32,16 @@ const api: PevApi = {
     ),
   reportError: (report: ErrorReport) => ipcRenderer.send(IPC.report, report),
   onLinkDialog: (listener) => {
-    const handler = (_event: unknown, url: unknown) => {
-      if (typeof url === 'string') listener(url);
+    const handler = (_event: unknown, prompt: unknown) => {
+      if (isPrompt(prompt)) listener(prompt);
     };
     ipcRenderer.on(IPC.linkDialog, handler);
     return () => {
       ipcRenderer.off(IPC.linkDialog, handler);
     };
   },
+  linkAction: (dialogId, action, generation) =>
+    ipcRenderer.invoke(IPC.linkAction, { dialogId, action, generation }),
   sources: (generation) => ipcRenderer.invoke(IPC.sources, { generation }),
   chooseFolder: (generation) => ipcRenderer.invoke(IPC.chooseFolder, { generation }),
   openExport: (sourceKey, generation) =>

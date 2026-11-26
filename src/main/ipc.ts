@@ -10,6 +10,7 @@ import { z } from 'zod';
 import {
   IPC,
   type ErrorKind,
+  type LinkActionResult,
   type MessageOpenResult,
   type OpenResult,
   type PingResult,
@@ -21,11 +22,12 @@ import {
 } from '../shared/api';
 import type { SourceOutcome } from '../shared/sources';
 import { STALE, type Stale } from './sources/manager';
-import { APP_ORIGIN } from '../shared/constants';
+import { APP_ORIGIN, LINK_ACTIONS } from '../shared/constants';
 import { isRendererLogCode } from '../shared/log/codes';
 import { OPEN_MODES } from '../shared/reader-protocol';
 import { CoreUnavailableError } from './core-host';
 import type { AppContext, AppWindow } from './context';
+import { DIALOG_ID_RE } from './link-dialog';
 import { sameFrame } from './navigation';
 import { PLACEHOLDER } from './placeholder';
 import { bodyUrl } from './views';
@@ -46,6 +48,16 @@ const MessageOpenArgs = z.tuple([
     .object({
       rowid: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
       mode: z.enum(OPEN_MODES),
+      generation: Generation,
+    })
+    .strict(),
+]);
+// The shell names the dialog and the choice; main keeps the URL.
+const LinkActionArgs = z.tuple([
+  z
+    .object({
+      dialogId: z.string().regex(DIALOG_ID_RE),
+      action: z.enum(LINK_ACTIONS),
       generation: Generation,
     })
     .strict(),
@@ -237,6 +249,15 @@ export function registerIpc(ctx: AppContext): void {
       truncated: message.truncated,
       headers: message.headers,
     };
+  });
+
+  guarded<LinkActionResult>(IPC.linkAction, async (appWin, raw) => {
+    const args = LinkActionArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ dialogId, action, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    const refused = await ctx.linkDialog.act(appWin, dialogId, action, ctx.generation);
+    return refused === null ? { ok: true } : reject(refused, appWin);
   });
 
   guarded<SourcesResult>(IPC.sources, (appWin, raw) => {

@@ -5,7 +5,7 @@
 import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { BrowserWindow, app, dialog } from 'electron';
+import { BrowserWindow, app, clipboard, dialog, shell } from 'electron';
 import { bumpGeneration, type AppContext } from '../main/context';
 import type { PolicyObserver } from '../main/harden';
 import { PROD_SWITCHES } from '../main/switches';
@@ -57,6 +57,40 @@ function stubDialogs(calls: string[]): void {
   }
 }
 
+const SHELL_METHODS = ['openExternal', 'openPath', 'showItemInFolder', 'trashItem'] as const;
+const CLIPBOARD_METHODS = ['write', 'writeText', 'clear'] as const;
+
+/** One call to a stubbed shell or clipboard method, with its string arguments. */
+export interface ExternalCall {
+  method: string;
+  args: string[];
+}
+
+/**
+ * Replaces the shell's open and show methods and every clipboard write with
+ * recorders, so tests never open another app or touch the clipboard.
+ */
+function stubExternal(calls: ExternalCall[]): void {
+  const record = (method: string, args: unknown[]) =>
+    calls.push({ method, args: args.filter((a): a is string => typeof a === 'string') });
+  for (const name of SHELL_METHODS) {
+    const stub = (...args: unknown[]) => {
+      record(`shell.${name}`, args);
+      return name === 'showItemInFolder'
+        ? undefined
+        : Promise.resolve(name === 'openPath' ? '' : undefined);
+    };
+    Object.defineProperty(shell, name, { value: stub, configurable: true, writable: true });
+  }
+  for (const name of CLIPBOARD_METHODS) {
+    const stub = (...args: unknown[]) => {
+      record(`clipboard.${name}`, args);
+      return Promise.resolve();
+    };
+    Object.defineProperty(clipboard, name, { value: stub, configurable: true, writable: true });
+  }
+}
+
 /** The seccomp mode of a Linux process ('2' when a filter is active), or null. */
 function seccompMode(pid: number): string | null {
   try {
@@ -72,6 +106,8 @@ export async function install(ctx: AppContext): Promise<boolean> {
   const realOpenDialog = dialog.showOpenDialog.bind(dialog) as OpenDialog;
   const dialogCalls: string[] = [];
   stubDialogs(dialogCalls);
+  const externalCalls: ExternalCall[] = [];
+  stubExternal(externalCalls);
   const windowEvents = new WindowEventRecorder();
   app.on('browser-window-created', (_event, win) => windowEvents.attach(win));
 
@@ -156,6 +192,10 @@ export async function install(ctx: AppContext): Promise<boolean> {
     dialogCalls: () => [...dialogCalls],
     dialogsStubbed: () =>
       DIALOG_METHODS.every((name) => String(dialog[name]).includes('calls.push')),
+    externalCalls: () => externalCalls.map((c) => ({ method: c.method, args: [...c.args] })),
+    externalStubbed: () =>
+      SHELL_METHODS.every((name) => String(shell[name]).includes('record(')) &&
+      CLIPBOARD_METHODS.every((name) => String(clipboard[name]).includes('record(')),
     windowEvents: () => windowEvents.events(),
     windowState: () =>
       BrowserWindow.getAllWindows().map((w) => ({

@@ -33,7 +33,11 @@ export interface LaneOptions<Out extends LaneMessage> {
   /** A worker message that answers no job or call, such as a log line. */
   onOther?: (message: Out) => void;
   onSpawn?: () => void;
-  onExit?: (exitCode: number) => void;
+  /**
+   * A worker exited. `planned` is true when the lane ended a sound worker on
+   * purpose: replaced after a job, for new limits, or when the lane stopped.
+   */
+  onExit?: (exitCode: number, planned: boolean) => void;
   onError?: (err: unknown) => void;
   /** A job breached a limit; its worker is ended and replaced. */
   onBreach?: (breach: Breach, ms: number) => void;
@@ -66,6 +70,8 @@ interface Running<In, Out> extends Job<In, Out> {
 
 interface WorkerState {
   breach: Breach | null;
+  /** The lane ended this worker on purpose, not for a breach or a crash. */
+  planned: boolean;
 }
 
 export class ReaderLane<In extends LaneMessage, Out extends LaneMessage> {
@@ -142,6 +148,7 @@ export class ReaderLane<In extends LaneMessage, Out extends LaneMessage> {
     const worker = this.worker;
     if (worker) {
       this.worker = null;
+      this.endPlanned(worker);
       await worker.terminate();
     }
   }
@@ -189,14 +196,17 @@ export class ReaderLane<In extends LaneMessage, Out extends LaneMessage> {
     for (const job of this.queue.splice(0)) job.resolve({ ok: false, reason: 'crash' });
     const worker = this.worker;
     this.worker = null;
-    if (worker) await worker.terminate();
+    if (worker) {
+      this.endPlanned(worker);
+      await worker.terminate();
+    }
   }
 
   private ensureWorker(): Worker | null {
     if (this.stopped) return null;
     if (this.worker) return this.worker;
     const worker = this.options.spawn(this.heapMb);
-    const state: WorkerState = { breach: null };
+    const state: WorkerState = { breach: null, planned: false };
     this.states.set(worker, state);
     this.worker = worker;
     this.options.onSpawn?.();
@@ -227,7 +237,7 @@ export class ReaderLane<In extends LaneMessage, Out extends LaneMessage> {
 
   private onExit(worker: Worker, state: WorkerState, code: number): void {
     if (this.worker === worker) this.worker = null;
-    this.options.onExit?.(code);
+    this.options.onExit?.(code, state.planned);
     const running = this.running;
     if (running && running.worker === worker) {
       const reason: JobFailure = state.breach ?? 'crash';
@@ -247,9 +257,16 @@ export class ReaderLane<In extends LaneMessage, Out extends LaneMessage> {
   /** Ends a worker after its job, and has the next one ready. */
   private retire(worker: Worker, message: Out): void {
     if (this.worker === worker) this.worker = null;
+    this.endPlanned(worker);
     this.options.onRetire?.(message);
     void worker.terminate();
     this.ensureWorker();
+  }
+
+  /** Marks a worker the lane is about to end on purpose. */
+  private endPlanned(worker: Worker): void {
+    const state = this.states.get(worker);
+    if (state) state.planned = true;
   }
 
   private finish(outcome: JobOutcome<Out>): void {

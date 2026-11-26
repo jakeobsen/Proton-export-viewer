@@ -1,34 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Navigation policy: nothing navigates, except the body frame loading the one
-// mail-body URL main last authorized for this window. Popups never open; link
-// URLs go to the link dialog instead.
+// mail-body URL main last authorized for this window. Popups never open; a
+// link id of this window's live body view opens the link dialog instead.
 
 import type { WebContents, WebFrameMain } from 'electron';
-import { LINK_SCHEMES } from '../shared/constants';
 import type { Logger } from '../shared/log/writer';
 import { schemeLabel } from './harden';
+import type { LinkRefusal } from './links';
 import type { ViewRegistry } from './views';
 
 export interface NavigationOptions {
   views: ViewRegistry;
   windowId: number;
   log: Logger;
-  showLinkDialog: (url: string) => void;
+  /** Opens the link dialog for a link id of this window, or returns why it didn't. */
+  openLink: (url: string) => LinkRefusal | null;
   /** Another subframe URL this window may load. Only test windows set it. */
   allowFrameUrl?: string | undefined;
 }
 
 export function sameFrame(a: WebFrameMain | null | undefined, b: WebFrameMain | null | undefined) {
   return !!a && !!b && a.processId === b.processId && a.frameToken === b.frameToken;
-}
-
-export function linkScheme(url: string): string | null {
-  try {
-    const protocol = new URL(url).protocol;
-    return LINK_SCHEMES.includes(protocol) ? protocol : null;
-  } catch {
-    return null;
-  }
 }
 
 export function guardNavigation(contents: WebContents, options: NavigationOptions): void {
@@ -59,10 +51,9 @@ export function guardNavigation(contents: WebContents, options: NavigationOption
   });
 
   contents.setWindowOpenHandler(({ url }) => {
-    if (linkScheme(url)) {
-      options.showLinkDialog(url);
-    } else {
-      log.warn('nav.window_open_denied', { scheme: schemeLabel(url), windowId });
+    const refused = options.openLink(url);
+    if (refused !== null) {
+      log.warn('nav.window_open_denied', { reason: refused, scheme: schemeLabel(url), windowId });
     }
     return { action: 'deny' };
   });

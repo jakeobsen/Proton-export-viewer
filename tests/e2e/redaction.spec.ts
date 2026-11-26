@@ -3,7 +3,7 @@
 // the core worker and the renderer, including the crash and exit handlers.
 // Each path must first prove it logged; then no marker may be in any log file.
 
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { MessageOpenResult } from '../../src/shared/api';
 import { MARKER_TEXT, findMarkers } from '../markers';
@@ -37,12 +37,32 @@ test('no marker reaches a log file through any path', async ({ pev }) => {
   // Reader lane: a parse failure whose error carries the markers, a timeout
   // and a heap breach, each ending in the reader's fallback. Lower limits keep
   // it short; the paths are the same.
-  const source = await pev.main<{ ok: boolean }>('readerSource', testDir('redaction-reader'), [
+  const root = testDir('redaction-reader');
+  writeFileSync(
+    join(root, 'link.eml'),
+    ['Subject: Link', 'Content-Type: text/plain; charset=utf-8', '', M, ''].join('\r\n'),
+  );
+  const source = await pev.main<{ ok: boolean }>('readerSource', root, [
     [1, { test: { kind: 'throw', markers: M } }],
     [2, { test: { kind: 'spin' } }],
     [3, { test: { kind: 'heap' } }],
+    [4, { file: 'link.eml' }],
   ]);
   expect(source.ok).toBe(true);
+
+  // The link dialog: a link whose URL and text carry markers is shown and
+  // copied, a choice is refused, and a URL that is not a link id is denied.
+  const linked = await pev.page.evaluate(async () => {
+    const state = await window.pev.state();
+    if (!state.ok) return state;
+    return window.pev.open(4, 'plain', state.generation);
+  });
+  if (!linked.ok || linked.outcome !== 'view') throw new Error('no view');
+  await pev.shell('windowOpen', [`${linked.url.replace('mail-body:', 'mail-asset:')}/l1`]);
+  await pev.page.click('.link-copy');
+  await expect.poll(() => pev.hasLog('nav.link_action', { action: 'copy' })).toBe(true);
+  await pev.shell('windowOpen', [`${linked.url.replace('mail-body:', 'mail-asset:')}/l9`]);
+  await pev.shell('windowOpen', [M]);
   await pev.main('readerLimits', { heapMb: 64, timeoutMs: 500 });
   for (const rowid of [1, 2, 3]) {
     const opened = await pev.page.evaluate(async (r) => {
@@ -76,6 +96,9 @@ test('no marker reaches a log file through any path', async ({ pev }) => {
     ['core', 'reader.timeout'],
     ['core', 'reader.limit'],
     ['main', 'open.fallback'],
+    ['main', 'nav.link_dialog'],
+    ['main', 'nav.link_action'],
+    ['main', 'nav.window_open_denied'],
     ['renderer', 'test.log'],
     ['renderer', 'renderer.error'],
     ['renderer', 'renderer.uncaught'],

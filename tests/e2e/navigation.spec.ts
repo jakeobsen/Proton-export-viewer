@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Navigation: links go to the link dialog, nothing navigates, and only the
+// Navigation: link ids go to the link dialog, nothing navigates, and only the
 // authorized body URL can be (re)loaded.
 
 import type { Frame } from '@playwright/test';
 import { expect, test, type PevApp } from './app';
 
+interface Shown {
+  windowId: number;
+  url: string;
+}
+
 async function dialogs(pev: PevApp): Promise<Array<{ windowId: number; url: string }>> {
-  return pev.main('linkDialogs');
+  const shown = await pev.main<Shown[]>('linkDialogs');
+  return shown.map(({ windowId, url }) => ({ windowId, url }));
 }
 
 /** Polls `check` every 100 ms for up to `ms`; returns its last result. */
@@ -44,49 +50,35 @@ async function bodyRequests(pev: PevApp, url: string): Promise<number> {
   return r.body.filter((u) => u === url).length;
 }
 
-test.beforeEach(async ({ pev }) => {
-  // Count openExternal calls; the stub dialog must never make one.
-  await pev.app.evaluate(({ shell }) => {
-    const g = globalThis as unknown as { __openExternal: number };
-    g.__openExternal = 0;
-    shell.openExternal = async () => {
-      g.__openExternal += 1;
-    };
-  });
-});
-
+// Nothing here may open another app or write to the clipboard.
 test.afterEach(async ({ pev }) => {
-  expect(
-    await pev.app.evaluate(
-      () => (globalThis as unknown as { __openExternal: number }).__openExternal,
-    ),
-  ).toBe(0);
+  expect(await pev.main('externalCalls')).toEqual([]);
 });
 
 test('a link click in the body opens the link dialog and nothing navigates', async ({ pev }) => {
   const opened = await pev.open('sample');
   const url = opened.url as string;
   const frame = await pev.bodyFrame(url);
-  await frame.click('#stub-link');
-
-  await expect.poll(() => dialogs(pev)).toEqual([{ windowId: 1, url: 'https://example.com/' }]);
-  await expect(pev.page.locator('.dialog-url')).toHaveText('https://example.com/');
+  await clickToDialog(pev, frame, '#stub-link', 1);
+  expect(await dialogs(pev)).toEqual([{ windowId: 1, url: 'https://example.com/' }]);
+  await expect(pev.page.locator('.link-url')).toHaveText('https://example.com/');
+  await expect(pev.page.locator('.link-title')).toHaveText('example.com');
   expect(frame.url()).toBe(url);
   expect(pev.page.url()).toBe('app://shell/index.html');
   expect(pev.app.windows()).toHaveLength(1);
 });
 
-test('target=_blank links go to the dialog', async ({ pev }) => {
+test('target=_blank link ids go to the dialog', async ({ pev }) => {
   const opened = await pev.open('links');
   const frame = await pev.bodyFrame(opened.url as string);
   await clickToDialog(pev, frame, '#link-blank', 1);
   expect(await dialogs(pev)).toEqual([{ windowId: 1, url: 'https://example.org/blank' }]);
   // The link dialog covers the body; cancel it like a user before the next link.
-  await expect(pev.page.locator('.dialog-url')).toHaveText('https://example.org/blank');
-  await pev.page.click('.dialog-button');
-  await expect(pev.page.locator('.dialog')).toHaveCount(0);
+  await expect(pev.page.locator('.link-url')).toHaveText('https://example.org/blank');
+  await pev.page.click('.link-cancel');
+  await expect(pev.page.locator('.link-dialog')).toHaveCount(0);
   await clickToDialog(pev, frame, '#link-mailto', 2);
-  await expect(pev.page.locator('.dialog-url')).toHaveText('mailto:someone@example.org');
+  await expect(pev.page.locator('.link-url')).toHaveText('mailto:someone@example.org');
   await expect
     .poll(() => dialogs(pev))
     .toEqual([
@@ -133,11 +125,39 @@ for (const id of ['#link-self', '#link-plain']) {
   });
 }
 
-test('window.open from the shell goes to the dialog', async ({ pev }) => {
+test('a raw URL, a javascript: or data: link, or an id without a link scheme opens no dialog', async ({
+  pev,
+}) => {
+  const opened = await pev.open('links');
+  const url = opened.url as string;
+  const frame = await pev.bodyFrame(url);
+  const denied = (reason: string, scheme: string) =>
+    pev.hasLog('nav.window_open_denied', { reason, scheme });
+  for (const id of ['#link-js', '#link-data', '#link-raw', '#link-poisoned']) {
+    await frame.evaluate((s) => (document.querySelector(s) as HTMLElement).click(), id);
+  }
+  await expect.poll(() => denied('not_link', 'data')).toBe(true);
+  await expect.poll(() => denied('not_link', 'https')).toBe(true);
+  await expect.poll(() => denied('scheme', 'mail-asset')).toBe(true);
+  expect(await dialogs(pev)).toEqual([]);
+  await expect(pev.page.locator('.link-dialog')).toHaveCount(0);
+  expect(frame.url()).toBe(url);
+  expect(pev.page.url()).toBe('app://shell/index.html');
+  expect(pev.app.windows()).toHaveLength(1);
+});
+
+test('window.open from the shell opens the dialog only for a link id of the live view', async ({
+  pev,
+}) => {
+  const opened = await pev.open('links');
   await pev.shell('windowOpen', ['https://example.org/popup']);
+  await expect.poll(() => pev.hasLog('nav.window_open_denied', { reason: 'not_link' })).toBe(true);
+  await pev.shell('windowOpen', [
+    `${(opened.url as string).replace('mail-body:', 'mail-asset:')}/l1`,
+  ]);
   await expect
     .poll(() => dialogs(pev))
-    .toEqual([{ windowId: 1, url: 'https://example.org/popup' }]);
+    .toEqual([{ windowId: 1, url: 'https://example.org/blank' }]);
   expect(pev.app.windows()).toHaveLength(1);
 });
 
