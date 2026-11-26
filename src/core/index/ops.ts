@@ -34,7 +34,16 @@ import {
   type Db,
 } from './sql';
 import type { ThreadRole } from './pool';
-import { IndexWriter, StaleBatch, type Phase1Item, type Phase1Stats } from './writer';
+import {
+  IndexWriter,
+  StaleBatch,
+  type ApplyItem,
+  type ApplyStats,
+  type FileStat,
+  type Phase1Item,
+  type Phase1Stats,
+  type ReconcilePlan,
+} from './writer';
 
 function isFile(path: string): boolean {
   try {
@@ -92,6 +101,10 @@ export interface WriterOpened {
 }
 
 export interface BatchResult extends Phase1Stats {
+  indexBytes: number;
+}
+
+export interface ApplyResult extends ApplyStats {
   indexBytes: number;
 }
 
@@ -257,9 +270,19 @@ export class WriterState {
     return result;
   }
 
-  labels(stamp: Stamp, labels: LabelEntry[], stat: string): void {
+  labels(stamp: Stamp, labels: LabelEntry[], stat: string | null): void {
     const { writer } = this.need();
     this.commit(() => writer.writeLabels(stamp, labels, stat));
+  }
+
+  plan(metadata: Map<string, FileStat>, eml: Map<string, FileStat>): ReconcilePlan {
+    return this.need().writer.planReconcile(metadata, eml);
+  }
+
+  apply(stamp: Stamp, items: ApplyItem[]): ApplyResult {
+    const { writer } = this.need();
+    const stats = this.commit(() => writer.applyChanges(stamp, items));
+    return { ...stats, indexBytes: familyBytes(this.dbPath) };
   }
 
   phase1(stamp: Stamp, items: Phase1Item[]): BatchResult {
@@ -271,10 +294,6 @@ export class WriterState {
   finish(stamp: Stamp): void {
     this.need().writer.finishPhase1(stamp);
     this.truncateWal();
-  }
-
-  pairIds(): string[] {
-    return this.need().writer.pairIds();
   }
 
   shrink(): void {
@@ -472,15 +491,17 @@ export function threadHandler(role: ThreadRole): (op: string, args: unknown) => 
         case 'open':
           return writer.open(a as unknown as WriterOpen);
         case 'labels':
-          writer.labels(a.stamp as Stamp, a.labels as LabelEntry[], a.stat as string);
+          writer.labels(a.stamp as Stamp, a.labels as LabelEntry[], a.stat as string | null);
           return null;
+        case 'plan':
+          return writer.plan(a.metadata as Map<string, FileStat>, a.eml as Map<string, FileStat>);
+        case 'apply':
+          return writer.apply(a.stamp as Stamp, a.items as ApplyItem[]);
         case 'phase1':
           return writer.phase1(a.stamp as Stamp, a.items as Phase1Item[]);
         case 'finish':
           writer.finish(a.stamp as Stamp);
           return null;
-        case 'pair-ids':
-          return writer.pairIds();
         case 'shrink':
           writer.shrink();
           return null;

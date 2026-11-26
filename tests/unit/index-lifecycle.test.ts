@@ -534,15 +534,18 @@ describe('Forget', () => {
 describe('the writer', () => {
   it('rolls back the write in flight when the index is torn down', async () => {
     const { WriterState } = await import('../../src/core/index/ops');
-    const { item, message, STAMP } = await import('../index-helpers');
+    const { newPair, STAMP } = await import('../index-helpers');
     const dir = realpathSync(testDir('lc-cancel'));
     const cancel = new SharedArrayBuffer(4);
     const w = new WriterState();
     const dbPath = join(dir, 'x.sqlite');
     w.open({ dbPath, stamp: STAMP, expectedUuid: null, capBytes: null, cancel });
     Atomics.store(new Int32Array(cancel), 0, 1);
-    expect(() => w.phase1(STAMP, [item(message('m1', ['k1']))])).toThrow('CANCELLED');
-    expect(w.pairIds()).toEqual([]);
+    expect(() => w.apply(STAMP, [newPair('m1')])).toThrow('CANCELLED');
+    // Nothing was registered: the pair is still new to the index.
+    expect(w.plan(new Map([['m1', newPair('m1').files.meta!]]), new Map()).changes).toEqual([
+      newPair('m1').change,
+    ]);
     w.close();
     rmSync(dir, { recursive: true, force: true });
   });

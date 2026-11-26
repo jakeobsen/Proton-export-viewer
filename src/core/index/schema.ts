@@ -7,7 +7,7 @@ import { statSync } from 'node:fs';
 import { CRISIS_MERGE } from './limits';
 import { openDb, type Db } from './sql';
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /** The full-text index's prefix lengths. */
 export const FTS_PREFIX = '2 3';
@@ -44,12 +44,14 @@ export const CAPPED = {
 export type CappedList = keyof typeof CAPPED;
 export const CAPPED_LISTS = Object.keys(CAPPED) as CappedList[];
 
+// A message's rowid is never used again once it is gone (AUTOINCREMENT), so a
+// row a list or reader still holds can't come to mean another message.
 const TABLES = `
 CREATE TABLE messages(
-  rowid INTEGER PRIMARY KEY, proton_id TEXT UNIQUE NOT NULL, time INT, subject TEXT,
+  rowid INTEGER PRIMARY KEY AUTOINCREMENT, proton_id TEXT UNIQUE NOT NULL, time INT, subject TEXT,
   sender_name TEXT, sender_addr TEXT, to_json, cc_json, bcc_json, reply_to_json,
   flags INT, unread INT, replied INT, replied_all INT, forwarded INT, size INT,
-  num_attachments INT, mime_type TEXT, message_id TEXT, in_reply_to TEXT,
+  num_attachments INT, mime_type TEXT, message_id TEXT, in_reply_to_json TEXT,
   references_json TEXT, dmarc TEXT,
   capped INT NOT NULL DEFAULT 0,
   thread_id INT NOT NULL);
@@ -102,7 +104,7 @@ export const META = {
   generation: 'generation',
   /** 1 once phase 1 has indexed every metadata file the scan found. */
   phase1Done: 'phase1_done',
-  /** labels.json's size, mtime and identity when it was last stored, as JSON. */
+  /** Which labels.json the stored labels came from (see `labelsStatOf`); absent if none. */
   labelsStat: 'labels_stat',
 } as const;
 

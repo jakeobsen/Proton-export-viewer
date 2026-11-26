@@ -9,7 +9,9 @@ import {
   fresh,
   ingest,
   item,
+  keysOf,
   message,
+  newPair,
   partition,
   shuffled,
 } from '../index-helpers';
@@ -69,7 +71,7 @@ describe('conversation keys from the metadata headers', () => {
       row('c', 'Message-ID: <Your>\r\n'),
       row('d', 'Message-ID: <d@x>\r\nIn-Reply-To: Your message of Monday\r\n'),
     ];
-    expect(rows[1]!.keys).toEqual(['b@x', 'a@x']);
+    expect(keysOf(rows[1]!)).toEqual(['b@x', 'a@x']);
     expect(groupChecked(rows)).toEqual([['a', 'b'], ['c'], ['d']]);
   });
 
@@ -78,7 +80,7 @@ describe('conversation keys from the metadata headers', () => {
       row('a', 'Message-ID: <a@x>\r\nIn-Reply-To: <>\r\n'),
       row('b', 'Message-ID: <b@x>\r\nIn-Reply-To: <>\r\nReferences: <> < >\r\n'),
     ];
-    expect(rows[1]!.keys).toEqual(['b@x']);
+    expect(keysOf(rows[1]!)).toEqual(['b@x']);
     expect(groupChecked(rows)).toEqual([['a'], ['b']]);
   });
 
@@ -107,9 +109,9 @@ describe('conversation keys from the metadata headers', () => {
   it('uses only the last 100 References', () => {
     const refs = Array.from({ length: 150 }, (_, i) => `<r${i}@x>`).join(' ');
     const long = row('long', `Message-ID: <long@x>\r\nReferences: ${refs}\r\n`);
-    expect(long.keys).toHaveLength(101);
-    expect(long.keys).not.toContain('r49@x');
-    expect(long.keys).toContain('r50@x');
+    expect(keysOf(long)).toHaveLength(101);
+    expect(keysOf(long)).not.toContain('r49@x');
+    expect(keysOf(long)).toContain('r50@x');
     const rows = [
       long,
       row('early', 'Message-ID: <r10@x>\r\n'),
@@ -126,7 +128,7 @@ describe('conversation keys from the metadata headers', () => {
       row('d', ''),
     ];
     expect(rows[0]!.messageId).toBe('ext-1@x');
-    expect(rows[2]!.keys).toEqual([]);
+    expect(keysOf(rows[2]!)).toEqual([]);
     expect(groupChecked(rows)).toEqual([['a', 'b'], ['c'], ['d']]);
   });
 
@@ -249,8 +251,9 @@ describe('merges and counts', () => {
     const { db, writer } = fresh();
     ingest(writer, [message('a', ['a']), message('b', ['b'])], 10);
     const before = partition(db);
-    // A late copy of b's result that would link it to a.
-    const stats = writer.phase1Batch(STAMP, [item(message('b', ['b', 'a']))]);
+    // A late copy of b's result, for the rev it was written for, that would link it to a.
+    const rev = asNumber(db.stmt("SELECT rev FROM pairs WHERE proton_id = 'b'").get()?.rev);
+    const stats = writer.phase1Batch(STAMP, [item(message('b', ['b', 'a']), rev)]);
     expect(stats).toMatchObject({ dropped: 1, messages: 0, merges: 0 });
     expect(partition(db)).toEqual(before);
     db.close();
@@ -258,9 +261,9 @@ describe('merges and counts', () => {
 
   it('writes nothing for a batch from another generation', () => {
     const { db, writer } = fresh();
-    const stats = writer.phase1Batch({ ...STAMP, generation: STAMP.generation + 1 }, [
-      item(message('a', ['a'])),
-    ]);
+    const other = { ...STAMP, generation: STAMP.generation + 1 };
+    expect(writer.applyChanges(other, [newPair('a')]).stale).toBe(true);
+    const stats = writer.phase1Batch(other, [item(message('a', ['a']), 1)]);
     expect(stats.stale).toBe(true);
     expect(asNumber(db.stmt('SELECT count(*) AS n FROM pairs').get()?.n)).toBe(0);
     db.close();

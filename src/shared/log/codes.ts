@@ -69,6 +69,7 @@ export const LOG_CODES = [
   'index.delete_refused',
   'index.stale_dropped',
   'index.rebuild',
+  'index.reconciled',
   'source.forgotten',
   'source.forget_refused',
   'app.reset',

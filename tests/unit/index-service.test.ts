@@ -27,8 +27,9 @@ import type { ThreadRole } from '../../src/core/index/pool';
 import type { IndexTotals, ListPage, Sidebar } from '../../src/shared/index-types';
 import type { Logger } from '../../src/shared/log/writer';
 import { sanitizeEvent } from '../../src/shared/log/schema';
+import { digest } from '../../tools/gen-export/tree.mjs';
 import { writeExport } from '../exports';
-import { InlineThread, STAMP, expected, item, message } from '../index-helpers';
+import { InlineThread, STAMP, expected, item, message, newPair } from '../index-helpers';
 import { testDir } from '../paths';
 
 interface Logged {
@@ -403,6 +404,124 @@ describe('phase 1', () => {
   });
 });
 
+describe('reconcile on reopen', () => {
+  it('brings the index in line with the folder, reads only what changed, and writes nothing there', async () => {
+    const { dir, run, indexDir } = exportAt('reconcile', 30);
+    const first = harness(run, indexDir);
+    const opened = await first.service.open(null);
+    await first.service.startPhase1(scanRun(run));
+    await first.service.close();
+    const revSeq = (path: string) =>
+      Number(dbRows(path, "SELECT value FROM source_meta WHERE key = 'rev_seq'")[0]?.value);
+    const highest = revSeq(first.service.dbPath);
+
+    const metaPath = (id: string) => join(run, `${id}.metadata.json`);
+    const emlPath = (id: string) => join(run, `${id}.eml`);
+    const ids = readdirSync(run)
+      .filter((n) => n.endsWith('.metadata.json'))
+      .map((n) => n.slice(0, -'.metadata.json'.length))
+      .sort();
+    const [metaGone, bothGone, changed, emlChanged, emlGone, linkTarget, template] = ids as [
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+    ];
+    rmSync(metaPath(metaGone));
+    rmSync(metaPath(bothGone));
+    rmSync(emlPath(bothGone));
+    // New metadata for one message: another subject, and a reply to another conversation.
+    const target = parseMetadata(linkTarget, readFileSync(metaPath(linkTarget), 'utf8'));
+    const doc = JSON.parse(readFileSync(metaPath(changed), 'utf8')) as {
+      Payload: Record<string, unknown>;
+    };
+    doc.Payload.Subject = 'Changed subject';
+    doc.Payload.Headers = `Message-ID: <changed@example.com>\r\nReferences: <${target.messageId}>\r\n`;
+    writeFileSync(metaPath(changed), JSON.stringify(doc));
+    writeFileSync(
+      emlPath(emlChanged),
+      Buffer.concat([readFileSync(emlPath(emlChanged)), Buffer.from('\r\n')]),
+    );
+    rmSync(emlPath(emlGone));
+    // A new pair.
+    const added = `${template}Added`;
+    const copy = JSON.parse(readFileSync(metaPath(template), 'utf8')) as {
+      Payload: Record<string, unknown>;
+    };
+    copy.Payload.ID = added;
+    writeFileSync(metaPath(added), JSON.stringify(copy));
+    writeFileSync(emlPath(added), readFileSync(emlPath(template)));
+    // labels.json gets one more label.
+    const labelsPath = join(run, 'labels.json');
+    const labels = JSON.parse(readFileSync(labelsPath, 'utf8')) as { Payload: unknown[] };
+    labels.Payload.push({ ID: 'added-label', Name: 'Added', Path: 'Added', Type: 1 });
+    writeFileSync(labelsPath, JSON.stringify(labels));
+    const exportRoot = join(dir, 'export');
+    const folderBefore = digest(exportRoot);
+
+    const second = harness(run, indexDir, { metaJob: 1 });
+    await second.service.open(opened.dbUuid);
+    await second.service.startPhase1(scanRun(run));
+    const files = ids.length - 2 + 1;
+    expect(second.service.progress).toMatchObject({
+      phase: 'done',
+      loaded: files,
+      total: files,
+      failed: 0,
+    });
+    expect(dbPartition(second.service.dbPath)).toEqual(partitionOfFiles(run));
+    const totals = (await second.service.ask({ op: 'totals' })) as IndexTotals;
+    expect(totals).toMatchObject({ messages: files, pairs: ids.length });
+    // Only the changed and the new metadata files were read, and labels.json once.
+    const parse = second.threads.filter((t) => t.role === 'parse').flatMap((t) => t.calls);
+    expect(parse.filter((op) => op === 'meta')).toHaveLength(2);
+    expect(parse.filter((op) => op === 'labels')).toHaveLength(1);
+    const sidebar = (await second.service.ask({ op: 'sidebar' })) as Sidebar;
+    expect(sidebar.folders.find((f) => f.id === 'added-label')?.name).toBe('Added');
+
+    const pairs = new Map(
+      dbRows(
+        second.service.dbPath,
+        'SELECT proton_id, rev, meta_state, body_state, error_code FROM pairs',
+      ).map((r) => [String(r.proton_id), r]),
+    );
+    expect(pairs.has(bothGone)).toBe(false);
+    expect(pairs.get(metaGone)).toMatchObject({ meta_state: 4, error_code: 'PAIR_META_MISSING' });
+    expect(pairs.get(emlGone)).toMatchObject({ meta_state: 1, body_state: 4 });
+    expect(pairs.get(emlChanged)).toMatchObject({ meta_state: 1, body_state: 0 });
+    for (const id of [metaGone, changed, emlChanged, emlGone, added]) {
+      expect(Number(pairs.get(id)?.rev), id).toBeGreaterThan(highest);
+    }
+    expect(Number(pairs.get(template)?.rev)).toBeLessThanOrEqual(highest);
+    const subject = dbRows(
+      second.service.dbPath,
+      `SELECT subject FROM messages WHERE proton_id = '${changed}'`,
+    )[0]?.subject;
+    expect(subject).toBe('Changed subject');
+    expect(
+      second.logs.find((l) => l.code === 'index.reconciled')?.data.count,
+      'pairs the index had that changed',
+    ).toBe(5);
+    await second.service.close();
+    // The folder is read, never written.
+    expect(digest(exportRoot)).toBe(folderBefore);
+
+    // Nothing changed since: nothing is written or read but the plan.
+    const third = harness(run, indexDir);
+    await third.service.open(opened.dbUuid);
+    await third.service.startPhase1(scanRun(run));
+    expect(third.service.progress).toMatchObject({ phase: 'done', loaded: files, total: files });
+    const writer = third.threads.find((t) => t.role === 'writer')!;
+    expect(writer.calls.filter((op) => op !== 'shrink')).toEqual(['open', 'plan', 'finish']);
+    expect(third.threads.filter((t) => t.role === 'parse').flatMap((t) => t.calls)).toEqual([]);
+    expect(third.logs.map((l) => l.code)).not.toContain('index.reconciled');
+    await third.service.close();
+  });
+});
+
 describe('an unavailable export', () => {
   it('opens only its own index, read-only, and leaves a rejected one untouched', async () => {
     const { run, indexDir } = exportAt('offline', 10);
@@ -486,9 +605,15 @@ describe('the query thread', () => {
     const dbPath = join(dir, 'x.sqlite');
     const writer = new WriterState();
     const opened = writer.open({ dbPath, stamp: STAMP, expectedUuid: null, capBytes: null });
+    const revs = new Map(
+      writer.apply(
+        STAMP,
+        ['a', 'b', 'z'].map((id) => newPair(id)),
+      ).revs,
+    );
     writer.phase1(STAMP, [
-      item(message('a', ['a'], { time: 1 })),
-      item(message('b', ['b'], { time: 2 })),
+      item(message('a', ['a'], { time: 1 }), revs.get('a')!),
+      item(message('b', ['b'], { time: 2 }), revs.get('b')!),
     ]);
     const query = new QueryState();
     query.open(dbPath, opened.uuid);
@@ -500,7 +625,7 @@ describe('the query thread', () => {
       const statement = prepare(sql);
       if (!merged && sql.includes('JOIN message_labels ml')) {
         merged = true;
-        writer.phase1(STAMP, [item(message('z', ['z', 'a', 'b'], { time: 3 }))]);
+        writer.phase1(STAMP, [item(message('z', ['z', 'a', 'b'], { time: 3 }), revs.get('z')!)]);
       }
       return statement;
     };

@@ -11,6 +11,12 @@
 // after a while without queries or writes, both connections release their
 // caches.
 //
+// On reopen, phase 1 reconciles: the folder's files are compared with the
+// stored pairs, what needs nothing read (a file gone, a message file changed)
+// is applied first, and only new and changed metadata files are read.
+// labels.json is read again only if it changed. Pages read meanwhile stay
+// usable throughout.
+//
 // An index that was already there is checked once it is open: SQLite's quick
 // check runs on its own read-only connection in a short-lived thread, while
 // pages are read as usual. A failed check, or SQLite reporting the file as
@@ -33,6 +39,7 @@ import type { Stamp } from '../../shared/sources';
 import type { FileRef, RunScan } from '../containment';
 import { TXN_INPUT_BYTES, WRITE_BATCH_PAIRS } from './limits';
 import type {
+  ApplyResult,
   BatchResult,
   CheckResult,
   LabelsJobResult,
@@ -49,7 +56,14 @@ import {
   type ThreadRole,
 } from './pool';
 import { CAPPED, CAPPED_LISTS } from './schema';
-import type { FileStat, PairFiles, Phase1Item } from './writer';
+import {
+  labelsStatOf,
+  type ApplyItem,
+  type FileStat,
+  type PairFiles,
+  type Phase1Item,
+  type ReconcilePlan,
+} from './writer';
 
 /** A metadata job's wall-clock limit. */
 export const INDEX_JOB_MS = 10_000;
@@ -466,7 +480,6 @@ export class IndexService {
     const started = performance.now();
     const stamp = this.deps.stamp;
     this.touch();
-    this.progress.phase = 'loading';
     this.progress.total = scan.metadata.size;
     try {
       const writer = this.writer;
@@ -480,76 +493,44 @@ export class IndexService {
         );
         throw new ThreadError('STALE');
       }
-      if (scan.labels) await this.storeLabels(pool, writer, scan.labels);
-      const known = new Set(await writer.call<string[]>('pair-ids'));
-      const pairs: PairFiles[] = [];
-      for (const [protonId, ref] of scan.metadata) {
-        if (known.has(protonId)) {
-          this.progress.loaded += 1;
-          continue;
-        }
-        const eml = scan.eml.get(protonId);
-        pairs.push({ protonId, meta: fileStat(ref), eml: eml ? fileStat(eml) : null });
+      const plan = await writer.call<ReconcilePlan>('plan', {
+        metadata: scan.metadata,
+        eml: scan.eml,
+      });
+      await this.reconcileLabels(pool, writer, scan.labels, plan.labelsStat);
+      const toRead: ApplyItem[] = [];
+      const now: ApplyItem[] = [];
+      for (const change of plan.changes) {
+        const meta = scan.metadata.get(change.protonId);
+        const eml = scan.eml.get(change.protonId);
+        const files: PairFiles = {
+          protonId: change.protonId,
+          meta: meta ? fileStat(meta) : null,
+          eml: eml ? fileStat(eml) : null,
+        };
+        (change.meta === 'parse' ? toRead : now).push({ change, files });
       }
-      for (const [protonId, ref] of scan.eml) {
-        if (scan.metadata.has(protonId) || known.has(protonId)) continue;
-        pairs.push({ protonId, meta: null, eml: fileStat(ref) });
+      // Loading starts at what the index already has, so a reopen never shows 0.
+      this.progress.loaded = scan.metadata.size - toRead.length;
+      this.progress.phase = 'loading';
+      // Changes that need nothing read: at most 1,000 pairs per transaction.
+      const reconciled = performance.now();
+      for (const part of chunk(now, WRITE_BATCH_PAIRS)) {
+        if (!this.current()) throw new ThreadError('STALE');
+        const result = await writer.call<ApplyResult>('apply', { stamp, items: part });
+        if (result.stale) throw new ThreadError('STALE');
+        this.touch();
       }
-      const refs = scan.metadata;
-      const batches = splitBatches(
-        pairs,
-        WRITE_BATCH_PAIRS,
-        TXN_INPUT_BYTES,
-        (p) => p.meta?.size ?? 0,
-      );
-      let writes: Promise<void> = Promise.resolve();
-      let failure: unknown = null;
-      const inFlight = new Set<Promise<void>>();
-      for (const batch of batches) {
-        if (failure) break;
-        if (!this.current()) {
-          this.deps.log.info(
-            'writer.stale_dropped',
-            { generation: stamp.generation, count: batch.length },
-            this.src,
-          );
-          break;
-        }
-        const parsed = this.parseBatch(pool, batch, refs);
-        const job = parsed.then((sized) => {
-          // The budget again, on the bytes actually read: a file can have
-          // grown since the scan.
-          const parts = splitBatches(sized, WRITE_BATCH_PAIRS, TXN_INPUT_BYTES, (s) => s.bytes);
-          writes = writes.then(async () => {
-            for (const part of parts) {
-              if (failure) return;
-              const items = part.map((s) => s.item);
-              if (!this.current()) {
-                this.deps.log.info(
-                  'writer.stale_dropped',
-                  { generation: stamp.generation, count: items.length },
-                  this.src,
-                );
-                failure = new ThreadError('STALE');
-                return;
-              }
-              try {
-                const result = await writer.call<BatchResult>('phase1', { stamp, items });
-                this.afterBatch(result, items);
-              } catch (err) {
-                failure = err;
-              }
-            }
-          });
-          return writes;
-        });
-        const tracked = job.finally(() => inFlight.delete(tracked));
-        inFlight.add(tracked);
-        if (inFlight.size > BATCHES_AHEAD) await Promise.race(inFlight);
+      // Pairs the index had that changed; new pairs are counted as they are read.
+      const known = plan.changes.filter((c) => !c.fresh).length;
+      if (known > 0) {
+        this.deps.log.info(
+          'index.reconciled',
+          { count: known, ms: Math.round(performance.now() - reconciled) },
+          this.src,
+        );
       }
-      await Promise.all(inFlight);
-      await writes;
-      if (failure) throw failure;
+      await this.readAndWrite(pool, writer, toRead, scan.metadata);
       if (!this.current()) throw new ThreadError('STALE');
       await writer.call('finish', { stamp });
       this.progress.phase = 'done';
@@ -570,7 +551,104 @@ export class IndexService {
     }
   }
 
-  private async storeLabels(pool: Pool, writer: IndexThread, ref: FileRef): Promise<void> {
+  /**
+   * Reads the metadata of new and changed pairs and writes it, in batches of
+   * at most 1,000 pairs and 4 MiB. Each batch first gets its revs (a new pair
+   * is registered, a changed one moves to the next rev), so every result
+   * carries the rev it was read for. A few batches are read ahead of the
+   * writer, and none is read before the one before it was dispatched.
+   */
+  private async readAndWrite(
+    pool: Pool,
+    writer: IndexThread,
+    toRead: ApplyItem[],
+    refs: Map<string, FileRef>,
+  ): Promise<void> {
+    const stamp = this.deps.stamp;
+    const batches = splitBatches(
+      toRead,
+      WRITE_BATCH_PAIRS,
+      TXN_INPUT_BYTES,
+      (u) => u.files.meta?.size ?? 0,
+    );
+    let writes: Promise<void> = Promise.resolve();
+    let failure: unknown = null;
+    const inFlight = new Set<Promise<void>>();
+    const stale = (count: number): void => {
+      this.deps.log.info('writer.stale_dropped', { generation: stamp.generation, count }, this.src);
+    };
+    for (const batch of batches) {
+      if (failure) break;
+      if (!this.current()) {
+        stale(batch.length);
+        failure = new ThreadError('STALE');
+        break;
+      }
+      const job = writer
+        .call<ApplyResult>('apply', { stamp, items: batch })
+        .then((applied) => {
+          if (applied.stale) throw new ThreadError('STALE');
+          const revs = new Map(applied.revs);
+          // A pair the plan saw differently is left alone, as if handled.
+          this.progress.loaded += batch.length - revs.size;
+          return this.parseBatch(
+            pool,
+            batch.map((u) => u.files).filter((p) => revs.has(p.protonId)),
+            refs,
+            revs,
+          );
+        })
+        .then((sized) => {
+          // The budget again, on the bytes actually read: a file can have
+          // grown since the scan.
+          const parts = splitBatches(sized, WRITE_BATCH_PAIRS, TXN_INPUT_BYTES, (s) => s.bytes);
+          writes = writes.then(async () => {
+            for (const part of parts) {
+              if (failure) return;
+              const items = part.map((s) => s.item);
+              if (!this.current()) {
+                stale(items.length);
+                failure = new ThreadError('STALE');
+                return;
+              }
+              try {
+                const result = await writer.call<BatchResult>('phase1', { stamp, items });
+                this.afterBatch(result, items);
+              } catch (err) {
+                failure = err;
+              }
+            }
+          });
+          return writes;
+        })
+        .catch((err: unknown) => {
+          failure ??= err;
+        });
+      const tracked = job.finally(() => inFlight.delete(tracked));
+      inFlight.add(tracked);
+      if (inFlight.size > BATCHES_AHEAD) await Promise.race(inFlight);
+    }
+    await Promise.all(inFlight);
+    await writes;
+    if (failure) throw failure;
+  }
+
+  /**
+   * Stores labels.json again only if it isn't the file the stored labels came
+   * from. With no labels.json any more, the stored labels go.
+   */
+  private async reconcileLabels(
+    pool: Pool,
+    writer: IndexThread,
+    ref: FileRef | null,
+    storedStat: string | null,
+  ): Promise<void> {
+    const stat = ref ? labelsStatOf(fileStat(ref)) : null;
+    if (stat === storedStat) return;
+    if (!ref) {
+      await writer.call('labels', { stamp: this.deps.stamp, labels: [], stat: null });
+      return;
+    }
     let result: LabelsJobResult;
     try {
       result = await pool.run<LabelsJobResult>('labels', { root: this.deps.root, ref }, this.jobMs);
@@ -583,26 +661,25 @@ export class IndexService {
       this.deps.log.warn('index.labels_failed', { reason: reasonOf(result.error ?? '') }, this.src);
       return;
     }
-    const stat = JSON.stringify({
-      size: result.ref.size,
-      mtimeNs: String(result.ref.mtimeNs),
-      dev: String(result.ref.dev),
-      ino: String(result.ref.ino),
+    await writer.call('labels', {
+      stamp: this.deps.stamp,
+      labels: result.labels,
+      stat: labelsStatOf(fileStat(result.ref)),
     });
-    await writer.call('labels', { stamp: this.deps.stamp, labels: result.labels, stat });
   }
 
   /**
-   * Reads and parses a batch's metadata files on the pool. Each item comes
-   * with the bytes actually read, which can differ from the scan's size.
+   * Reads and parses a batch's metadata files on the pool. Each item carries
+   * the rev its pair was given for this read, and the bytes actually read,
+   * which can differ from the scan's size.
    */
   private async parseBatch(
     pool: Pool,
     batch: PairFiles[],
     refs: Map<string, FileRef>,
+    revs: Map<string, number>,
   ): Promise<Array<{ item: Phase1Item; bytes: number }>> {
-    const withMeta = batch.filter((p) => p.meta !== null);
-    const jobs = chunk(withMeta, this.metaJob).map((job) =>
+    const jobs = chunk(batch, this.metaJob).map((job) =>
       this.parseJob(
         pool,
         job.map((p) => ({ protonId: p.protonId, ref: refs.get(p.protonId)! })),
@@ -611,13 +688,11 @@ export class IndexService {
     const results = new Map<string, MetaJobResult>();
     for (const list of await Promise.all(jobs)) for (const r of list) results.set(r.protonId, r);
     return batch.map((pair) => {
-      if (!pair.meta)
-        return { item: { pair, expectedRev: null, row: null, error: null }, bytes: 0 };
       const r = results.get(pair.protonId);
       return {
         item: {
           pair: r ? { ...pair, meta: fileStat(r.ref) } : pair,
-          expectedRev: null,
+          expectedRev: revs.get(pair.protonId)!,
           row: r?.row ?? null,
           error: r ? r.error : 'META_FAILED',
         },
