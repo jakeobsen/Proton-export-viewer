@@ -13,6 +13,7 @@ import type {
 } from '../shared/core-protocol';
 import { errorData } from '../shared/log/schema';
 import type { LogWriter } from '../shared/log/writer';
+import type { SourceSession } from '../core/source';
 import type { ReadRequest } from '../shared/reader-protocol';
 import { markLoaded } from './marker';
 import { READER_SOURCE_ACTION, TestReaderSource, parsePayload } from './reader-source';
@@ -28,6 +29,8 @@ export interface CoreTestDeps {
   reply: (result: CoreResult) => void;
   /** The folder of core's own script, where its worker scripts are. */
   dir: string;
+  /** The open source, if core was started with one. */
+  session: SourceSession | null;
   lane: ReaderLane<WorkerRequest, WorkerMessage>;
   setReaderSource: (source: ReaderSource) => void;
   readerSource: () => ReaderSource | null;
@@ -150,6 +153,22 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
     case 'reader-lane':
       deps.reply({ type: 'result', reqId: request.reqId, ok: true, data: deps.lane.describe() });
       return;
+    case 'source-records': {
+      const records = deps.session?.records ?? null;
+      deps.reply({
+        type: 'result',
+        reqId: request.reqId,
+        ok: true,
+        data: records && {
+          scans: records.scans,
+          summary: records.summary,
+          rejected: records.rejected.map((r) => ({ ...r })),
+          stamp: deps.session?.gate.current ?? null,
+          hasRoot: deps.session?.hasRoot ?? false,
+        },
+      });
+      return;
+    }
     case 'exit':
       ok();
       setTimeout(() => process.exit(3), 50);

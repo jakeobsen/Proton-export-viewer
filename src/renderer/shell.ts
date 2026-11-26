@@ -1,17 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Shell state: the current generation, the body URL main authorized, and the pending link.
+// Shell state: the current generation, the body URL main authorized, the
+// pending link, and the exports main knows about.
 
 import { useSyncExternalStore } from 'react';
-import type { OpenResult } from '../shared/api';
+import type { OpenResult, SourceActionResult } from '../shared/api';
+import type { SourcesView } from '../shared/sources';
 
 export interface ShellState {
   generation: number | null;
   bodyUrl: string | null;
   frameKey: number;
   link: string | null;
+  /** Null until main has answered. */
+  sources: SourcesView | null;
+  /** An open, a switch or a Locate is under way. */
+  busy: boolean;
+  /** A short warning from the last source action. */
+  notice: string | null;
 }
 
-let state: ShellState = { generation: null, bodyUrl: null, frameKey: 0, link: null };
+let state: ShellState = {
+  generation: null,
+  bodyUrl: null,
+  frameKey: 0,
+  link: null,
+  sources: null,
+  busy: false,
+  notice: null,
+};
 const listeners = new Set<() => void>();
 
 function update(patch: Partial<ShellState>): void {
@@ -52,6 +68,59 @@ export async function openMessage(id: string): Promise<OpenResult> {
   }
   return result;
 }
+
+/** Reloads the exports from main, after the generation it's at. */
+export async function refreshSources(): Promise<SourcesView | null> {
+  let generation = state.generation ?? (await refreshGeneration());
+  for (let attempt = 0; attempt < 2 && generation !== null; attempt += 1) {
+    const result = await window.pev.sources(generation);
+    if (result.ok) {
+      update({ generation: result.generation, sources: result.sources });
+      return result.sources;
+    }
+    if (result.code !== 'stale_generation') return null;
+    generation = await refreshGeneration();
+  }
+  return null;
+}
+
+const NOTICES: Partial<Record<string, string>> = {
+  no_export: 'No export found',
+  unavailable: 'Export not found.',
+};
+
+/** Runs an open, a switch or a Locate, then reloads the exports. */
+async function sourceAction(
+  run: (generation: number) => Promise<SourceActionResult>,
+): Promise<SourceActionResult> {
+  const generation = state.generation ?? (await refreshGeneration());
+  if (generation === null) return { ok: false, code: 'stale_generation' };
+  update({ busy: true, notice: null });
+  let result: SourceActionResult;
+  try {
+    result = await run(generation);
+  } finally {
+    update({ busy: false });
+  }
+  if (result.ok) {
+    // The generation moved, so main has revoked the open body.
+    update({
+      generation: result.generation,
+      bodyUrl: null,
+      notice: NOTICES[result.outcome] ?? null,
+    });
+  } else if (result.code === 'stale_generation') {
+    await refreshGeneration();
+  }
+  await refreshSources();
+  return result;
+}
+
+export const chooseFolder = () => sourceAction((g) => window.pev.chooseFolder(g));
+export const openExport = (sourceKey: string) =>
+  sourceAction((g) => window.pev.openExport(sourceKey, g));
+export const switchRun = (runId: string) => sourceAction((g) => window.pev.switchRun(runId, g));
+export const locateExport = () => sourceAction((g) => window.pev.locateExport(g));
 
 export function showLink(url: string): void {
   update({ link: url });

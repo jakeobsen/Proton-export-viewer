@@ -24,6 +24,19 @@ const api: PevApi = {
       ipcRenderer.off(IPC.linkDialog, handler);
     };
   },
+  sources: (generation) => ipcRenderer.invoke(IPC.sources, { generation }),
+  chooseFolder: (generation) => ipcRenderer.invoke(IPC.chooseFolder, { generation }),
+  openExport: (sourceKey, generation) =>
+    ipcRenderer.invoke(IPC.openExport, { sourceKey, generation }),
+  switchRun: (runId, generation) => ipcRenderer.invoke(IPC.switchRun, { runId, generation }),
+  locateExport: (generation) => ipcRenderer.invoke(IPC.locateExport, { generation }),
+  onSourcesChanged: (listener) => {
+    const handler = () => listener();
+    ipcRenderer.on(IPC.sourcesChanged, handler);
+    return () => {
+      ipcRenderer.off(IPC.sourcesChanged, handler);
+    };
+  },
 };
 
 contextBridge.exposeInMainWorld('pev', api);

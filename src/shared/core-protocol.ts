@@ -8,11 +8,19 @@ import type {
   WorkerRender,
   WorkerRendered,
 } from './reader-protocol';
+import type { RunIdentity, ScanSummary, Stamp } from './sources';
+
+/** The export run core serves. `root` is null while the run is unavailable. */
+export interface CoreSource extends Stamp {
+  root: string | null;
+}
 
 export interface CoreInit {
   type: 'init';
   logsDir: string;
   appRoot: string;
+  /** Null until a source is open: core then has no access to any export. */
+  source: CoreSource | null;
 }
 
 export interface StubAssetMessage {
@@ -111,7 +119,28 @@ export interface ProofRequest {
   call: ProofCall;
 }
 
-export type CoreRequest = OpenRequest | PingRequest | TestRequest | ProofRequest | ReadRequest;
+/** Computes the open run's identity. */
+export interface IdentifyRequest {
+  type: 'identify';
+  reqId: number;
+  stamp: Stamp;
+}
+
+/** Scans the open run's folder and records what it rejects. */
+export interface ScanRequest {
+  type: 'scan';
+  reqId: number;
+  stamp: Stamp;
+}
+
+export type CoreRequest =
+  | OpenRequest
+  | PingRequest
+  | TestRequest
+  | ProofRequest
+  | IdentifyRequest
+  | ScanRequest
+  | ReadRequest;
 
 export type CoreResult =
   | {
@@ -123,6 +152,10 @@ export type CoreResult =
       /** Test builds only: the result of a structured test action. */
       data?: unknown;
       proof?: ProofReply;
+      /** The source and generation the work was done for. */
+      stamp?: Stamp;
+      identity?: RunIdentity;
+      scan?: ScanSummary;
       /** The rendered message of a `read`. */
       read?: RenderedMessage;
     }
@@ -134,7 +167,9 @@ export type CoreResult =
         | 'unknown_stub'
         | 'worker_failed'
         | 'invalid'
+        | 'stale'
         | 'no_source'
+        | 'unavailable'
         | 'not_found'
         | 'superseded'
         | 'reader_failed';
@@ -142,6 +177,7 @@ export type CoreResult =
       reason?: ReaderFailure;
       /** Test builds only: why a test action failed. */
       detail?: string;
+      stamp?: Stamp;
     };
 
 export interface WorkerBuild {

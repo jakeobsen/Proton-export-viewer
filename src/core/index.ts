@@ -19,6 +19,7 @@ import { LogWriter, type Logger } from '../shared/log/writer';
 import type { ReadRequest, ReaderFailure } from '../shared/reader-protocol';
 import { ReaderLane } from './reader/lane';
 import type { ReaderSource } from './reader/source';
+import { SourceSession } from './source';
 
 process.umask(0o077);
 
@@ -44,6 +45,7 @@ const lane = new ReaderLane<WorkerRequest, WorkerMessage>({
     if (message.type === 'log') workerLog?.log(message.level, message.code, message.data);
   },
 });
+let session: SourceSession | null = null;
 
 /** Test builds can hold opens in core to keep them pending. */
 const testState = { holding: false, held: [] as Array<OpenRequest | ReadRequest> };
@@ -145,6 +147,7 @@ function handle(request: CoreRequest): void {
               readerSource = source;
             },
             readerSource: () => readerSource,
+            session,
           }),
         );
         return;
@@ -163,6 +166,14 @@ function handle(request: CoreRequest): void {
       }
       reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
       return;
+    case 'identify':
+    case 'scan':
+      if (!session) {
+        reply({ type: 'result', reqId: request.reqId, ok: false, code: 'no_source' });
+        return;
+      }
+      session.handle(request);
+      return;
   }
 }
 
@@ -171,6 +182,7 @@ process.parentPort.once('message', (event) => {
   roots = [[init.appRoot + sep, '']];
   log = new LogWriter(init.logsDir, 'core', 'core');
   workerLog = log.forProc('worker');
+  session = new SourceSession(init.source, log, reply);
   const p = event.ports[0];
   if (!p) return;
   port = p;

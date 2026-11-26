@@ -135,10 +135,16 @@ async function waitForShell(page: Page): Promise<void> {
   );
 }
 
-export async function launch(name: string): Promise<PevApp> {
-  const userData = testDir(`e2e-${name}`);
+export interface LaunchOptions {
+  /** Start with this userData, e.g. to launch again after a quit. */
+  userData?: string;
+  args?: string[];
+}
+
+export async function launch(name: string, options: LaunchOptions = {}): Promise<PevApp> {
+  const userData = options.userData ?? testDir(`e2e-${name}`);
   const app = await electron.launch({
-    args: [join(REPO_ROOT, 'out-test'), `--pev-user-data=${userData}`],
+    args: [join(REPO_ROOT, 'out-test'), `--pev-user-data=${userData}`, ...(options.args ?? [])],
     cwd: REPO_ROOT,
     // Without this, Playwright turns Chromium's sandbox off on Linux.
     chromiumSandbox: true,

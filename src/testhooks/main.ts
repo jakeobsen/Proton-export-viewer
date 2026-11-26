@@ -8,6 +8,8 @@ import { BrowserWindow, app, dialog } from 'electron';
 import { bumpGeneration, type AppContext } from '../main/context';
 import type { PolicyObserver } from '../main/harden';
 import { PROD_SWITCHES } from '../main/switches';
+import { ScopeError, type Picked } from '../main/sources/scope';
+import type { OrderStep } from '../main/sources/manager';
 import { createAppWindow } from '../main/windows';
 import type { CoreResult } from '../shared/core-protocol';
 import { errorData } from '../shared/log/schema';
@@ -70,6 +72,43 @@ export async function install(ctx: AppContext): Promise<boolean> {
   stubDialogs(dialogCalls);
   const windowEvents = new WindowEventRecorder();
   app.on('browser-window-created', (_event, win) => windowEvents.attach(win));
+
+  // The folder picker answers from a queue the test fills, and folder scopes
+  // are recorded instead of started: test builds run without the App Sandbox.
+  // Every scope and core step of the source manager is recorded in order.
+  const picks: Array<Picked | null> = [];
+  let pickerCalls = 0;
+  // A bookmark named on the command line fails from the start, so a test can
+  // make the reopen at launch find it stale.
+  const failingBookmarks = new Set<string>(
+    process.argv
+      .filter((a) => a.startsWith('--pev-fail-bookmark='))
+      .map((a) => a.slice('--pev-fail-bookmark='.length)),
+  );
+  const liveScopes = new Map<number, string | null>();
+  let scopeSeq = 0;
+  const order: OrderStep[] = [];
+  const heldResults: Array<() => void> = [];
+  ctx.sources.setAccess({
+    picker: () => {
+      pickerCalls += 1;
+      return Promise.resolve(picks.shift() ?? null);
+    },
+    scopes: {
+      start(bookmark) {
+        if (bookmark === null || failingBookmarks.has(bookmark)) throw new ScopeError('test');
+        scopeSeq += 1;
+        const id = scopeSeq;
+        liveScopes.set(id, bookmark);
+        return {
+          release() {
+            liveScopes.delete(id);
+          },
+        };
+      },
+    },
+    record: (step) => order.push(step),
+  });
 
   const requests = new Map<number, WindowRequests>();
   let bodyCsp = true;
@@ -243,6 +282,33 @@ export async function install(ctx: AppContext): Promise<boolean> {
       void Promise.reject(new Error(markers));
     },
     folderProofControl: (first: string, second: string) => runControl(ctx, first, second),
+    /** The next folder picks; null stands for a cancelled dialog. */
+    queuePick: (path: string | null, bookmark: string | null = 'test-bookmark') => {
+      picks.push(path === null ? null : { path, bookmark });
+    },
+    pickerCalls: () => pickerCalls,
+    failBookmark: (bookmark: string) => failingBookmarks.add(bookmark),
+    clearFailingBookmarks: () => failingBookmarks.clear(),
+    sourceOrder: () => order.map((step) => ({ ...step })),
+    clearSourceOrder: () => {
+      order.length = 0;
+    },
+    liveScopes: () => [...liveScopes.values()],
+    sourcesView: () => ctx.sources.view(),
+    sourceStamp: () => ctx.sources.stamp(),
+    scanSummary: () => ctx.sources.scanSummary(),
+    registryFile: () => ctx.sources.registry.file,
+    /** Holds core's scan results in main, before main checks them. */
+    holdSourceResults: () => {
+      ctx.sources.setAccess({ hold: (next) => heldResults.push(next) });
+    },
+    releaseSourceResults: () => {
+      ctx.sources.setAccess({ hold: null });
+      const waiting = heldResults.splice(0);
+      for (const next of waiting) next();
+      return waiting.length;
+    },
+    heldSourceResults: () => heldResults.length,
   };
   (globalThis as { __pevTest?: typeof api }).__pevTest = api;
 

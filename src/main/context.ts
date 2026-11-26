@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { BrowserWindow, Session } from 'electron';
+import { IPC } from '../shared/api';
 import type { LogWriter } from '../shared/log/writer';
 import type { CoreHost } from './core-host';
 import type { PolicyObserver } from './harden';
 import type { LinkDialog } from './link-dialog';
+import type { SourceManager } from './sources/manager';
 import type { ViewRegistry } from './views';
 
 export interface Paths {
@@ -32,10 +34,19 @@ export interface AppContext {
   /** App windows keyed by their webContents id. */
   windows: Map<number, AppWindow>;
   core: CoreHost;
+  /** The export sources: picks, runs, scopes and the open one. */
+  sources: SourceManager;
   linkDialog: LinkDialog;
   shellCsp: string;
   /** Set only in builds with test hooks: observes one window's session policy. */
   observerFor?: ((windowId: number) => PolicyObserver) | undefined;
+}
+
+/** Tells every shell window that the sources changed. */
+export function notifySources(ctx: AppContext): void {
+  for (const appWin of ctx.windows.values()) {
+    if (!appWin.win.isDestroyed()) appWin.win.webContents.send(IPC.sourcesChanged);
+  }
 }
 
 /** Moves to the next generation and revokes every view in every window. */
