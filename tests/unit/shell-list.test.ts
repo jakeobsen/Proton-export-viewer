@@ -161,6 +161,65 @@ describe('the list model', () => {
     expect(list.snapshot.selected).toBeNull();
   });
 
+  it('keeps a selection made while a read is out, and reads again for it', async () => {
+    const folder = new Folder();
+    folder.add(1, 100, 10);
+    folder.add(2, 200, 20);
+    let release!: () => void;
+    let hold = false;
+    const reads: WindowQuery[] = [];
+    const list = new ListModel(
+      async (q) => {
+        reads.push(q);
+        if (hold) {
+          hold = false;
+          await new Promise<void>((r) => (release = r));
+        }
+        return folder.read(q);
+      },
+      () => undefined,
+    );
+    list.reset('5');
+    list.setViewport(0, 9);
+    await settle();
+    // A read for rowid 10 is out when rowid 20 is selected.
+    list.select(list.rowAt(1)!);
+    expect(list.snapshot.selected).toEqual({ rowid: 10, threadId: 1 });
+    hold = true;
+    list.refresh();
+    await settle();
+    list.select(list.rowAt(0)!);
+    expect(list.snapshot.selected).toEqual({ rowid: 20, threadId: 2 });
+    release();
+    await settle();
+    await settle();
+    expect(list.snapshot.selected).toEqual({ rowid: 20, threadId: 2 });
+    expect(reads.at(-1)?.selected).toBe(20);
+
+    // A read that began with nothing selected doesn't clear a click.
+    const fresh = new ListModel(
+      async (q) => {
+        reads.push(q);
+        if (hold) {
+          hold = false;
+          await new Promise<void>((r) => (release = r));
+        }
+        return folder.read(q);
+      },
+      () => undefined,
+    );
+    hold = true;
+    fresh.reset('5');
+    fresh.setViewport(0, 9);
+    await settle();
+    fresh.select({ ...folder.rows[1]!, details: null });
+    release();
+    await settle();
+    await settle();
+    expect(fresh.snapshot.selected).toEqual({ rowid: 10, threadId: 1 });
+    expect(reads.at(-1)?.selected).toBe(10);
+  });
+
   it('reads one window at a time, and drops a read made for another folder', async () => {
     const folder = new Folder();
     for (let i = 1; i <= 30; i += 1) folder.add(i, i);

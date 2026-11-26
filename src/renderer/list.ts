@@ -164,6 +164,8 @@ export class ListModel {
     if (labelId === null) return;
     const epoch = this.epoch;
     const { anchor, index } = this.anchor();
+    // The answer's selection is for this message, not one picked while it was read.
+    const asked = this.snap.selected?.rowid ?? null;
     const screen = this.last - this.first + 1;
     const answer = await this.read({
       op: 'window',
@@ -171,7 +173,7 @@ export class ListModel {
       anchor,
       before: READ_ABOVE,
       after: Math.min(WINDOW_AFTER, screen + 2 * MARGIN + READ_ABOVE),
-      selected: this.snap.selected?.rowid ?? null,
+      selected: asked,
     });
     if (!answer || epoch !== this.epoch) return;
     const rows: Row[] = answer.rows.map((row, i) => {
@@ -180,16 +182,22 @@ export class ListModel {
     });
     // Without its anchor row the window was placed by position, so nothing moves.
     const moved = answer.anchor === null ? 0 : answer.anchor - index;
-    const selected = this.snap.selected;
+    // A selection made while this was read is kept, and read again.
+    let selected = this.snap.selected;
+    if ((selected?.rowid ?? null) === asked) {
+      selected =
+        asked !== null && answer.selected !== null
+          ? { rowid: asked, threadId: answer.selected }
+          : null;
+    } else {
+      this.again = true;
+    }
     this.set({
       total: answer.total,
       start: answer.start,
       rows,
       ready: true,
-      selected:
-        selected && answer.selected !== null
-          ? { rowid: selected.rowid, threadId: answer.selected }
-          : null,
+      selected,
       ...(moved !== 0 ? { shiftId: this.snap.shiftId + 1, shift: moved } : {}),
     });
     // The screen moves with the anchor.
