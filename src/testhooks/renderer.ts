@@ -2,7 +2,16 @@
 // Shell test hooks, reached by tests as window.__pevTest.
 
 import { reportError } from '../renderer/errors';
-import { getShellState, openMessage, refreshGeneration } from '../renderer/shell';
+import {
+  chooseFolder,
+  getShellState,
+  locateExport,
+  openExport,
+  openMessage,
+  refreshGeneration,
+  refreshSources,
+  switchRun,
+} from '../renderer/shell';
 import { markLoaded } from './marker';
 
 markLoaded();
@@ -16,6 +25,11 @@ export function install(): void {
     state: () => getShellState(),
     refreshGeneration,
     open: (id: string) => openMessage(id),
+    refreshSources,
+    chooseFolder,
+    openExport,
+    switchRun,
+    locateExport,
     frameSrc: () => frame()?.getAttribute('src') ?? null,
     frameSandbox: () => frame()?.getAttribute('sandbox') ?? null,
     setFrameSrc: (url: string) => {

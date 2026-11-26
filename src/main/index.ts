@@ -6,8 +6,10 @@ import { app, protocol } from 'electron';
 import { SHELL_CSP } from '../shared/constants';
 import { errorData } from '../shared/log/schema';
 import { LogWriter } from '../shared/log/writer';
-import type { AppContext, Paths } from './context';
+import { bumpGeneration, notifySources, type AppContext, type Paths } from './context';
 import { CoreHost } from './core-host';
+import { systemPicker, systemScopes } from './sources/access';
+import { SourceManager } from './sources/manager';
 import { registerIpc } from './ipc';
 import { LinkDialog } from './link-dialog';
 import { applySwitches } from './switches';
@@ -87,6 +89,18 @@ log.info('app.start', {
 });
 
 async function start(): Promise<void> {
+  const core = new CoreHost({ corePath: paths.corePath, logsDir, appRoot: outRoot, log });
+  // The manager calls back into the context only after start() has built it.
+  const sources = new SourceManager({
+    userData: app.getPath('userData'),
+    log,
+    core,
+    generation: () => ctx.generation,
+    bumpGeneration: () => bumpGeneration(ctx),
+    notify: () => notifySources(ctx),
+    picker: systemPicker,
+    scopes: systemScopes,
+  });
   const ctx: AppContext = {
     paths,
     log,
@@ -94,10 +108,12 @@ async function start(): Promise<void> {
     frameRoots,
     generation: 1,
     windows: new Map(),
-    core: new CoreHost({ corePath: paths.corePath, logsDir, appRoot: outRoot, log }),
+    core,
+    sources,
     linkDialog: new LinkDialog(log),
     shellCsp: SHELL_CSP,
   };
+  app.on('will-quit', () => sources.close());
   registerIpc(ctx);
   if (__PEV_TEST_HOOKS__) {
     const hooks = await import('../testhooks/main');
@@ -105,6 +121,8 @@ async function start(): Promise<void> {
   }
   createAppWindow(ctx);
   log.info('app.ready');
+  // Reopens the export that was open at quit; it goes offline if it's gone.
+  void sources.restore();
 }
 
 app

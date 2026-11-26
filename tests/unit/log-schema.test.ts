@@ -49,6 +49,47 @@ describe('sanitizeEvent', () => {
     expect(event?.data).toEqual({ windowId: 2, reason: 'invalid', dropped: 1 });
   });
 
+  it('logs the source events with fixed reasons, counts and the opaque source key only', () => {
+    const src = '01234567-89ab-cdef-0123-456789abcdef';
+    const rejected = sanitizeEvent({
+      level: 'info',
+      proc: 'core',
+      code: 'scan.rejected',
+      src,
+      data: { reason: 'fifo', count: 2, path: MARKERS[2] },
+    });
+    expect(rejected).toMatchObject({ src, data: { reason: 'fifo', count: 2, dropped: 1 } });
+    for (const reason of ['symlink', 'directory', 'socket', 'device', 'too_large', 'changed']) {
+      expect(
+        sanitizeEvent({ level: 'info', proc: 'core', code: 'scan.rejected', data: { reason } })
+          ?.data,
+      ).toEqual({ reason });
+    }
+    const opened = sanitizeEvent({
+      level: 'info',
+      proc: 'main',
+      code: 'source.opened',
+      src: MARKERS[0],
+      data: { generation: 4, account: MARKERS[0], path: MARKERS[2] },
+    });
+    expect(opened).toMatchObject({ src: null, data: { generation: 4, dropped: 2 } });
+    expect(findMarkers(JSON.stringify(opened))).toEqual([]);
+    for (const code of [
+      'sources.invalid',
+      'source.offline',
+      'source.unavailable',
+      'source.no_runs',
+      'source.not_same',
+      'source.stale_result',
+      'scope.failed',
+      'scope.released',
+      'scan.done',
+      'writer.stale_dropped',
+    ]) {
+      expect(sanitizeEvent({ level: 'info', proc: 'main', code }), code).not.toBeNull();
+    }
+  });
+
   it('rejects unknown codes, levels and processes', () => {
     expect(sanitizeEvent({ level: 'info', proc: 'main', code: MARKERS[0] })).toBeNull();
     expect(sanitizeEvent({ level: 'loud' as 'info', proc: 'main', code: 'app.start' })).toBeNull();

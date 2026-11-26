@@ -14,8 +14,12 @@ import {
   type PingResult,
   type Rejected,
   type RejectCode,
+  type SourceActionResult,
+  type SourcesResult,
   type StateResult,
 } from '../shared/api';
+import type { SourceOutcome } from '../shared/sources';
+import { STALE, type Stale } from './sources/manager';
 import { APP_ORIGIN } from '../shared/constants';
 import { isRendererLogCode } from '../shared/log/codes';
 import { CoreUnavailableError } from './core-host';
@@ -54,6 +58,12 @@ const ReportArgs = z.tuple([
     })
     .strict(),
 ]);
+
+const SourceKey = z.uuid();
+const RunId = z.string().regex(/^[0-9a-f]{16}$/);
+const GenerationArgs = z.tuple([z.object({ generation: Generation }).strict()]);
+const SourceArgs = z.tuple([z.object({ sourceKey: SourceKey, generation: Generation }).strict()]);
+const RunArgs = z.tuple([z.object({ runId: RunId, generation: Generation }).strict()]);
 
 const REPORT_CODES: Record<ErrorKind, string> = {
   uncaught: 'renderer.uncaught',
@@ -136,6 +146,47 @@ export function registerIpc(ctx: AppContext): void {
     ctx.log.info('view.installed', { openId, windowId: appWin.id });
     return { ok: true, openId, url: bodyUrl(token) };
   });
+
+  guarded<SourcesResult>(IPC.sources, (appWin, raw) => {
+    const args = GenerationArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
+    return { ok: true, generation: ctx.generation, sources: ctx.sources.view() };
+  });
+
+  /**
+   * An open, a switch or a Locate: the outcome and the generation it left.
+   * The generation is checked here and again when the action's turn comes,
+   * since an action queued behind another may find it moved on.
+   */
+  const sourceAction = <A extends { generation: number }>(
+    channel: string,
+    schema: z.ZodType<[A]>,
+    missing: RejectCode,
+    run: (appWin: AppWindow, args: A) => Promise<SourceOutcome | null | Stale>,
+  ) =>
+    guarded<SourceActionResult>(channel, async (appWin, raw) => {
+      const args = schema.safeParse(raw);
+      if (!args.success) return reject('invalid', appWin);
+      if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
+      const outcome = await run(appWin, args.data[0]);
+      if (outcome === null) return reject(missing, appWin);
+      if (outcome === STALE) return reject('stale_generation', appWin);
+      return { ok: true, outcome, generation: ctx.generation };
+    });
+
+  sourceAction(IPC.chooseFolder, GenerationArgs, 'invalid', (appWin, { generation }) =>
+    ctx.sources.chooseFolder(appWin.win, generation),
+  );
+  sourceAction(IPC.openExport, SourceArgs, 'unknown_source', (_appWin, { sourceKey, generation }) =>
+    ctx.sources.openRecent(sourceKey, generation),
+  );
+  sourceAction(IPC.switchRun, RunArgs, 'unknown_run', (_appWin, { runId, generation }) =>
+    ctx.sources.switchRun(runId, generation),
+  );
+  sourceAction(IPC.locateExport, GenerationArgs, 'no_source', (appWin, { generation }) =>
+    ctx.sources.locate(appWin.win, generation),
+  );
 
   /** Like `guarded`, for one-way sends; also drops a send made for a stale generation. */
   const guardedSend = <A extends { generation: number }>(
