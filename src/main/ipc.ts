@@ -27,6 +27,7 @@ import { OPEN_MODES } from '../shared/reader-protocol';
 import { CoreUnavailableError } from './core-host';
 import type { AppContext, AppWindow } from './context';
 import { sameFrame } from './navigation';
+import { PLACEHOLDER } from './placeholder';
 import { bodyUrl } from './views';
 
 const Generation = z
@@ -212,7 +213,11 @@ export function registerIpc(ctx: AppContext): void {
 
     const outcome = appWin.views.install(openId, token, generation, ctx.generation, {
       html: message.html,
-      assets: [],
+      // Every remote image shows as the same neutral placeholder.
+      assets: Array.from({ length: message.remote }, (_, i) => ({
+        id: `r${i + 1}`,
+        ...PLACEHOLDER,
+      })),
       links: message.links,
     });
     if (!outcome.ok) {
@@ -227,6 +232,7 @@ export function registerIpc(ctx: AppContext): void {
       url: bodyUrl(token),
       format: message.format,
       hasHtml: message.hasHtml,
+      remote: message.remote,
       headers: message.headers,
     };
   });

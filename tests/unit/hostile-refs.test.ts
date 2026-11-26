@@ -78,7 +78,7 @@ describe('hostile reference declarations', () => {
     expect(byName.get('script_markup/remote-image')?.rewrite).toBe(1);
     expect(byName.get('script_markup/srcset')?.loads[0]).toHaveLength(2);
     expect(byName.get('script_markup/link-hints')?.hints).toHaveLength(2);
-    expect(byName.get('script_markup/dns-prefetch-control')?.hints).toHaveLength(1);
+    expect(byName.get('script_markup/dns-prefetch-control')?.hints).toHaveLength(2);
     expect(byName.get('css/media-url')?.rewrite).toBe(1);
     expect(byName.get('plain_text/alternative')?.rewrite).toBe(1);
     const loads = plans.reduce((n, p) => n + p.refs.loads.length, 0);

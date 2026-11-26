@@ -13,6 +13,7 @@ import {
 import type { MessageHeaders, OpenMode, RenderedMessage } from '../../shared/reader-protocol';
 import { htmlToText } from '../text/html-to-text';
 import { plainBody } from './plain';
+import { sanitizeHtml } from './sanitize';
 
 /** The longest subject passed on, in characters. */
 export const MAX_SUBJECT = 2000;
@@ -124,22 +125,29 @@ function parse(input: Readable): Promise<Parsed> {
 }
 
 /**
- * Renders a message. Bodies are plain text for now: the text part, or the
- * text of the HTML part when there is none.
+ * Renders a message: its HTML body sanitized, when HTML is asked for and the
+ * message has one, or else its plain text: the text part, or the text of the
+ * HTML part when there is none.
  */
 export async function renderMessage(
   input: Readable,
   options: RenderOptions,
 ): Promise<RenderedMessage> {
   const parsed = await parse(input);
+  const headers = headerFields(parsed.headers, parsed.lines);
   const hasHtml = parsed.html.length > 0;
+  if (options.mode === 'html' && hasHtml) {
+    const body = sanitizeHtml(parsed.html, options.assetBase);
+    return {
+      headers,
+      html: body.html,
+      links: body.links,
+      format: 'html',
+      remote: body.remote,
+      hasHtml,
+    };
+  }
   const text = parsed.text.length > 0 ? parsed.text : hasHtml ? tidy(htmlToText(parsed.html)) : '';
   const body = plainBody(text, options.assetBase);
-  return {
-    headers: headerFields(parsed.headers, parsed.lines),
-    html: body.html,
-    links: body.links,
-    format: 'plain',
-    hasHtml,
-  };
+  return { headers, html: body.html, links: body.links, format: 'plain', remote: 0, hasHtml };
 }

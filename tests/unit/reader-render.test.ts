@@ -124,23 +124,45 @@ describe('rendering a message', () => {
     ]);
   });
 
-  it('shows the text of an HTML-only message, without scripts or styles, in either mode', async () => {
-    const eml = [
-      'Subject: h',
-      'Content-Type: text/html; charset=utf-8',
-      '',
-      '<html><head><title>t</title><style>p{}</style></head><body><p>one</p>',
-      '<script>bad()</script><div>two &amp; <b>three</b></div><a href="https://leak-abc123.test/">link</a></body></html>',
-      '',
-    ].join('\n');
-    for (const mode of ['plain', 'html'] as const) {
-      const message = await render(eml, mode);
-      expect(message.format).toBe('plain');
-      expect(message.hasHtml).toBe(true);
-      expect(bodyText(message.html)).toBe('one\n\ntwo & three\nlink');
-      expect(message.links).toEqual([]);
-      expect(message.html).not.toContain('leak-abc123');
-    }
+  const HTML_ONLY = [
+    'Subject: h',
+    'Content-Type: text/html; charset=utf-8',
+    '',
+    '<html><head><title>t</title><style>p{}</style></head><body><p>one</p>',
+    '<script>bad()</script><div>two &amp; <b>three</b></div><a href="https://leak-abc123.test/">link</a>',
+    '<img src="https://leak-abc123.test/i.png"></body></html>',
+    '',
+  ].join('\n');
+
+  it('shows the text of an HTML-only message as plain text, without scripts or styles', async () => {
+    const message = await render(HTML_ONLY, 'plain');
+    expect(message.format).toBe('plain');
+    expect(message.hasHtml).toBe(true);
+    expect(message.remote).toBe(0);
+    expect(bodyText(message.html)).toBe('one\n\ntwo & three\nlink');
+    expect(message.links).toEqual([]);
+    expect(message.html).not.toContain('leak-abc123');
+  });
+
+  it('shows an HTML message as sanitized HTML when HTML is asked for', async () => {
+    const message = await render(HTML_ONLY, 'html');
+    expect(message.format).toBe('html');
+    expect(message.hasHtml).toBe(true);
+    expect(message.remote).toBe(1);
+    expect(message.links).toEqual([{ id: 'l1', url: 'https://leak-abc123.test/', text: 'link' }]);
+    expect(message.html).not.toContain('leak-abc123');
+    expect(message.html).not.toMatch(/<script|<style|<title/);
+    expect(message.html).toContain(`<img src="${BASE}/r1">`);
+    expect(message.html).toContain(
+      `<a href="${BASE}/l1" target="_blank" rel="noopener noreferrer">link</a>`,
+    );
+  });
+
+  it('shows a message without HTML as plain text when HTML is asked for', async () => {
+    const message = await render(['Subject: p', '', 'just text', ''].join('\n'), 'html');
+    expect(message.format).toBe('plain');
+    expect(message.hasHtml).toBe(false);
+    expect(bodyText(message.html).trim()).toBe('just text');
   });
 
   it('caps a long subject and gives no date for an invalid one', async () => {
