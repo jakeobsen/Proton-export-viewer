@@ -28,6 +28,9 @@ const HTML = [
   '<p><a id="lookalike" href="https://аpple.test/verify">Sign in</a></p>',
   '<p><a id="both" href="https://xn--pple-43d.test/">apple.test</a></p>',
   '<p><a id="mailto" href="mailto:help@shop.example">help@shop.example</a></p>',
+  '<p><a id="subdomain" href="https://evil.shop.example/">shop.example</a></p>',
+  '<p><a id="mailto-idn" href="mailto:help@аpple.test">Write to us</a></p>',
+  '<p><a id="invisible" href="https://evil.example/">paypal&#x2060;.com</a></p>',
   '<p><a id="js" href="javascript:alert(1)">js</a> <a id="data" href="data:text/html,x">data</a></p>',
   '',
 ].join('\r\n');
@@ -177,6 +180,31 @@ test('each warning shows only when it applies, with the host marked', async ({ p
         lookalike: false,
       },
       'shop.example',
+    ],
+    [
+      '#subdomain',
+      {
+        title: 'shop.example',
+        url: 'https://evil.shop.example/',
+        mismatch: true,
+        lookalike: false,
+      },
+      'evil.shop.example',
+    ],
+    [
+      '#mailto-idn',
+      {
+        title: 'Write to us',
+        url: 'mailto:help@xn--pple-43d.test',
+        mismatch: false,
+        lookalike: true,
+      },
+      'xn--pple-43d.test',
+    ],
+    [
+      '#invisible',
+      { title: 'paypal.com', url: 'https://evil.example/', mismatch: true, lookalike: false },
+      'evil.example',
     ],
   ];
   for (const [index, [id, want, host]] of cases.entries()) {

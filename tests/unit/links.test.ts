@@ -8,7 +8,7 @@ import {
   isLookalike,
   linkPrompt,
   resolveLink,
-  sameSite,
+  sameHost,
 } from '../../src/main/links';
 import { ViewRegistry } from '../../src/main/views';
 
@@ -125,15 +125,16 @@ describe('hostsIn', () => {
   });
 });
 
-describe('sameSite and isLookalike', () => {
-  it('matches the same host, www and subdomains of the named host', () => {
-    expect(sameSite('shop.example', 'shop.example')).toBe(true);
-    expect(sameSite('www.shop.example', 'shop.example')).toBe(true);
-    expect(sameSite('shop.example', 'www.shop.example')).toBe(true);
-    expect(sameSite('shop.example', 'mail.shop.example')).toBe(true);
-    expect(sameSite('shop.example', 'shop.example.evil.test')).toBe(false);
-    expect(sameSite('shop.example', 'evilshop.example')).toBe(false);
-    expect(sameSite('bank.example', 'evil.test')).toBe(false);
+describe('sameHost and isLookalike', () => {
+  it('matches only the same host, with a leading www ignored', () => {
+    expect(sameHost('shop.example', 'shop.example')).toBe(true);
+    expect(sameHost('www.shop.example', 'shop.example')).toBe(true);
+    expect(sameHost('shop.example', 'www.shop.example')).toBe(true);
+    expect(sameHost('shop.example', 'mail.shop.example')).toBe(false);
+    expect(sameHost('mail.shop.example', 'shop.example')).toBe(false);
+    expect(sameHost('shop.example', 'shop.example.evil.test')).toBe(false);
+    expect(sameHost('shop.example', 'evilshop.example')).toBe(false);
+    expect(sameHost('bank.example', 'evil.test')).toBe(false);
   });
 
   it('flags non-ASCII and punycode hosts', () => {
@@ -170,6 +171,19 @@ describe('linkPrompt', () => {
     expect(prompt('https://evil.test/', 'evil.test or bank.example')).toMatchObject({
       mismatch: true,
     });
+  });
+
+  it('warns when the URL goes to a subdomain of the host the title names', () => {
+    expect(prompt('https://evil.example.com/login', 'example.com')).toMatchObject({
+      mismatch: true,
+    });
+    expect(prompt('https://login.bank.example/', 'https://www.bank.example/')).toMatchObject({
+      mismatch: true,
+    });
+    expect(prompt('mailto:x@mail.shop.example', 'help@shop.example')).toMatchObject({
+      mismatch: true,
+    });
+    expect(prompt('https://www.example.com/', 'example.com')).toMatchObject({ mismatch: false });
   });
 
   it('warns about a non-ASCII host and shows it in punycode', () => {
@@ -221,6 +235,36 @@ describe('linkPrompt', () => {
       lookalike: true,
     });
     expect(prompt('mailto:nobody', 'shop.example')).toMatchObject({ host: null, mismatch: true });
+  });
+
+  it('shows mailto address domains in punycode and marks the first', () => {
+    const idn = prompt(new URL('mailto:x@аpple.test').href, 'Write to us');
+    expect(idn).toMatchObject({ url: 'mailto:x@xn--pple-43d.test', lookalike: true });
+    expect(idn.url.slice(idn.host!.start, idn.host!.end)).toBe('xn--pple-43d.test');
+    const first = prompt(new URL('mailto:%D0%B0@Exämple.test,b@аpple.test?subject=Hi#f').href, 'x');
+    expect(first.url).toBe('mailto:%D0%B0@xn--exmple-cua.test,b@xn--pple-43d.test?subject=Hi#f');
+    expect(first.url.slice(first.host!.start, first.host!.end)).toBe('xn--exmple-cua.test');
+    expect(prompt('mailto:x@xn--pple-43d.test', 'аpple.test')).toMatchObject({ mismatch: false });
+  });
+
+  it('keeps a mailto domain encoded when its decoded form is not a plain host name', () => {
+    for (const url of ['mailto:a@ex%2Cample.test', 'mailto:a@%E2%80%AEevil.test']) {
+      const p = prompt(url, 'Write');
+      expect(p.url).toBe(url);
+      expect(p.url.slice(p.host!.start, p.host!.end)).toBe(url.slice(url.indexOf('@') + 1));
+    }
+  });
+
+  it('warns for a look-alike host name split or dotted by invisible or compatibility characters', () => {
+    const titles = ['paypal\u2060.com', 'paypal\u2024com', 'pay\u00adpal.com', 'p\u200baypal.com'];
+    for (const text of titles) {
+      expect(hostsIn(displayTitle(text))).toEqual(['paypal.com']);
+      expect(prompt('https://evil.example/', text)).toMatchObject({ mismatch: true });
+      expect(prompt('https://paypal.com/', text)).toMatchObject({ mismatch: false });
+    }
+    expect(displayTitle('pay\u00adpal\u2060.com\u200b')).toBe('paypal.com');
+    expect(hostsIn('ｐａｙｐａｌ．ｃｏｍ')).toEqual(['paypal.com']);
+    expect(hostsIn('p\u200baypal\u2060.com')).toEqual(['paypal.com']);
   });
 
   it('drops bidirectional controls from the title and caps its length', () => {

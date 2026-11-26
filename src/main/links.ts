@@ -59,8 +59,9 @@ export function resolveLink(url: string, views: ViewRegistry, generation: number
   return { ok: true, token: view.token, generation: view.generation, link };
 }
 
-// Bidirectional controls could make a title read differently from what it holds.
-const BIDI_RE = /[؜‎‏‪-‮⁦-⁩]/g;
+// Invisible characters, bidirectional controls among them, could make a title
+// read differently from what it holds, or split a host name it shows whole.
+const INVISIBLE_RE = /\p{Default_Ignorable_Code_Point}/gu;
 const DOTS_RE = /[。．｡]/g;
 // Anything but printable ASCII.
 const UNUSUAL_RE = /[^ -~]/;
@@ -76,7 +77,7 @@ const IPV4_RE = /^\d{1,3}(?:\.\d{1,3}){3}$/;
 
 /** The title as the dialog shows it. */
 export function displayTitle(text: string): string {
-  const clean = text.replace(BIDI_RE, '').replace(/\s+/g, ' ').trim();
+  const clean = text.replace(INVISIBLE_RE, '').replace(/\s+/g, ' ').trim();
   return clean.length <= MAX_TITLE ? clean : `${clean.slice(0, MAX_TITLE - 1)}…`;
 }
 
@@ -95,10 +96,15 @@ export function isLookalike(host: string): boolean {
     .some((label) => label.startsWith('xn--'));
 }
 
-/** The host names a text holds, in ASCII form. Plain words hold none. */
+/**
+ * The host names a text holds, in ASCII form. Plain words hold none. The text
+ * is read in its compatibility form without invisible characters, so a dot
+ * leader or a full-width letter counts as the character it looks like.
+ */
 export function hostsIn(text: string): string[] {
   const hosts = new Set<string>();
-  for (const [token] of text.matchAll(TOKEN_RE)) {
+  const folded = text.replace(INVISIBLE_RE, '').normalize('NFKC').replace(INVISIBLE_RE, '');
+  for (const [token] of folded.matchAll(TOKEN_RE)) {
     const name = token.replace(DOTS_RE, '.').replace(/^[.-]+|[.-]+$/g, '');
     if (IPV4_RE.test(name) || HOST_NAME_RE.test(name)) hosts.add(asciiHost(name));
   }
@@ -107,11 +113,9 @@ export function hostsIn(text: string): string[] {
 
 const bare = (host: string) => (host.startsWith('www.') ? host.slice(4) : host);
 
-/** True when `target` is the host a text names, or a subdomain of it. */
-export function sameSite(named: string, target: string): boolean {
-  const a = bare(named);
-  const b = bare(target);
-  return a === b || b.endsWith(`.${a}`);
+/** True when a text names the target's host itself; a leading `www.` is ignored on both. */
+export function sameHost(named: string, target: string): boolean {
+  return bare(named) === bare(target);
 }
 
 function decoded(text: string): string {
@@ -123,9 +127,11 @@ function decoded(text: string): string {
 }
 
 interface Target {
+  /** The URL as the dialog shows it. */
+  shown: string;
   /** The host the link goes to, in ASCII form, or null if it has none. */
   host: string | null;
-  /** Where that host is in the URL. */
+  /** Where that host is in the shown URL. */
   span: { start: number; end: number } | null;
   lookalike: boolean;
 }
@@ -138,29 +144,55 @@ function webTarget(url: URL): Target {
   const start = url.protocol.length + 2 + user;
   const end = start + url.hostname.length;
   return {
+    shown: href,
     host: asciiHost(url.hostname),
     span: url.hostname && href.slice(start, end) === url.hostname ? { start, end } : null,
     lookalike: isLookalike(url.hostname),
   };
 }
 
+// A host name made only of letters, digits, hyphens and dots.
+const LDH_HOST_RE = /^[a-z0-9-]+(?:\.[a-z0-9-]+)*$/;
+
+/**
+ * An address domain as the dialog shows it: a percent-encoded name in its
+ * punycode form, when that form is a plain host name. Anything else stays as
+ * it is in the URL, so the shown text never gains a separator it didn't have.
+ */
+function shownDomain(domain: string): string {
+  if (!domain.includes('%')) return domain;
+  const ascii = asciiHost(decoded(domain));
+  return LDH_HOST_RE.test(ascii) ? ascii : domain;
+}
+
 function mailTarget(url: URL): Target {
-  const addresses = url.pathname.split(',');
-  const domains = addresses.map((a) => (a.includes('@') ? a.slice(a.lastIndexOf('@') + 1) : ''));
-  const lookalike = domains.some((d) => isLookalike(decoded(d)));
-  const first = addresses[0] ?? '';
-  const domain = domains[0] ?? '';
-  if (domain === '') return { host: null, span: null, lookalike };
-  const start = url.protocol.length + first.length - domain.length;
-  const end = start + domain.length;
+  const addresses = url.pathname.split(',').map((address) => {
+    const at = address.lastIndexOf('@');
+    const domain = at < 0 ? '' : address.slice(at + 1);
+    return {
+      local: at < 0 ? address : address.slice(0, at + 1),
+      domain,
+      shown: shownDomain(domain),
+    };
+  });
+  const shown = `${url.protocol}${addresses.map((a) => a.local + a.shown).join(',')}${url.search}${url.hash}`;
+  const lookalike = addresses.some((a) => isLookalike(decoded(a.domain)));
+  const first = addresses[0];
+  if (!first || first.domain === '') return { shown, host: null, span: null, lookalike };
+  const start = url.protocol.length + first.local.length;
+  const end = start + first.shown.length;
   return {
-    host: asciiHost(decoded(domain)),
-    span: url.href.slice(start, end) === domain ? { start, end } : null,
+    shown,
+    host: asciiHost(decoded(first.domain)),
+    span: shown.slice(start, end) === first.shown ? { start, end } : null,
     lookalike,
   };
 }
 
-/** What the dialog shows for a link. The URL is already normalized, hosts in punycode. */
+/**
+ * What the dialog shows for a link: the URL with its hosts in punycode, also
+ * an address's domain in a `mailto:` URL. Main keeps the URL it acts on.
+ */
 export function linkPrompt(dialogId: string, link: ViewLink): LinkPrompt {
   const title = displayTitle(link.text);
   let url: URL | null;
@@ -170,7 +202,7 @@ export function linkPrompt(dialogId: string, link: ViewLink): LinkPrompt {
     url = null;
   }
   const target: Target = !url
-    ? { host: null, span: null, lookalike: false }
+    ? { shown: link.url, host: null, span: null, lookalike: false }
     : url.protocol === 'mailto:'
       ? mailTarget(url)
       : webTarget(url);
@@ -178,9 +210,9 @@ export function linkPrompt(dialogId: string, link: ViewLink): LinkPrompt {
   return {
     dialogId,
     title,
-    url: url ? url.href : link.url,
+    url: target.shown,
     host: target.span,
-    mismatch: named.some((host) => target.host === null || !sameSite(host, target.host)),
+    mismatch: named.some((host) => target.host === null || !sameHost(host, target.host)),
     lookalike: target.lookalike,
   };
 }
