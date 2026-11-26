@@ -47,4 +47,7 @@ parentPort?.on('message', (request: WorkerRequest) => {
   if (__PEV_TEST_HOOKS__ && request.type === 'test') {
     void import('../testhooks/worker').then((hooks) => hooks.handleWorkerTest(request));
   }
+  if (__PEV_TEST_HOOKS__ && request.type === 'proof-read') {
+    void import('../testhooks/proof/worker').then((hooks) => post(hooks.handleProofRead(request)));
+  }
 });

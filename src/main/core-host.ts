@@ -99,7 +99,12 @@ export class CoreHost {
     });
   }
 
-  stop(): void {
-    this.child?.kill();
+  /** Ends core; resolves once it has exited. The next request starts a new one. */
+  stop(): Promise<void> {
+    const child = this.child;
+    if (!child) return Promise.resolve();
+    const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+    child.kill();
+    return exited;
   }
 }

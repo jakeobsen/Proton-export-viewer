@@ -1,5 +1,6 @@
 out/
 out-test/
+out-proof/
 dist/
 build/
 test-output/

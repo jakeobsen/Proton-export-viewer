@@ -8,16 +8,27 @@ import {
   htmlAppName,
   writeAppManifest,
 } from './scripts/vite-plugins.mjs';
+import { expectedExports } from './scripts/folder-proof-exports.mjs';
 
 // PEV_TEST_HOOKS=1 compiles the test hooks in and writes to out-test/.
 // Without it the hooks are removed at build time and the output goes to out/.
+// PEV_FOLDER_PROOF=1 (with PEV_TEST_HOOKS=1) builds the folder-proof app into
+// out-proof/: it runs the folder-access proof at launch and may show the
+// system folder picker, so it is never part of the test runs. It accepts only
+// the two exports named in PEV_FOLDER_PROOF_EXPORTS (see
+// scripts/folder-proof-exports.mjs).
 const testHooks = process.env.PEV_TEST_HOOKS === '1';
-const outRoot = testHooks ? 'out-test' : 'out';
+const folderProof = process.env.PEV_FOLDER_PROOF === '1';
+if (folderProof && !testHooks) throw new Error('PEV_FOLDER_PROOF=1 needs PEV_TEST_HOOKS=1');
+const outRoot = folderProof ? 'out-proof' : testHooks ? 'out-test' : 'out';
+const proofExports = folderProof ? expectedExports(process.env.PEV_FOLDER_PROOF_EXPORTS) : [];
 
 export default defineConfig(({ command }) => {
   const name = appName();
   const define = {
     __PEV_TEST_HOOKS__: JSON.stringify(testHooks),
+    __PEV_FOLDER_PROOF__: JSON.stringify(folderProof),
+    __PEV_FOLDER_PROOF_EXPORTS__: JSON.stringify(JSON.stringify(proofExports)),
     __PEV_DEV__: JSON.stringify(command === 'serve'),
     __PEV_APP_NAME__: JSON.stringify(name),
   };

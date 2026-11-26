@@ -39,10 +39,79 @@ export interface TestRequest {
   markers?: string;
 }
 
-export type CoreRequest = OpenRequest | PingRequest | TestRequest;
+/** The outcome of one file-system operation: `code` is the error code it failed with. */
+export interface ProofOutcome {
+  ok: boolean;
+  code: string | null;
+}
+
+/** One file read: its size and SHA-256 (hex) when the read succeeded. */
+export interface ProofFileRead extends ProofOutcome {
+  path: string;
+  bytes: number | null;
+  sha256: string | null;
+}
+
+/** Files the write, create, rename and delete checks target. */
+export interface ProofTargets {
+  /** An existing file, opened for writing and appended to. */
+  write: string;
+  /** A file that doesn't exist yet, created exclusively. */
+  create: string;
+  /** An existing file, renamed to the same name plus `.renamed`. */
+  rename: string;
+  /** An existing file, deleted. */
+  remove: string;
+}
+
+/** The change checks; they run in this order. */
+export type ProofOpName = 'write' | 'create' | 'rename' | 'remove';
+
+/**
+ * What the change checks expect: the sandbox denies them, or (in the
+ * unsandboxed control) they succeed. The first outcome that differs ends the
+ * checks.
+ */
+export type ProofExpect = 'denied' | 'allowed';
+
+/** Each change check's outcome; null for the checks after the first unexpected one. */
+export type ProofOps = Record<ProofOpName, ProofOutcome | null>;
+
+/** A walk of a whole folder, with the digest of every entry (see the proof tree module). */
+export interface ProofScan extends ProofOutcome {
+  digest: string | null;
+  entries: number;
+  files: number;
+}
+
+/** Folder-access proof calls, handled by core in builds with test hooks only. */
+export type ProofCall =
+  | { action: 'scan'; root: string; reads: string[] }
+  | { action: 'ops'; targets: ProofTargets; expect: ProofExpect }
+  | { action: 'read'; path: string };
+
+export type ProofReply =
+  | { action: 'scan'; pid: number; scan: ProofScan; worker: ProofFileRead[] | null }
+  | { action: 'ops'; pid: number; ops: ProofOps }
+  | { action: 'read'; pid: number; read: ProofFileRead };
+
+export interface ProofRequest {
+  type: 'proof';
+  reqId: number;
+  call: ProofCall;
+}
+
+export type CoreRequest = OpenRequest | PingRequest | TestRequest | ProofRequest;
 
 export type CoreResult =
-  | { type: 'result'; reqId: number; ok: true; body?: StubBodyMessage; value?: number }
+  | {
+      type: 'result';
+      reqId: number;
+      ok: true;
+      body?: StubBodyMessage;
+      value?: number;
+      proof?: ProofReply;
+    }
   | {
       type: 'result';
       reqId: number;
@@ -63,9 +132,17 @@ export interface WorkerTest {
   markers?: string;
 }
 
-export type WorkerRequest = WorkerBuild | WorkerTest;
+/** Folder-access proof: read these files from the worker thread. */
+export interface WorkerProofRead {
+  type: 'proof-read';
+  reqId: number;
+  paths: string[];
+}
+
+export type WorkerRequest = WorkerBuild | WorkerTest | WorkerProofRead;
 
 export type WorkerMessage =
   | { type: 'result'; reqId: number; ok: true; body: StubBodyMessage }
+  | { type: 'proof-read'; reqId: number; reads: ProofFileRead[] }
   | { type: 'result'; reqId: number; ok: false; code: 'unknown_stub' }
   | { type: 'log'; level: 'error' | 'warn' | 'info'; code: string; data?: Record<string, unknown> };

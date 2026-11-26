@@ -160,6 +160,7 @@ vite.config.ts.timestamp-*
 out/
 dist/
 out-test/
+out-proof/
 test-output/
 *.sqlite*
 .DS_Store
