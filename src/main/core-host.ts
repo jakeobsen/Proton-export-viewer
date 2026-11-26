@@ -16,6 +16,7 @@ import type {
   CoreRequest,
   CoreResult,
   CoreSource,
+  CoreTestInit,
 } from '../shared/core-protocol';
 import type { Logger } from '../shared/log/writer';
 
@@ -48,6 +49,8 @@ export class CoreHost {
   onEvent: ((event: CoreEvent) => void) | null = null;
   /** The run folders of the exports the app knows, for the next start of core. */
   exports: () => string[] = () => [];
+  /** Builds with test hooks only: what the next start of core gets for its tests. */
+  testInit: CoreTestInit | null = null;
 
   constructor(private readonly options: CoreHostOptions) {}
 
@@ -122,6 +125,7 @@ export class CoreHost {
           indexDir: this.options.indexDir,
           source,
           exports: this.exports(),
+          ...(__PEV_TEST_HOOKS__ && this.testInit ? { test: { ...this.testInit } } : {}),
         };
         child.postMessage(init, [port2]);
       });

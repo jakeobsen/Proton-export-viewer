@@ -6,7 +6,7 @@ import { app, protocol } from 'electron';
 import { SHELL_CSP } from '../shared/constants';
 import { errorData } from '../shared/log/schema';
 import { LogWriter } from '../shared/log/writer';
-import { bumpGeneration, notifySources, type AppContext, type Paths } from './context';
+import { bumpGeneration, notifyIndex, notifySources, type AppContext, type Paths } from './context';
 import { CoreHost } from './core-host';
 import { systemPicker, systemScopes } from './sources/access';
 import { SourceManager } from './sources/manager';
@@ -108,6 +108,7 @@ async function start(): Promise<void> {
       log.stop();
       rendererLog.stop();
     },
+    indexChanged: (progress) => notifyIndex(ctx, progress),
     picker: systemPicker,
     scopes: systemScopes,
   });

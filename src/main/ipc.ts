@@ -10,6 +10,7 @@ import { z } from 'zod';
 import {
   IPC,
   type ErrorKind,
+  type IndexResult,
   type MessageOpenResult,
   type OpenResult,
   type PingResult,
@@ -19,6 +20,7 @@ import {
   type SourcesResult,
   type StateResult,
 } from '../shared/api';
+import { WINDOW_AFTER, WINDOW_BEFORE } from '../shared/index-types';
 import type { SourceOutcome } from '../shared/sources';
 import { STALE, type Stale } from './sources/manager';
 import { APP_ORIGIN } from '../shared/constants';
@@ -70,6 +72,39 @@ const ReportArgs = z.tuple([
     })
     .strict(),
 ]);
+
+const Rowid = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+const ListKey = z
+  .object({
+    time: z.number().int().min(Number.MIN_SAFE_INTEGER).max(Number.MAX_SAFE_INTEGER),
+    threadId: Rowid,
+  })
+  .strict();
+const ShellQuery = z.discriminatedUnion('op', [
+  z.object({ op: z.literal('sidebar') }).strict(),
+  z
+    .object({
+      op: z.literal('window'),
+      // A folder or label ID from labels.json; never a path.
+      labelId: z.string().min(1).max(256),
+      anchor: z
+        .object({
+          rowid: Rowid.optional(),
+          key: ListKey.optional(),
+          index: z
+            .number()
+            .int()
+            .nonnegative()
+            .max(2 ** 31),
+        })
+        .strict(),
+      before: z.number().int().min(0).max(WINDOW_BEFORE),
+      after: z.number().int().min(1).max(WINDOW_AFTER),
+      selected: Rowid.nullable(),
+    })
+    .strict(),
+]);
+const IndexArgs = z.tuple([z.object({ query: ShellQuery, generation: Generation }).strict()]);
 
 const SourceKey = z.uuid();
 const RunId = z.string().regex(/^[0-9a-f]{16}$/);
@@ -244,6 +279,22 @@ export function registerIpc(ctx: AppContext): void {
     if (!args.success) return reject('invalid', appWin);
     if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
     return { ok: true, generation: ctx.generation, sources: ctx.sources.view() };
+  });
+
+  /**
+   * A read from the open export's index. Before its index is open there is
+   * nothing to read; that answer isn't logged, as the shell asks again when
+   * the index reports.
+   */
+  guarded<IndexResult<unknown>>(IPC.index, async (appWin, raw) => {
+    const args = IndexArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ query, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    const result = await ctx.sources.queryIndex(query);
+    if (!result) return { ok: false, code: 'no_source' };
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    return { ok: true, generation, answer: result.answer, progress: result.progress };
   });
 
   /**

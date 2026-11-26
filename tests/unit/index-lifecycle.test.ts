@@ -269,7 +269,11 @@ describe('an index found damaged on open', () => {
       await c.session.index!.settled();
       expect(await c.totals()).toMatchObject({ messages: pairs, pairs });
       expect(c.session.index!.progress.condition).toBe('ok');
-      expect(c.events.map((e) => [e.progress.condition, e.damaged])).toEqual([['ok', false]]);
+      // Progress while it rebuilds, then ok once; main is never told of damage.
+      const conditions = c.events.map((e) => e.progress.condition);
+      expect(conditions.filter((condition) => condition !== 'rebuilding')).toEqual(['ok']);
+      expect(conditions.at(-1)).toBe('ok');
+      expect(c.events.some((e) => e.damaged)).toBe(false);
       await c.session.close();
       expect(digest(root)).toBe(before);
     });

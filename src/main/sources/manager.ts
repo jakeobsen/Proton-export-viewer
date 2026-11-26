@@ -85,6 +85,8 @@ export interface SourceManagerDeps {
   notify(): void;
   /** Stops main's own log files, so a reset leaves no log folder behind. */
   stopLogs?(): void;
+  /** Tells the shell where the open source's index stands. */
+  indexChanged?(progress: IndexProgress): void;
   picker: Picker;
   scopes: Scopes;
   discover?: typeof discoverRuns;
@@ -695,7 +697,9 @@ export class SourceManager {
       );
       return;
     }
+    const changed = active.index !== event.progress.condition;
     active.index = event.progress.condition;
+    this.deps.indexChanged?.(event.progress);
     if (event.damaged) {
       const key = active.source.sourceKey;
       this.rebuilds.add(key);
@@ -706,7 +710,7 @@ export class SourceManager {
         void this.serial(() => this.rebuild(event.stamp), event.stamp.generation);
       }
     }
-    this.deps.notify();
+    if (changed || event.damaged) this.deps.notify();
   }
 
   /** Reopens the open source to rebuild its index, if it is still the open, known source. */
