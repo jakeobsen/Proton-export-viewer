@@ -179,7 +179,9 @@ test("the sidebar and the list show the export's folders, labels and conversatio
 test('rows that arrive while the export loads never move the anchored row', async ({ pev }) => {
   const root = realpathSync(testDir('list-anchor'));
   const written = writeExport(root, { seed: 42, messages: 160 });
-  await pev.main('indexTestSettings', { batchPairs: 10, holdWrites: true });
+  // Read in name order, not the folder's order, which differs between file
+  // systems: the names are random, so rows arrive above and below the anchor.
+  await pev.main('indexTestSettings', { batchPairs: 10, holdWrites: true, readByName: true });
   await pev.main('queuePick', root, 'bm1');
   await pev.shell('chooseFolder', []);
   await expect.poll(() => pev.main<number>('heldWrites')).toBeGreaterThan(0);
