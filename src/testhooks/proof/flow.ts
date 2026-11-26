@@ -19,7 +19,10 @@
 // launch: the result says where and why, core is stopped, every folder is
 // released, and the state is marked failed, so later launches do nothing.
 // Before anything is changed, main checks that a folder is the expected
-// export: the same physical path, and the digest its manifest gives.
+// export: the same physical path, and the digest its manifest gives. The
+// single account folder inside an export may be picked instead (the folder
+// dialog hands over a highlighted subfolder); it is checked the same way,
+// against the path and digest the build recorded for it.
 
 import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
@@ -48,10 +51,18 @@ markLoaded();
 
 export const STATE_FILE = 'folder-proof-state.json';
 
-/** An export the proof accepts: its physical path and its manifest digest. */
-export interface ExpectedExport {
+/** A folder the proof accepts: its physical path and the digest of its tree. */
+export interface ExpectedFolder {
   path: string;
   digest: string;
+}
+
+/**
+ * An export the proof accepts: its folder and manifest digest, and the single
+ * account folder directly inside it, which may be picked instead.
+ */
+export interface ExpectedExport extends ExpectedFolder {
+  account?: ExpectedFolder | null;
 }
 
 /** Access to a folder through its security-scoped bookmark. */
@@ -130,26 +141,42 @@ function physicalPath(path: string): string | null {
 export interface ExportCheck {
   path: string;
   physical: string | null;
+  /** Which of the export's folders was picked, once the path matched one. */
+  level: 'export' | 'account' | null;
   digest: string | null;
 }
 
 /**
- * Checks from main that `path` is the expected export: first its physical
- * path, and only if that matches, its digest (every entry listed and read).
- * The record is filled in before a mismatch throws, so it shows what was found.
+ * Checks from main that `path` is the expected export or its account folder:
+ * first its physical path, and only if that matches, its digest (every entry
+ * listed and read). The record is filled in before a mismatch throws, so it
+ * shows what was found. Returns the folder that matched.
  */
-export function checkExport(path: string, expected: ExpectedExport, record: ExportCheck): void {
+export function checkExport(
+  path: string,
+  expected: ExpectedExport,
+  record: ExportCheck,
+): ExpectedFolder {
   record.path = path;
   record.physical = physicalPath(path);
-  check(record.physical === expected.path, `${path} is not the expected export`);
+  const account = expected.account ?? null;
+  const match =
+    record.physical === expected.path
+      ? expected
+      : account !== null && record.physical === account.path
+        ? account
+        : null;
+  check(match !== null, `${path} is not the expected export`);
+  record.level = match === expected ? 'export' : 'account';
   const scan = scanTree(path);
   record.digest = scan.digest;
   check(scan.ok, `main could not read ${path} (${scan.code})`);
-  check(scan.digest === expected.digest, `${path} does not match its manifest digest`);
+  check(scan.digest === match.digest, `${path} does not match its manifest digest`);
+  return { path: match.path, digest: match.digest };
 }
 
 function emptyCheck(): ExportCheck {
-  return { path: '', physical: null, digest: null };
+  return { path: '', physical: null, level: null, digest: null };
 }
 
 export interface ExportRead {
@@ -289,7 +316,7 @@ export async function runProofLaunch(deps: ProofDeps): Promise<Record<string, un
     key: string,
     root: string,
     targets: ExportTargets,
-    expected: ExpectedExport,
+    expected: ExpectedFolder,
   ) => {
     const change = {
       ...(await changeExport(core, targets, 'denied')),
@@ -321,7 +348,7 @@ export async function runProofLaunch(deps: ProofDeps): Promise<Record<string, un
         event('first export picked');
         const picked = emptyCheck();
         result.picked = picked;
-        checkExport(first.path, firstExpected, picked);
+        const firstFolder = checkExport(first.path, firstExpected, picked);
         event('first export checked');
         state.first = { ...first, launch: launch.id };
         saveState();
@@ -337,10 +364,10 @@ export async function runProofLaunch(deps: ProofDeps): Promise<Record<string, un
         step = 'step 1';
         const read = await readExport(core, first.path, targets);
         result.step1 = read;
-        noProblem(readProblem(read, firstExpected.digest));
+        noProblem(readProblem(read, firstFolder.digest));
 
         step = 'step 2';
-        await changeStep(result, 'step2', first.path, targets, firstExpected);
+        await changeStep(result, 'step2', first.path, targets, firstFolder);
         await stopCore();
         release(scope);
       } else {
@@ -357,21 +384,21 @@ export async function runProofLaunch(deps: ProofDeps): Promise<Record<string, un
         check(scope.started, 'the stored bookmark could not be used');
         const verified = emptyCheck();
         step3.checked = verified;
-        checkExport(stored.path, firstExpected, verified);
+        const firstFolder = checkExport(stored.path, firstExpected, verified);
         event('first export checked');
         await spawnCore();
         const targets = exportTargets(stored.path, launch.id);
         const read = await readExport(core, stored.path, targets);
         step3.read = read;
-        noProblem(readProblem(read, firstExpected.digest));
-        await changeStep(step3, 'change', stored.path, targets, firstExpected);
+        noProblem(readProblem(read, firstFolder.digest));
+        await changeStep(step3, 'change', stored.path, targets, firstFolder);
 
         step = 'pick the second export';
         const second = await pick(secondExpected);
         event('second export picked');
         const picked = emptyCheck();
         result.picked = picked;
-        checkExport(second.path, secondExpected, picked);
+        const secondFolder = checkExport(second.path, secondExpected, picked);
         check(picked.physical !== verified.physical, 'the same folder was picked twice');
         event('second export checked');
         state.second = { ...second, launch: launch.id };
@@ -392,7 +419,7 @@ export async function runProofLaunch(deps: ProofDeps): Promise<Record<string, un
         const secondTargets = exportTargets(second.path, launch.id);
         const secondRead = await readExport(core, second.path, secondTargets);
         step4.read = secondRead;
-        noProblem(readProblem(secondRead, secondExpected.digest));
+        noProblem(readProblem(secondRead, secondFolder.digest));
         // A file of the first export that step 3 read in this launch: it exists.
         const known = targets.read[1];
         const coreRead = (await core.call({ action: 'read', path: known })).read;
@@ -401,7 +428,7 @@ export async function runProofLaunch(deps: ProofDeps): Promise<Record<string, un
           isDenial(coreRead),
           `core's read of a known file of the first export was not denied (${coreRead.code ?? 'it succeeded'})`,
         );
-        await changeStep(step4, 'change', second.path, secondTargets, secondExpected);
+        await changeStep(step4, 'change', second.path, secondTargets, secondFolder);
         await stopCore();
         release(secondScope);
       }

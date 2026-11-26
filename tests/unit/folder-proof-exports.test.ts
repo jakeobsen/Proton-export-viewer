@@ -17,6 +17,7 @@ import { describe, expect, it } from 'vitest';
 import { expectedExports, overlaps } from '../../scripts/folder-proof-exports.mjs';
 import { removeOutputDir, removeTestOutput, testOutputOf } from '../../scripts/test-output.mjs';
 import { scanTree, walk } from '../../src/testhooks/proof/fs';
+import { digest } from '../../tools/gen-export/tree.mjs';
 import { copyTree, unlockFolders } from '../copy-tree';
 import { permissionDenials } from '../permission-check';
 import { testDir } from '../paths';
@@ -51,26 +52,73 @@ function smallExport(root: string) {
   return { root, run };
 }
 
-/** A folder with a manifest next to it, as the generator writes them. */
+/** A folder with an account folder and a manifest next to it, as the generator writes them. */
 function generated(root: string, name: string, manifest: Record<string, unknown> = {}) {
   const folder = join(root, name);
-  mkdirSync(join(folder, 'acct'), { recursive: true });
+  mkdirSync(join(folder, 'acct', 'mail_20250101_000000'), { recursive: true });
+  writeFileSync(join(folder, 'acct', 'mail_20250101_000000', 'labels.json'), `{"n":"${name}"}`);
   writeFileSync(
     `${folder}.manifest.json`,
-    JSON.stringify({ destination: folder, digest: DIGEST, ...manifest }),
+    JSON.stringify({ destination: folder, digest: digest(folder), ...manifest }),
   );
   return folder;
 }
 
+/** What the build records for a generated export. */
+const recorded = (folder: string) => ({
+  path: folder,
+  digest: digest(folder),
+  account: { path: join(folder, 'acct'), digest: digest(join(folder, 'acct')) },
+});
+
 describe('expectedExports', () => {
-  it('gives each export its physical path and manifest digest, in order', () => {
+  it('gives each export its physical path and manifest digest, and its account folder, in order', () => {
     const root = realpathSync(testDir('proof-exports'));
     const a = generated(root, 'small1');
-    const b = generated(root, 'small2', { digest: 'cd'.repeat(32) });
-    expect(expectedExports(`${a}:${b}/`)).toEqual([
-      { path: a, digest: DIGEST },
-      { path: b, digest: 'cd'.repeat(32) },
-    ]);
+    const b = generated(root, 'small2');
+    const exports = expectedExports(`${a}:${b}/`);
+    expect(exports).toEqual([recorded(a), recorded(b)]);
+    // The app checks with its own tree walk: the digests agree.
+    for (const e of exports) {
+      expect(scanTree(e.path).digest).toBe(e.digest);
+      expect(scanTree(e.account!.path).digest).toBe(e.account!.digest);
+    }
+  });
+
+  it('refuses an export that no longer matches its manifest', () => {
+    const root = realpathSync(testDir('proof-exports-stale'));
+    const a = generated(root, 'small1');
+    const b = generated(root, 'small2', { digest: DIGEST });
+    expect(() => expectedExports(`${a}:${b}`)).toThrow(`${b} does not match its manifest digest`);
+    writeFileSync(join(a, 'acct', 'mail_20250101_000000', 'labels.json'), '{"changed":1}');
+    const c = generated(root, 'small3');
+    expect(() => expectedExports(`${a}:${c}`)).toThrow(`${a} does not match its manifest digest`);
+  });
+
+  it('records no account folder unless the export holds exactly one folder', () => {
+    const root = realpathSync(testDir('proof-exports-account'));
+    const two = generated(root, 'two');
+    mkdirSync(join(two, 'other'));
+    writeFileSync(
+      `${two}.manifest.json`,
+      JSON.stringify({ destination: two, digest: digest(two) }),
+    );
+    const file = join(root, 'file');
+    mkdirSync(file);
+    writeFileSync(join(file, 'acct'), 'not a folder');
+    writeFileSync(
+      `${file}.manifest.json`,
+      JSON.stringify({ destination: file, digest: digest(file) }),
+    );
+    const link = join(root, 'link');
+    mkdirSync(link);
+    symlinkSync(join(two, 'acct'), join(link, 'acct'));
+    writeFileSync(
+      `${link}.manifest.json`,
+      JSON.stringify({ destination: link, digest: digest(link) }),
+    );
+    expect(expectedExports(`${two}:${file}`).map((e) => e.account)).toEqual([null, null]);
+    expect(expectedExports(`${link}:${file}`)[0]!.account).toBeNull();
   });
 
   it('refuses anything but two separate generated exports', () => {
@@ -83,6 +131,8 @@ describe('expectedExports', () => {
     expect(() => expectedExports(`small1:${b}`)).toThrow('not an absolute path');
     expect(() => expectedExports(`${a}:${a}`)).toThrow('separate folders');
     const inner = generated(a, 'inner');
+    // The first export's manifest again, now that it holds the second.
+    generated(root, 'small1');
     expect(() => expectedExports(`${a}:${inner}`)).toThrow('separate folders');
     const none = join(root, 'none');
     mkdirSync(none);
@@ -99,7 +149,7 @@ describe('expectedExports', () => {
     const b = generated(root, 'small2');
     symlinkSync(b, join(root, 'link'));
     symlinkSync(`${b}.manifest.json`, join(root, 'link.manifest.json'));
-    expect(expectedExports(`${a}:${join(root, 'link')}`)[1]).toEqual({ path: b, digest: DIGEST });
+    expect(expectedExports(`${a}:${join(root, 'link')}`)[1]).toEqual(recorded(b));
   });
 });
 
