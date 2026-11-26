@@ -14,7 +14,9 @@ import { errorData } from '../shared/log/schema';
 import { TESTHOOKS_MARKER, markLoaded } from './marker';
 import { TEST_PAGE, testRoute } from './pages';
 import { runControl, runFolderProof, type OpenDialog } from './proof/main';
+import { killRenderer } from './renderer-kill';
 import { runSelfTest } from './selftest';
+import { WindowEventRecorder } from './window-events';
 
 markLoaded();
 
@@ -65,11 +67,8 @@ export async function install(ctx: AppContext): Promise<boolean> {
   const realOpenDialog = dialog.showOpenDialog.bind(dialog) as OpenDialog;
   const dialogCalls: string[] = [];
   stubDialogs(dialogCalls);
-  const windowEvents: string[] = [];
-  app.on('browser-window-created', (_event, win) => {
-    win.on('show', () => windowEvents.push('show'));
-    win.on('focus', () => windowEvents.push('focus'));
-  });
+  const windowEvents = new WindowEventRecorder();
+  app.on('browser-window-created', (_event, win) => windowEvents.attach(win));
 
   const requests = new Map<number, WindowRequests>();
   let bodyCsp = true;
@@ -115,7 +114,7 @@ export async function install(ctx: AppContext): Promise<boolean> {
     dialogCalls: () => [...dialogCalls],
     dialogsStubbed: () =>
       DIALOG_METHODS.every((name) => String(dialog[name]).includes('calls.push')),
-    windowEvents: () => [...windowEvents],
+    windowEvents: () => windowEvents.events(),
     windowState: () =>
       BrowserWindow.getAllWindows().map((w) => ({
         visible: w.isVisible(),
@@ -195,12 +194,20 @@ export async function install(ctx: AppContext): Promise<boolean> {
       };
     },
     download: (windowId: number, url: string) => byId(windowId).win.webContents.downloadURL(url),
-    crashRenderer: (windowId: number) => {
+    crashRenderer: (windowId: number): boolean => {
       const contents = byId(windowId).win.webContents;
       // On Linux, forcefullyCrashRenderer() asks the renderer to crash itself
-      // instead of ending it from main, so end the process directly there.
-      if (process.platform === 'linux') process.kill(contents.getOSProcessId(), 'SIGKILL');
-      else contents.forcefullyCrashRenderer();
+      // instead of ending it from main, so end the process directly there,
+      // but only by a PID that names one process.
+      if (process.platform !== 'linux') {
+        contents.forcefullyCrashRenderer();
+        return true;
+      }
+      const killed = killRenderer(contents.getOSProcessId(), (pid, signal) =>
+        process.kill(pid, signal),
+      );
+      if (!killed) ctx.log.warn('test.crash_refused', { windowId, reason: 'invalid' });
+      return killed;
     },
     core,
     corePid: () => ctx.core.pid,
@@ -237,7 +244,7 @@ export async function install(ctx: AppContext): Promise<boolean> {
 
   const selfTest = process.argv.includes('--pev-selftest');
   if (selfTest) {
-    await runSelfTest(ctx, process.argv);
+    await runSelfTest(ctx, process.argv, windowEvents);
     return true;
   }
   return false;

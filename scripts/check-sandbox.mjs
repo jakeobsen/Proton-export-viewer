@@ -143,6 +143,25 @@ function readResult(file, nonce) {
   return result.nonce === nonce ? result : null;
 }
 
+/** True when the self-test's probe saw one show, then one focus, of one window. */
+function recorderConnected(result) {
+  const probe = result.recorderProbe;
+  return (
+    Array.isArray(probe) &&
+    probe.length === 2 &&
+    probe[0]?.event === 'show' &&
+    probe[1]?.event === 'focus' &&
+    Number.isSafeInteger(probe[0]?.window) &&
+    probe[0].window > 0 &&
+    probe[1].window === probe[0].window
+  );
+}
+
+/** The self-test's record of show and focus events, which must be empty. */
+function noWindowEvents(result) {
+  return Array.isArray(result.windowEvents) && result.windowEvents.length === 0;
+}
+
 async function main() {
   checkEntitlements('mas-selftest');
   checkEntitlements('mas-release');
@@ -198,6 +217,14 @@ async function main() {
     );
     check(sandboxed.error === null, `sandboxed: no self-test error (${sandboxed.error})`);
     check(sandboxed.shownWindows === 0, 'sandboxed: no window was shown or focused');
+    check(
+      noWindowEvents(sandboxed),
+      `sandboxed: no show or focus event recorded (${JSON.stringify(sandboxed.windowEvents)})`,
+    );
+    check(
+      recorderConnected(sandboxed),
+      `sandboxed: the event recorder is connected (${JSON.stringify(sandboxed.recorderProbe)})`,
+    );
   }
   check(!existsSync(sandboxTarget), 'sandboxed: the write target does not exist');
   check(listener.count() === 0, `sandboxed: the listener saw ${listener.count()} connections`);
@@ -227,6 +254,14 @@ async function main() {
     check(control.write.ok === true, 'control: write succeeds');
     check(control.connect.ok === true, 'control: connect succeeds');
     check(control.shownWindows === 0, 'control: no window was shown or focused');
+    check(
+      noWindowEvents(control),
+      `control: no show or focus event recorded (${JSON.stringify(control.windowEvents)})`,
+    );
+    check(
+      recorderConnected(control),
+      `control: the event recorder is connected (${JSON.stringify(control.recorderProbe)})`,
+    );
   }
   check(existsSync(controlTarget), 'control: the write target exists');
   check(listener.count() >= 1, `control: the listener saw ${listener.count()} connection(s)`);

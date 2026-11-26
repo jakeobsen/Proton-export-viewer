@@ -38,6 +38,17 @@ describe('sanitizeEvent', () => {
     expect(findMarkers(JSON.stringify(event))).toEqual([]);
   });
 
+  it('logs a refused renderer kill with its window and a fixed reason only', () => {
+    const event = sanitizeEvent({
+      level: 'warn',
+      proc: 'main',
+      code: 'test.crash_refused',
+      data: { windowId: 2, reason: 'invalid', pid: 0 },
+    });
+    expect(event?.code).toBe('test.crash_refused');
+    expect(event?.data).toEqual({ windowId: 2, reason: 'invalid', dropped: 1 });
+  });
+
   it('rejects unknown codes, levels and processes', () => {
     expect(sanitizeEvent({ level: 'info', proc: 'main', code: MARKERS[0] })).toBeNull();
     expect(sanitizeEvent({ level: 'loud' as 'info', proc: 'main', code: 'app.start' })).toBeNull();
