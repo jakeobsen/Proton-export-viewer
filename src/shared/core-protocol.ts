@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Messages between main and the core utility process, and between core and its reader worker.
 
+import type { IndexAnswer, IndexOpened, IndexProgress, IndexQuery } from './index-types';
 import type {
   ReadRequest,
   ReaderFailure,
@@ -19,6 +20,8 @@ export interface CoreInit {
   type: 'init';
   logsDir: string;
   appRoot: string;
+  /** `<userData>/index`: where each source's index is kept. */
+  indexDir: string;
   /** Null until a source is open: core then has no access to any export. */
   source: CoreSource | null;
 }
@@ -133,6 +136,26 @@ export interface ScanRequest {
   stamp: Stamp;
 }
 
+/**
+ * Opens the open run's index: the one with this identity, or a new one if
+ * there is none or it isn't usable. Phase 1 starts after the answer.
+ */
+export interface IndexRequest {
+  type: 'index';
+  reqId: number;
+  stamp: Stamp;
+  /** The identity the registry holds for this source's index; null if none. */
+  dbUuid: string | null;
+}
+
+/** A read from the open run's index. */
+export interface IndexQueryRequest {
+  type: 'index-query';
+  reqId: number;
+  stamp: Stamp;
+  query: IndexQuery;
+}
+
 export type CoreRequest =
   | OpenRequest
   | PingRequest
@@ -140,7 +163,9 @@ export type CoreRequest =
   | ProofRequest
   | IdentifyRequest
   | ScanRequest
-  | ReadRequest;
+  | ReadRequest
+  | IndexRequest
+  | IndexQueryRequest;
 
 export type CoreResult =
   | {
@@ -158,6 +183,9 @@ export type CoreResult =
       scan?: ScanSummary;
       /** The rendered message of a `read`. */
       read?: RenderedMessage;
+      index?: IndexOpened;
+      answer?: IndexAnswer;
+      progress?: IndexProgress;
     }
   | {
       type: 'result';
@@ -172,7 +200,8 @@ export type CoreResult =
         | 'unavailable'
         | 'not_found'
         | 'superseded'
-        | 'reader_failed';
+        | 'reader_failed'
+        | 'no_index';
       /** Why the reader gave no body, for `reader_failed`. */
       reason?: ReaderFailure;
       /** Test builds only: why a test action failed. */

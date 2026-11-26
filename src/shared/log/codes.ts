@@ -53,6 +53,16 @@ export const LOG_CODES = [
   'reader.timeout',
   'reader.limit',
   'reader.parse_failed',
+  'index.created',
+  'index.replaced',
+  'index.opened',
+  'index.phase1_done',
+  'index.phase1_failed',
+  'index.labels_failed',
+  'index.meta_failed',
+  'index.timeout',
+  'index.capped',
+  'index.idle_release',
 ] as const;
 
 /** Codes that only exist in builds with test hooks. */
@@ -135,7 +145,16 @@ export const REASONS = [
   'changed',
   'unreadable',
   'unknown',
+  'meta_json',
+  'meta_shape',
+  'meta_id',
+  'worker_failed',
+  'index_full',
+  'wal',
 ] as const;
+
+/** The lists of a message whose entries can be cut to a limit when indexed. */
+export const CAPPED_LIST_NAMES = ['labels', 'attachments', 'to', 'cc', 'bcc', 'replyTo'] as const;
 
 export const SCHEMES = [
   'http',

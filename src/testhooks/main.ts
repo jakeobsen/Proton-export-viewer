@@ -4,6 +4,7 @@
 
 import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { BrowserWindow, app, dialog } from 'electron';
 import { bumpGeneration, type AppContext } from '../main/context';
 import type { PolicyObserver } from '../main/harden';
@@ -12,6 +13,7 @@ import { ScopeError, type Picked } from '../main/sources/scope';
 import type { OrderStep } from '../main/sources/manager';
 import { createAppWindow } from '../main/windows';
 import type { CoreResult } from '../shared/core-protocol';
+import type { IndexQuery } from '../shared/index-types';
 import { errorData } from '../shared/log/schema';
 import { TESTHOOKS_MARKER, markLoaded } from './marker';
 import { TEST_PAGE, testRoute } from './pages';
@@ -309,6 +311,9 @@ export async function install(ctx: AppContext): Promise<boolean> {
       return waiting.length;
     },
     heldSourceResults: () => heldResults.length,
+    /** A read from the open source's index, as the shell will make it. */
+    indexQuery: (query: IndexQuery) => ctx.sources.queryIndex(query),
+    indexDir: () => join(app.getPath('userData'), 'index'),
   };
   (globalThis as { __pevTest?: typeof api }).__pevTest = api;
 

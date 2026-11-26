@@ -2,7 +2,15 @@
 // Redaction schema: only allowlisted fields with validated values reach a log file.
 // Paths, addresses, subjects, URLs, host names and exception messages never pass.
 
-import { DEVICES, PERMISSIONS, PROCESS_TYPES, REASONS, SCHEMES, isLogCode } from './codes';
+import {
+  CAPPED_LIST_NAMES,
+  DEVICES,
+  PERMISSIONS,
+  PROCESS_TYPES,
+  REASONS,
+  SCHEMES,
+  isLogCode,
+} from './codes';
 
 export const LEVELS = ['error', 'warn', 'info', 'debug'] as const;
 export type Level = (typeof LEVELS)[number];
@@ -64,6 +72,7 @@ const FIELDS: Record<string, Validator> = {
   exitCode: isInt,
   status: (v) => isInt(v) && (v as number) >= 100 && (v as number) <= 599,
   reason: oneOf(REASONS),
+  list: oneOf(CAPPED_LIST_NAMES),
   scheme: oneOf(SCHEMES),
   processType: oneOf(PROCESS_TYPES),
   permission: oneOf(PERMISSIONS),

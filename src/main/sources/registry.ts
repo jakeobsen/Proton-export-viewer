@@ -47,6 +47,8 @@ const SourceSchema = z
     openedAt: z.number().int().nonnegative(),
     /** Whether the run was unavailable when it was last opened. */
     offline: z.boolean(),
+    /** The identity of this source's index, written when the index is created. */
+    dbUuid: Uuid.nullable().optional(),
   })
   .strict();
 
