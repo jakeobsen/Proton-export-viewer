@@ -18,7 +18,7 @@ import { errorData } from '../shared/log/schema';
 import { LogWriter, type Logger } from '../shared/log/writer';
 import type { ReadRequest, ReaderFailure } from '../shared/reader-protocol';
 import { WorkerThread, type ThreadRole } from './index/pool';
-import { ReaderLane } from './reader/lane';
+import { READER_RETIRE_MB, ReaderLane } from './reader/lane';
 import type { ReaderSource } from './reader/source';
 import { SourceSession } from './source';
 
@@ -42,6 +42,13 @@ const lane = new ReaderLane<WorkerRequest, WorkerMessage>({
   onError: (err) => log?.error('core.worker_error', errorData(err, roots)),
   onBreach: (breach, ms) =>
     log?.warn(breach === 'timeout' ? 'reader.timeout' : 'reader.limit', { ms }),
+  // A large message can leave the worker holding hundreds of MB: a new worker gives it back.
+  retire: (message) =>
+    message.type === 'rendered' && message.heldBytes > READER_RETIRE_MB * 1024 * 1024,
+  onRetire: (message) =>
+    log?.info('reader.worker_retired', {
+      bytes: message.type === 'rendered' ? message.heldBytes : 0,
+    }),
   onOther: (message) => {
     if (message.type === 'log') workerLog?.log(message.level, message.code, message.data);
   },

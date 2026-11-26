@@ -5,6 +5,7 @@
 import { createReadStream } from 'node:fs';
 import { sep } from 'node:path';
 import type { Readable } from 'node:stream';
+import { getHeapStatistics } from 'node:v8';
 import { parentPort, workerData } from 'node:worker_threads';
 import type { WorkerMessage, WorkerRequest } from '../shared/core-protocol';
 import { errorData } from '../shared/log/schema';
@@ -48,24 +49,31 @@ async function inputStream(input: ReaderInput): Promise<Readable | null> {
   return null;
 }
 
+/** The memory this worker holds now: its JS heap, and the buffers outside it. */
+function heldBytes(): number {
+  const heap = getHeapStatistics();
+  return heap.total_heap_size + heap.external_memory;
+}
+
 async function render(request: WorkerRender): Promise<WorkerRendered> {
-  const failed: WorkerRendered = {
+  const failed = (): WorkerRendered => ({
     type: 'rendered',
     reqId: request.reqId,
+    heldBytes: heldBytes(),
     ok: false,
     code: 'parse',
-  };
+  });
   try {
     const input = await inputStream(request.input);
-    if (!input) return failed;
+    if (!input) return failed();
     const message = await renderMessage(input, {
       mode: request.mode,
       assetBase: request.assetBase,
     });
-    return { type: 'rendered', reqId: request.reqId, ok: true, message };
+    return { type: 'rendered', reqId: request.reqId, heldBytes: heldBytes(), ok: true, message };
   } catch (err) {
     post({ type: 'log', level: 'warn', code: 'reader.parse_failed', data: errorData(err, roots) });
-    return failed;
+    return failed();
   }
 }
 

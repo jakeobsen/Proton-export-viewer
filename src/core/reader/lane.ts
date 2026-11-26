@@ -3,14 +3,18 @@
 // a time. Each job has a wall-clock limit from the moment it reaches the
 // worker, and the worker runs with a heap limit. A job that breaches either
 // ends the worker; the job fails with the reason, and a new worker is spawned
-// for the jobs that follow.
+// for the jobs that follow. A worker that a job left holding a lot of memory
+// is ended after the job, and replaced, so that memory goes back.
 
+import type { HeapInfo } from 'node:v8';
 import type { Worker } from 'node:worker_threads';
 
 /** Every job gets this long, from the moment it reaches the worker. */
 export const READER_TIMEOUT_MS = 3000;
 /** The reader worker's old-generation heap limit. */
 export const READER_HEAP_MB = 512;
+/** A reader worker that holds more than this after a job is replaced. */
+export const READER_RETIRE_MB = 256;
 
 export type Breach = 'timeout' | 'limit';
 export type JobFailure = Breach | 'crash' | 'superseded';
@@ -33,6 +37,13 @@ export interface LaneOptions<Out extends LaneMessage> {
   onError?: (err: unknown) => void;
   /** A job breached a limit; its worker is ended and replaced. */
   onBreach?: (breach: Breach, ms: number) => void;
+  /**
+   * Asked with each job's reply: true ends the worker once the reply is in,
+   * and a new one takes over, as after a breach.
+   */
+  retire?: (message: Out) => boolean;
+  /** A worker was ended after the job that this reply answers. */
+  onRetire?: (message: Out) => void;
 }
 
 /** Whose job it is, and how new: a newer job of the same key supersedes an older one. */
@@ -139,13 +150,38 @@ export class ReaderLane<In extends LaneMessage, Out extends LaneMessage> {
     return this.queue.length;
   }
 
-  /** The current worker's thread id and limits, as the worker itself was started with. */
-  describe(): { threadId: number | null; heapMb: number | null; timeoutMs: number } {
+  /** The current worker's thread id and limits, as the worker itself was started with, and the jobs waiting. */
+  describe(): {
+    threadId: number | null;
+    heapMb: number | null;
+    timeoutMs: number;
+    queued: number;
+  } {
     return {
       threadId: this.worker?.threadId ?? null,
       heapMb: this.worker?.resourceLimits?.maxOldGenerationSizeMb ?? null,
       timeoutMs: this.timeoutMs,
+      queued: this.queue.length,
     };
+  }
+
+  /**
+   * The current worker's heap statistics, or null when there is no worker, or
+   * it has ended or ends before it answers. A worker that ran out of heap is
+   * still the current one until its exit event, and refuses the request. For
+   * measurements.
+   */
+  heapStatistics(): Promise<HeapInfo | null> {
+    const worker = this.worker;
+    if (!worker) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const ended = () => resolve(null);
+      worker.once('exit', ended);
+      worker
+        .getHeapStatistics()
+        .then(resolve, () => resolve(null))
+        .finally(() => worker.off('exit', ended));
+    });
   }
 
   async stop(): Promise<void> {
@@ -176,6 +212,7 @@ export class ReaderLane<In extends LaneMessage, Out extends LaneMessage> {
   private onMessage(worker: Worker, message: Out): void {
     const running = this.running;
     if (running && running.worker === worker && message.reqId === running.message.reqId) {
+      if (this.options.retire?.(message)) this.retire(worker, message);
       this.finish({ ok: true, message });
       return;
     }
@@ -205,6 +242,14 @@ export class ReaderLane<In extends LaneMessage, Out extends LaneMessage> {
     // A breach was the job's doing, not the worker's: have the next one ready.
     if (state.breach) this.ensureWorker();
     this.pump();
+  }
+
+  /** Ends a worker after its job, and has the next one ready. */
+  private retire(worker: Worker, message: Out): void {
+    if (this.worker === worker) this.worker = null;
+    this.options.onRetire?.(message);
+    void worker.terminate();
+    this.ensureWorker();
   }
 
   private finish(outcome: JobOutcome<Out>): void {

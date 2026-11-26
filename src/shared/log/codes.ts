@@ -53,6 +53,7 @@ export const LOG_CODES = [
   'reader.timeout',
   'reader.limit',
   'reader.parse_failed',
+  'reader.worker_retired',
   'index.created',
   'index.opened',
   'index.phase1_done',
