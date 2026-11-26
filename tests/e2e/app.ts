@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Launches the e2e build (production bundles plus test hooks) unpackaged with
-// the stock Electron binary. Each launch gets its own userData under test-output/.
+// the stock Electron binary. Each launch gets its own userData under test-output/,
+// removed again when the test passes.
 
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -12,7 +13,7 @@ import {
   type Frame,
   type Page,
 } from '@playwright/test';
-import { REPO_ROOT, testDir } from '../paths';
+import { REPO_ROOT, removeTestDirs, takeTestDirs, testDir } from '../paths';
 
 export interface LogLine {
   ts: string;
@@ -148,8 +149,23 @@ export async function launch(name: string): Promise<PevApp> {
   return new PevApp(app, page, userData);
 }
 
-export const test = base.extend<{ pev: PevApp }>({
-  // Playwright requires an object pattern as the first fixture argument.
+export const test = base.extend<{ pev: PevApp; testDirs: void }>({
+  // Removes the folders the test made under test-output/ once it passed,
+  // after every other fixture (the app included) has been torn down. A
+  // failed test keeps them as evidence.
+  testDirs: [
+    // Playwright requires an object pattern as the first fixture argument.
+    // eslint-disable-next-line no-empty-pattern
+    async ({}, use, testInfo) => {
+      takeTestDirs();
+      await use();
+      const dirs = takeTestDirs();
+      if (testInfo.status === testInfo.expectedStatus && testInfo.errors.length === 0) {
+        removeTestDirs(dirs);
+      }
+    },
+    { auto: true },
+  ],
   // eslint-disable-next-line no-empty-pattern
   pev: async ({}, use, testInfo) => {
     const pev = await launch(testInfo.title.replace(/[^a-z0-9]+/gi, '-').slice(0, 40));
