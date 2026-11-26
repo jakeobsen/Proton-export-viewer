@@ -6,7 +6,13 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, readSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { TestReaderSource, openContained, parsePayload } from '../../src/testhooks/reader-source';
+import {
+  TestReaderSource,
+  openContained,
+  openGate,
+  parsePayload,
+  waitingAt,
+} from '../../src/testhooks/reader-source';
 import { testDir } from '../paths';
 
 function layout() {
@@ -86,6 +92,26 @@ describe('the reader test source', () => {
     expect(await source!.open(4)).toBeNull();
   });
 
+  it('holds a lookup at its gate until the gate opens, and lets later ones through', async () => {
+    const { root } = layout();
+    const source = await TestReaderSource.create({
+      root,
+      entries: [[1, { test: { kind: 'spin' }, gate: 'unit-gate' }]],
+    });
+    let found = false;
+    const lookup = source!.open(1).then((opened) => {
+      found = opened !== null;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(found).toBe(false);
+    expect(waitingAt('unit-gate')).toBe(1);
+    expect(openGate('unit-gate')).toBe(1);
+    await lookup;
+    expect(found).toBe(true);
+    expect(waitingAt('unit-gate')).toBe(0);
+    expect(await source!.open(1)).not.toBeNull();
+  });
+
   it('needs a folder as its root', async () => {
     const { root } = layout();
     expect(await TestReaderSource.create({ root: join(root, 'a.eml'), entries: [] })).toBeNull();
@@ -96,7 +122,7 @@ describe('the reader test source', () => {
     const root = '/tmp/x';
     expect(parsePayload({ root, entries: [[1, { file: 'a.eml' }]] })).not.toBeNull();
     expect(parsePayload({ root, entries: [[1, { test: { kind: 'heap' } }]] })).not.toBeNull();
-    expect(parsePayload({ root, entries: [[1, { file: 'a.eml', delayMs: 500 }]] })).not.toBeNull();
+    expect(parsePayload({ root, entries: [[1, { file: 'a.eml', gate: 'g' }]] })).not.toBeNull();
     expect(
       parsePayload({ root, entries: [[1, { test: { kind: 'sleep', ms: 1 } }]] }),
     ).not.toBeNull();
@@ -107,8 +133,9 @@ describe('the reader test source', () => {
       { root, entries: [[1.5, { file: 'a' }]] },
       { root, entries: [[1, { path: 'a' }]] },
       { root, entries: [[1, { test: { kind: 'other' } }]] },
-      { root, entries: [[1, { file: 'a.eml', delayMs: -1 }]] },
-      { root, entries: [[1, { file: 'a.eml', delayMs: 0.5 }]] },
+      { root, entries: [[1, { file: 'a.eml', gate: '' }]] },
+      { root, entries: [[1, { file: 'a.eml', gate: 'g'.repeat(65) }]] },
+      { root, entries: [[1, { file: 'a.eml', gate: 1 }]] },
       { root, entries: [[1]] },
       { root },
     ]) {

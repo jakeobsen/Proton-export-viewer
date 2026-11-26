@@ -7,7 +7,14 @@ import { randomBytes } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import { MAX_LINKS, linkUrl, plainBody, trimUrl } from '../../src/core/reader/plain';
-import { MAX_SUBJECT, renderMessage } from '../../src/core/reader/render';
+import {
+  FIRST_TEXT_BYTES,
+  HTML_ANYWAY_BYTES,
+  HTML_VIEW_BYTES,
+  MAX_SUBJECT,
+  firstBytes,
+  renderMessage,
+} from '../../src/core/reader/render';
 import { htmlToText } from '../../src/core/text/html-to-text';
 import { hostileMessages } from '../../tools/gen-export/hostile.mjs';
 
@@ -18,7 +25,7 @@ function hrefs(html: string): string[] {
   return [...html.matchAll(HREF_RE)].map((m) => m[1] ?? '');
 }
 
-function render(eml: string | Buffer, mode: 'html' | 'plain' = 'plain') {
+function render(eml: string | Buffer, mode: 'html' | 'plain' | 'html-anyway' = 'plain') {
   const bytes = typeof eml === 'string' ? Buffer.from(eml.replace(/\n/g, '\r\n')) : eml;
   return renderMessage(Readable.from([bytes]), { mode, assetBase: BASE });
 }
@@ -195,6 +202,135 @@ describe('rendering a message', () => {
       ].join('\n'),
     );
     expect(bodyText(message.html)).toBe('see attached');
+  });
+});
+
+/** A single-part message whose body has exactly `bytes` bytes. */
+function sized(type: 'text/html' | 'text/plain', bytes: number, fill = 'x'): Buffer {
+  const head = `Subject: Sized\r\nContent-Type: ${type}; charset=utf-8\r\n\r\n`;
+  const body =
+    type === 'text/html'
+      ? `<p>${fill.repeat(bytes - 7)}</p>`
+      : fill.repeat(bytes / Buffer.byteLength(fill));
+  expect(Buffer.byteLength(body)).toBe(bytes);
+  return Buffer.from(head + body);
+}
+
+/** A multipart/alternative message with these bodies, and an attachment if given. */
+function alternative(text: string, html: string, attachment?: Buffer): Buffer {
+  const lines = [
+    'Subject: Sized',
+    'Content-Type: multipart/mixed; boundary="m"',
+    '',
+    '--m',
+    'Content-Type: multipart/alternative; boundary="a"',
+    '',
+    '--a',
+    'Content-Type: text/plain; charset=utf-8',
+    '',
+    text,
+    '--a',
+    'Content-Type: text/html; charset=utf-8',
+    '',
+    html,
+    '--a--',
+  ];
+  if (attachment) {
+    lines.push(
+      '--m',
+      'Content-Type: application/octet-stream',
+      'Content-Disposition: attachment; filename="a.bin"',
+      'Content-Transfer-Encoding: base64',
+      '',
+      attachment.toString('base64').replace(/.{76}/g, '$&\r\n'),
+    );
+  }
+  lines.push('--m--', '');
+  return Buffer.from(lines.join('\r\n'));
+}
+
+describe('the reader ceilings', () => {
+  it('shows HTML up to its size limit, and plain text above it, saying the HTML can be shown anyway', async () => {
+    const within = await render(sized('text/html', HTML_VIEW_BYTES), 'html');
+    expect(within).toMatchObject({ format: 'html', htmlTooLarge: false, truncated: false });
+
+    const over = sized('text/html', HTML_VIEW_BYTES + 1);
+    const asked = await render(over, 'html');
+    expect(asked).toMatchObject({ format: 'plain', hasHtml: true, htmlTooLarge: true });
+    expect(asked.truncated).toBe(false);
+    expect(bodyText(asked.html).trim()).toHaveLength(HTML_VIEW_BYTES + 1 - 7);
+
+    const anyway = await render(over, 'html-anyway');
+    expect(anyway).toMatchObject({ format: 'html', htmlTooLarge: false, truncated: false });
+
+    // Plain text was asked for: nothing to offer.
+    const plain = await render(over, 'plain');
+    expect(plain).toMatchObject({ format: 'plain', htmlTooLarge: false, truncated: false });
+  });
+
+  it('shows HTML anyway up to the hard limit, and above it only the first part of its text', async () => {
+    const atLimit = await render(sized('text/html', HTML_ANYWAY_BYTES), 'html-anyway');
+    expect(atLimit).toMatchObject({ format: 'html', truncated: false });
+
+    const over = sized('text/html', HTML_ANYWAY_BYTES + 1);
+    for (const mode of ['html', 'html-anyway', 'plain'] as const) {
+      const message = await render(over, mode);
+      expect(message).toMatchObject({ format: 'plain', htmlTooLarge: false, truncated: true });
+      expect(bodyText(message.html)).toBe('x'.repeat(FIRST_TEXT_BYTES));
+    }
+  });
+
+  it('shows a text body up to the hard limit whole, and above it only its first part', async () => {
+    const whole = await render(sized('text/plain', HTML_ANYWAY_BYTES));
+    expect(whole.truncated).toBe(false);
+    expect(bodyText(whole.html)).toHaveLength(HTML_ANYWAY_BYTES);
+
+    // Two-byte characters: the cut falls on a character boundary.
+    const over = await render(sized('text/plain', HTML_ANYWAY_BYTES + 2, 'é'));
+    expect(over).toMatchObject({ format: 'plain', truncated: true, hasHtml: false });
+    expect(bodyText(over.html)).toBe('é'.repeat(FIRST_TEXT_BYTES / 2));
+  });
+
+  it('applies each limit to the body being shown, whatever the size of the other one', async () => {
+    const over = HTML_ANYWAY_BYTES + 4096;
+
+    // Text over the hard limit, small HTML: the HTML shows; plain text shows its first part.
+    const bigText = alternative('x'.repeat(over), '<p>small</p>');
+    for (const mode of ['html', 'html-anyway'] as const) {
+      const message = await render(bigText, mode);
+      expect(message).toMatchObject({ format: 'html', htmlTooLarge: false, truncated: false });
+      expect(htmlToText(message.html).trim()).toBe('small');
+    }
+    const bigTextPlain = await render(bigText, 'plain');
+    expect(bigTextPlain).toMatchObject({ format: 'plain', hasHtml: true, truncated: true });
+    expect(bodyText(bigTextPlain.html)).toBe('x'.repeat(FIRST_TEXT_BYTES));
+
+    // HTML over the hard limit, text between the cut and the hard limit: the text shows whole,
+    // as it would in a text-only message, and HTML can't be asked for anyway.
+    const midText = alternative('y'.repeat(2 * FIRST_TEXT_BYTES), `<p>${'h'.repeat(over)}</p>`);
+    for (const mode of ['html', 'html-anyway', 'plain'] as const) {
+      const message = await render(midText, mode);
+      expect(message).toMatchObject({
+        format: 'plain',
+        hasHtml: true,
+        htmlTooLarge: false,
+        truncated: false,
+      });
+      expect(bodyText(message.html)).toBe('y'.repeat(2 * FIRST_TEXT_BYTES));
+    }
+
+    // An attachment over the hard limit counts for neither body.
+    const attached = alternative('small', '<p>small</p>', Buffer.alloc(over, 7));
+    expect(await render(attached, 'html')).toMatchObject({ format: 'html', truncated: false });
+    const plain = await render(attached, 'plain');
+    expect(plain).toMatchObject({ format: 'plain', truncated: false });
+    expect(bodyText(plain.html)).toBe('small');
+  });
+
+  it('cuts text on a character boundary', () => {
+    expect(firstBytes('aé', 2)).toBe('a');
+    expect(firstBytes('aé', 3)).toBe('aé');
+    expect(firstBytes('😀😀', 5)).toBe('😀');
   });
 });
 

@@ -9,12 +9,12 @@ import { join } from 'node:path';
 import type { Page } from '@playwright/test';
 import type { MessageOpenResult } from '../../src/shared/api';
 import { BODY_CSP } from '../../src/shared/constants';
-import type { TestInput } from '../../src/shared/reader-protocol';
+import type { OpenMode, TestInput } from '../../src/shared/reader-protocol';
 import { hostileMessages } from '../../tools/gen-export/hostile.mjs';
 import { testDir } from '../paths';
 import { expect, test, tokenOf, type PevApp } from './app';
 
-type Entry = ({ file: string } | { test: TestInput }) & { delayMs?: number };
+type Entry = ({ file: string } | { test: TestInput }) & { gate?: string };
 
 const PLAIN = [
   'Subject: Plain <b>subject</b>',
@@ -47,14 +47,14 @@ async function source(
 function openRow(
   pev: PevApp,
   rowid: number,
-  mode: 'plain' | 'html' = 'plain',
+  mode: OpenMode = 'plain',
   page: Page = pev.page,
 ): Promise<MessageOpenResult> {
   return page.evaluate(
     async ([r, m]) => {
       const state = await window.pev.state();
       if (!state.ok) return state;
-      return window.pev.open(r as number, m as 'plain' | 'html', state.generation);
+      return window.pev.open(r as number, m as OpenMode, state.generation);
     },
     [rowid, mode] as const,
   );
@@ -89,11 +89,15 @@ function viewUrl(result: MessageOpenResult): string {
 }
 
 async function laneInfo(pev: PevApp) {
-  const result = await pev.main<{ data: { threadId: number | null; heapMb: number | null } }>(
-    'core',
-    'reader-lane',
-  );
+  const result = await pev.main<{
+    data: { threadId: number | null; heapMb: number | null; queued: number };
+  }>('core', 'reader-lane');
   return result.data;
+}
+
+/** How many lookups wait at a gate of the test source. */
+async function gateWaiting(pev: PevApp, name: string): Promise<number> {
+  return (await pev.main<{ value: number }>('readerGateWaiting', name)).value;
 }
 
 test('a message opens as plain text, served by mail-body: with its body headers', async ({
@@ -319,13 +323,196 @@ test('the huge-style and regex-heavy messages open in time or fall back', async 
   }
 });
 
+const MB = 1024 * 1024;
+
+interface Memory {
+  worker: { used: number; external: number; total: number; limit: number } | null;
+  core: { rss: number; heapUsed: number; external: number; arrayBuffers: number };
+}
+
+async function memory(pev: PevApp): Promise<Memory> {
+  return (await pev.main<{ data: Memory }>('core', 'reader-memory')).data;
+}
+
+/** The reader worker's live memory: its JS heap and the buffers outside it. */
+const workerMemory = (m: Memory) => (m.worker ? m.worker.used + m.worker.external : 0);
+
+/**
+ * Opens `rowid` on a fresh reader worker and reports the time, the peak of the
+ * worker's live memory, and how far core's resident memory (the worker's
+ * included) rose above where it was, sampled while the job runs. Rowid 1
+ * must be a small message: it starts the fresh worker before the measurement.
+ */
+async function measured(
+  pev: PevApp,
+  label: string,
+  rowid: number,
+  mode: OpenMode,
+): Promise<{ result: MessageOpenResult; ms: number; workerPeak: number; rssGrowth: number }> {
+  await pev.main('readerLimits', { heapMb: 512 });
+  viewUrl(await openRow(pev, 1));
+  const before = await memory(pev);
+  let workerPeak = workerMemory(before);
+  let rssPeak = before.core.rss;
+  const started = Date.now();
+  let done = false;
+  const opening = openRow(pev, rowid, mode).finally(() => {
+    done = true;
+  });
+  while (!done) {
+    const now = await memory(pev);
+    workerPeak = Math.max(workerPeak, workerMemory(now));
+    rssPeak = Math.max(rssPeak, now.core.rss);
+  }
+  const result = await opening;
+  const ms = Date.now() - started;
+  const rssGrowth = rssPeak - before.core.rss;
+  const outcome = !result.ok
+    ? result.code
+    : result.outcome === 'view'
+      ? `${result.format}${result.htmlTooLarge ? ', HTML too large' : ''}${result.truncated ? ', first 1 MB' : ''}`
+      : 'fallback';
+  console.log(
+    `${label} (${mode}): ${outcome} in ${ms} ms; worker memory peak ${(workerPeak / MB).toFixed(0)} MB; core RSS +${(rssGrowth / MB).toFixed(0)} MB at peak`,
+  );
+  return { result, ms, workerPeak, rssGrowth };
+}
+
+function generated(kind: 'text' | 'html' | 'attachment', bytes: number): Entry {
+  return { test: { kind: 'generated', spec: { kind, bytes, seed: 1 } } };
+}
+
+test('each reader ceiling: HTML too large, HTML anyway, the first 1 MB, and parts drained', async ({
+  pev,
+}) => {
+  await source(pev, { 'plain.eml': PLAIN }, [
+    [1, { file: 'plain.eml' }],
+    [2, generated('html', 6 * MB)],
+    [3, generated('html', 21 * MB)],
+    [4, generated('text', 21 * MB)],
+    [5, generated('attachment', 30 * MB)],
+  ]);
+  const bodyLength = async (result: MessageOpenResult) =>
+    (await pev.main<{ status: number; length: number }>('fetchIn', 1, viewUrl(result))).length;
+
+  // Over 5 MB: plain text, and HTML can be asked for anyway.
+  const large = await measured(pev, 'HTML 6 MB', 2, 'html');
+  expect(large.result).toMatchObject({
+    outcome: 'view',
+    format: 'plain',
+    hasHtml: true,
+    htmlTooLarge: true,
+    truncated: false,
+  });
+  const anyway = await measured(pev, 'HTML 6 MB', 2, 'html-anyway');
+  expect(anyway.result).toMatchObject({ outcome: 'view', format: 'html', htmlTooLarge: false });
+
+  // Over 20 MB: the first 1 MB of plain text only, for HTML and text bodies.
+  for (const [rowid, label] of [
+    [3, 'HTML 21 MB'],
+    [4, 'Text 21 MB'],
+  ] as const) {
+    for (const mode of ['html', 'html-anyway', 'plain'] as const) {
+      const cut = await measured(pev, label, rowid, mode);
+      expect(cut.result).toMatchObject({
+        outcome: 'view',
+        format: 'plain',
+        htmlTooLarge: false,
+        truncated: true,
+      });
+      const length = await bodyLength(cut.result);
+      expect(length).toBeGreaterThan(0.9 * MB);
+      expect(length).toBeLessThan(1.5 * MB);
+      // At most 20 MB of the body is kept, and decoded once.
+      expect(cut.workerPeak).toBeLessThan(256 * MB);
+    }
+  }
+
+  // A large attachment is drained: the text part shows, whole.
+  const drained = await measured(pev, 'Attachment 30 MB', 5, 'html');
+  expect(drained.result).toMatchObject({
+    outcome: 'view',
+    format: 'plain',
+    hasHtml: false,
+    truncated: false,
+  });
+  expect(drained.workerPeak).toBeLessThan(128 * MB);
+});
+
+test('"Show HTML anyway" near 20 MB ends in a view or the fallback, and plain text still opens', async ({
+  pev,
+}) => {
+  // The generated part has 30 bytes of markup around its text: just under 20 MB.
+  await source(pev, { 'plain.eml': PLAIN }, [
+    [1, { file: 'plain.eml' }],
+    [2, generated('html', 20 * MB - 64 * 1024)],
+  ]);
+  const offered = await measured(pev, 'HTML near 20 MB', 2, 'html');
+  expect(offered.result).toMatchObject({ outcome: 'view', format: 'plain', htmlTooLarge: true });
+  const anyway = await measured(pev, 'HTML near 20 MB', 2, 'html-anyway');
+  expect(anyway.result.ok).toBe(true);
+  if (anyway.result.ok && anyway.result.outcome === 'view') {
+    expect(anyway.result.format).toBe('html');
+  }
+  // The lane's limit is 3 s per job; past it, the result is the fallback.
+  expect(anyway.ms).toBeLessThan(5000);
+  // A worker left holding that much is replaced after the job (or was ended by the limit).
+  if (anyway.result.ok && anyway.result.outcome === 'view') {
+    await expect.poll(() => pev.hasLog('reader.worker_retired', { proc: 'core' })).toBe(true);
+  }
+  const plain = await measured(pev, 'HTML near 20 MB', 2, 'plain');
+  expect(plain.result).toMatchObject({ outcome: 'view', format: 'plain', truncated: false });
+});
+
+test('a body too heavy to render as HTML gives the fallback, and its plain text still opens', async ({
+  pev,
+}) => {
+  await source(pev, { 'plain.eml': PLAIN }, [
+    [1, { file: 'plain.eml' }],
+    [2, generated('html', 6 * MB)],
+  ]);
+  // Rendering this HTML needs well over this heap; its plain text needs less.
+  await pev.main('readerLimits', { heapMb: 64 });
+  expect(await openRow(pev, 2, 'html-anyway')).toMatchObject({ ok: true, outcome: 'fallback' });
+  expect(pev.hasLog('open.fallback', { reason: 'limit' })).toBe(true);
+  // The fallback's action: the same message as plain text.
+  expect(await openRow(pev, 2, 'plain')).toMatchObject({
+    ok: true,
+    outcome: 'view',
+    format: 'plain',
+    truncated: false,
+  });
+});
+
+test('the 200 MB text, HTML and attachment parts end in a view or the fallback', async ({
+  pev,
+}) => {
+  await source(pev, { 'plain.eml': PLAIN }, [
+    [1, { file: 'plain.eml' }],
+    [2, generated('text', 200 * MB)],
+    [3, generated('html', 200 * MB)],
+    [4, generated('attachment', 200 * MB)],
+  ]);
+  for (const [rowid, label] of [
+    [2, 'Text 200 MB'],
+    [3, 'HTML 200 MB'],
+    [4, 'Attachment 200 MB'],
+  ] as const) {
+    const opened = await measured(pev, label, rowid, 'html');
+    expect(opened.result.ok).toBe(true);
+    expect(opened.ms).toBeLessThan(5000);
+    // Drained, not buffered: less than the part itself.
+    expect(opened.workerPeak).toBeLessThan(192 * MB);
+  }
+});
+
 test('a stale openId or generation installs no view', async ({ pev }) => {
   await source(pev, { 'plain.eml': PLAIN }, [
     [1, { file: 'plain.eml' }],
-    // Found a little later, so the older open's result always reaches main
-    // first and main's own check discards it. (When the newer one is found
-    // first, the reader lane drops the older one; another test covers that.)
-    [2, { file: 'plain.eml', delayMs: 300 }],
+    // Found only once the older open's result has reached main, so main's own
+    // check discards it. (When the newer one is found first, the reader lane
+    // drops the older one; another test covers that.)
+    [2, { file: 'plain.eml', gate: 'second' }],
   ]);
   const held = async () => (await pev.main<{ value: number }>('core', 'held')).value;
 
@@ -335,6 +522,8 @@ test('a stale openId or generation installs no view', async ({ pev }) => {
   await expect.poll(held).toBe(2);
   await pev.main('core', 'release');
   expect(await finishOpen(pev, '__first')).toEqual({ ok: false, code: 'superseded' });
+  expect(await gateWaiting(pev, 'second')).toBe(1);
+  await pev.main('readerGate', 'second');
   const second = await finishOpen(pev, '__second');
   expect(await pev.main('liveViews', 1)).toBe(1);
   expect(await pev.main('authorizedUrl', 1)).toBe(viewUrl(second));
@@ -353,15 +542,18 @@ test('a stale openId or generation installs no view', async ({ pev }) => {
 
 test('an older open whose lookup finishes last never drops the newer one', async ({ pev }) => {
   await source(pev, { 'plain.eml': PLAIN }, [
-    // Keeps the worker busy while the next two opens arrive.
-    [1, { test: { kind: 'sleep', ms: 1500 } }],
-    // Found only after the newer open below is already queued.
-    [2, { file: 'plain.eml', delayMs: 600 }],
+    // Keeps the worker busy (within the lane's 3 s) while the next two opens arrive.
+    [1, { test: { kind: 'sleep', ms: 2500 } }],
+    // Found only once the newer open below is queued.
+    [2, { file: 'plain.eml', gate: 'older' }],
     [3, { file: 'plain.eml' }],
   ]);
   await startOpen(pev, 1, '__busy');
   await startOpen(pev, 2, '__older');
   await startOpen(pev, 3, '__newer');
+  await expect.poll(async () => (await laneInfo(pev)).queued).toBe(1);
+  expect(await gateWaiting(pev, 'older')).toBe(1);
+  await pev.main('readerGate', 'older');
   expect(await finishOpen(pev, '__older')).toEqual({ ok: false, code: 'superseded' });
   expect(await finishOpen(pev, '__busy')).toEqual({ ok: false, code: 'superseded' });
   const newer = await finishOpen(pev, '__newer');

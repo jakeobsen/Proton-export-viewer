@@ -233,6 +233,8 @@ export function registerIpc(ctx: AppContext): void {
       format: message.format,
       hasHtml: message.hasHtml,
       remote: message.remote,
+      htmlTooLarge: message.htmlTooLarge,
+      truncated: message.truncated,
       headers: message.headers,
     };
   });

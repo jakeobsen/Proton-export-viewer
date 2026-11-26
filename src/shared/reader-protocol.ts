@@ -2,8 +2,11 @@
 // Opening one message in the reader: the messages between the shell and main,
 // main and core, and core and its reader worker.
 
-/** What the shell asks for: the message's HTML body or its plain text. */
-export const OPEN_MODES = ['html', 'plain'] as const;
+/**
+ * What the shell asks for: the message's HTML body, its plain text, or its
+ * HTML body even though it is too large to open as HTML by default.
+ */
+export const OPEN_MODES = ['html', 'plain', 'html-anyway'] as const;
 export type OpenMode = (typeof OPEN_MODES)[number];
 
 /** Header fields for display. Plain strings: the shell shows them as text, never as HTML. */
@@ -38,6 +41,10 @@ export interface RenderedMessage {
   remote: number;
   /** True when the message has an HTML body. */
   hasHtml: boolean;
+  /** True when HTML was asked for but its size alone kept it from being shown; it can be asked for anyway. */
+  htmlTooLarge: boolean;
+  /** True when the body is so large that only the first part of its plain text is shown. */
+  truncated: boolean;
 }
 
 /** A large synthetic message, generated while a test runs (test builds only). */
@@ -88,7 +95,10 @@ export interface WorkerRender {
   assetBase: string;
 }
 
-/** reader worker -> core. */
+/**
+ * reader worker -> core. `heldBytes` is the memory the worker holds once the
+ * job is done: its JS heap and the buffers outside it.
+ */
 export type WorkerRendered =
-  | { type: 'rendered'; reqId: number; ok: true; message: RenderedMessage }
-  | { type: 'rendered'; reqId: number; ok: false; code: 'parse' };
+  | { type: 'rendered'; reqId: number; heldBytes: number; ok: true; message: RenderedMessage }
+  | { type: 'rendered'; reqId: number; heldBytes: number; ok: false; code: 'parse' };
