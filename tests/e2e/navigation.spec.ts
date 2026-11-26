@@ -2,6 +2,7 @@
 // Navigation: links go to the link dialog, nothing navigates, and only the
 // authorized body URL can be (re)loaded.
 
+import type { Frame } from '@playwright/test';
 import { expect, test, type PevApp } from './app';
 
 async function dialogs(pev: PevApp): Promise<Array<{ windowId: number; url: string }>> {
@@ -13,6 +14,29 @@ async function waitFor(check: () => boolean, ms: number): Promise<boolean> {
   const end = Date.now() + ms;
   while (!check() && Date.now() < end) await new Promise((r) => setTimeout(r, 100));
   return check();
+}
+
+/**
+ * Clicks a link in the body frame until the link dialog has recorded `count`
+ * links. A click into the body frame of a window that was never shown can be
+ * lost while the frame is not yet ready for input, so it is tried again, up to
+ * five times, two seconds apart. Callers still check the exact list of
+ * dialogs, so a late click that opened a second one fails the test.
+ */
+async function clickToDialog(
+  pev: PevApp,
+  frame: Frame,
+  selector: string,
+  count: number,
+): Promise<void> {
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    await frame.click(selector);
+    const end = Date.now() + 2_000;
+    while (Date.now() < end) {
+      if ((await dialogs(pev)).length >= count) return;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
 }
 
 async function bodyRequests(pev: PevApp, url: string): Promise<number> {
@@ -55,12 +79,13 @@ test('a link click in the body opens the link dialog and nothing navigates', asy
 test('target=_blank links go to the dialog', async ({ pev }) => {
   const opened = await pev.open('links');
   const frame = await pev.bodyFrame(opened.url as string);
-  await frame.click('#link-blank');
+  await clickToDialog(pev, frame, '#link-blank', 1);
+  expect(await dialogs(pev)).toEqual([{ windowId: 1, url: 'https://example.org/blank' }]);
   // The link dialog covers the body; cancel it like a user before the next link.
   await expect(pev.page.locator('.dialog-url')).toHaveText('https://example.org/blank');
   await pev.page.click('.dialog-button');
   await expect(pev.page.locator('.dialog')).toHaveCount(0);
-  await frame.click('#link-mailto');
+  await clickToDialog(pev, frame, '#link-mailto', 2);
   await expect(pev.page.locator('.dialog-url')).toHaveText('mailto:someone@example.org');
   await expect
     .poll(() => dialogs(pev))
