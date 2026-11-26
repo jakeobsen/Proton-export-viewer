@@ -12,7 +12,7 @@ import {
   realpathSync,
   writeFileSync,
 } from 'node:fs';
-import { join, sep } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ProofCall, ProofReply } from '../../src/shared/core-protocol';
 import { handleProof } from '../../src/testhooks/proof/core';
@@ -32,9 +32,12 @@ const asRoot = process.getuid?.() === 0;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Result = Record<string, any>;
 
+const ACCOUNT = 'proof@example.com';
+const RUN = 'mail_20250101_000000';
+
 /** A small export with `pairs` message pairs. */
 function makeExport(root: string, pairs = 4): string {
-  const run = join(root, 'proof@example.com', 'mail_20250101_000000');
+  const run = join(root, ACCOUNT, RUN);
   mkdirSync(run, { recursive: true });
   writeFileSync(join(run, 'labels.json'), '{"Version":1,"Payload":[]}');
   for (let i = 0; i < pairs; i += 1) {
@@ -125,6 +128,10 @@ function setup(options: { writable?: boolean } = {}) {
   const expected: ExpectedExport[] = [one, two].map((path) => ({
     path,
     digest: scanTree(path).digest!,
+    account: {
+      path: join(path, ACCOUNT),
+      digest: scanTree(join(path, ACCOUNT)).digest!,
+    },
   }));
   if (!options.writable) {
     lock(one);
@@ -166,6 +173,8 @@ function setup(options: { writable?: boolean } = {}) {
   return { root, one, two, expected, dir, core, inScope, pickedAt, launch, state };
 }
 
+type Setup = ReturnType<typeof setup>;
+
 const eventNames = (result: Result) =>
   (result.events as Array<{ event: string }>).map((e) => e.event);
 
@@ -179,7 +188,12 @@ describe('runProofLaunch', () => {
     expect(first.stopped).toBeUndefined();
     expect(first.phase).toBe('first launch');
     expect(t.pickedAt).toEqual([t.one]);
-    expect(first.picked).toEqual({ path: t.one, physical: t.one, digest: t.expected[0]!.digest });
+    expect(first.picked).toEqual({
+      path: t.one,
+      physical: t.one,
+      level: 'export',
+      digest: t.expected[0]!.digest,
+    });
     expect(first.step1.scan).toMatchObject({ ok: true, digest: t.expected[0]!.digest });
     expect(first.step2).toMatchObject({ main: allDenied, core: allDenied });
     expect(first.step2.after).toBe(t.expected[0]!.digest);
@@ -240,7 +254,7 @@ describe('runProofLaunch', () => {
       reason: `${other} is not the expected export`,
       failedCheck: true,
     });
-    expect(result.picked).toEqual({ path: other, physical: other, digest: null });
+    expect(result.picked).toEqual({ path: other, physical: other, level: null, digest: null });
     expect(t.core.spawns).toEqual([]);
     expect(t.state()).toEqual({
       failed: { launch: 'launch1', step: 'pick the first export', reason: result.stopped.reason },
@@ -250,6 +264,71 @@ describe('runProofLaunch', () => {
     expect(next.phase).toBe('stopped before');
     expect(next.previous).toEqual(t.state().failed);
     expect(t.pickedAt).toHaveLength(1);
+    expect(t.core.spawns).toEqual([]);
+  });
+
+  it.skipIf(asRoot)(
+    'accepts the account folder inside an export, checked against its own digest',
+    async () => {
+      const t = setup();
+      const first = join(t.one, ACCOUNT);
+      const second = join(t.two, ACCOUNT);
+      const [one, two] = [t.expected[0]!.account!, t.expected[1]!.account!];
+
+      const launch1 = (await t.launch([first])) as Result;
+      expect(launch1.stopped).toBeUndefined();
+      expect(launch1.picked).toEqual({
+        path: first,
+        physical: first,
+        level: 'account',
+        digest: one.digest,
+      });
+      expect(launch1.step1.scan).toMatchObject({ ok: true, digest: one.digest });
+      expect(launch1.step2.after).toBe(one.digest);
+      expect(t.state().first).toMatchObject({ path: first });
+
+      const launch2 = (await t.launch([second])) as Result;
+      expect(launch2.stopped).toBeUndefined();
+      expect(launch2.step3.checked).toMatchObject({ level: 'account', digest: one.digest });
+      expect(launch2.picked).toMatchObject({ level: 'account', digest: two.digest });
+      expect(launch2.step4.read.scan).toMatchObject({ ok: true, digest: two.digest });
+      expect(launch2.step4.firstExport.core).toMatchObject({ ok: false, code: 'EPERM' });
+      expect(t.inScope.size).toBe(0);
+    },
+  );
+
+  it.each([
+    ['a run folder inside the account folder', (t: Setup) => join(t.one, ACCOUNT, RUN)],
+    ['the other export', (t: Setup) => t.two],
+    ["the other export's account folder", (t: Setup) => join(t.two, ACCOUNT)],
+    ['the folder holding the export', (t: Setup) => dirname(t.one)],
+  ])('refuses %s, before anything else', async (_name, at) => {
+    const t = setup();
+    const path = at(t);
+    const result = (await t.launch([path])) as Result;
+    expect(result.stopped).toEqual({
+      step: 'pick the first export',
+      reason: `${path} is not the expected export`,
+      failedCheck: true,
+    });
+    expect(result.picked).toEqual({ path, physical: path, level: null, digest: null });
+    expect(t.core.spawns).toEqual([]);
+    expect(t.state().first).toBeUndefined();
+  });
+
+  it('refuses the account folder when it no longer matches its recorded digest', async () => {
+    const t = setup();
+    const account = join(t.one, ACCOUNT);
+    const changed = [
+      { ...t.expected[0]!, account: { path: account, digest: '0'.repeat(64) } },
+      t.expected[1]!,
+    ];
+    const result = (await t.launch([account], { expected: changed })) as Result;
+    expect(result.stopped.reason).toBe(`${account} does not match its manifest digest`);
+    expect(result.picked).toMatchObject({
+      level: 'account',
+      digest: t.expected[0]!.account!.digest,
+    });
     expect(t.core.spawns).toEqual([]);
   });
 

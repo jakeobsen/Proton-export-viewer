@@ -18,7 +18,7 @@ import { appName } from './vite-plugins.mjs';
 export const APP_ID = 'com.example.pev';
 // The app group in the entitlements, APP_ID, is a prefix of this bundle ID, as
 // the Mac App Store build of Electron requires.
-export const FOLDER_PROOF_APP_ID = `${APP_ID}.folderproof`;
+export const FOLDER_PROOF_APP_ID = `${APP_ID}.folderproof2`;
 export const PRODUCT_NAME = appName();
 
 export const FUSES = {
