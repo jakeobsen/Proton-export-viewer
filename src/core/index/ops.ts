@@ -5,6 +5,8 @@
 // worker threads (see thread.ts); tests call them directly.
 
 import { chmodSync, closeSync, openSync, statSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { overlaps } from '../../shared/overlap';
 import type { Stamp } from '../../shared/sources';
 import { readWithRescan, type FileRef } from '../containment';
 import { FamilyInUse, deleteFamily, familyBytes } from './family';
@@ -95,6 +97,11 @@ export interface WriterOpen {
   /** The most the index may take on disk with its WAL and shared memory; null for no cap. */
   capBytes: number | null;
   /**
+   * The folders of the exports the app knows. While one of them overlaps the
+   * index folder, no index file is opened for writing, deleted or made.
+   */
+  exportRoots?: string[];
+  /**
    * Set to 1 when the index is torn down: the write in flight stops at its
    * next unit of work and rolls back.
    */
@@ -120,6 +127,18 @@ export interface ApplyResult extends ApplyStats {
   indexBytes: number;
 }
 
+/**
+ * Throws INDEX_OVERLAP if a known export overlaps the index folder now, with
+ * links resolved at this moment: then nothing of an export may be written,
+ * deleted or made in its place. Asked right before each such step.
+ */
+function refuseOverlap(args: WriterOpen): void {
+  const dir = dirname(args.dbPath);
+  if ((args.exportRoots ?? []).some((root) => overlaps(root, dir))) {
+    throw new Error('INDEX_OVERLAP');
+  }
+}
+
 /** The pause between checkpoint tries while readers keep the WAL busy. */
 const CHECKPOINT_PAUSE_MS = 50;
 const PAUSE = new Int32Array(new SharedArrayBuffer(4));
@@ -140,11 +159,13 @@ export class WriterState {
     if (exists) {
       mismatch = probeMismatch(args.dbPath, args.expectedUuid);
       if (mismatch === null && args.expectedUuid !== null) {
+        refuseOverlap(args);
         const kept = this.openExisting(args, args.expectedUuid);
         if (typeof kept !== 'string') return kept;
         mismatch = kept;
       }
     }
+    refuseOverlap(args);
     // A failed candidate was closed; this refuses if anything still holds the family.
     deleteFamily(args.dbPath);
     // SQLite gives the WAL and shared-memory files the database file's mode,

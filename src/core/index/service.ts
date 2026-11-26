@@ -136,6 +136,8 @@ export interface IndexServiceDeps {
   /** False once the source's generation has moved on. */
   isCurrent: () => boolean;
   options?: IndexOptions;
+  /** The folders of the exports the app knows, checked by the writer before it changes a file. */
+  exportRoots?: string[];
   /** Core's registry of connections; the index's own one if none is given. */
   connections?: ConnectionRegistry;
   /** Called once, with the reason, when the index turns out to be damaged. */
@@ -320,6 +322,7 @@ export class IndexService {
       stamp: this.deps.stamp,
       expectedUuid,
       capBytes: this.capBytes,
+      exportRoots: this.deps.exportRoots ?? [],
       cancel: this.cancel,
     });
     this.writerEntry = this.connections.add({ role: 'writer', dbPath: this.dbPath });
