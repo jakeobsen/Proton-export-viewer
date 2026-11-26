@@ -112,7 +112,72 @@ export function gif(width, height, frames) {
   return Buffer.concat(parts);
 }
 
+/**
+ * A PNG of `bytes` bytes or a little more: a valid 1x1 image whose size comes
+ * from a private ancillary chunk of zeros, which decoders skip.
+ */
+export function paddedPng(bytes) {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(1, 0);
+  ihdr.writeUInt32BE(1, 4);
+  ihdr.set([1, 0, 0, 0, 0], 8);
+  // One row: filter byte 0 and one pixel byte, as a stored zlib block.
+  const row = Buffer.from([0, 0]);
+  const zlib = Buffer.concat([
+    Buffer.from([0x78, 0x01, 0x01, row.length, 0, ~row.length & 0xff, 0xff]),
+    row,
+    Buffer.alloc(4),
+  ]);
+  zlib.writeUInt32BE(adler32(row), zlib.length - 4);
+  const head = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+  ]);
+  const tail = Buffer.concat([pngChunk('IDAT', zlib), pngChunk('IEND', Buffer.alloc(0))]);
+  const pad = Math.max(0, bytes - head.length - tail.length - 12);
+  return Buffer.concat([head, pngChunk('prVt', Buffer.alloc(pad)), tail]);
+}
+
 // --- Messages ------------------------------------------------------------------
+
+/** Script that runs anywhere sets this attribute on the root element and logs this line. */
+export const SCRIPT_MARKER = 'pev-script-marker';
+export const MARKER_ATTRIBUTE = 'data-pev-script';
+const MARKER_JS = `document.documentElement.setAttribute('${MARKER_ATTRIBUTE}','ran');console.log('${SCRIPT_MARKER}')`;
+
+/**
+ * What a message's body refers to. Every hostile message declares it next to
+ * its definition:
+ * - `rewrite`: how many distinct remote URLs the sanitizer must rewrite to
+ *   placeholders: `src`, `srcset`, `background`, `poster` and CSS image
+ *   `url()`/`image-set()` on what it keeps;
+ * - `loads`: the remote references a browser fetches or reports when the body
+ *   is served unsanitized, with the header CSP and the frame sandbox in place.
+ *   An item that is a list names alternatives, of which the browser picks one
+ *   (by pixel density, as for `srcset`). URLs are as written; compare them
+ *   after URL parsing;
+ * - `hints`: DNS-only hints (`dns-prefetch`, `preconnect`). They are no load
+ *   but must not survive the sanitizer.
+ */
+function refs(rewrite, loads = [], hints = []) {
+  return { rewrite, loads, hints };
+}
+
+export function checkRefs(where, declared) {
+  const ok =
+    declared &&
+    Number.isSafeInteger(declared.rewrite) &&
+    declared.rewrite >= 0 &&
+    Array.isArray(declared.loads) &&
+    declared.loads.every(
+      (l) =>
+        typeof l === 'string' ||
+        (Array.isArray(l) && l.length > 1 && l.every((a) => typeof a === 'string')),
+    ) &&
+    Array.isArray(declared.hints) &&
+    declared.hints.every((h) => typeof h === 'string');
+  if (!ok) throw new Error(`${where}: no valid reference declaration`);
+}
 
 function crlf(lines) {
   return lines.join('\r\n');
@@ -135,7 +200,8 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
   let time = Date.UTC(2024, 0, 1) / 1000;
   const sender = { Name: 'Hostile Sender', Address: 'sender@example.org' };
 
-  const add = (category, name, contentType, body, extra = {}) => {
+  const add = (category, name, contentType, body, declared, extra = {}) => {
+    checkRefs(`${category}/${name}`, declared);
     counts[category] = (counts[category] ?? 0) + 1;
     time += 600;
     const id = exportId(rng);
@@ -179,6 +245,7 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
       mimeType: contentType?.split(';')[0] ?? 'text/plain',
       skipEml: extra.skipEml,
       skipMetadata: extra.skipMetadata,
+      refs: declared,
     };
     plans.push(plan);
     return plan;
@@ -189,67 +256,242 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
 
   // Script and markup.
   const markup = {
-    'script-inline': page(`<script>document.title = 'ran';</script><p>text</p>`),
-    'script-src': page(`<script src="${url('script.js')}"></script>`),
-    'event-handlers': page(
-      `<img src="x" onerror="this.src='${url('onerror.png')}'"><div onmouseover="fetch('${url('hover')}')">hover</div>`,
-      '',
-    ).replace('<body>', `<body onload="new Image().src='${url('onload.png')}'">`),
-    'javascript-url': page(
-      `<a href="javascript:fetch('${url('js-link')}')">link</a><iframe src="javascript:alert(1)"></iframe>`,
-    ),
-    'svg-image': page(`<svg><image href="${url('svg-image.png')}" width="10" height="10"/></svg>`),
-    'svg-use': page(`<svg><use href="${url('sprite.svg')}#icon"/></svg>`),
-    'svg-feimage': page(
-      `<svg><filter id="f"><feImage href="${url('feimage.png')}"/></filter><rect filter="url(#f)" width="9" height="9"/></svg>`,
-    ),
-    srcset: page(
-      `<img srcset="${url('srcset-1x.png')} 1x, ${url('srcset-2x.png')} 2x"><picture><source srcset="${url('source.png')}"><img src="cid:none"></picture>`,
-    ),
-    poster: page(`<video poster="${url('poster.png')}" src="${url('video.mp4')}"></video>`),
-    'background-attribute': page(
-      `<table background="${url('table-bg.png')}"><tr><td background="${url('td-bg.png')}">cell</td></tr></table>`,
-    ).replace('<body>', `<body background="${url('body-bg.png')}">`),
-    'css-url': page(
-      `<div style="background:url('${url('style-attr.png')}')">x</div>`,
-      `<style>p{background-image:url(${url('style-block.png')})}</style>`,
-    ),
-    'css-image-set': page(
-      `<div style="background-image:image-set('${url('set-1x.png')}' 1x, '${url('set-2x.png')}' 2x)">x</div>`,
-    ),
-    'css-import': page('<p>x</p>', `<style>@import url("${url('import.css')}");</style>`),
-    'css-font-face': page(
-      '<p style="font-family:Canary">x</p>',
-      `<style>@font-face{font-family:Canary;src:url(${url('font.woff2')})}</style>`,
-    ),
-    'meta-refresh': page(
-      '<p>x</p>',
-      `<meta http-equiv="refresh" content="0;url=${url('refresh')}">`,
-    ),
-    base: page(
-      '<img src="relative.png"><a href="relative">link</a>',
-      `<base href="${url('base/')}">`,
-    ),
-    form: page(
-      `<form action="${url('form')}" method="post"><input name="q" value="1"><button>Send</button></form>`,
-    ),
-    'link-hints': page(
-      '<p>x</p>',
-      `<link rel="preconnect" href="https://pc.${host}"><link rel="dns-prefetch" href="//dns.${host}">` +
-        `<link rel="prefetch" href="${url('prefetch')}"><link rel="preload" as="image" href="${url('preload.png')}">`,
-    ),
-    'speculation-rules': page(
-      `<script type="speculationrules">{"prefetch":[{"source":"list","urls":["${url('spec-prefetch')}"],"eagerness":"eager"}],` +
-        `"prerender":[{"source":"list","urls":["${url('spec-prerender')}"],"eagerness":"eager"}]}</script>`,
-    ),
-    'remote-image': page(`<img src="${url('pixel.png')}" width="1" height="1">`),
-    'embedded-content': page(
-      `<iframe src="${url('frame')}"></iframe><object data="${url('object')}"></object><embed src="${url('embed')}"><audio src="${url('audio.mp3')}"></audio>`,
-    ),
-    stylesheet: page('<p>x</p>', `<link rel="stylesheet" href="${url('sheet.css')}">`),
-    'anchor-ping': page(`<a href="${url('ping-target')}" ping="${url('ping')}">link</a>`),
+    'script-inline': [
+      page(`<script>document.title = 'ran';${MARKER_JS}</script><p>text</p>`),
+      refs(0),
+    ],
+    'script-src': [
+      page(`<script src="${url('script.js')}"></script><script>${MARKER_JS}</script>`),
+      refs(0),
+    ],
+    'event-handlers': [
+      page(
+        `<img src="x" onerror="${MARKER_JS};this.src='${url('onerror.png')}'"><div onmouseover="${MARKER_JS};fetch('${url('hover')}')">hover</div>`,
+        '',
+      ).replace('<body>', `<body onload="${MARKER_JS};new Image().src='${url('onload.png')}'">`),
+      refs(0),
+    ],
+    'javascript-url': [
+      page(
+        `<a href="javascript:${MARKER_JS};fetch('${url('js-link')}')">link</a><iframe src="javascript:${MARKER_JS}"></iframe>`,
+      ),
+      refs(0),
+    ],
+    'svg-image': [
+      page(`<svg><image href="${url('svg-image.png')}" width="10" height="10"/></svg>`),
+      refs(0, [url('svg-image.png')]),
+    ],
+    'svg-use': [page(`<svg><use href="${url('sprite.svg')}#icon"/></svg>`), refs(0)],
+    'svg-feimage': [
+      page(
+        `<svg><filter id="f"><feImage href="${url('feimage.png')}"/></filter><rect filter="url(#f)" width="9" height="9"/></svg>`,
+      ),
+      refs(0, [url('feimage.png')]),
+    ],
+    srcset: [
+      page(
+        `<img srcset="${url('srcset-1x.png')} 1x, ${url('srcset-2x.png')} 2x"><picture><source srcset="${url('source.png')}"><img src="cid:none"></picture>`,
+      ),
+      refs(3, [[url('srcset-1x.png'), url('srcset-2x.png')], url('source.png')]),
+    ],
+    poster: [
+      page(`<video poster="${url('poster.png')}" src="${url('video.mp4')}"></video>`),
+      refs(2, [url('poster.png'), url('video.mp4')]),
+    ],
+    'background-attribute': [
+      page(
+        `<table background="${url('table-bg.png')}"><tr><td background="${url('td-bg.png')}">cell</td></tr></table>`,
+      ).replace('<body>', `<body background="${url('body-bg.png')}">`),
+      refs(3, [url('body-bg.png'), url('table-bg.png'), url('td-bg.png')]),
+    ],
+    'css-url': [
+      page(
+        `<div style="background:url('${url('style-attr.png')}')">x</div>`,
+        `<style>p{background-image:url(${url('style-block.png')})}</style>`,
+      ),
+      // Nothing matches the <style> rule, so only the attribute's image loads.
+      refs(2, [url('style-attr.png')]),
+    ],
+    'css-image-set': [
+      page(
+        `<div style="background-image:image-set('${url('set-1x.png')}' 1x, '${url('set-2x.png')}' 2x)">x</div>`,
+      ),
+      refs(2, [[url('set-1x.png'), url('set-2x.png')]]),
+    ],
+    'css-import': [
+      page('<p>x</p>', `<style>@import url("${url('import.css')}");</style>`),
+      refs(0, [url('import.css')]),
+    ],
+    'css-font-face': [
+      page(
+        '<p style="font-family:Canary">x</p>',
+        `<style>@font-face{font-family:Canary;src:url(${url('font.woff2')})}</style>`,
+      ),
+      refs(0, [url('font.woff2')]),
+    ],
+    'meta-refresh': [
+      page('<p>x</p>', `<meta http-equiv="refresh" content="0;url=${url('refresh')}">`),
+      refs(0),
+    ],
+    base: [
+      page('<img src="relative.png"><a href="relative">link</a>', `<base href="${url('base/')}">`),
+      // The header CSP refuses the base URL, and reports it.
+      refs(0, [url('base/')]),
+    ],
+    form: [
+      page(
+        `<form action="${url('form')}" method="post"><input name="q" value="1"><button>Send</button></form>`,
+      ),
+      refs(0),
+    ],
+    'link-hints': [
+      page(
+        '<p>x</p>',
+        `<link rel="preconnect" href="https://pc.${host}"><link rel="dns-prefetch" href="//dns.${host}">` +
+          `<link rel="prefetch" href="${url('prefetch')}"><link rel="preload" as="image" href="${url('preload.png')}">`,
+      ),
+      refs(0, [url('prefetch'), url('preload.png')], [`https://pc.${host}`, `//dns.${host}`]),
+    ],
+    'dns-prefetch-control': [
+      page(
+        `<a href="https://dns-link.${host}/">link</a>`,
+        `<meta http-equiv="x-dns-prefetch-control" content="on"><link rel="dns-prefetch" href="//dns-control.${host}">`,
+      ),
+      refs(0, [], [`//dns-control.${host}`]),
+    ],
+    'speculation-rules': [
+      page(
+        `<script type="speculationrules">{"prefetch":[{"source":"list","urls":["${url('spec-prefetch')}"],"eagerness":"eager"}],` +
+          `"prerender":[{"source":"list","urls":["${url('spec-prerender')}"],"eagerness":"eager"}]}</script>`,
+      ),
+      refs(0),
+    ],
+    'remote-image': [
+      page(`<img src="${url('pixel.png')}" width="1" height="1">`),
+      refs(1, [url('pixel.png')]),
+    ],
+    'embedded-content': [
+      page(
+        `<iframe src="${url('frame')}"></iframe><object data="${url('object')}"></object><embed src="${url('embed')}"><audio src="${url('audio.mp3')}"></audio>`,
+      ),
+      // The CSP reports a refused frame by its origin only.
+      refs(1, [`https://${host}/`, url('object'), url('embed'), url('audio.mp3')]),
+    ],
+    stylesheet: [
+      page('<p>x</p>', `<link rel="stylesheet" href="${url('sheet.css')}">`),
+      refs(0, [url('sheet.css')]),
+    ],
+    'anchor-ping': [
+      page(`<a href="${url('ping-target')}" ping="${url('ping')}">link</a>`),
+      refs(0),
+    ],
   };
-  for (const [name, body] of Object.entries(markup)) add('script_markup', name, htmlType, body);
+  for (const [name, [body, declared]] of Object.entries(markup))
+    add('script_markup', name, htmlType, body, declared);
+
+  // CSS the filter must drop or keep.
+  const css = {
+    behavior: [page(`<p style="behavior:url(${url('behavior.htc')})">x</p>`), refs(0)],
+    'moz-binding': [page(`<p style="-moz-binding:url(${url('binding.xml')}#b)">x</p>`), refs(0)],
+    expression: [page(`<p style="width:expression(fetch('${url('expression')}'))">x</p>`), refs(0)],
+    'position-fixed': [
+      page('<div style="position:fixed;top:0;left:0;right:0;bottom:0;z-index:9">cover</div>'),
+      refs(0),
+    ],
+    keyframes: [
+      page(
+        '<p>x</p>',
+        `<style>@keyframes k{from{background-image:url(${url('keyframes.png')})}}p{animation:k 1s}</style>`,
+      ),
+      refs(0, [url('keyframes.png')]),
+    ],
+    supports: [
+      page(
+        '<p>x</p>',
+        `<style>@supports (display:block){p{background-image:url(${url('supports.png')})}}</style>`,
+      ),
+      refs(0, [url('supports.png')]),
+    ],
+    namespace: [
+      page('<p>x</p>', `<style>@namespace url(${url('namespace')});p{color:red}</style>`),
+      refs(0),
+    ],
+    page: [
+      page('<p>x</p>', `<style>@page{background-image:url(${url('page.png')})}</style>`),
+      refs(0),
+    ],
+    'media-url': [
+      page(
+        '<p>x</p>',
+        `<style>@media screen{p{background-image:url(${url('media.png')})}}</style>`,
+      ),
+      refs(1, [url('media.png')]),
+    ],
+  };
+  for (const [name, [body, declared]] of Object.entries(css))
+    add('css', name, htmlType, body, declared);
+
+  // data: URIs on links and images.
+  const dataHtml = `data:text/html,${encodeURIComponent(`<script>${MARKER_JS}</script>`)}`;
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">` +
+    `<image href="${url('data-svg.png')}" width="10" height="10"/><script>${MARKER_JS}</script></svg>`;
+  const dataSvg = `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
+  const fakePng = `data:image/png;base64,${Buffer.from('not an image at all').toString('base64')}`;
+  const largePng = `data:image/png;base64,${paddedPng(1024 * 1024 + 4096).toString('base64')}`;
+  const dataUris = {
+    'html-link': [page(`<a href="${dataHtml}">link</a>`), refs(0)],
+    'html-image': [page(`<img src="${dataHtml}" width="10" height="10">`), refs(0)],
+    'svg-link': [page(`<a href="${dataSvg}">link</a>`), refs(0)],
+    'svg-image': [page(`<img src="${dataSvg}" width="10" height="10">`), refs(0)],
+    'fake-png': [page(`<img src="${fakePng}" width="10" height="10">`), refs(0)],
+    'large-png': [page(`<img src="${largePng}" width="10" height="10">`), refs(0)],
+  };
+  for (const [name, [body, declared]] of Object.entries(dataUris))
+    add('data_uris', name, htmlType, body, declared);
+
+  // Links whose text or host misleads.
+  const links = {
+    'text-names-other-host': [
+      page(`<a href="${url('real')}">https://bank.${host}/login</a>`),
+      refs(0),
+    ],
+    'idn-host': [page(`<a href="https://bücher.${host}/">bücher</a>`), refs(0)],
+    'mixed-script-host': [page(`<a href="https://pаypal.${host}/">paypal</a>`), refs(0)],
+  };
+  for (const [name, [body, declared]] of Object.entries(links))
+    add('links', name, htmlType, body, declared);
+
+  // Plain text with markup and URLs, and a message with both forms.
+  add(
+    'plain_text',
+    'markup-and-urls',
+    'text/plain; charset=utf-8',
+    crlf([
+      `<script>${MARKER_JS}</script> <b>bold?</b> <img src="${url('plain.png')}">`,
+      `javascript:${MARKER_JS}`,
+      `http://192.0.2.10/plain http://[2001:db8::10]/plain http://0x7f000001/plain`,
+      `${url('plain-link')} and mailto:someone@${host}`,
+    ]),
+    refs(0),
+  );
+  add(
+    'plain_text',
+    'alternative',
+    'multipart/alternative; boundary="alt"',
+    crlf([
+      '--alt',
+      'Content-Type: text/plain; charset=utf-8',
+      '',
+      `The plain form, with a link: ${url('alt-link')}`,
+      '--alt',
+      `Content-Type: ${htmlType}`,
+      '',
+      page(`<p>The HTML form.</p><img src="${url('alt.png')}"><script>${MARKER_JS}</script>`),
+      '--alt--',
+    ]),
+    refs(1, [url('alt.png')]),
+  );
 
   // IP-literal URLs, as links and as images.
   for (const [name, literal] of IP_LITERAL_FORMS) {
@@ -258,6 +500,7 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
       name,
       htmlType,
       page(`<a href="http://${literal}/link">link</a> <img src="http://${literal}/image.png">`),
+      refs(1, [`http://${literal}/image.png`]),
     );
   }
 
@@ -294,20 +537,27 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
     ],
   };
   for (const [name, [type, body]] of Object.entries(malformed))
-    add('malformed_mime', name, type, body);
+    add('malformed_mime', name, type, body, refs(0));
   add(
     'malformed_mime',
     'bad-quoted-printable',
     'text/plain; charset=utf-8',
     '=ZZ broken =\r\nline=4',
+    refs(0),
     {
       headers: ['Content-Transfer-Encoding: quoted-printable'],
     },
   );
-  add('malformed_mime', 'long-header-line', 'text/plain', 'body', {
+  add('malformed_mime', 'long-header-line', 'text/plain', 'body', refs(0), {
     subject: `long ${'x'.repeat(100000)}`,
   });
-  add('malformed_mime', 'lf-only', 'text/plain', Buffer.from('line one\nline two\nline three\n'));
+  add(
+    'malformed_mime',
+    'lf-only',
+    'text/plain',
+    Buffer.from('line one\nline two\nline three\n'),
+    refs(0),
+  );
 
   const charsets = {
     'iso-8859-1': Buffer.from([0x63, 0x61, 0x66, 0xe9, 0x20, 0x6e, 0x61, 0xef, 0x76, 0x65]),
@@ -320,7 +570,7 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
     'x-made-up': Buffer.from([0xc3, 0x28, 0xa0, 0xa1]),
   };
   for (const [charset, bytes] of Object.entries(charsets)) {
-    add('odd_charsets', charset, `text/plain; charset=${charset}`, bytes);
+    add('odd_charsets', charset, `text/plain; charset=${charset}`, bytes, refs(0));
   }
 
   // Inputs that are slow to parse or render.
@@ -329,12 +579,14 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
     'nested-divs',
     htmlType,
     page(`${'<div>'.repeat(5000)}deep${'</div>'.repeat(5000)}`),
+    refs(0),
   );
   add(
     'pathological',
     'nested-tables',
     htmlType,
     page(`${'<table><tr><td>'.repeat(1000)}deep${'</td></tr></table>'.repeat(1000)}`),
+    refs(0),
   );
   {
     const rules = [];
@@ -345,6 +597,7 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
       'huge-style',
       htmlType,
       page('<p class="c1">x</p>', `<style>\n${rules.join('\n')}\n</style>`),
+      refs(0),
     );
   }
   add(
@@ -357,8 +610,9 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
         `[title*="${'a'.repeat(5000)}"]{color:blue} ` +
         `${'div '.repeat(2000)}p{color:green}</style>`,
     ),
+    refs(0),
   );
-  add('pathological', 'long-line', htmlType, page(`<p>${'word '.repeat(200000)}</p>`));
+  add('pathological', 'long-line', htmlType, page(`<p>${'word '.repeat(200000)}</p>`), refs(0));
 
   // Attachments with hostile file names, and image bombs.
   const names = [
@@ -396,6 +650,7 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
         base64Lines(Buffer.from('attachment\n')),
         `--${b}--`,
       ]),
+      refs(0),
       { attachments: [{ name: filename, type: 'application/octet-stream', bytes: 11 }] },
     );
   }
@@ -425,12 +680,14 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
         base64Lines(bytes),
         `--${b}--`,
       ]),
+      // The image is a cid: part, not a remote reference.
+      refs(0),
       { attachments: [{ name: `${name}.${type.split('/')[1]}`, type, bytes: bytes.length }] },
     );
   }
 
   // Export structure.
-  add('export_structure', 'unknown-label-ids', 'text/plain', 'unknown labels', {
+  add('export_structure', 'unknown-label-ids', 'text/plain', 'unknown labels', refs(0), {
     labels: ['0', '5', '22', '24', 'NotALabel=='],
   });
   counts.export_structure_nested_labels = labelInfo.file.Payload.filter((l) => l.ParentID).length;
@@ -449,13 +706,27 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
       data: Buffer.from('{"Version":1,"Payload":{"ID":"decoy"}}'),
     },
   );
-  const symlinkEml = add('export_structure', 'symlink-eml', 'text/plain', 'replaced by a link', {
-    skipEml: true,
-  });
+  const symlinkEml = add(
+    'export_structure',
+    'symlink-eml',
+    'text/plain',
+    'replaced by a link',
+    refs(0),
+    {
+      skipEml: true,
+    },
+  );
   extras.push({ path: `${symlinkEml.id}.eml`, type: 'symlink', target: '../../decoy/decoy.eml' });
-  const symlinkMeta = add('export_structure', 'symlink-metadata', 'text/plain', 'real eml', {
-    skipMetadata: true,
-  });
+  const symlinkMeta = add(
+    'export_structure',
+    'symlink-metadata',
+    'text/plain',
+    'real eml',
+    refs(0),
+    {
+      skipMetadata: true,
+    },
+  );
   extras.push(
     {
       path: 'decoy-target.metadata.txt',
@@ -473,28 +744,47 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
     'symlink-directory',
     'text/plain',
     'link to a folder',
+    refs(0),
     { skipEml: true },
   );
   extras.push({ path: `${symlinkDir.id}.eml`, type: 'symlink', target: '../../decoy' });
-  const fifoEml = add('export_structure', 'fifo-eml', 'text/plain', 'replaced by a FIFO', {
+  const fifoEml = add('export_structure', 'fifo-eml', 'text/plain', 'replaced by a FIFO', refs(0), {
     skipEml: true,
   });
   extras.push({ path: `${fifoEml.id}.eml`, type: 'fifo' });
-  const fifoMeta = add('export_structure', 'fifo-metadata', 'text/plain', 'real eml', {
+  const fifoMeta = add('export_structure', 'fifo-metadata', 'text/plain', 'real eml', refs(0), {
     skipMetadata: true,
   });
   extras.push({ path: `${fifoMeta.id}.metadata.json`, type: 'fifo' });
-  add('export_structure', 'metadata-only-1', 'text/plain', 'no eml', { skipEml: true });
-  add('export_structure', 'metadata-only-2', 'text/plain', 'no eml', { skipEml: true });
-  add('export_structure', 'eml-only-1', 'text/plain', 'no metadata', { skipMetadata: true });
-  add('export_structure', 'eml-only-2', 'text/plain', 'no metadata', { skipMetadata: true });
-  const emptyEml = add('export_structure', 'empty-eml', 'text/plain', 'replaced by an empty file', {
-    skipEml: true,
-  });
-  extras.push({ path: `${emptyEml.id}.eml`, type: 'file', data: Buffer.alloc(0) });
-  const badJson = add('export_structure', 'invalid-json', 'text/plain', 'metadata is not JSON', {
+  add('export_structure', 'metadata-only-1', 'text/plain', 'no eml', refs(0), { skipEml: true });
+  add('export_structure', 'metadata-only-2', 'text/plain', 'no eml', refs(0), { skipEml: true });
+  add('export_structure', 'eml-only-1', 'text/plain', 'no metadata', refs(0), {
     skipMetadata: true,
   });
+  add('export_structure', 'eml-only-2', 'text/plain', 'no metadata', refs(0), {
+    skipMetadata: true,
+  });
+  const emptyEml = add(
+    'export_structure',
+    'empty-eml',
+    'text/plain',
+    'replaced by an empty file',
+    refs(0),
+    {
+      skipEml: true,
+    },
+  );
+  extras.push({ path: `${emptyEml.id}.eml`, type: 'file', data: Buffer.alloc(0) });
+  const badJson = add(
+    'export_structure',
+    'invalid-json',
+    'text/plain',
+    'metadata is not JSON',
+    refs(0),
+    {
+      skipMetadata: true,
+    },
+  );
   extras.push({
     path: `${badJson.id}.metadata.json`,
     type: 'file',
@@ -505,6 +795,7 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
     'wrong-types',
     'text/plain',
     'metadata has wrong types',
+    refs(0),
     { skipMetadata: true },
   );
   extras.push({
