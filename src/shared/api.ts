@@ -17,6 +17,7 @@ export const IPC = {
   openExport: 'pev:open-export',
   switchRun: 'pev:switch-run',
   locateExport: 'pev:locate-export',
+  forgetExport: 'pev:forget-export',
   sourcesChanged: 'pev:sources-changed',
 } as const;
 
@@ -40,7 +41,7 @@ export type StateResult = { ok: true; generation: number } | Rejected;
 export type PingResult = { ok: true; generation: number } | Rejected;
 export type OpenResult = { ok: true; openId: number; url: string } | Rejected;
 export type SourcesResult = { ok: true; generation: number; sources: SourcesView } | Rejected;
-/** The outcome of an open, a switch or a Locate, and the generation it left. */
+/** The outcome of an open, a switch, a Locate or a Forget, and the generation it left. */
 export type SourceActionResult =
   { ok: true; outcome: SourceOutcome; generation: number } | Rejected;
 
@@ -94,6 +95,8 @@ export interface PevApi {
   openExport(sourceKey: string, generation: number): Promise<SourceActionResult>;
   switchRun(runId: string, generation: number): Promise<SourceActionResult>;
   locateExport(generation: number): Promise<SourceActionResult>;
+  /** Removes an export from the app and deletes its index; its files stay as they are. */
+  forgetExport(sourceKey: string, generation: number): Promise<SourceActionResult>;
   /** Called when the open export or the list of exports changed. */
   onSourcesChanged(listener: () => void): () => void;
 }

@@ -206,7 +206,11 @@ describe('phase 1', () => {
       const again = await other.service.open(expectedUuid);
       expect(again).toMatchObject({ created: true, replaced: true });
       expect(again.dbUuid).not.toBe(opened.dbUuid);
-      expect(other.logs.map((l) => l.code)).toEqual(['index.replaced', 'index.created']);
+      expect(other.logs.map((l) => [l.code, l.data.reason])).toEqual([
+        ['index.damaged', 'identity'],
+        ['index.created', undefined],
+      ]);
+      expect(other.service.progress.condition).toBe('rebuilding');
       const n = dbRows(other.service.dbPath, 'SELECT count(*) AS n FROM pairs')[0]?.n;
       expect(Number(n)).toBe(0);
       await other.service.close();
@@ -425,9 +429,12 @@ describe('an unavailable export', () => {
     expect(before.map((f) => f[0])).toEqual([`${STAMP.sourceKey}.sqlite`]);
 
     // Another identity, or none: refused, with the family byte for byte as it was.
+    // The index itself never deletes anything; another identity is reported as damage.
     for (const uuid of ['00000000-0000-4000-8000-00000000abcd', null]) {
       const other = harness('', indexDir);
-      await expect(other.service.open(uuid, false)).rejects.toMatchObject({ code: 'NO_INDEX' });
+      await expect(other.service.open(uuid, false)).rejects.toMatchObject({
+        code: uuid === null ? 'NO_INDEX' : 'INDEX_DAMAGED',
+      });
       expect(other.threads.every((t) => t.role === 'query')).toBe(true);
       expect(other.service.connections.size).toBe(0);
       await other.service.close();
@@ -441,7 +448,9 @@ describe('an unavailable export', () => {
       created: false,
       replaced: false,
     });
-    expect(browse.threads.map((t) => t.role)).toEqual(['query']);
+    // It is checked on its own short-lived connection, read-only too.
+    await browse.service.checkEnded();
+    expect(browse.threads.map((t) => t.role)).toEqual(['query', 'verify']);
     expect(browse.service.connections.list().map((c) => c.role)).toEqual(['query']);
     expect(browse.service.progress.phase).toBe('unavailable');
     expect(((await browse.service.ask({ op: 'totals' })) as IndexTotals).messages).toBe(10);

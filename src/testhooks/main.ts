@@ -320,6 +320,8 @@ export async function install(ctx: AppContext): Promise<boolean> {
     /** A read from the open source's index, as the shell will make it. */
     indexQuery: (query: IndexQuery) => ctx.sources.queryIndex(query),
     indexDir: () => join(app.getPath('userData'), 'index'),
+    /** Resets the app's data, as Settings will. */
+    resetApp: () => ctx.sources.reset(),
   };
   (globalThis as { __pevTest?: typeof api }).__pevTest = api;
 

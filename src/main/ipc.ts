@@ -247,7 +247,7 @@ export function registerIpc(ctx: AppContext): void {
   });
 
   /**
-   * An open, a switch or a Locate: the outcome and the generation it left.
+   * An open, a switch, a Locate or a Forget: the outcome and the generation it left.
    * The generation is checked here and again when the action's turn comes,
    * since an action queued behind another may find it moved on.
    */
@@ -278,6 +278,12 @@ export function registerIpc(ctx: AppContext): void {
   );
   sourceAction(IPC.locateExport, GenerationArgs, 'no_source', (appWin, { generation }) =>
     ctx.sources.locate(appWin.win, generation),
+  );
+  sourceAction(
+    IPC.forgetExport,
+    SourceArgs,
+    'unknown_source',
+    (_appWin, { sourceKey, generation }) => ctx.sources.forget(sourceKey, generation),
   );
 
   /** Like `guarded`, for one-way sends; also drops a send made for a stale generation. */

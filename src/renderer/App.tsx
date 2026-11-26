@@ -2,6 +2,7 @@
 
 import { useEffect } from 'react';
 import { BODY_IFRAME_SANDBOX } from '../shared/constants';
+import type { IndexCondition } from '../shared/index-types';
 import type { ActiveExport } from '../shared/sources';
 import { exportLabel } from './labels';
 import {
@@ -14,6 +15,12 @@ import {
   useShellState,
 } from './shell';
 import { Welcome } from './Welcome';
+
+const INDEX_STATES: Partial<Record<IndexCondition, string>> = {
+  verifying: 'Verifying index…',
+  rebuilding: 'Index was damaged; rebuilding',
+  damaged: 'Index damaged; it will be rebuilt when the export is available',
+};
 
 function ExportBar({ active, busy }: { active: ActiveExport; busy: boolean }) {
   const current = active.runs.find((r) => r.current);
@@ -76,6 +83,11 @@ export function App() {
           >
             Locate export…
           </button>
+        </div>
+      )}
+      {active?.index && INDEX_STATES[active.index] && (
+        <div className="index-state" role="status">
+          {INDEX_STATES[active.index]}
         </div>
       )}
       {welcome ? (

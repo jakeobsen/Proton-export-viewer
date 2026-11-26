@@ -82,6 +82,14 @@ export type IndexQuery =
 export type IndexAnswer = Sidebar | ListPage | RowDetails[] | number | null | IndexTotals;
 
 /**
+ * The index's own state: 'verifying' while an index that was already there
+ * is checked; 'rebuilding' while an index made in place of a damaged one is
+ * filled; 'damaged' once a damaged index was deleted and the export can't be
+ * read to rebuild it.
+ */
+export type IndexCondition = 'ok' | 'verifying' | 'rebuilding' | 'damaged';
+
+/**
  * Where phase 1 stands. During it, list pages hold the rows loaded so far.
  * 'unavailable': the export can't be read, and the index shows what it holds.
  */
@@ -97,6 +105,7 @@ export interface IndexProgress {
   timeouts: number;
   /** Messages with a list cut to its limit. */
   capped: number;
+  condition: IndexCondition;
 }
 
 /** What core reports once a source's index is open. */

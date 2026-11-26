@@ -198,6 +198,14 @@ function handle(request: CoreRequest): void {
       }
       session.handle(request);
       return;
+    case 'forget':
+    case 'reset':
+      if (!session) {
+        reply({ type: 'result', reqId: request.reqId, ok: false, code: 'no_source' });
+        return;
+      }
+      void (request.type === 'forget' ? session.forget(request) : session.reset(request));
+      return;
   }
 }
 
@@ -206,10 +214,13 @@ process.parentPort.once('message', (event) => {
   roots = [[init.appRoot + sep, '']];
   log = new LogWriter(init.logsDir, 'core', 'core');
   workerLog = log.forProc('worker');
-  session = new SourceSession(init.source, log, reply, {
-    dir: init.indexDir,
-    thread: indexThread,
-  });
+  session = new SourceSession(
+    init.source,
+    log,
+    reply,
+    { dir: init.indexDir, thread: indexThread, exports: init.exports },
+    (event) => port?.postMessage(event),
+  );
   const p = event.ports[0];
   if (!p) return;
   port = p;
