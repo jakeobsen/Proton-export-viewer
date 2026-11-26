@@ -22,7 +22,17 @@ import {
 import { MetadataError, parseMetadata, type MessageRow } from './metadata';
 import type { IndexAnswer, IndexQuery } from '../../shared/index-types';
 import { listPage, rowDetails, sidebar, threadOfMessage } from './queries';
-import { META, createSchema, metaValue, probeSame, sameIdentity } from './schema';
+import {
+  META,
+  createSchema,
+  identityOf,
+  metaValue,
+  mismatchOf,
+  probeMismatch,
+  probeSame,
+  sameIdentity,
+  type Mismatch,
+} from './schema';
 import {
   SQLITE_CORRUPT,
   SQLITE_FULL,
@@ -88,6 +98,8 @@ export interface WriterOpened {
   created: boolean;
   /** An existing database was replaced because its version or identity didn't match. */
   replaced: boolean;
+  /** Why it was replaced. */
+  mismatch: Mismatch | null;
   phase1Done: boolean;
 }
 
@@ -111,9 +123,14 @@ export class WriterState {
     this.dbPath = args.dbPath;
     this.walPath = `${args.dbPath}-wal`;
     const exists = isFile(args.dbPath);
-    if (exists && args.expectedUuid !== null) {
-      const kept = this.openExisting(args, args.expectedUuid);
-      if (kept) return kept;
+    let mismatch: Mismatch | null = null;
+    if (exists) {
+      mismatch = probeMismatch(args.dbPath, args.expectedUuid);
+      if (mismatch === null && args.expectedUuid !== null) {
+        const kept = this.openExisting(args, args.expectedUuid);
+        if (typeof kept !== 'string') return kept;
+        mismatch = kept;
+      }
     }
     // A failed candidate was closed; this refuses if anything still holds the family.
     deleteFamily(args.dbPath);
@@ -124,7 +141,7 @@ export class WriterState {
     try {
       configure(db, 'writer');
       const uuid = createSchema(db, args.stamp.generation);
-      return this.ready(db, args, uuid, true, exists);
+      return this.ready(db, args, uuid, true, exists, mismatch);
     } catch (err) {
       this.drop(db);
       throw err;
@@ -132,23 +149,23 @@ export class WriterState {
   }
 
   /**
-   * Opens the database there if it has this schema version and identity,
-   * checked first without changing anything on disk. Any other outcome
-   * closes it again and returns null.
+   * Opens the database there, which the probe found to have this schema
+   * version and identity. If the open connection finds otherwise, or the
+   * open fails, it is closed again, and the answer is why.
    */
-  private openExisting(args: WriterOpen, expectedUuid: string): WriterOpened | null {
-    if (!probeSame(args.dbPath, expectedUuid)) return null;
+  private openExisting(args: WriterOpen, expectedUuid: string): WriterOpened | Mismatch {
     let db: Db | null = null;
     try {
       chmodSync(args.dbPath, 0o600);
       db = openDb(args.dbPath);
       configure(db, 'writer');
-      if (!sameIdentity(db, expectedUuid)) return null;
-      const opened = this.ready(db, args, expectedUuid, false, false);
+      const mismatch = mismatchOf(identityOf(db), expectedUuid);
+      if (mismatch) return mismatch;
+      const opened = this.ready(db, args, expectedUuid, false, false, null);
       db = null;
       return opened;
     } catch {
-      return null;
+      return 'corrupt';
     } finally {
       if (db) this.drop(db);
     }
@@ -173,6 +190,7 @@ export class WriterState {
     uuid: string,
     created: boolean,
     replaced: boolean,
+    mismatch: Mismatch | null,
   ): WriterOpened {
     if (args.capBytes !== null) {
       const pageSize = scalar(db, 'PRAGMA page_size');
@@ -191,6 +209,7 @@ export class WriterState {
       uuid,
       created,
       replaced,
+      mismatch,
       phase1Done: Number(metaValue(db, META.phase1Done) ?? 0) === 1,
     };
   }
@@ -369,7 +388,7 @@ export class QueryState {
 export interface CheckResult {
   /** True: the check passed. False: the index is damaged. Null: the check couldn't run. */
   ok: boolean | null;
-  /** Why it is damaged: 'identity' or 'quick_check'. */
+  /** Why it is damaged: 'identity', 'schema' or 'quick_check'. */
   reason: string | null;
 }
 
@@ -383,7 +402,8 @@ export function quickCheck(dbPath: string, expectedUuid: string): CheckResult {
   try {
     db = openDb(dbPath, true);
     db.exec('PRAGMA busy_timeout = 5000');
-    if (!sameIdentity(db, expectedUuid)) return { ok: false, reason: 'identity' };
+    const mismatch = mismatchOf(identityOf(db), expectedUuid);
+    if (mismatch) return { ok: false, reason: mismatch };
     const rows = db.stmt('PRAGMA quick_check').all();
     const fine = rows.length === 1 && Object.values(rows[0]!)[0] === 'ok';
     return fine ? { ok: true, reason: null } : { ok: false, reason: 'quick_check' };

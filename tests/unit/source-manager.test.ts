@@ -30,6 +30,7 @@ import {
   type OrderStep,
 } from '../../src/main/sources/manager';
 import { ScopeError, type Picked, type Scopes } from '../../src/main/sources/scope';
+import { digest } from '../../tools/gen-export/tree.mjs';
 import { testDir } from '../paths';
 
 type Call = CoreRequest extends infer R ? (R extends unknown ? Omit<R, 'reqId'> : never) : never;
@@ -158,8 +159,8 @@ class FakeCore implements CoreControl {
   }
 }
 
-function setup(name: string) {
-  const userData = realpathSync(testDir(`${name}-ud`));
+function setup(name: string, at?: string) {
+  const userData = at ?? realpathSync(testDir(`${name}-ud`));
   const core = new FakeCore();
   const order: OrderStep[] = [];
   const picks: Array<Picked | null> = [];
@@ -805,6 +806,86 @@ describe('Forget', () => {
     expect(t.manager.registry.source(key)).toBeDefined();
     expect(t.manager.view().active).toBeNull();
     expect(t.lines.some((l) => l.includes('"source.forget_refused"'))).toBe(true);
+  });
+});
+
+describe('an export overlapping the app’s data folder', () => {
+  it('is refused when it lies inside it, and nothing changes', async () => {
+    const t = setup('mgr-inside');
+    const root = join(t.userData, 'index', 'tool');
+    runAt(join(root, 'secret.account@example.com', 'mail_20250630_120000'), ['a', 'b']);
+    const before = digest(root);
+    t.picks.push({ path: root, bookmark: 'bm1' });
+    const generation = t.generation();
+    expect(await t.manager.chooseFolder(null, generation)).toBe('app_data');
+    expect(t.generation()).toBe(generation);
+    expect(t.core.started).toEqual([]);
+    expect(t.order).toEqual([]);
+    expect(t.manager.view()).toEqual({ restoring: false, active: null, recent: [] });
+    expect(t.lines.map((l) => JSON.parse(l) as { code: string; data: unknown })).toContainEqual({
+      code: 'source.refused',
+      data: { reason: 'app_data' },
+    });
+    expect(JSON.stringify(t.lines)).not.toContain('secret');
+    expect(digest(root)).toBe(before);
+  });
+
+  it('is refused when it holds it', async () => {
+    const root = realpathSync(testDir('mgr-holds-tool'));
+    const run = join(root, 'secret.account@example.com', 'mail_20250630_120000');
+    runAt(run, ['a']);
+    const userData = join(run, 'app-data');
+    mkdirSync(userData);
+    const t = setup('mgr-holds', userData);
+    t.picks.push({ path: root, bookmark: 'bm1' });
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('app_data');
+    expect(t.core.started).toEqual([]);
+  });
+
+  it('makes Reset delete nothing while the app knows it', async () => {
+    const t = setup('mgr-reset-overlap');
+    const pickPath = join(t.userData, 'logs', 'moved');
+    runAt(join(pickPath, 'acct', 'mail_20250630_120000'), ['a']);
+    const before = digest(pickPath);
+    const key = '00000000-0000-4000-8000-0000000000e5';
+    const pickId = '00000000-0000-4000-8000-0000000000f6';
+    mkdirSync(join(t.userData, 'index'));
+    writeFileSync(join(t.userData, 'index', `${key}.sqlite`), 'x');
+    // A registry from before exports like this were refused.
+    writeFileSync(
+      join(t.userData, 'sources.json'),
+      JSON.stringify({
+        version: 1,
+        picks: [{ pickId, path: pickPath, bookmark: null }],
+        sources: [
+          {
+            sourceKey: key,
+            pickId,
+            rel: 'acct/mail_20250630_120000',
+            runName: 'mail_20250630_120000',
+            accountName: 'acct',
+            labelsSha256: null,
+            namesSha256: '0'.repeat(64),
+            openedAt: 1,
+            offline: false,
+          },
+        ],
+        active: null,
+      }),
+    );
+    const manager = t.make();
+    expect(manager.view().recent).toHaveLength(1);
+    expect(manager.exportRoots()).toEqual([join(pickPath, 'acct', 'mail_20250630_120000')]);
+    await manager.reset();
+    expect(t.lines.map((l) => JSON.parse(l) as { code: string; data: unknown })).toContainEqual({
+      code: 'app.reset_refused',
+      data: { reason: 'overlap' },
+    });
+    expect(existsSync(join(t.userData, 'sources.json'))).toBe(true);
+    expect(existsSync(join(t.userData, 'index', `${key}.sqlite`))).toBe(true);
+    expect(digest(pickPath)).toBe(before);
+    // And it stays closed.
+    expect(await manager.openRecent(key, t.generation())).toBe('closed');
   });
 });
 

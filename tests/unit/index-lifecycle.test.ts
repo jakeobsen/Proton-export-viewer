@@ -8,14 +8,17 @@ import {
   closeSync,
   copyFileSync,
   existsSync,
+  mkdirSync,
   openSync,
   readdirSync,
   realpathSync,
   rmSync,
   truncateSync,
+  writeFileSync,
   writeSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 import { descriptorsOn } from '../../src/core/index/family';
 import type { CheckResult } from '../../src/core/index/ops';
@@ -25,6 +28,7 @@ import {
   type IndexThread,
   type ThreadRole,
 } from '../../src/core/index/pool';
+import { SCHEMA_VERSION } from '../../src/core/index/schema';
 import type { IndexOptions } from '../../src/core/index/service';
 import { SourceSession } from '../../src/core/source';
 import type { CoreEvent, CoreRequest, CoreResult } from '../../src/shared/core-protocol';
@@ -106,6 +110,8 @@ interface CoreOptions {
   check?: HeldCheck;
   query?: CorruptingQuery;
   options?: IndexOptions;
+  /** Other exports the app knows. */
+  exports?: string[];
 }
 
 let reqSeq = 0;
@@ -138,7 +144,12 @@ function core(o: CoreOptions) {
     { ...stamp, root: o.root },
     log,
     (r) => replies.push(r),
-    { dir: o.indexDir, thread, ...(o.options ? { options: o.options } : {}) },
+    {
+      dir: o.indexDir,
+      thread,
+      ...(o.options ? { options: o.options } : {}),
+      ...(o.exports ? { exports: o.exports } : {}),
+    },
     (e) => events.push(e),
   );
   const send = async (request: CoreRequest): Promise<CoreResult> => {
@@ -216,7 +227,22 @@ describe('an index found damaged on open', () => {
         copyFileSync(join(indexDir, `${OTHER}.sqlite`), dbPath);
       },
     ],
+    [
+      'of another schema version',
+      (dbPath) => {
+        const db = new DatabaseSync(dbPath);
+        db.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
+        db.close();
+        return Promise.resolve();
+      },
+    ],
   ];
+  const reasons: Record<string, string> = {
+    truncated: 'corrupt',
+    with: 'corrupt',
+    swapped: 'identity',
+    of: 'schema',
+  };
   for (const [name, damage] of cases) {
     it(`is rebuilt when ${name}`, async () => {
       const { run, root, indexDir, pairs } = exportAt(`lc-open-${name.split(' ')[0]}`);
@@ -229,7 +255,9 @@ describe('an index found damaged on open', () => {
       expect(opened).toMatchObject({ ok: true, index: { created: true, replaced: true } });
       expect(opened.ok && opened.index!.dbUuid).not.toBe(uuid);
       expect(opened.ok && opened.progress?.condition).toBe('rebuilding');
-      expect(c.logs.find((l) => l.code === 'index.damaged')?.data).toEqual({ reason: 'identity' });
+      expect(c.logs.find((l) => l.code === 'index.damaged')?.data).toEqual({
+        reason: reasons[name.split(' ')[0]!],
+      });
       await c.session.index!.settled();
       expect(await c.totals()).toMatchObject({ messages: pairs, pairs });
       expect(c.session.index!.progress.condition).toBe('ok');
@@ -462,7 +490,7 @@ describe('the lifecycle lock', () => {
     expect(descriptorsOn(c.dbPath)).toBe(0);
   });
 
-  it('lets a reset run after a queued recovery, and nothing opens after it', async () => {
+  it('makes a queued recovery do nothing: the reset tears the index down, and nothing opens after it', async () => {
     const { run, indexDir } = exportAt('lc-reset-recovery');
     const query = new CorruptingQuery();
     const c = core({ root: run, indexDir, query });
@@ -478,9 +506,45 @@ describe('the lifecycle lock', () => {
     release();
     expect(await reset).toMatchObject({ ok: true });
     expect(await open).toMatchObject({ ok: false, code: 'closed' });
-    // The recovery queued first ran, under the lock, before the reset.
-    expect(c.events.filter((e) => e.damaged)).toHaveLength(1);
-    expect(family(indexDir)).toEqual([]);
+    // The recovery was queued first, but the reset had closed core: it was
+    // dropped, so nothing was deleted or reported. The reset tore the index
+    // down; deleting the app's data is main's part of it.
+    expect(c.events.filter((e) => e.damaged)).toEqual([]);
+    expect(c.logs.some((l) => l.code === 'index.damaged' || l.code === 'index.deleted')).toBe(
+      false,
+    );
+    expect(c.logs.some((l) => l.code === 'index.stale_dropped')).toBe(true);
+    expect(c.session.index).toBeNull();
+    expect(c.session.connections.size).toBe(0);
+    expect(family(indexDir)).toContain(`${KEY}.sqlite`);
+  });
+});
+
+describe('an index folder that overlaps an export', () => {
+  it('is never written or deleted when another export holds it', async () => {
+    const { run, indexDir } = exportAt('lc-overlap-holds');
+    mkdirSync(indexDir, { recursive: true });
+    writeFileSync(join(indexDir, `${OTHER}.sqlite`), 'x');
+    const c = core({ root: run, indexDir, exports: [dirname(indexDir)] });
+    expect(await c.openIndex(null)).toMatchObject({ ok: false, code: 'closed' });
+    expect(await c.forget(OTHER)).toMatchObject({ ok: false, code: 'busy' });
+    expect(c.logs.filter((l) => l.level === 'warn').map((l) => [l.code, l.data])).toEqual([
+      ['index.open_refused', { reason: 'overlap' }],
+      ['index.delete_refused', { reason: 'overlap' }],
+    ]);
+    expect(readdirSync(indexDir)).toEqual([`${OTHER}.sqlite`]);
+  });
+
+  it('is never written or deleted when the open export lies inside it', async () => {
+    const dir = realpathSync(testDir('lc-overlap-inside'));
+    const indexDir = join(dir, 'index');
+    const written = writeExport(join(indexDir, 'nested'), { seed: 13, messages: 4 });
+    const before = digest(join(indexDir, 'nested'));
+    const c = core({ root: realpathSync(written.run), indexDir });
+    expect(await c.openIndex(null)).toMatchObject({ ok: false, code: 'closed' });
+    expect(await c.forget()).toMatchObject({ ok: false, code: 'busy' });
+    expect(readdirSync(indexDir)).toEqual(['nested']);
+    expect(digest(join(indexDir, 'nested'))).toBe(before);
   });
 });
 

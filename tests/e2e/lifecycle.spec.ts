@@ -2,10 +2,17 @@
 // The index's lifecycle in the app: a damaged index is found by its check
 // after a reopen and rebuilt; while the export is gone it is deleted and
 // rebuilt once the export is located; Forget leaves no file of the index; and
-// Reset deletes the app's data once the open export is torn down. The exports
-// are never changed.
+// Reset deletes the app's own data once the open export is torn down. The
+// exports are never changed, not even one put inside the app's data folder.
 
-import { existsSync, readFileSync, readdirSync, realpathSync, renameSync } from 'node:fs';
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import type { SourceActionResult } from '../../src/shared/api';
 import type { IndexProgress, IndexTotals } from '../../src/shared/index-types';
@@ -185,30 +192,59 @@ test('Forget leaves no file of the index, and late work recreates none', async (
   expect([digest(rootA), digest(rootB)]).toEqual(digests);
 });
 
-test('Reset deletes the app data once the open export is torn down', async ({ pev }) => {
+test('Reset deletes the app data once the open export is torn down, and nothing else', async ({
+  pev,
+}) => {
   const root = realpathSync(testDir('life-reset'));
   const written = writeExport(root, { seed: 25, messages: 20 });
   const before = digest(root);
+  // An export put inside the app's own index folder: it is never opened, and
+  // Reset leaves it as it is.
+  const indexDir = await pev.main<string>('indexDir');
+  const nestedRoot = join(indexDir, 'nested');
+  writeExport(nestedRoot, { seed: 26, messages: 5 });
+  const nestedBefore = digest(nestedRoot);
+  await pev.main('queuePick', nestedRoot, 'bm0');
+  expect(await pev.shell<SourceActionResult>('chooseFolder', [])).toMatchObject({
+    ok: true,
+    outcome: 'app_data',
+  });
+  await expect(pev.page.locator('.notice')).toHaveText(
+    "This folder is inside the app's data folder.",
+  );
+  expect(pev.hasLog('source.refused', { proc: 'main', reason: 'app_data' })).toBe(true);
+  expect(await view(pev)).toMatchObject({ active: null, recent: [] });
+
   await pev.main('queuePick', root, 'bm1');
   await pev.shell('chooseFolder', []);
   await phase1Done(pev, written.pairs);
-  const indexDir = await pev.main<string>('indexDir');
   const registry = await pev.main<string>('registryFile');
+  const logsDir = pev.logsDir();
+  const settings = join(pev.userData, 'settings.json');
+  writeFileSync(settings, '{}');
   expect(existsSync(registry)).toBe(true);
+  expect(readdirSync(logsDir).length).toBeGreaterThan(0);
 
   await pev.main('resetApp');
-  expect(existsSync(indexDir)).toBe(false);
+  // The index folder keeps only what the app didn't make there.
+  expect(readdirSync(indexDir)).toEqual(['nested']);
   expect(existsSync(registry)).toBe(false);
+  expect(existsSync(settings)).toBe(false);
+  expect(existsSync(logsDir)).toBe(false);
   expect(await view(pev)).toEqual({ restoring: false, active: null, recent: [] });
   expect(await pev.main('liveScopes')).toEqual([]);
-  // Nothing opens afterwards, and nothing comes back.
+  // Nothing opens afterwards, and nothing comes back: not the index, the
+  // registry or the logs, though main and the shell keep logging.
   await pev.main('queuePick', root, 'bm2');
   expect(await pev.shell<SourceActionResult>('chooseFolder', [])).toMatchObject({
     ok: true,
     outcome: 'closed',
   });
+  await pev.shell('log', ['after-reset']);
   await new Promise((r) => setTimeout(r, 1000));
-  expect(existsSync(indexDir)).toBe(false);
+  expect(readdirSync(indexDir)).toEqual(['nested']);
   expect(existsSync(registry)).toBe(false);
+  expect(existsSync(logsDir)).toBe(false);
   expect(digest(root)).toBe(before);
+  expect(digest(nestedRoot)).toBe(nestedBefore);
 });

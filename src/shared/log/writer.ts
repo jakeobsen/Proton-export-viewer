@@ -29,6 +29,7 @@ export class LogWriter implements Logger {
   private readonly maxFiles: number;
   private readonly minLevel: Level;
   private size = -1;
+  private stopped = false;
 
   constructor(
     private readonly dir: string,
@@ -77,7 +78,13 @@ export class LogWriter implements Logger {
     this.log('info', code, data, meta);
   }
 
+  /** Writes nothing from now on, so the log folder isn't made again. */
+  stop(): void {
+    this.stopped = true;
+  }
+
   write(input: LogInput): void {
+    if (this.stopped) return;
     if (LEVEL_RANK[input.level] > LEVEL_RANK[this.minLevel]) return;
     const event = sanitizeEvent(input);
     if (!event) return;

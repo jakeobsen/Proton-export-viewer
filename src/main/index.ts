@@ -104,6 +104,10 @@ async function start(): Promise<void> {
     generation: () => ctx.generation,
     bumpGeneration: () => bumpGeneration(ctx),
     notify: () => notifySources(ctx),
+    stopLogs: () => {
+      log.stop();
+      rendererLog.stop();
+    },
     picker: systemPicker,
     scopes: systemScopes,
   });
@@ -120,6 +124,7 @@ async function start(): Promise<void> {
     shellCsp: SHELL_CSP,
   };
   core.onEvent = (event) => sources.handleCoreEvent(event);
+  core.exports = () => sources.exportRoots();
   app.on('will-quit', () => sources.close());
   registerIpc(ctx);
   if (__PEV_TEST_HOOKS__) {

@@ -310,7 +310,9 @@ export class IndexService {
     });
     this.writerEntry = this.connections.add({ role: 'writer', dbPath: this.dbPath });
     this.opened = opened;
-    if (opened.replaced) this.deps.log.warn('index.damaged', { reason: 'identity' }, this.src);
+    if (opened.replaced) {
+      this.deps.log.warn('index.damaged', { reason: opened.mismatch ?? 'identity' }, this.src);
+    }
     if (opened.created) this.deps.log.info('index.created', {}, this.src);
     this.progress.condition = opened.created
       ? options.rebuild || opened.replaced
@@ -327,7 +329,13 @@ export class IndexService {
   /** The unavailable run's index, read-only, for browsing. */
   private async openForBrowsing(expectedUuid: string | null): Promise<IndexOpened> {
     if (expectedUuid === null) throw new ThreadError('NO_INDEX');
-    this.opened = { uuid: expectedUuid, created: false, replaced: false, phase1Done: false };
+    this.opened = {
+      uuid: expectedUuid,
+      created: false,
+      replaced: false,
+      mismatch: null,
+      phase1Done: false,
+    };
     this.progress.phase = 'unavailable';
     this.progress.condition = 'verifying';
     this.startQuery();

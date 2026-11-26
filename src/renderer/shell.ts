@@ -89,6 +89,7 @@ const NOTICES: Partial<Record<string, string>> = {
   unavailable: 'Export not found.',
   forgotten: 'Export forgotten.',
   busy: 'Index in use. Try again.',
+  app_data: "This folder is inside the app's data folder.",
 };
 
 /** Runs an open, a switch, a Locate or a Forget, then reloads the exports. */
