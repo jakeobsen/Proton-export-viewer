@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The typed surface between the shell renderer and the main process.
 
+import type { LinkAction } from './constants';
 import type { MessageHeaders, OpenMode } from './reader-protocol';
 import type { SourceOutcome, SourcesView } from './sources';
 
@@ -12,6 +13,7 @@ export const IPC = {
   log: 'pev:log',
   report: 'pev:report',
   linkDialog: 'pev:link-dialog',
+  linkAction: 'pev:link-action',
   sources: 'pev:sources',
   chooseFolder: 'pev:choose-folder',
   openExport: 'pev:open-export',
@@ -33,7 +35,8 @@ export type RejectCode =
   | 'unknown_source'
   | 'unknown_run'
   | 'no_source'
-  | 'not_found';
+  | 'not_found'
+  | 'unknown_dialog';
 
 export type Rejected = { ok: false; code: RejectCode };
 
@@ -68,6 +71,23 @@ export type MessageOpenResult =
   | { ok: true; openId: number; outcome: 'fallback' }
   | Rejected;
 
+/** What the link dialog shows. Main keeps the URL it acts on. */
+export interface LinkPrompt {
+  dialogId: string;
+  /** The link's text. */
+  title: string;
+  /** The URL, with any non-ASCII host in punycode. */
+  url: string;
+  /** Where the host is in `url`, or null when there is none. */
+  host: { start: number; end: number } | null;
+  /** The title names a host other than the URL's. */
+  mismatch: boolean;
+  /** The URL's host has non-ASCII characters. */
+  lookalike: boolean;
+}
+
+export type LinkActionResult = { ok: true } | Rejected;
+
 export type ErrorKind = 'uncaught' | 'rejection' | 'error';
 
 export interface ErrorReport {
@@ -89,7 +109,10 @@ export interface PevApi {
     data?: Record<string, unknown>,
   ): void;
   reportError(report: ErrorReport): void;
-  onLinkDialog(listener: (url: string) => void): () => void;
+  /** Called when main opens the link dialog. */
+  onLinkDialog(listener: (prompt: LinkPrompt) => void): () => void;
+  /** The user's choice in the link dialog. Only the dialog's id goes to main. */
+  linkAction(dialogId: string, action: LinkAction, generation: number): Promise<LinkActionResult>;
   sources(generation: number): Promise<SourcesResult>;
   chooseFolder(generation: number): Promise<SourceActionResult>;
   openExport(sourceKey: string, generation: number): Promise<SourceActionResult>;

@@ -3,6 +3,7 @@
 
 import type { IndexAnswer, IndexOpened, IndexProgress, IndexQuery } from './index-types';
 import type {
+  BodyLink,
   ReadRequest,
   ReaderFailure,
   RenderedMessage,
@@ -40,6 +41,7 @@ export interface StubAssetMessage {
 export interface StubBodyMessage {
   html: string;
   assets: StubAssetMessage[];
+  links?: BodyLink[];
 }
 
 export interface OpenRequest {

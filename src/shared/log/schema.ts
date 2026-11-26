@@ -2,6 +2,7 @@
 // Redaction schema: only allowlisted fields with validated values reach a log file.
 // Paths, addresses, subjects, URLs, host names and exception messages never pass.
 
+import { LINK_ACTIONS } from '../constants';
 import {
   CAPPED_LIST_NAMES,
   DEVICES,
@@ -74,6 +75,7 @@ const FIELDS: Record<string, Validator> = {
   reason: oneOf(REASONS),
   list: oneOf(CAPPED_LIST_NAMES),
   scheme: oneOf(SCHEMES),
+  action: oneOf(LINK_ACTIONS),
   processType: oneOf(PROCESS_TYPES),
   permission: oneOf(PERMISSIONS),
   device: oneOf(DEVICES),

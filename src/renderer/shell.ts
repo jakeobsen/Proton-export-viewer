@@ -3,14 +3,16 @@
 // pending link, and the exports main knows about.
 
 import { useSyncExternalStore } from 'react';
-import type { OpenResult, SourceActionResult } from '../shared/api';
+import type { LinkActionResult, LinkPrompt, OpenResult, SourceActionResult } from '../shared/api';
+import type { LinkAction } from '../shared/constants';
 import type { SourcesView } from '../shared/sources';
 
 export interface ShellState {
   generation: number | null;
   bodyUrl: string | null;
   frameKey: number;
-  link: string | null;
+  /** The open link dialog. */
+  link: LinkPrompt | null;
   /** Null until main has answered. */
   sources: SourcesView | null;
   /** An open, a switch or a Locate is under way. */
@@ -58,7 +60,7 @@ export async function refreshGeneration(): Promise<number | null> {
 /** Opens a message body. The old body is cleared at once; main has already revoked it. */
 export async function openMessage(id: string): Promise<OpenResult> {
   const generation = state.generation ?? (await refreshGeneration());
-  update({ bodyUrl: null });
+  update({ bodyUrl: null, link: null });
   if (generation === null) return { ok: false, code: 'stale_generation' };
   const result = await window.pev.openStub(id, generation);
   if (result.ok) {
@@ -98,7 +100,7 @@ async function sourceAction(
 ): Promise<SourceActionResult> {
   const generation = state.generation ?? (await refreshGeneration());
   if (generation === null) return { ok: false, code: 'stale_generation' };
-  update({ busy: true, notice: null });
+  update({ busy: true, notice: null, link: null });
   let result: SourceActionResult;
   try {
     result = await run(generation);
@@ -127,10 +129,18 @@ export const locateExport = () => sourceAction((g) => window.pev.locateExport(g)
 export const forgetExport = (sourceKey: string) =>
   sourceAction((g) => window.pev.forgetExport(sourceKey, g));
 
-export function showLink(url: string): void {
-  update({ link: url });
+export function showLink(prompt: LinkPrompt): void {
+  update({ link: prompt });
 }
 
-export function closeLink(): void {
+/** Closes the link dialog and tells main the user's choice. */
+export async function answerLink(action: LinkAction): Promise<LinkActionResult | null> {
+  const prompt = state.link;
+  if (prompt === null) return null;
   update({ link: null });
+  const generation = state.generation ?? (await refreshGeneration());
+  if (generation === null) return null;
+  const result = await window.pev.linkAction(prompt.dialogId, action, generation);
+  if (!result.ok && result.code === 'stale_generation') await refreshGeneration();
+  return result;
 }

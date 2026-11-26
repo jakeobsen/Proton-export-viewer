@@ -39,5 +39,9 @@ export const BODY_IFRAME_SANDBOX = 'allow-popups';
 /** Link schemes that may be offered to the user for opening outside the app. */
 export const LINK_SCHEMES: readonly string[] = ['http:', 'https:', 'mailto:'];
 
+/** What the user can choose in the link dialog. */
+export const LINK_ACTIONS = ['open', 'copy', 'cancel'] as const;
+export type LinkAction = (typeof LINK_ACTIONS)[number];
+
 export const LOG_FILE_MAX_BYTES = 5 * 1024 * 1024;
 export const LOG_FILE_COUNT = 5;

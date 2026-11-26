@@ -5,8 +5,8 @@ import { BODY_IFRAME_SANDBOX } from '../shared/constants';
 import type { IndexCondition } from '../shared/index-types';
 import type { ActiveExport } from '../shared/sources';
 import { exportLabel } from './labels';
+import { LinkDialog } from './LinkDialog';
 import {
-  closeLink,
   locateExport,
   openMessage,
   refreshSources,
@@ -115,15 +115,7 @@ export function App() {
           </section>
         </main>
       )}
-      {state.link !== null && (
-        <div className="dialog" role="dialog" aria-label="Open link">
-          <p className="dialog-title">Open link?</p>
-          <p className="dialog-url">{state.link}</p>
-          <button type="button" className="dialog-button" onClick={closeLink}>
-            Cancel
-          </button>
-        </div>
-      )}
+      {state.link !== null && <LinkDialog key={state.link.dialogId} prompt={state.link} />}
     </div>
   );
 }

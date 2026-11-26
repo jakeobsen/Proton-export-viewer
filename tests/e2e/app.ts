@@ -176,6 +176,7 @@ export const test = base.extend<{ pev: PevApp; testDirs: void }>({
   pev: async ({}, use, testInfo) => {
     const pev = await launch(testInfo.title.replace(/[^a-z0-9]+/gi, '-').slice(0, 40));
     expect(await pev.main('dialogsStubbed')).toBe(true);
+    expect(await pev.main('externalStubbed')).toBe(true);
     await use(pev);
     // Test runs stay in the background: no window was ever shown or focused,
     // and no native dialog was opened.
