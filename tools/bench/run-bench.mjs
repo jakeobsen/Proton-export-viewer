@@ -1,0 +1,494 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Runs the index bench in a packaged test build, hidden, and keeps its result.
+//
+//   node tools/bench/run-bench.mjs --scenario perf|stress|sandbox --out <dir> [options]
+//
+//   --corpus <dir>      the export's run folder (mail_YYYYMMDD_HHMMSS), for perf and stress
+//   --build test|mas-selftest   which packaged test build runs (default: test;
+//                       sandbox always uses mas-selftest)
+//   --engine node:sqlite|better-sqlite3   --addon <dir>  (better-sqlite3's package folder)
+//   --pool <n>  --old-gen <MB>  --label <text>  --term <word>  --repeats <n>
+//   --opens <n>  --reopens <n>  --large kind:bytes,…  --no-window  --no-quarantine
+//   --warm-up           read every corpus file once first, so a warm run finds
+//                       them in the OS file cache
+//   --scan-data <dir>   a folder to search for generated test data (repeatable)
+//   --index-cap <bytes> a lower index cap, to test the stop
+//   --max-messages <n>  index only the first n messages (size analysis)
+//   --fts-prefix "<list>"  the full-text prefix lengths (size analysis; "" for none)
+//
+// Before the run it refuses when the index folder holds anything but the
+// bench's own index, when less than 20 GiB of disk is free, when the results
+// folder is near its 50 MB share, or when all generated test data it finds
+// (under each --scan-data folder, in the app's containers and the capture
+// folder) plus a full index would reach 1 GB. The app keeps the index (with
+// -wal and -shm) under 300 MB and empties it when it's done; this script checks
+// that it did. The frontmost app is sampled throughout, and the
+// downloaded file's quarantine attribute is read here, outside the app.
+
+import { execFileSync, spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statfsSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { homedir } from 'node:os';
+import { isAbsolute, join, resolve } from 'node:path';
+import { parseArgs } from 'node:util';
+import { APP_ID, PRODUCT_NAME, appPath } from '../../scripts/package.mjs';
+
+export const INDEX_CAP = 300 * 1000 * 1000;
+/** All generated test data on this Mac, every agent's, stays under this. */
+export const TEST_DATA_LIMIT = 1000 * 1000 * 1000;
+/** Where the leak harness keeps its packet captures. */
+export const CAPTURE_DIR = '/usr/local/var/pev-leak/captures';
+const PRUNE = new Set(['node_modules', '.git', 'dist', 'out', 'out-test', 'build']);
+export const RESULTS_CAP = 50 * 1000 * 1000;
+export const MIN_FREE = 20 * 2 ** 30;
+const INDEX_NAME = 'pev-bench.db';
+const INDEX_FAMILY = ['', '-wal', '-shm', '-journal'].map((s) => INDEX_NAME + s);
+
+const DEFAULT_LARGE = {
+  perf: 'attachment:10000000,attachment:50000000,text:200000000,html:200000000',
+  sandbox: '',
+  stress: '',
+};
+
+export function parseLarge(spec) {
+  if (!spec) return [];
+  return spec.split(',').map((item) => {
+    const [kind, bytes] = item.split(':');
+    if (!['text', 'html', 'attachment'].includes(kind) || !/^\d+$/.test(bytes ?? ''))
+      throw new Error(`bad --large item ${item}`);
+    return { kind, bytes: Number(bytes) };
+  });
+}
+
+function dirBytes(path) {
+  if (!existsSync(path)) return 0;
+  const st = statSync(path);
+  if (!st.isDirectory()) return st.size;
+  return readdirSync(path).reduce((n, name) => n + dirBytes(join(path, name)), 0);
+}
+
+/**
+ * Every folder of generated test data under the scan roots: generator exports
+ * (the folder next to each `<name>.manifest.json`), every `test-output/` folder
+ * and every bench output folder; plus the app's container data and the
+ * capture folder. Nested finds are counted once.
+ */
+export function findTestData(
+  scanRoots,
+  { containers = [], captureDir = CAPTURE_DIR, maxDepth = 6 } = {},
+) {
+  const found = new Set();
+  const walk = (dir, depth) => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    if (entries.some((e) => e.isFile() && /^config-[0-9a-f]{16}\.json$/.test(e.name))) {
+      found.add(dir);
+      return;
+    }
+    for (const e of entries) {
+      const path = join(dir, e.name);
+      if (e.isFile() && e.name.endsWith('.manifest.json')) {
+        const exported = path.slice(0, -'.manifest.json'.length);
+        if (existsSync(exported)) found.add(exported);
+      } else if (e.isDirectory() && !e.isSymbolicLink()) {
+        if (e.name === 'test-output') found.add(path);
+        else if (!PRUNE.has(e.name) && depth < maxDepth) walk(path, depth + 1);
+      }
+    }
+  };
+  for (const root of scanRoots) walk(root, 0);
+  for (const c of containers) if (existsSync(c)) found.add(c);
+  if (captureDir && existsSync(captureDir)) found.add(captureDir);
+  const sorted = [...found].sort();
+  return sorted.filter((p) => !sorted.some((q) => q !== p && p.startsWith(q + '/')));
+}
+
+/** Allocated bytes on disk of a folder, as du counts them; fails closed if it can't read it all. */
+export function diskBytes(path) {
+  const out = execFileSync('du', ['-sk', path], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  return Number(out.split('\t')[0]) * 1024;
+}
+
+/** Refuses to start unless all test data plus a full index stays under the limit. */
+export function budgetCheck(folders, indexCap = INDEX_CAP, measure = diskBytes) {
+  const parts = folders.map((path) => ({ path, bytes: measure(path) }));
+  const total = parts.reduce((n, p) => n + p.bytes, 0);
+  if (total + indexCap >= TEST_DATA_LIMIT)
+    throw new Error(
+      `test data is ${total} B; with a ${indexCap} B index it would pass ${TEST_DATA_LIMIT} B`,
+    );
+  return { total, withIndex: total + indexCap, limit: TEST_DATA_LIMIT, parts };
+}
+
+/** Refuses to start when the run could pass its share of the disk. */
+export function preflight({ indexDir, resultsDir }) {
+  const strangers = existsSync(indexDir)
+    ? readdirSync(indexDir).filter((name) => !INDEX_FAMILY.includes(name))
+    : [];
+  if (strangers.length > 0)
+    throw new Error(`the index folder holds other files: ${strangers.join(', ')}`);
+  const fs = statfsSync(resultsDir);
+  const free = fs.bavail * fs.bsize;
+  if (free < MIN_FREE)
+    throw new Error(`only ${(free / 2 ** 30).toFixed(1)} GiB free; 20 GiB needed`);
+  const results = dirBytes(resultsDir) - dirBytes(indexDir);
+  if (results > RESULTS_CAP - 5 * 1000 * 1000)
+    throw new Error(`the results folder holds ${results} bytes, near its ${RESULTS_CAP} cap`);
+  return { freeBytes: free, resultsBytes: results };
+}
+
+function frontmost() {
+  try {
+    const front = execFileSync('lsappinfo', ['front'], { encoding: 'utf8' }).trim();
+    const info = execFileSync('lsappinfo', ['info', '-only', 'name', front], { encoding: 'utf8' });
+    return /"LSDisplayName"="(.*)"/.exec(info)?.[1] ?? info.trim();
+  } catch {
+    return null;
+  }
+}
+
+/** The app's processes: the one the runner started and every process it started. */
+function processTree(root) {
+  const pids = [root];
+  for (let i = 0; i < pids.length; i++) {
+    try {
+      const kids = execFileSync('pgrep', ['-P', String(pids[i])], { encoding: 'utf8' });
+      for (const line of kids.split('\n'))
+        if (/^\d+$/.test(line.trim())) pids.push(Number(line.trim()));
+    } catch {
+      // pgrep exits 1 when a process has no children.
+    }
+  }
+  return pids;
+}
+
+/**
+ * Each process's physical footprint (the memory Activity Monitor shows), in
+ * bytes. Resident sizes count shared framework pages in every process, so
+ * their sum overstates what the app uses.
+ */
+export function parseFootprint(text) {
+  const out = [];
+  for (const m of text.matchAll(
+    /^(.+?) \[(\d+)\]: .*?Footprint: (\d+) B[\s\S]*?phys_footprint: (\d+) B\s+phys_footprint_peak: (\d+) B/gm,
+  )) {
+    out.push({ name: m[1], pid: Number(m[2]), bytes: Number(m[4]), peakBytes: Number(m[5]) });
+  }
+  return out;
+}
+
+function footprintOf(root) {
+  try {
+    const text = execFileSync(
+      'footprint',
+      ['-f', 'bytes', '--noCategories', ...processTree(root).map(String)],
+      {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      },
+    );
+    const procs = parseFootprint(text);
+    return { at: Date.now(), totalBytes: procs.reduce((n, p) => n + p.bytes, 0), procs };
+  } catch {
+    return null;
+  }
+}
+
+/** Footprint samples matched to the app's phases: the peak of each phase, and the idle median. */
+export function footprintByPhase(samples, phaseLog, types = {}) {
+  const phaseAt = (at) => {
+    let name = null;
+    for (const p of phaseLog) if (p.at <= at) name = p.phase;
+    return name;
+  };
+  const byPhase = {};
+  for (const s of samples) {
+    const name = phaseAt(s.at);
+    if (name) (byPhase[name] ??= []).push(s.totalBytes);
+  }
+  const mib = (b) => Math.round((b / 2 ** 20) * 10) / 10;
+  const peak = (names) => {
+    const v = names.flatMap((n) => byPhase[n] ?? []);
+    return v.length ? mib(Math.max(...v)) : null;
+  };
+  const median = (name) => {
+    const v = [...(byPhase[name] ?? [])].sort((a, b) => a - b);
+    return v.length ? mib(v[Math.floor(v.length / 2)]) : null;
+  };
+  /** Each process's median footprint in one phase, so idle memory can be attributed. */
+  const byProcess = (phase) => {
+    const per = new Map();
+    for (const s of samples) {
+      if (phaseAt(s.at) !== phase) continue;
+      for (const p of s.procs ?? []) {
+        const e = per.get(p.pid) ?? { name: types[p.pid] ?? p.name, values: [] };
+        e.values.push(p.bytes);
+        per.set(p.pid, e);
+      }
+    }
+    return [...per.values()].map((e) => {
+      const v = e.values.sort((a, b) => a - b);
+      return { name: e.name, mib: mib(v[Math.floor(v.length / 2)]) };
+    });
+  };
+  return {
+    unit: 'MiB',
+    samples: samples.length,
+    idleByProcess: byProcess('idle-no-pool'),
+    idleShrunkByProcess: byProcess('idle-shrunk'),
+    peakByPhase: Object.fromEntries(Object.keys(byPhase).map((n) => [n, peak([n])])),
+    peakPhase2: peak(['phase2']),
+    peak: peak(Object.keys(byPhase)),
+    idle: median('idle-no-pool'),
+    idlePoolAlive: median('idle'),
+    idleShrunk: median('idle-shrunk'),
+  };
+}
+
+function quarantineOf(file) {
+  if (!file || !existsSync(file)) return { present: false, value: null, file: Boolean(file) };
+  try {
+    const value = execFileSync('xattr', ['-p', 'com.apple.quarantine', file], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return { present: true, value };
+  } catch {
+    return { present: false, value: null };
+  }
+}
+
+function sha256(file) {
+  return execFileSync('shasum', ['-a', '256', file], { encoding: 'utf8' }).split(' ')[0];
+}
+
+async function main() {
+  const { values } = parseArgs({
+    options: {
+      scenario: { type: 'string', default: 'perf' },
+      corpus: { type: 'string' },
+      out: { type: 'string' },
+      build: { type: 'string', default: 'test' },
+      engine: { type: 'string', default: 'node:sqlite' },
+      addon: { type: 'string' },
+      pool: { type: 'string', default: '4' },
+      'old-gen': { type: 'string', default: '512' },
+      label: { type: 'string', default: 'warm' },
+      term: { type: 'string', default: 'check' },
+      repeats: { type: 'string', default: '20' },
+      opens: { type: 'string', default: '200' },
+      reopens: { type: 'string', default: '3' },
+      large: { type: 'string' },
+      'interval-ms': { type: 'string', default: '20' },
+      'max-messages': { type: 'string' },
+      'fts-prefix': { type: 'string' },
+      'hold-ms': { type: 'string' },
+      'index-cap': { type: 'string' },
+      'scan-data': { type: 'string', multiple: true },
+      'timeout-min': { type: 'string', default: '40' },
+      'no-window': { type: 'boolean', default: false },
+      'no-quarantine': { type: 'boolean', default: false },
+      'warm-up': { type: 'boolean', default: false },
+    },
+  });
+  const scenario = values.scenario;
+  if (!['perf', 'stress', 'sandbox'].includes(scenario))
+    throw new Error('--scenario perf|stress|sandbox');
+  if (!values.out || !isAbsolute(values.out)) throw new Error('--out needs an absolute folder');
+  const sandbox = scenario === 'sandbox';
+  if (!sandbox && (!values.corpus || !isAbsolute(values.corpus)))
+    throw new Error('--corpus needs the absolute path of a run folder');
+  if (values.engine === 'better-sqlite3' && (!values.addon || !isAbsolute(values.addon)))
+    throw new Error('--addon needs the absolute path of the better-sqlite3 package');
+  if (sandbox && values.engine !== 'node:sqlite')
+    throw new Error('the sandboxed check runs node:sqlite');
+
+  const out = resolve(values.out);
+  const indexDir = join(out, 'index');
+  const downloadDir = join(out, 'downloads');
+  mkdirSync(indexDir, { recursive: true });
+  const disk = preflight({ indexDir, resultsDir: out });
+  const indexCap = values['index-cap'] ? Number(values['index-cap']) : INDEX_CAP;
+  if (!Number.isSafeInteger(indexCap) || indexCap <= 0 || indexCap > INDEX_CAP)
+    throw new Error(`--index-cap must be a whole number up to ${INDEX_CAP}`);
+  const containersRoot = join(homedir(), 'Library', 'Containers');
+  const containers = existsSync(containersRoot)
+    ? readdirSync(containersRoot)
+        .filter((name) => name === APP_ID || name.startsWith(`${APP_ID}.`))
+        .map((name) =>
+          join(containersRoot, name, 'Data', 'Library', 'Application Support', PRODUCT_NAME),
+        )
+    : [];
+  const budget = budgetCheck(
+    findTestData([...(values['scan-data'] ?? []), out], { containers }),
+    indexCap,
+  );
+
+  const build = sandbox ? 'mas-selftest' : values.build;
+  const app = appPath(build);
+  const executable = join(app, 'Contents', 'MacOS', PRODUCT_NAME);
+  if (!existsSync(executable)) throw new Error(`${app} is missing; package it first`);
+
+  let warmUp = null;
+  if (values['warm-up'] && !sandbox) {
+    const t0 = Date.now();
+    let bytes = 0;
+    for (const name of readdirSync(values.corpus))
+      bytes += readFileSync(join(values.corpus, name)).length;
+    warmUp = { bytes, ms: Date.now() - t0 };
+  }
+
+  const nonce = randomBytes(8).toString('hex');
+  const userData = join(out, 'user-data');
+  const resultPath = join(out, `result-${nonce}.json`);
+  const config = {
+    nonce,
+    scenario,
+    label: values.label,
+    engine: values.engine,
+    addonDir: values.addon,
+    poolSize: Number(values.pool),
+    oldGenMb: Number(values['old-gen']),
+    indexCapBytes: indexCap,
+    term: values.term,
+    searchRepeats: Number(values.repeats),
+    opens: Number(values.opens),
+    loadIntervalMs: Number(values['interval-ms']),
+    large: parseLarge(values.large ?? DEFAULT_LARGE[scenario]),
+    reopens: Number(values.reopens),
+    quarantine: !values['no-quarantine'],
+    window: !values['no-window'],
+    ...(values['max-messages'] ? { maxMessages: Number(values['max-messages']) } : {}),
+    ...(values['fts-prefix'] !== undefined ? { ftsPrefix: values['fts-prefix'] } : {}),
+    ...(values['hold-ms'] ? { holdMs: Number(values['hold-ms']) } : {}),
+    ...(sandbox
+      ? {}
+      : { runDir: values.corpus, dbPath: join(indexDir, INDEX_NAME), resultPath, downloadDir }),
+  };
+  const args = sandbox
+    ? [`--pev-bench-inline=${Buffer.from(JSON.stringify(config)).toString('base64url')}`]
+    : [`--pev-bench=${join(out, `config-${nonce}.json`)}`, `--pev-user-data=${userData}`];
+  if (!sandbox)
+    writeFileSync(join(out, `config-${nonce}.json`), JSON.stringify(config, null, 2) + '\n');
+
+  const seen = new Map();
+  const note = () => {
+    const name = frontmost();
+    seen.set(name, (seen.get(name) ?? 0) + 1);
+  };
+  note();
+  const sampler = setInterval(note, 1000);
+  const footprints = [];
+  let footprintTimer = null;
+  const started = Date.now();
+  console.log(
+    `bench: ${scenario} ${values.label} ${values.engine} pool ${config.poolSize} (${build}), nonce ${nonce}`,
+  );
+  const exit = await new Promise((done) => {
+    const child = spawn(executable, args, { stdio: 'ignore' });
+    footprintTimer = setInterval(() => {
+      const s = footprintOf(child.pid);
+      if (s) footprints.push(s);
+    }, 500);
+    const timer = setTimeout(
+      () => {
+        child.kill('SIGKILL');
+        done({ code: null, timedOut: true });
+      },
+      Number(values['timeout-min']) * 60_000,
+    );
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      done({ code, signal, timedOut: false });
+    });
+  });
+  clearInterval(sampler);
+  clearInterval(footprintTimer);
+  note();
+
+  const containerData = join(homedir(), 'Library', 'Containers', APP_ID, 'Data');
+  const appSupport = join(containerData, 'Library', 'Application Support', PRODUCT_NAME);
+  const resultFile = sandbox ? join(appSupport, `bench-result-${nonce}.json`) : resultPath;
+  const result = existsSync(resultFile) ? JSON.parse(readFileSync(resultFile, 'utf8')) : null;
+  const leftover = existsSync(indexDir)
+    ? readdirSync(indexDir).filter((name) => INDEX_FAMILY.includes(name))
+    : [];
+  for (const name of leftover) rmSync(join(indexDir, name), { force: true });
+  const downloaded = result?.quarantine?.path ?? null;
+  const report = {
+    runner: {
+      nonce,
+      scenario,
+      build,
+      app,
+      appExecutableSha256: sha256(executable),
+      addonSha256: values.addon
+        ? sha256(join(values.addon, 'prebuilds', `${process.platform}-${process.arch}.node`))
+        : null,
+      wallMs: Date.now() - started,
+      exit,
+      frontmost: Object.fromEntries(seen),
+      disk,
+      budget,
+      warmUp,
+      indexLeftover: leftover,
+      quarantine: quarantineOf(downloaded),
+      footprint: result?.phaseLog
+        ? footprintByPhase(footprints, result.phaseLog, result.processTypes ?? {})
+        : null,
+      footprintPeakByProcess: footprints.length
+        ? Object.values(
+            Object.fromEntries(
+              footprints
+                .flatMap((s) => s.procs)
+                .map((p) => [
+                  p.pid,
+                  {
+                    name: result?.processTypes?.[p.pid] ?? p.name,
+                    peakMiB: Math.round(p.peakBytes / 2 ** 20),
+                  },
+                ]),
+            ),
+          )
+        : null,
+    },
+    result: result?.nonce === nonce ? result : null,
+  };
+  // The app's own profile (logs, caches) isn't kept; the result holds what counts.
+  if (!sandbox) rmSync(userData, { recursive: true, force: true });
+  if (sandbox) {
+    // The result and the downloaded check file are this run's only files in the container.
+    rmSync(resultFile, { force: true });
+    if (downloaded && downloaded.startsWith(containerData)) rmSync(downloaded, { force: true });
+  }
+  const name = `${values.label}-${scenario}-${values.engine.replace(':', '-')}-pool${config.poolSize}-${nonce}.json`;
+  writeFileSync(join(out, name), JSON.stringify(report, null, 2) + '\n');
+  console.log(`bench: wrote ${join(out, name)}`);
+  if (!report.result?.ok) {
+    console.error(`bench: run failed: ${report.result?.error ?? 'no result'}`);
+    process.exit(1);
+  }
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => {
+    console.error(`bench: ${err.message}`);
+    process.exit(1);
+  });
+}

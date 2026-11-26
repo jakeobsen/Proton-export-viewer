@@ -220,6 +220,12 @@ export async function install(ctx: AppContext): Promise<boolean> {
   };
   (globalThis as { __pevTest?: typeof api }).__pevTest = api;
 
+  const bench = await import('./bench/main');
+  if (bench.benchRequested(process.argv)) {
+    void bench.runBench(ctx, process.argv);
+    return true;
+  }
+
   const selfTest = process.argv.includes('--pev-selftest');
   if (selfTest) {
     await runSelfTest(ctx, process.argv);

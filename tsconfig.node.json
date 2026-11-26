@@ -15,6 +15,7 @@
     "src/testhooks/selftest.ts",
     "src/testhooks/stubs.ts",
     "src/testhooks/pages.ts",
+    "src/testhooks/bench/**/*.ts",
     "electron.vite.config.ts",
     "vitest.config.ts"
   ]

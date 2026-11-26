@@ -37,17 +37,29 @@ export interface TestRequest {
   reqId: number;
   action: string;
   markers?: string;
+  /** Test builds only: the arguments of a structured test action. */
+  payload?: unknown;
 }
 
 export type CoreRequest = OpenRequest | PingRequest | TestRequest;
 
 export type CoreResult =
-  | { type: 'result'; reqId: number; ok: true; body?: StubBodyMessage; value?: number }
+  | {
+      type: 'result';
+      reqId: number;
+      ok: true;
+      body?: StubBodyMessage;
+      value?: number;
+      /** Test builds only: the result of a structured test action. */
+      data?: unknown;
+    }
   | {
       type: 'result';
       reqId: number;
       ok: false;
       code: 'unknown_stub' | 'worker_failed' | 'invalid';
+      /** Test builds only: why a test action failed. */
+      detail?: string;
     };
 
 export interface WorkerBuild {

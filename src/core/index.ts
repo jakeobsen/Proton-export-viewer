@@ -103,6 +103,7 @@ function handle(request: CoreRequest): void {
             open,
             toWorker,
             reply,
+            dir: import.meta.dirname,
           }),
         );
         return;

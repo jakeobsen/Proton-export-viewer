@@ -16,6 +16,8 @@ export interface CoreTestDeps {
   open: (request: OpenRequest) => void;
   toWorker: (message: WorkerRequest) => void;
   reply: (result: CoreResult) => void;
+  /** The folder of core's own script, where its worker scripts are. */
+  dir: string;
 }
 
 export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
@@ -70,6 +72,21 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
     case 'worker-reject':
       deps.toWorker({ type: 'test', action: request.action, markers });
       ok();
+      return;
+    case 'bench':
+      import('./bench/core')
+        .then((bench) => bench.handleBench(request.payload, deps.dir))
+        .then(
+          (data) => deps.reply({ type: 'result', reqId: request.reqId, ok: true, data }),
+          (err: unknown) =>
+            deps.reply({
+              type: 'result',
+              reqId: request.reqId,
+              ok: false,
+              code: 'invalid',
+              detail: String((err as Error)?.message ?? err).slice(0, 200),
+            }),
+        );
       return;
     case 'exit':
       ok();

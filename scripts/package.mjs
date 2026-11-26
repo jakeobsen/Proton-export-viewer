@@ -4,6 +4,7 @@
 //   release       standard Electron, fuses applied, no test hooks      (from out/)
 //   mas-release   Mac App Store flavor, sandboxed, no test hooks       (from out/)
 //   mas-selftest  Mac App Store flavor, sandboxed, with test hooks     (from out-test/)
+//   test          standard Electron, fuses applied, with test hooks    (from out-test/)
 
 import { existsSync, readdirSync, rmSync, rmdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -28,6 +29,7 @@ const FLAVORS = {
   release: { out: 'out', mas: false },
   'mas-release': { out: 'out', mas: true },
   'mas-selftest': { out: 'out-test', mas: true },
+  test: { out: 'out-test', mas: false },
 };
 
 export function appPath(flavor) {

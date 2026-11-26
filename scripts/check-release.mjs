@@ -36,11 +36,13 @@ const FORBIDDEN_CONTENT = [
   '/__test/',
   'pev-selftest',
   'pev-script-marker',
+  'pev-bench',
+  'better-sqlite3',
   'ws://localhost',
   "style-src 'self' 'unsafe-inline'",
   '/Users/',
 ];
-const FORBIDDEN_PATH = /testhooks|__test|bundled-|out-test/;
+const FORBIDDEN_PATH = /testhooks|__test|bundled-|out-test|bench-worker/;
 
 const failures = [];
 const check = (ok, message) => {

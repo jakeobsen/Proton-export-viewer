@@ -35,6 +35,8 @@ export default defineConfig(({ command }) => {
             index: resolve('src/main/index.ts'),
             core: resolve('src/core/index.ts'),
             'core-worker': resolve('src/core/worker.ts'),
+            // The index bench's worker threads exist only in builds with test hooks.
+            ...(testHooks ? { 'bench-worker': resolve('src/testhooks/bench/worker.ts') } : {}),
           },
         },
       },
