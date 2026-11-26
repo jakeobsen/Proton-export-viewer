@@ -291,6 +291,29 @@ export function groupMembers(members: Member[]): number[][] {
   );
 }
 
+/**
+ * A group's message, unread and attachment counts and its first and last
+ * times, in one pass: a conversation can have more members than a function
+ * call takes arguments, so the times are never spread into Math.min/max.
+ */
+export function groupTotals(
+  members: readonly Member[],
+  group: readonly number[],
+): { count: number; unread: number; withAttachments: number; first: number; last: number } {
+  let unread = 0;
+  let withAttachments = 0;
+  let first = Infinity;
+  let last = -Infinity;
+  for (const i of group) {
+    const m = members[i]!;
+    unread += m.unread;
+    if (m.numAttachments > 0) withAttachments += 1;
+    if (m.time < first) first = m.time;
+    if (m.time > last) last = m.time;
+  }
+  return { count: group.length, unread, withAttachments, first, last };
+}
+
 function jsonList(value: unknown): string[] {
   if (typeof value !== 'string') return [];
   try {
@@ -857,20 +880,13 @@ export class IndexWriter {
         keyPut.run(key, id);
         written += 1;
       }
-      const list = group.map((m) => members[m]!);
+      const totals = groupTotals(members, group);
       this.db
         .stmt(
           `UPDATE threads SET msg_count = ?, unread_count = ?, attach_count = ?, first_time = ?, last_time = ?
            WHERE thread_id = ?`,
         )
-        .run(
-          list.length,
-          list.reduce((n, m) => n + m.unread, 0),
-          list.filter((m) => m.numAttachments > 0).length,
-          Math.min(...list.map((m) => m.time)),
-          Math.max(...list.map((m) => m.time)),
-          id,
-        );
+        .run(totals.count, totals.unread, totals.withAttachments, totals.first, totals.last, id);
       this.step();
       this.db
         .stmt(

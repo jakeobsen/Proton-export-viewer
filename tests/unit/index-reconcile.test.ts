@@ -14,6 +14,7 @@ import {
   PAIR_META_MISSING,
   classify,
   groupMembers,
+  groupTotals,
   labelsStatOf,
   type ApplyItem,
   type ApplyStats,
@@ -324,6 +325,33 @@ describe('grouping members again', () => {
       m(6, []),
     ]);
     expect(groups).toEqual([[1, 2, 4], [0, 3], [5]]);
+  });
+
+  it('totals a group of any size, with more members than a call takes arguments', () => {
+    const n = 500_000;
+    const members = Array.from({ length: n }, (_, i) => ({
+      rowid: i + 1,
+      // Times out of order, so first and last aren't the ends of the list.
+      time: ((i * 7_919) % n) - 1_000,
+      unread: i % 3 === 0 ? 1 : 0,
+      numAttachments: i % 5 === 0 ? 2 : 0,
+      keys: [],
+    }));
+    const group = members.map((_, i) => i);
+    expect(groupTotals(members, group)).toEqual({
+      count: n,
+      unread: Math.ceil(n / 3),
+      withAttachments: n / 5,
+      first: -1_000,
+      last: n - 1 - 1_000,
+    });
+    expect(groupTotals(members, [3, 1, 4])).toEqual({
+      count: 3,
+      unread: 1,
+      withAttachments: 0,
+      first: Math.min(members[1]!.time, members[3]!.time, members[4]!.time),
+      last: Math.max(members[1]!.time, members[3]!.time, members[4]!.time),
+    });
   });
 });
 
