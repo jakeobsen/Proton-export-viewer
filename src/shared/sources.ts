@@ -92,4 +92,6 @@ export type SourceOutcome =
   /** Nothing can be opened: the app's data is being reset. */
   | 'closed'
   /** The index couldn't be deleted yet; nothing was changed. */
-  | 'busy';
+  | 'busy'
+  /** The export is inside the app's data folder, or holds it: it isn't opened. */
+  | 'app_data';

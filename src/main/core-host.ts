@@ -46,6 +46,8 @@ export class CoreHost {
   private childSource: CoreSource | null = null;
   /** Receives what core reports without being asked. */
   onEvent: ((event: CoreEvent) => void) | null = null;
+  /** The run folders of the exports the app knows, for the next start of core. */
+  exports: () => string[] = () => [];
 
   constructor(private readonly options: CoreHostOptions) {}
 
@@ -119,6 +121,7 @@ export class CoreHost {
           appRoot: this.options.appRoot,
           indexDir: this.options.indexDir,
           source,
+          exports: this.exports(),
         };
         child.postMessage(init, [port2]);
       });

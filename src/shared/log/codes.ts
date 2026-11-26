@@ -72,7 +72,10 @@ export const LOG_CODES = [
   'index.reconciled',
   'source.forgotten',
   'source.forget_refused',
+  'source.refused',
+  'index.open_refused',
   'app.reset',
+  'app.reset_refused',
 ] as const;
 
 /** Codes that only exist in builds with test hooks. */
@@ -164,7 +167,10 @@ export const REASONS = [
   'identity',
   'quick_check',
   'corrupt',
+  'schema',
   'in_use',
+  'overlap',
+  'app_data',
 ] as const;
 
 /** The lists of a message whose entries can be cut to a limit when indexed. */

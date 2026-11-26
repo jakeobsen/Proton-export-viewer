@@ -34,6 +34,8 @@ export interface RenderedMessage {
   links: BodyLink[];
   /** The format the body was rendered in. */
   format: 'plain' | 'html';
+  /** How many distinct remote images and media the body refers to, each shown as a placeholder. */
+  remote: number;
   /** True when the message has an HTML body. */
   hasHtml: boolean;
 }

@@ -44,6 +44,8 @@ import { runIdentity } from './identity';
 import { FamilyInUse, deleteFamily } from './index/family';
 import type { CheckResult } from './index/ops';
 import { ThreadError, type IndexThread, type ThreadRole } from './index/pool';
+import { probeMismatch } from './index/schema';
+import { overlaps } from '../shared/overlap';
 import { ConnectionRegistry, IndexService, type IndexOptions } from './index/service';
 
 /** Entries scanned between yields, so core keeps answering during a long scan. */
@@ -84,6 +86,8 @@ export interface IndexSetup {
   dir: string;
   thread: (role: ThreadRole) => IndexThread;
   options?: IndexOptions;
+  /** The run folders of the other exports the app knows. */
+  exports?: string[];
 }
 
 export class SourceSession {
@@ -103,6 +107,8 @@ export class SourceSession {
   private readonly retired = new Set<string>();
   /** Closed for good by a reset: no open, rebuild or recovery starts. */
   private admitting = true;
+  /** The run folders of the exports the app knows, this one included. */
+  private readonly exportRoots: string[];
 
   constructor(
     source: CoreSource | null,
@@ -111,6 +117,7 @@ export class SourceSession {
     private readonly indexSetup: IndexSetup | null = null,
     private readonly emit: (event: CoreEvent) => void = () => {},
   ) {
+    this.exportRoots = [...(source?.root ? [source.root] : []), ...(indexSetup?.exports ?? [])];
     this.writer = new Writer(this.gate, (scan) => {
       this.records.scans += 1;
       this.records.rejected = scan.rejected;
@@ -168,13 +175,29 @@ export class SourceSession {
     });
   }
 
+  /**
+   * Whether an export the app knows overlaps the index folder now: lies
+   * inside it, or holds it, with links resolved at this moment. Then no index
+   * file is opened, made, replaced or deleted, so nothing of an export can be
+   * changed. Asked right before each of those, never remembered.
+   */
+  private overlapsIndex(): boolean {
+    const dir = this.indexSetup?.dir;
+    return dir !== undefined && this.exportRoots.some((root) => overlaps(root, dir));
+  }
+
   private dbPathOf(sourceKey: string): string | null {
     return this.indexSetup ? join(this.indexSetup.dir, `${sourceKey}.sqlite`) : null;
   }
 
-  /** True while `service` is the source's index and its generation is current. */
+  /**
+   * True while `service` is the source's index, its generation is current and
+   * no reset has closed core: a check result or a recovery waiting for the
+   * lock has no effect otherwise.
+   */
   private isLive(service: IndexService, stamp: Stamp): boolean {
     return (
+      this.admitting &&
       this.index === service &&
       !service.isClosed &&
       this.gate.isCurrent(stamp) &&
@@ -218,6 +241,11 @@ export class SourceSession {
       if (!this.gate.isCurrent(stamp)) return fail('stale');
       let service = this.index;
       if (!service) {
+        // Opening can make or replace the index's files.
+        if (this.overlapsIndex()) {
+          this.log.warn('index.open_refused', { reason: 'overlap' }, { src: stamp.sourceKey });
+          return fail('closed');
+        }
         const fresh = this.newService(setup, stamp, root);
         let opened: IndexOpened;
         try {
@@ -227,7 +255,9 @@ export class SourceSession {
         } catch (err) {
           await fresh.close();
           if (err instanceof ThreadError && err.code === 'INDEX_DAMAGED') {
-            this.log.warn('index.damaged', { reason: 'identity' }, { src: stamp.sourceKey });
+            const dbPath = this.dbPathOf(stamp.sourceKey);
+            const reason = (dbPath && probeMismatch(dbPath, request.dbUuid)) || 'identity';
+            this.log.warn('index.damaged', { reason }, { src: stamp.sourceKey });
             this.removeFamily(stamp.sourceKey, true);
             this.sendEvent(stamp, { ...fresh.progress, condition: 'damaged' }, true);
             return fail('damaged');
@@ -279,7 +309,8 @@ export class SourceSession {
     }
     if (result?.ok === false) {
       // Recovery is queued behind this, on the same lock.
-      service.reportDamage(result.reason === 'identity' ? 'identity' : 'quick_check');
+      const reason = result.reason;
+      service.reportDamage(reason === 'identity' || reason === 'schema' ? reason : 'quick_check');
       return;
     }
     if (result?.ok) this.log.info('index.verified', { ms }, { src: stamp.sourceKey });
@@ -326,10 +357,11 @@ export class SourceSession {
   private removeFamily(sourceKey: string, own: boolean): boolean {
     const dbPath = this.dbPathOf(sourceKey);
     if (dbPath === null) return false;
-    const refuse = () => {
-      this.log.warn('index.delete_refused', { reason: 'in_use' }, { src: sourceKey });
+    const refuse = (reason: 'in_use' | 'overlap' = 'in_use') => {
+      this.log.warn('index.delete_refused', { reason }, { src: sourceKey });
       return false;
     };
+    if (this.overlapsIndex()) return refuse('overlap');
     if (this.connections.holds(dbPath) || (own && this.connections.size > 0)) return refuse();
     try {
       deleteFamily(dbPath);

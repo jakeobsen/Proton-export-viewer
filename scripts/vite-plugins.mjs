@@ -78,3 +78,25 @@ export function writeAppManifest(outRoot) {
     },
   };
 }
+
+const SYNC_XHR_IMPL = '/jsdom/lib/jsdom/living/xhr/XMLHttpRequest-impl.js';
+const SYNC_XHR_LOOKUP = 'const syncWorkerFile = require.resolve("./xhr-sync-worker.js");';
+
+/**
+ * jsdom looks up the file of its synchronous-XMLHttpRequest worker as soon as
+ * it loads, and that file isn't part of a bundle. The app never runs scripts
+ * in jsdom, so the worker is never used: the lookup becomes null, and a
+ * synchronous request would fail instead. The build fails if jsdom changes
+ * that line.
+ */
+export function withoutSyncXhrWorker() {
+  return {
+    name: 'pev-without-sync-xhr-worker',
+    transform(code, id) {
+      if (!id.split('?')[0].replaceAll('\\', '/').endsWith(SYNC_XHR_IMPL)) return null;
+      if (!code.includes(SYNC_XHR_LOOKUP))
+        throw new Error('jsdom: the sync XHR worker lookup changed');
+      return { code: code.replace(SYNC_XHR_LOOKUP, 'const syncWorkerFile = null;'), map: null };
+    },
+  };
+}

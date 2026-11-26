@@ -171,6 +171,154 @@ test('a message opens as plain text, served by mail-body: with its body headers'
   expect(await pev.main('linkDialogs')).toEqual([]);
 });
 
+const HTML = [
+  'Subject: HTML body',
+  'From: "Sender" <sender@example.org>',
+  'Content-Type: multipart/related; boundary="rel"',
+  '',
+  '--rel',
+  'Content-Type: text/html; charset=utf-8',
+  '',
+  '<html><head><style>p{color:red}</style><link rel="stylesheet" href="https://leak-reader.test/s.css">',
+  '<meta http-equiv="refresh" content="0;url=https://leak-reader.test/r"></head>',
+  '<body><p id="p" style="color:blue">Hello</p>',
+  '<div id="bg" style="background-image:url(https://leak-reader.test/bg.png);width:4px;height:4px"></div>',
+  '<img id="remote" src="https://leak-reader.test/pixel.png" width="1" height="1">',
+  '<img id="inline" src="cid:part1@example.org">',
+  '<a id="link" href="https://leak-reader.test/page">a page</a>',
+  `<script>document.documentElement.setAttribute('data-pev-script','ran')</script>`,
+  '<iframe src="https://leak-reader.test/frame"></iframe></body></html>',
+  '--rel',
+  'Content-Type: image/png',
+  'Content-ID: <part1@example.org>',
+  'Content-Transfer-Encoding: base64',
+  '',
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNgAAIAAAUAAen63NgAAAAASUVORK5CYII=',
+  '--rel--',
+  '',
+].join('\r\n');
+
+test('an HTML message opens sanitized, with placeholders, and requests nothing remote', async ({
+  pev,
+}) => {
+  await source(pev, { 'html.eml': HTML }, [[1, { file: 'html.eml' }]]);
+  // A first body puts the frame in place; let it finish loading before the record starts.
+  const sample = await pev.open('sample');
+  await pev.bodyFrame(sample.url as string);
+  await pev.main('clearRequests');
+  const before = pev.consoleMessages.length;
+  const opened = await openRow(pev, 1, 'html');
+  expect(opened).toMatchObject({
+    ok: true,
+    outcome: 'view',
+    format: 'html',
+    hasHtml: true,
+    remote: 2,
+  });
+  const url = viewUrl(opened);
+  const token = tokenOf(url);
+  await pev.shell('setFrameSrc', [url]);
+  const frame = await pev.bodyFrame(url);
+  await expect
+    .poll(() =>
+      frame.evaluate(() => {
+        const img = document.getElementById('remote') as HTMLImageElement | null;
+        return img?.complete ? img.naturalWidth : -1;
+      }),
+    )
+    .toBe(1);
+  const dom = await frame.evaluate(() => ({
+    remote: document.getElementById('remote')?.getAttribute('src'),
+    inline: document.getElementById('inline')?.getAttribute('src'),
+    link: document.getElementById('link')?.getAttribute('href'),
+    target: document.getElementById('link')?.getAttribute('target'),
+    style: document.getElementById('p')?.getAttribute('style') ?? null,
+    color: getComputedStyle(document.getElementById('p') as HTMLElement).color,
+    background: getComputedStyle(document.getElementById('bg') as HTMLElement).backgroundImage,
+    sheets: [...document.querySelectorAll('style')].map((e) => e.textContent),
+    dropped: document.querySelectorAll('script, link, meta, iframe').length,
+    ran: document.documentElement.getAttribute('data-pev-script'),
+  }));
+  expect(dom).toEqual({
+    remote: `mail-asset://v/${token}/r1`,
+    inline: `mail-asset://v/${token}/c1`,
+    link: `mail-asset://v/${token}/l1`,
+    target: '_blank',
+    // The style sheet and the style attributes stay, filtered, and render.
+    style: 'color:blue',
+    color: 'rgb(0, 0, 255)',
+    background: `url("mail-asset://v/${token}/r2")`,
+    sheets: ['p{color:red}'],
+    dropped: 0,
+    ran: null,
+  });
+
+  await expect
+    .poll(async () =>
+      (await pev.main<{ asset: string[] }>('requests', 1)).asset.includes(
+        `mail-asset://v/${token}/r2`,
+      ),
+    )
+    .toBe(true);
+
+  // The placeholder serves; a cid and a link id serve nothing for now.
+  const asset = (id: string) =>
+    pev.main<{ status: number; headers: Record<string, string>; length: number }>(
+      'fetchIn',
+      1,
+      `mail-asset://v/${token}/${id}`,
+    );
+  expect(await asset('r1')).toMatchObject({ status: 200, length: 68 });
+  expect((await asset('r1')).headers['content-type']).toBe('image/png');
+  expect((await asset('c1')).status).toBe(404);
+  expect((await asset('l1')).status).toBe(404);
+
+  // Nothing but this view's own URLs was requested, nothing was cancelled,
+  // and the body caused no CSP report.
+  const requests = await pev.main<{ body: string[]; asset: string[]; blocked: string[] }>(
+    'requests',
+    1,
+  );
+  expect(requests.blocked).toEqual([]);
+  expect(requests.body.every((u) => u === url)).toBe(true);
+  expect(requests.asset.every((u) => u.startsWith(`mail-asset://v/${token}/`))).toBe(true);
+  const reports = pev.consoleMessages
+    .slice(before)
+    .filter((m) => /Content Security Policy/i.test(m.text));
+  expect(reports).toEqual([]);
+});
+
+test('the huge-style and regex-heavy messages open in time or fall back', async ({ pev }) => {
+  const { plans } = hostileMessages({
+    seed: 1,
+    nonce: randomBytes(6).toString('hex'),
+    labelInfo: { file: { Payload: [] } },
+    owner: { Name: 'Owner', Address: 'owner@example.com' },
+  });
+  const chosen = plans.filter((p) =>
+    ['pathological/huge-style', 'pathological/regex-heavy-css'].includes(
+      p.key.split('/').slice(3).join('/'),
+    ),
+  );
+  expect(chosen).toHaveLength(2);
+  await source(
+    pev,
+    Object.fromEntries(chosen.map((p, i) => [`p${i}.eml`, p.emlData])),
+    chosen.map((_p, i) => [i + 1, { file: `p${i}.eml` }] as [number, Entry]),
+  );
+  for (const [i, plan] of chosen.entries()) {
+    const started = Date.now();
+    const result = await openRow(pev, i + 1, 'html');
+    const ms = Date.now() - started;
+    console.log(
+      `${plan.key.split('/').slice(3).join('/')}: ${result.ok ? result.outcome : result.code} in ${ms} ms`,
+    );
+    expect(result.ok).toBe(true);
+    // The lane's own limit is 3 s per job; past it, the result is the fallback.
+    expect(ms).toBeLessThan(5000);
+  }
+});
+
 test('a stale openId or generation installs no view', async ({ pev }) => {
   await source(pev, { 'plain.eml': PLAIN }, [
     [1, { file: 'plain.eml' }],

@@ -211,7 +211,7 @@ process.parentPort.once('message', (event) => {
     init.source,
     log,
     reply,
-    { dir: init.indexDir, thread: indexThread },
+    { dir: init.indexDir, thread: indexThread, exports: init.exports },
     (event) => port?.postMessage(event),
   );
   const p = event.ports[0];

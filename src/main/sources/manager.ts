@@ -18,10 +18,11 @@
 // known; while the run is unavailable, that waits until it is back. Forget
 // tears the source down if it is open and has core delete its index before it
 // leaves the registry. Reset closes the app to every open first, tears down
-// the open source, and then deletes the app's data.
+// the open source, and then deletes the app's own files from its data folder,
+// unless an export the app knows overlaps them. An export inside the data
+// folder, or holding it, is never opened.
 
 import { randomBytes, randomUUID } from 'node:crypto';
-import { rmSync } from 'node:fs';
 import { lstat, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { CoreEvent, CoreRequest, CoreResult } from '../../shared/core-protocol';
@@ -32,6 +33,7 @@ import type {
   IndexQuery,
 } from '../../shared/index-types';
 import type { Logger } from '../../shared/log/writer';
+import { overlaps } from '../../shared/overlap';
 import {
   sameStamp,
   type ActiveExport,
@@ -42,11 +44,9 @@ import {
   type Stamp,
 } from '../../shared/sources';
 import { ScopeError, type Picker, type ScopeHandle, type Scopes } from './scope';
+import { appDataPaths, removeAppData } from './app-data';
 import { discoverRuns, type FoundRun } from './discovery';
-import { REGISTRY_FILE, Registry, type PickRecord, type SourceRecord } from './registry';
-
-/** What the app keeps in its data folder; a reset deletes all of it. */
-export const APP_DATA = ['index', REGISTRY_FILE, 'settings.json', 'logs'] as const;
+import { Registry, type PickRecord, type SourceRecord } from './registry';
 
 /** One step of opening or closing a source, in the order it happened. */
 export interface OrderStep {
@@ -83,6 +83,8 @@ export interface SourceManagerDeps {
   bumpGeneration(): number;
   /** Tells the shell that the sources changed. */
   notify(): void;
+  /** Stops main's own log files, so a reset leaves no log folder behind. */
+  stopLogs?(): void;
   picker: Picker;
   scopes: Scopes;
   discover?: typeof discoverRuns;
@@ -417,6 +419,13 @@ export class SourceManager {
    */
   private async activate(target: Target): Promise<SourceOutcome> {
     if (!this.admitting) return 'closed';
+    const root = join(target.pick.path, target.run.rel);
+    // Reset deletes the app's data folder: an export inside it, or around
+    // it, is never opened, so nothing the app deletes can be part of one.
+    if (overlaps(root, this.deps.userData)) {
+      this.deps.log.warn('source.refused', { reason: 'app_data' });
+      return 'app_data';
+    }
     const generation = this.deps.bumpGeneration();
     await this.stopCore(generation);
     const pickId = target.pick.pickId;
@@ -435,7 +444,6 @@ export class SourceManager {
         this.deps.log.warn('scope.failed', { generation });
       }
     }
-    const root = join(target.pick.path, target.run.rel);
     const online = scoped && (await isRunFolder(root));
     if (scoped && !online) this.releaseScope(generation);
 
@@ -777,6 +785,7 @@ export class SourceManager {
   reset(): Promise<void> {
     this.admitting = false;
     return this.serial(async () => {
+      const exports = this.exportRoots();
       const generation = this.deps.bumpGeneration();
       this.active = null;
       if (this.deps.core.running) {
@@ -790,13 +799,30 @@ export class SourceManager {
       this.releaseScope(generation);
       this.deps.core.setSource(null);
       this.rebuilds.clear();
+      // Nothing is deleted if any export the app knows overlaps what would be.
+      const targets = appDataPaths(this.deps.userData);
+      if (targets.some((target) => exports.some((root) => overlaps(root, target)))) {
+        this.deps.log.warn('app.reset_refused', { reason: 'overlap' });
+        this.deps.notify();
+        return;
+      }
       this.registry.clear();
       this.deps.log.info('app.reset', { generation });
-      for (const name of APP_DATA) {
-        rmSync(join(this.deps.userData, name), { recursive: true, force: true });
-      }
+      this.deps.stopLogs?.();
+      removeAppData(this.deps.userData);
       this.deps.notify();
     });
+  }
+
+  /** The run folder of every export the app knows, the open one included. */
+  exportRoots(): string[] {
+    const roots: string[] = [];
+    for (const source of this.registry.sources()) {
+      const pick = this.registry.pick(source.pickId);
+      if (pick) roots.push(join(pick.path, source.rel));
+    }
+    if (this.active) roots.push(join(this.active.pick.path, this.active.source.rel));
+    return roots;
   }
 
   /**

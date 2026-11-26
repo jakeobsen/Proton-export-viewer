@@ -24,6 +24,11 @@ export interface CoreInit {
   indexDir: string;
   /** Null until a source is open: core then has no access to any export. */
   source: CoreSource | null;
+  /**
+   * The run folder of every export the app knows. No index file is opened,
+   * made or deleted while one of them overlaps the index folder.
+   */
+  exports: string[];
 }
 
 export interface StubAssetMessage {
