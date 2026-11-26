@@ -12,6 +12,8 @@
     "src/testhooks/main.ts",
     "src/testhooks/core.ts",
     "src/testhooks/worker.ts",
+    "src/testhooks/reader-input.ts",
+    "src/testhooks/reader-source.ts",
     "src/testhooks/selftest.ts",
     "src/testhooks/stubs.ts",
     "src/testhooks/pages.ts",

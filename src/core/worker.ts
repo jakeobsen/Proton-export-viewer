@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Reader worker. It builds message bodies; for now, the fixed placeholder bodies.
+// Reader worker. It builds message bodies: rendered messages, and the fixed
+// placeholder bodies.
 
+import { createReadStream } from 'node:fs';
 import { sep } from 'node:path';
+import type { Readable } from 'node:stream';
 import { parentPort, workerData } from 'node:worker_threads';
 import type { WorkerMessage, WorkerRequest } from '../shared/core-protocol';
 import { errorData } from '../shared/log/schema';
+import type { ReaderInput, WorkerRender, WorkerRendered } from '../shared/reader-protocol';
+import { renderMessage } from './reader/render';
 import { STUBS, type StubBuilder } from './stubs';
 
 const appRoot = (workerData as { appRoot?: string } | null)?.appRoot ?? '';
@@ -32,7 +37,43 @@ async function builderFor(stubId: string): Promise<StubBuilder | undefined> {
   return Object.prototype.hasOwnProperty.call(TEST_STUBS, stubId) ? TEST_STUBS[stubId] : undefined;
 }
 
+async function inputStream(input: ReaderInput): Promise<Readable | null> {
+  // The file is core's: read it by position and leave it open for core to close.
+  if (input.kind === 'fd')
+    return createReadStream('', { fd: input.fd, autoClose: false, start: 0 });
+  if (__PEV_TEST_HOOKS__ && input.kind === 'test') {
+    const hooks = await import('../testhooks/reader-input');
+    return hooks.testStream(input.input);
+  }
+  return null;
+}
+
+async function render(request: WorkerRender): Promise<WorkerRendered> {
+  const failed: WorkerRendered = {
+    type: 'rendered',
+    reqId: request.reqId,
+    ok: false,
+    code: 'parse',
+  };
+  try {
+    const input = await inputStream(request.input);
+    if (!input) return failed;
+    const message = await renderMessage(input, {
+      mode: request.mode,
+      assetBase: request.assetBase,
+    });
+    return { type: 'rendered', reqId: request.reqId, ok: true, message };
+  } catch (err) {
+    post({ type: 'log', level: 'warn', code: 'reader.parse_failed', data: errorData(err, roots) });
+    return failed;
+  }
+}
+
 parentPort?.on('message', (request: WorkerRequest) => {
+  if (request.type === 'render') {
+    void render(request).then(post);
+    return;
+  }
   if (request.type === 'build') {
     void builderFor(request.stubId).then((builder) => {
       if (!builder) {

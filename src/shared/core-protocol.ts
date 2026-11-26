@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Messages between main and the core utility process, and between core and its reader worker.
 
+import type {
+  ReadRequest,
+  ReaderFailure,
+  RenderedMessage,
+  WorkerRender,
+  WorkerRendered,
+} from './reader-protocol';
+
 export interface CoreInit {
   type: 'init';
   logsDir: string;
@@ -103,7 +111,7 @@ export interface ProofRequest {
   call: ProofCall;
 }
 
-export type CoreRequest = OpenRequest | PingRequest | TestRequest | ProofRequest;
+export type CoreRequest = OpenRequest | PingRequest | TestRequest | ProofRequest | ReadRequest;
 
 export type CoreResult =
   | {
@@ -115,12 +123,23 @@ export type CoreResult =
       /** Test builds only: the result of a structured test action. */
       data?: unknown;
       proof?: ProofReply;
+      /** The rendered message of a `read`. */
+      read?: RenderedMessage;
     }
   | {
       type: 'result';
       reqId: number;
       ok: false;
-      code: 'unknown_stub' | 'worker_failed' | 'invalid';
+      code:
+        | 'unknown_stub'
+        | 'worker_failed'
+        | 'invalid'
+        | 'no_source'
+        | 'not_found'
+        | 'superseded'
+        | 'reader_failed';
+      /** Why the reader gave no body, for `reader_failed`. */
+      reason?: ReaderFailure;
       /** Test builds only: why a test action failed. */
       detail?: string;
     };
@@ -145,9 +164,10 @@ export interface WorkerProofRead {
   paths: string[];
 }
 
-export type WorkerRequest = WorkerBuild | WorkerTest | WorkerProofRead;
+export type WorkerRequest = WorkerBuild | WorkerTest | WorkerProofRead | WorkerRender;
 
 export type WorkerMessage =
+  | WorkerRendered
   | { type: 'result'; reqId: number; ok: true; body: StubBodyMessage }
   | { type: 'proof-read'; reqId: number; reads: ProofFileRead[] }
   | { type: 'result'; reqId: number; ok: false; code: 'unknown_stub' }

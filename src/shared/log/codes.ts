@@ -37,6 +37,10 @@ export const LOG_CODES = [
   'view.installed',
   'view.revoked',
   'open.stale',
+  'open.fallback',
+  'reader.timeout',
+  'reader.limit',
+  'reader.parse_failed',
 ] as const;
 
 /** Codes that only exist in builds with test hooks. */
@@ -79,6 +83,12 @@ export const REASONS = [
   'superseded',
   'unknown_stub',
   'core_unavailable',
+  'no_source',
+  'not_found',
+  'timeout',
+  'limit',
+  'crash',
+  'parse',
   'not_authorized',
   'main_frame',
   'subframe',
