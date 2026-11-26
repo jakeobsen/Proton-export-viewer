@@ -3,6 +3,7 @@
 // statements are cached per connection.
 
 import { DatabaseSync } from 'node:sqlite';
+import { pathToFileURL } from 'node:url';
 import { WRITER_CACHE_BYTES } from './limits';
 
 export type SqlValue = string | number | bigint | null | Uint8Array;
@@ -29,8 +30,19 @@ export interface Db {
 /** The query thread's page cache; released when the index is idle. */
 export const READER_CACHE_BYTES = 64 * 1024 * 1024;
 
-export function openDb(path: string, readOnly = false): Db {
-  const raw = new DatabaseSync(path, { readOnly });
+/**
+ * Opens a database. `immutable` reads the file as it is, read-only and
+ * without locks, so SQLite creates no WAL or shared-memory file beside it;
+ * it is only right for a file nothing is writing and whose WAL, if any, has
+ * been checkpointed.
+ */
+export function openDb(path: string, readOnly = false, immutable = false): Db {
+  let target: string | URL = path;
+  if (immutable) {
+    target = pathToFileURL(path);
+    target.searchParams.set('immutable', '1');
+  }
+  const raw = new DatabaseSync(target, { readOnly: readOnly || immutable });
   const cache = new Map<string, Statement>();
   return {
     exec: (sql) => {

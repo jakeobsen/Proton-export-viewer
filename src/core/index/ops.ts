@@ -21,7 +21,7 @@ import {
 import { MetadataError, parseMetadata, type MessageRow } from './metadata';
 import type { IndexAnswer, IndexQuery } from '../../shared/index-types';
 import { listPage, rowDetails, sidebar, threadOfMessage } from './queries';
-import { META, createSchema, metaValue, sameIdentity } from './schema';
+import { META, createSchema, metaValue, probeSame, sameIdentity } from './schema';
 import { SQLITE_FULL, configure, openDb, scalar, sqliteCode, type Db } from './sql';
 import type { ThreadRole } from './pool';
 import { IndexWriter, StaleBatch, type Phase1Item, type Phase1Stats } from './writer';
@@ -39,6 +39,14 @@ export function familyBytes(dbPath: string): number {
     }
   }
   return total;
+}
+
+function isFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
 }
 
 /** Deletes the database and every sidecar. Only with no connection open on it. */
@@ -66,8 +74,6 @@ export interface WriterOpen {
   expectedUuid: string | null;
   /** The most the index may take on disk with its WAL and shared memory; null for no cap. */
   capBytes: number | null;
-  /** False: open only an index with the expected identity, and change nothing on disk. */
-  create?: boolean;
 }
 
 export interface WriterOpened {
@@ -83,6 +89,10 @@ export interface BatchResult extends Phase1Stats {
   indexBytes: number;
 }
 
+/** The pause between checkpoint tries while readers keep the WAL busy. */
+const CHECKPOINT_PAUSE_MS = 50;
+const PAUSE = new Int32Array(new SharedArrayBuffer(4));
+
 export class WriterState {
   db: Db | null = null;
   writer: IndexWriter | null = null;
@@ -94,38 +104,61 @@ export class WriterState {
     this.close();
     this.dbPath = args.dbPath;
     this.walPath = `${args.dbPath}-wal`;
-    let replaced = false;
-    let exists = false;
-    try {
-      exists = statSync(args.dbPath).isFile();
-    } catch {
-      // No database yet.
-    }
+    const exists = isFile(args.dbPath);
     if (exists && args.expectedUuid !== null) {
-      try {
-        chmodSync(args.dbPath, 0o600);
-        const db = openDb(args.dbPath);
-        configure(db, 'writer');
-        if (sameIdentity(db, args.expectedUuid)) {
-          return this.ready(db, args, args.expectedUuid, false, false);
-        }
-        db.close();
-      } catch {
-        // Not a database this source can use; it is replaced below.
-      }
-      replaced = true;
-    } else if (exists) {
-      replaced = true;
+      const kept = this.openExisting(args, args.expectedUuid);
+      if (kept) return kept;
     }
-    if (args.create === false) throw new Error('NO_INDEX');
+    // No connection is open on the family here: a failed candidate was closed.
     deleteFamily(args.dbPath);
     // SQLite gives the WAL and shared-memory files the database file's mode,
     // so the file is made 0600 before SQLite opens it.
     closeSync(openSync(args.dbPath, 'wx', 0o600));
     const db = openDb(args.dbPath);
-    configure(db, 'writer');
-    const uuid = createSchema(db, args.stamp.generation);
-    return this.ready(db, args, uuid, true, replaced);
+    try {
+      configure(db, 'writer');
+      const uuid = createSchema(db, args.stamp.generation);
+      return this.ready(db, args, uuid, true, exists);
+    } catch (err) {
+      this.drop(db);
+      throw err;
+    }
+  }
+
+  /**
+   * Opens the database there if it has this schema version and identity,
+   * checked first without changing anything on disk. Any other outcome
+   * closes it again and returns null.
+   */
+  private openExisting(args: WriterOpen, expectedUuid: string): WriterOpened | null {
+    if (!probeSame(args.dbPath, expectedUuid)) return null;
+    let db: Db | null = null;
+    try {
+      chmodSync(args.dbPath, 0o600);
+      db = openDb(args.dbPath);
+      configure(db, 'writer');
+      if (!sameIdentity(db, expectedUuid)) return null;
+      const opened = this.ready(db, args, expectedUuid, false, false);
+      db = null;
+      return opened;
+    } catch {
+      return null;
+    } finally {
+      if (db) this.drop(db);
+    }
+  }
+
+  /** Closes a connection that didn't become the writer's. */
+  private drop(db: Db): void {
+    if (this.db === db) {
+      this.db = null;
+      this.writer = null;
+    }
+    try {
+      db.close();
+    } catch {
+      // Already closed.
+    }
   }
 
   private ready(
@@ -177,6 +210,9 @@ export class WriterState {
       const row = db.stmt('PRAGMA wal_checkpoint(TRUNCATE)').get();
       if (Number(row?.busy ?? 0) === 0) return;
       if (performance.now() > deadline) throw new Error('WAL_BUSY');
+      // Each try already waits up to the busy timeout; this keeps a reader
+      // that holds an old snapshot from turning the retries into a spin.
+      Atomics.wait(PAUSE, 0, 0, CHECKPOINT_PAUSE_MS);
     }
   }
 
@@ -250,16 +286,43 @@ export const SYSTEM_IDS: readonly string[] = Object.values(SYSTEM_LABELS).filter
 export class QueryState {
   db: Db | null = null;
 
-  open(dbPath: string): void {
+  /**
+   * Opens a read-only connection, only to a database with this schema version
+   * and identity. The identity is checked first without changing anything on
+   * disk; once it matches, SQLite may create the shared-memory and WAL files
+   * beside the database, as for any reader of a WAL database.
+   */
+  open(dbPath: string, expectedUuid: string): void {
     this.close();
+    if (!probeSame(dbPath, expectedUuid)) throw new Error('NO_INDEX');
     const db = openDb(dbPath, true);
-    configure(db, 'reader');
+    let usable: boolean;
+    try {
+      usable = sameIdentity(db, expectedUuid);
+      if (usable) configure(db, 'reader');
+    } catch {
+      usable = false;
+    }
+    if (!usable) {
+      db.close();
+      throw new Error('NO_INDEX');
+    }
     this.db = db;
   }
 
+  /** Answers a query from one read snapshot, however many statements it takes. */
   run(call: IndexQuery): IndexAnswer {
     const db = this.db;
     if (!db) throw new Error('NOT_OPEN');
+    db.exec('BEGIN');
+    try {
+      return this.answer(db, call);
+    } finally {
+      db.exec('COMMIT');
+    }
+  }
+
+  private answer(db: Db, call: IndexQuery): IndexAnswer {
     switch (call.op) {
       case 'sidebar':
         return sidebar(db, SYSTEM_IDS);
@@ -301,6 +364,8 @@ export interface MetaJobResult {
   error: string | null;
   /** The file as it was read (a rescan can find it at a new inode). */
   ref: FileRef;
+  /** The bytes read: a file can have changed since the scan sized it. */
+  bytes: number;
 }
 
 /** Reads and parses metadata files; each failure becomes the pair's code. */
@@ -308,17 +373,19 @@ export function parseMetaJob(root: string, items: MetaJobItem[]): MetaJobResult[
   return items.map(({ protonId, ref }) => {
     const read = readWithRescan(root, ref);
     if (!read.ok) {
-      return { protonId, row: null, error: rejectCode(read.rejection.kind), ref };
+      return { protonId, row: null, error: rejectCode(read.rejection.kind), ref, bytes: 0 };
     }
+    const bytes = read.bytes.length;
     try {
       return {
         protonId,
         row: parseMetadata(protonId, read.bytes.toString('utf8')),
         error: null,
         ref: read.ref,
+        bytes,
       };
     } catch (err) {
-      return { protonId, row: null, error: codeOf(err), ref: read.ref };
+      return { protonId, row: null, error: codeOf(err), ref: read.ref, bytes };
     }
   });
 }
@@ -379,9 +446,11 @@ export function threadHandler(role: ThreadRole): (op: string, args: unknown) => 
     const query = new QueryState();
     return (op, args) => {
       switch (op) {
-        case 'open':
-          query.open((args as { dbPath: string }).dbPath);
+        case 'open': {
+          const a = args as { dbPath: string; expectedUuid: string };
+          query.open(a.dbPath, a.expectedUuid);
           return null;
+        }
         case 'query':
           return query.run((args as { call: IndexQuery }).call);
         case 'shrink':

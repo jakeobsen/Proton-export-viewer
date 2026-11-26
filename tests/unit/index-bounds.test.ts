@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { parseLabels } from '../../src/core/index/labels';
 import {
+  LABEL_CHUNK,
   REPOINT_CHUNK,
   TXN_INPUT_BYTES,
   WAL_STOP,
@@ -36,6 +37,13 @@ function counted(stopAfter = Infinity) {
 }
 
 describe('write batches', () => {
+  it('have the fixed limits', () => {
+    expect(WRITE_BATCH_PAIRS).toBe(1000);
+    expect(TXN_INPUT_BYTES).toBe(4 * 1024 * 1024);
+    expect(REPOINT_CHUNK).toBe(500);
+    expect(LABEL_CHUNK).toBe(500);
+  });
+
   it('hold at most 1,000 pairs and 4 MiB of input; a larger item goes alone', () => {
     const sizes = [
       ...Array.from({ length: 2500 }, () => 1000),

@@ -3,8 +3,9 @@
 // a database with another version, or another identity, isn't used.
 
 import { randomUUID } from 'node:crypto';
+import { statSync } from 'node:fs';
 import { CRISIS_MERGE } from './limits';
-import type { Db } from './sql';
+import { openDb, type Db } from './sql';
 
 export const SCHEMA_VERSION = 1;
 
@@ -153,6 +154,45 @@ export function identityOf(db: Db): { version: number; uuid: string | null } {
     // No source_meta table: not one of ours.
   }
   return { version, uuid };
+}
+
+/**
+ * Reads a database file's schema version and identity without changing
+ * anything on disk. With both its WAL and shared-memory files present, a
+ * read-only connection creates nothing and sees committed rows still in the
+ * WAL; otherwise the file is read as immutable, so no sidecar is created.
+ * Null if it can't be read as one of these databases.
+ */
+export function probeIdentity(dbPath: string): { version: number; uuid: string | null } | null {
+  if (!isFile(dbPath)) return null;
+  const withSidecars = isFile(`${dbPath}-wal`) && isFile(`${dbPath}-shm`);
+  let db: Db | null = null;
+  try {
+    db = withSidecars ? openDb(dbPath, true) : openDb(dbPath, true, true);
+    return identityOf(db);
+  } catch {
+    return null;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // Already closed.
+    }
+  }
+}
+
+/** True if the file holds a database with this schema version and this identity. */
+export function probeSame(dbPath: string, expectedUuid: string): boolean {
+  const found = probeIdentity(dbPath);
+  return found !== null && found.version === SCHEMA_VERSION && found.uuid === expectedUuid;
+}
+
+function isFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
 }
 
 /** True if the database has this schema version and this identity. */

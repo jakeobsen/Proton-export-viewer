@@ -199,7 +199,7 @@ export class InlineThread implements IndexThread {
   private handle: (op: string, args: unknown) => unknown;
 
   constructor(
-    private readonly role: ThreadRole,
+    readonly role: ThreadRole,
     private readonly hang: (op: string, args: unknown) => boolean = () => false,
   ) {
     this.handle = threadHandler(role);

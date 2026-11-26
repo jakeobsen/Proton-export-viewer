@@ -189,10 +189,12 @@ export class IndexService {
 
   /**
    * Opens the source's index, creating it if there's none or the one there
-   * isn't usable. With `create` false (the run is unavailable), only an index
-   * with the expected identity opens; nothing is created or deleted.
+   * isn't usable. With `create` false (the run is unavailable), only the
+   * read-only query connection opens, and only to an index with the expected
+   * identity: nothing is created, replaced or written.
    */
   async open(expectedUuid: string | null, create = true): Promise<IndexOpened> {
+    if (!create) return this.openForBrowsing(expectedUuid);
     mkdirSync(this.deps.indexDir, { recursive: true, mode: 0o700 });
     chmodSync(this.deps.indexDir, 0o700);
     const writer = this.deps.thread('writer');
@@ -203,30 +205,50 @@ export class IndexService {
       stamp: this.deps.stamp,
       expectedUuid,
       capBytes: this.capBytes,
-      create,
     });
     this.connections.add({ role: 'writer', dbPath: this.dbPath });
     this.opened = opened;
-    if (!create) this.progress.phase = 'unavailable';
     if (opened.replaced) this.deps.log.warn('index.replaced', {}, this.src);
     if (opened.created) this.deps.log.info('index.created', {}, this.src);
+    this.startQuery();
+    await this.openQuery();
+    this.startIdleWatch();
+    return { dbUuid: opened.uuid, created: opened.created, replaced: opened.replaced };
+  }
+
+  /** The unavailable run's index, read-only, for browsing. */
+  private async openForBrowsing(expectedUuid: string | null): Promise<IndexOpened> {
+    if (expectedUuid === null) throw new ThreadError('NO_INDEX');
+    this.opened = { uuid: expectedUuid, created: false, replaced: false, phase1Done: false };
+    this.progress.phase = 'unavailable';
+    this.startQuery();
+    await this.openQuery();
+    this.startIdleWatch();
+    return { dbUuid: expectedUuid, created: false, replaced: false };
+  }
+
+  private startQuery(): void {
     const query = this.deps.thread('query');
     this.query = query;
     query.onRespawn = () => {
       this.connections.remove('query');
       this.queryReady = null;
     };
-    await this.openQuery();
-    this.startIdleWatch();
-    return { dbUuid: opened.uuid, created: opened.created, replaced: opened.replaced };
   }
 
   private openQuery(): Promise<void> {
     const query = this.query;
-    if (!query) return Promise.reject(new ThreadError('NOT_OPEN'));
-    this.queryReady ??= query.call('open', { dbPath: this.dbPath }).then(() => {
-      this.connections.add({ role: 'query', dbPath: this.dbPath });
-    });
+    const uuid = this.opened?.uuid;
+    if (!query || !uuid) return Promise.reject(new ThreadError('NOT_OPEN'));
+    this.queryReady ??= query.call('open', { dbPath: this.dbPath, expectedUuid: uuid }).then(
+      () => {
+        this.connections.add({ role: 'query', dbPath: this.dbPath });
+      },
+      (err: unknown) => {
+        this.queryReady = null;
+        throw err;
+      },
+    );
     return this.queryReady;
   }
 
@@ -342,23 +364,29 @@ export class IndexService {
           break;
         }
         const parsed = this.parseBatch(pool, batch, refs);
-        const job = parsed.then((items) => {
+        const job = parsed.then((sized) => {
+          // The budget again, on the bytes actually read: a file can have
+          // grown since the scan.
+          const parts = splitBatches(sized, WRITE_BATCH_PAIRS, TXN_INPUT_BYTES, (s) => s.bytes);
           writes = writes.then(async () => {
-            if (failure) return;
-            if (!this.deps.isCurrent()) {
-              this.deps.log.info(
-                'writer.stale_dropped',
-                { generation: stamp.generation, count: items.length },
-                this.src,
-              );
-              failure = new ThreadError('STALE');
-              return;
-            }
-            try {
-              const result = await writer.call<BatchResult>('phase1', { stamp, items });
-              this.afterBatch(result, items);
-            } catch (err) {
-              failure = err;
+            for (const part of parts) {
+              if (failure) return;
+              const items = part.map((s) => s.item);
+              if (!this.deps.isCurrent()) {
+                this.deps.log.info(
+                  'writer.stale_dropped',
+                  { generation: stamp.generation, count: items.length },
+                  this.src,
+                );
+                failure = new ThreadError('STALE');
+                return;
+              }
+              try {
+                const result = await writer.call<BatchResult>('phase1', { stamp, items });
+                this.afterBatch(result, items);
+              } catch (err) {
+                failure = err;
+              }
             }
           });
           return writes;
@@ -410,12 +438,15 @@ export class IndexService {
     await writer.call('labels', { stamp: this.deps.stamp, labels: result.labels, stat });
   }
 
-  /** Reads and parses a batch's metadata files on the pool. */
+  /**
+   * Reads and parses a batch's metadata files on the pool. Each item comes
+   * with the bytes actually read, which can differ from the scan's size.
+   */
   private async parseBatch(
     pool: Pool,
     batch: PairFiles[],
     refs: Map<string, FileRef>,
-  ): Promise<Phase1Item[]> {
+  ): Promise<Array<{ item: Phase1Item; bytes: number }>> {
     const withMeta = batch.filter((p) => p.meta !== null);
     const jobs = chunk(withMeta, this.metaJob).map((job) =>
       this.parseJob(
@@ -426,13 +457,17 @@ export class IndexService {
     const results = new Map<string, MetaJobResult>();
     for (const list of await Promise.all(jobs)) for (const r of list) results.set(r.protonId, r);
     return batch.map((pair) => {
-      if (!pair.meta) return { pair, expectedRev: null, row: null, error: null };
+      if (!pair.meta)
+        return { item: { pair, expectedRev: null, row: null, error: null }, bytes: 0 };
       const r = results.get(pair.protonId);
       return {
-        pair: r ? { ...pair, meta: fileStat(r.ref) } : pair,
-        expectedRev: null,
-        row: r?.row ?? null,
-        error: r ? r.error : 'META_FAILED',
+        item: {
+          pair: r ? { ...pair, meta: fileStat(r.ref) } : pair,
+          expectedRev: null,
+          row: r?.row ?? null,
+          error: r ? r.error : 'META_FAILED',
+        },
+        bytes: r?.bytes ?? 0,
       };
     });
   }
@@ -455,6 +490,7 @@ export class IndexService {
             row: null,
             error: code === TIMEOUT ? 'META_TIMEOUT' : 'META_FAILED',
             ref: items[0]!.ref,
+            bytes: 0,
           },
         ];
       }

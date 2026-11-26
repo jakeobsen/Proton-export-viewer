@@ -4,11 +4,14 @@
 // release and the connection registry.
 
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
+  existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -17,6 +20,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { scanRun, type RunScan } from '../../src/core/containment';
 import { parseMetadata, type MessageRow } from '../../src/core/index/metadata';
+import { QueryState, WriterState } from '../../src/core/index/ops';
 import { IndexService, type IndexOptions } from '../../src/core/index/service';
 import { openDb } from '../../src/core/index/sql';
 import type { ThreadRole } from '../../src/core/index/pool';
@@ -24,7 +28,7 @@ import type { IndexTotals, ListPage, Sidebar } from '../../src/shared/index-type
 import type { Logger } from '../../src/shared/log/writer';
 import { sanitizeEvent } from '../../src/shared/log/schema';
 import { writeExport } from '../exports';
-import { InlineThread, STAMP, expected } from '../index-helpers';
+import { InlineThread, STAMP, expected, item, message } from '../index-helpers';
 import { testDir } from '../paths';
 
 interface Logged {
@@ -346,6 +350,38 @@ describe('phase 1', () => {
     await h.service.close();
   });
 
+  it('keeps the 4 MiB budget for files that grew after the scan', async () => {
+    const { run, indexDir } = exportAt('grown', 6);
+    const scan = scanRun(run);
+    const names = [...scan.metadata.keys()].slice(0, 3);
+    const big = (id: string) => {
+      const doc = JSON.parse(readFileSync(join(run, `${id}.metadata.json`), 'utf8')) as {
+        Payload: Record<string, unknown>;
+      };
+      doc.Payload.Subject = 'x'.repeat(3 * 1024 * 1024);
+      return JSON.stringify(doc);
+    };
+    // One grows in place; two are replaced by a new, larger file.
+    writeFileSync(join(run, `${names[0]}.metadata.json`), big(names[0]!));
+    for (const id of names.slice(1)) {
+      writeFileSync(join(run, `${id}.tmp`), big(id));
+      renameSync(join(run, `${id}.tmp`), join(run, `${id}.metadata.json`));
+    }
+    const h = harness(run, indexDir);
+    await h.service.open(null);
+    await h.service.startPhase1(scan);
+    expect(h.service.progress).toMatchObject({ phase: 'done', loaded: 6, failed: 0 });
+    const writer = h.threads.find((t) => t.role === 'writer')!;
+    // Each 3 MiB file needs a transaction of its own; the scan saw them all small.
+    expect(writer.calls.filter((c) => c === 'phase1').length).toBeGreaterThanOrEqual(3);
+    const subjects = dbRows(
+      h.service.dbPath,
+      `SELECT length(subject) AS n FROM messages WHERE proton_id IN ('${names.join("','")}')`,
+    );
+    expect(subjects.map((r) => Number(r.n))).toEqual([3145728, 3145728, 3145728]);
+    await h.service.close();
+  });
+
   it('stops writing once the generation has moved on', async () => {
     const { run, indexDir } = exportAt('stale', 10);
     const h = harness(run, indexDir);
@@ -364,42 +400,133 @@ describe('phase 1', () => {
 });
 
 describe('an unavailable export', () => {
-  it('opens only its own existing index, for browsing, and creates or deletes nothing', async () => {
+  it('opens only its own index, read-only, and leaves a rejected one untouched', async () => {
     const { run, indexDir } = exportAt('offline', 10);
     const first = harness(run, indexDir);
     const opened = await first.service.open(null);
     await first.service.startPhase1(scanRun(run));
     await first.service.close();
-    const before = readdirSync(indexDir).sort();
+    const dbPath = join(indexDir, `${STAMP.sourceKey}.sqlite`);
+    const family = () =>
+      readdirSync(indexDir)
+        .sort()
+        .map((name) => [
+          name,
+          mode(join(indexDir, name)),
+          createHash('sha256')
+            .update(readFileSync(join(indexDir, name)))
+            .digest('hex'),
+        ]);
+    // A WAL-mode index closed cleanly: no WAL or shared-memory file beside it.
+    expect(dbRows(dbPath, 'PRAGMA journal_mode')).toEqual([{ journal_mode: 'wal' }]);
+    rmSync(`${dbPath}-wal`, { force: true });
+    rmSync(`${dbPath}-shm`, { force: true });
+    const before = family();
+    expect(before.map((f) => f[0])).toEqual([`${STAMP.sourceKey}.sqlite`]);
 
-    const browse = harness('', indexDir);
-    expect(await browse.service.open(opened.dbUuid, false)).toMatchObject({
-      dbUuid: opened.dbUuid,
-      created: false,
-    });
-    expect(browse.service.progress.phase).toBe('unavailable');
-    expect(((await browse.service.ask({ op: 'totals' })) as IndexTotals).messages).toBe(10);
-    await browse.service.close();
-
+    // Another identity, or none: refused, with the family byte for byte as it was.
     for (const uuid of ['00000000-0000-4000-8000-00000000abcd', null]) {
       const other = harness('', indexDir);
       await expect(other.service.open(uuid, false)).rejects.toMatchObject({ code: 'NO_INDEX' });
+      expect(other.threads.every((t) => t.role === 'query')).toBe(true);
+      expect(other.service.connections.size).toBe(0);
       await other.service.close();
-      expect(readdirSync(indexDir).sort()).toEqual(before);
+      expect(family()).toEqual(before);
     }
-    const kept = dbRows(
-      join(indexDir, `${STAMP.sourceKey}.sqlite`),
-      "SELECT value FROM source_meta WHERE key = 'db_uuid'",
-    );
-    expect(kept[0]?.value).toBe(opened.dbUuid);
+
+    // Its own identity: browsed through the read-only query connection only.
+    const browse = harness('', indexDir);
+    expect(await browse.service.open(opened.dbUuid, false)).toEqual({
+      dbUuid: opened.dbUuid,
+      created: false,
+      replaced: false,
+    });
+    expect(browse.threads.map((t) => t.role)).toEqual(['query']);
+    expect(browse.service.connections.list().map((c) => c.role)).toEqual(['query']);
+    expect(browse.service.progress.phase).toBe('unavailable');
+    expect(((await browse.service.ask({ op: 'totals' })) as IndexTotals).messages).toBe(10);
+    await browse.service.close();
+    expect(family()[0]).toEqual(before[0]);
 
     rmSync(indexDir, { recursive: true });
     const none = harness('', indexDir);
     await expect(none.service.open(opened.dbUuid, false)).rejects.toMatchObject({
       code: 'NO_INDEX',
     });
-    expect(readdirSync(indexDir)).toEqual([]);
+    expect(existsSync(indexDir)).toBe(false);
     await none.service.close();
+  });
+
+  it('reads rows still in the WAL', async () => {
+    const { run, indexDir } = exportAt('offline-wal', 8);
+    const h = harness(run, indexDir);
+    const opened = await h.service.open(null);
+    await h.service.startPhase1(scanRun(run));
+    // The writer is still open, so the last batches may be in the WAL only.
+    const query = new QueryState();
+    query.open(h.service.dbPath, opened.dbUuid);
+    expect((query.run({ op: 'totals' }) as IndexTotals).messages).toBe(8);
+    query.close();
+    await h.service.close();
+  });
+});
+
+describe('the query thread', () => {
+  it('reads a page and its anchors from one snapshot while the writer merges', () => {
+    const dir = testDir('snapshot');
+    const dbPath = join(dir, 'x.sqlite');
+    const writer = new WriterState();
+    const opened = writer.open({ dbPath, stamp: STAMP, expectedUuid: null, capBytes: null });
+    writer.phase1(STAMP, [
+      item(message('a', ['a'], { time: 1 })),
+      item(message('b', ['b'], { time: 2 })),
+    ]);
+    const query = new QueryState();
+    query.open(dbPath, opened.uuid);
+    const db = query.db!;
+    const prepare = db.stmt.bind(db);
+    let merged = false;
+    // The writer links the two conversations right after the page's first statement.
+    db.stmt = (sql) => {
+      const statement = prepare(sql);
+      if (!merged && sql.includes('JOIN message_labels ml')) {
+        merged = true;
+        writer.phase1(STAMP, [item(message('z', ['z', 'a', 'b'], { time: 3 }))]);
+      }
+      return statement;
+    };
+    const page = query.run({ op: 'page', labelId: '5', after: null }) as ListPage;
+    expect(merged).toBe(true);
+    // Still the page from before the merge, each row with its anchor.
+    expect(page.rows).toHaveLength(2);
+    expect(page.rows.every((r) => r.anchorRowid > 0)).toBe(true);
+    // The next query sees the merge.
+    const after = query.run({ op: 'page', labelId: '5', after: null }) as ListPage;
+    expect(after.rows).toHaveLength(1);
+    query.close();
+    writer.close();
+  });
+});
+
+describe('the writer', () => {
+  it('closes a database it cannot use before it replaces it', async () => {
+    const dir = testDir('writer-candidate');
+    const dbPath = join(dir, 'x.sqlite');
+    const fds = () => readdirSync('/dev/fd').length;
+    const writer = new WriterState();
+    const start = fds();
+    for (let i = 0; i < 20; i++) {
+      writeFileSync(dbPath, 'not a database, just some text that is long enough'.repeat(100));
+      const opened = writer.open({
+        dbPath,
+        stamp: STAMP,
+        expectedUuid: '00000000-0000-4000-8000-00000000abcd',
+        capBytes: null,
+      });
+      expect(opened).toMatchObject({ created: true, replaced: true });
+      writer.close();
+    }
+    expect(fds()).toBeLessThanOrEqual(start + 1);
   });
 });
 
