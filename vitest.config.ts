@@ -16,5 +16,6 @@ export default defineConfig({
     reporters: [...configDefaults.reporters, new RemovePassedTestDirs()],
     environment: 'node',
     testTimeout: 30_000,
+    hookTimeout: 30_000,
   },
 });
