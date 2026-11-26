@@ -66,13 +66,19 @@ export async function openInReader(
   const mine = latest;
   clearLink();
   update({ rowid, mode, pending: true, view: null, fallback: false, refused: null });
-  const generation = getShellState().generation ?? (await refreshGeneration());
+  const generation = getShellState().generation ?? (await refreshGeneration().catch(() => null));
   if (generation === null) {
     if (mine === latest) update({ pending: false, refused: 'stale_generation' });
     return { ok: false, code: 'stale_generation' };
   }
   openGeneration = generation;
-  const result = await window.pev.open(rowid, mode, generation);
+  let result: MessageOpenResult;
+  try {
+    result = await window.pev.open(rowid, mode, generation);
+  } catch {
+    // The call itself failed: the pane ends refused, not pending.
+    result = { ok: false, code: 'core_unavailable' };
+  }
   // A newer open owns the pane now.
   if (mine !== latest) return result;
   if (!result.ok) {
@@ -86,9 +92,11 @@ export async function openInReader(
   return result;
 }
 
+/** Closes the pane and any link dialog that came from its body. */
 export function closeReader(): void {
   latest += 1;
   openGeneration = null;
+  clearLink();
   if (state !== CLOSED) {
     state = CLOSED;
     for (const listener of listeners) listener();

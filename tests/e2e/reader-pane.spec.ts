@@ -46,6 +46,16 @@ const PLAIN = [
   '',
 ].join('\r\n');
 
+const LINK = [
+  'Subject: A link',
+  'From: <sender@example.org>',
+  'To: <owner@example.com>',
+  'Content-Type: text/html; charset=utf-8',
+  '',
+  '<p><a href="https://shop.example/">shop.example</a></p>',
+  '',
+].join('\r\n');
+
 function generated(kind: 'text' | 'html', bytes: number): Entry {
   return { test: { kind: 'generated', spec: { kind, bytes, seed: 1 } } };
 }
@@ -54,6 +64,7 @@ async function source(pev: PevApp, entries: Array<[number, Entry]>): Promise<voi
   const root = testDir('pane-root');
   writeFileSync(join(root, 'html.eml'), HTML);
   writeFileSync(join(root, 'plain.eml'), PLAIN);
+  writeFileSync(join(root, 'link.eml'), LINK);
   const result = await pev.main<{ ok: boolean }>('readerSource', root, entries);
   expect(result.ok).toBe(true);
 }
@@ -251,4 +262,21 @@ test('plain text stays readable in the light and the dark scheme', async ({ pev 
       .evaluate((el) => getComputedStyle(el).backgroundColor);
     expect(Math.abs(luminance(text) - luminance(behind)), colorScheme).toBeGreaterThan(0.5);
   }
+});
+
+test('a generation change that main pushes closes the pane and its link dialog', async ({
+  pev,
+}) => {
+  await source(pev, [[3, { file: 'link.eml' }]]);
+  await openInReader(pev, 3);
+  const url = await shownUrl(pev);
+  await pev.shell('windowOpen', [`mail-asset://v/${tokenOf(url)}/l1`]);
+  await expect(pev.page.locator('.link-dialog')).toHaveCount(1);
+
+  // Main moves on by itself, as after a restore or a rebuild, and tells the shell.
+  await pev.main('bumpGeneration');
+  await pev.main('notifySources');
+  await expect(pane(pev)).toHaveCount(0);
+  await expect(pev.page.locator('.link-dialog')).toHaveCount(0);
+  expect(await status(pev, url)).toBe(404);
 });

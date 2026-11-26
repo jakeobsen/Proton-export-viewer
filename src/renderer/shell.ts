@@ -33,7 +33,9 @@ let state: ShellState = {
 const listeners = new Set<() => void>();
 
 function update(patch: Partial<ShellState>): void {
-  state = { ...state, ...patch };
+  // A new generation revokes every view, so a link dialog from the old one goes.
+  const moved = 'generation' in patch && patch.generation !== state.generation;
+  state = { ...state, ...patch, ...(moved ? { link: null } : {}) };
   for (const listener of listeners) listener();
 }
 

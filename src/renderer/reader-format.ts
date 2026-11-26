@@ -10,9 +10,34 @@ export interface Sender {
 
 const ADDRESS_RE = /^(.*?)\s*<([^<>]*)>\s*$/s;
 
+/** The first mailbox of an address list. A comma in quotes or in angle brackets doesn't end it. */
+export function firstMailbox(field: string): string {
+  let quoted = false;
+  let escaped = false;
+  let angle = 0;
+  for (let i = 0; i < field.length; i += 1) {
+    const c = field[i];
+    if (escaped) {
+      escaped = false;
+    } else if (quoted) {
+      if (c === '\\') escaped = true;
+      else if (c === '"') quoted = false;
+    } else if (c === '"') {
+      quoted = true;
+    } else if (c === '<') {
+      angle += 1;
+    } else if (c === '>' && angle > 0) {
+      angle -= 1;
+    } else if (c === ',' && angle === 0) {
+      return field.slice(0, i);
+    }
+  }
+  return field;
+}
+
 /** Splits the first mailbox of a From field into its name and address. */
 export function senderOf(from: string): Sender {
-  const first = from.trim();
+  const first = firstMailbox(from).trim();
   const match = ADDRESS_RE.exec(first);
   if (!match) return { name: first, address: first.includes('@') ? first : '' };
   const address = (match[2] ?? '').trim();
@@ -56,7 +81,17 @@ export function shortDate(iso: string | null, timeZone?: string): string {
   })}`;
 }
 
-/** The full date in Details, e.g. "Wed, 25 Nov 2026 08:02:11 GMT+1". */
+/** A time zone's offset at a date, e.g. "+0100". */
+function offsetOf(date: Date, timeZone?: string): string {
+  const name =
+    new Intl.DateTimeFormat('en-GB', { timeZone, timeZoneName: 'longOffset' })
+      .formatToParts(date)
+      .find((p) => p.type === 'timeZoneName')?.value ?? '';
+  const match = /^GMT([+-])(\d{2}):(\d{2})$/.exec(name);
+  return match ? `${match[1]}${match[2]}${match[3]}` : '+0000';
+}
+
+/** The full date in Details, e.g. "Wed, 25 Nov 2026 08:02:11 +0100". */
 export function fullDate(iso: string | null, timeZone?: string): string {
   if (iso === null) return '';
   const date = new Date(iso);
@@ -67,14 +102,8 @@ export function fullDate(iso: string | null, timeZone?: string): string {
     /^(\w+) /,
     '$1, ',
   );
-  const time = part({
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hourCycle: 'h23',
-    timeZoneName: 'short',
-  });
-  return `${day} ${time}`;
+  const time = part({ hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+  return `${day} ${time} ${offsetOf(date, timeZone)}`;
 }
 
 /** "N external images blocked", for N > 0. */

@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import {
   avatarColor,
   blockedImages,
+  firstMailbox,
   fullDate,
   initialsOf,
   senderOf,
@@ -36,6 +37,32 @@ describe('senderOf', () => {
   });
 });
 
+describe('firstMailbox', () => {
+  it('takes the first of several mailboxes', () => {
+    expect(senderOf('Ana Lee <ana@example.org>, Bo Kim <bo@example.org>')).toEqual({
+      name: 'Ana Lee',
+      address: 'ana@example.org',
+    });
+    expect(senderOf('ana@example.org, bo@example.org')).toEqual({
+      name: 'ana@example.org',
+      address: 'ana@example.org',
+    });
+  });
+
+  it('keeps a comma in a quoted name or in angle brackets', () => {
+    expect(senderOf('"Lee, Ana" <ana@example.org>, Bo <bo@example.org>')).toEqual({
+      name: 'Lee, Ana',
+      address: 'ana@example.org',
+    });
+    expect(firstMailbox('"A \\" , B" <a@example.org>, c@example.org')).toBe(
+      '"A \\" , B" <a@example.org>',
+    );
+    expect(firstMailbox('Ana <ana,x@example.org>, Bo <bo@example.org>')).toBe(
+      'Ana <ana,x@example.org>',
+    );
+  });
+});
+
 describe('initialsOf', () => {
   it('takes up to two letters', () => {
     expect(initialsOf('Northwind Outfitters')).toBe('NO');
@@ -49,7 +76,16 @@ describe('initialsOf', () => {
 describe('dates', () => {
   it('formats the short and the full date', () => {
     expect(shortDate('2026-11-25T07:02:11.000Z', 'UTC')).toBe('Wed 25 Nov, 07:02');
-    expect(fullDate('2026-11-25T07:02:11.000Z', 'UTC')).toBe('Wed, 25 Nov 2026 07:02:11 UTC');
+    expect(fullDate('2026-11-25T07:02:11.000Z', 'UTC')).toBe('Wed, 25 Nov 2026 07:02:11 +0000');
+    expect(fullDate('2026-11-25T07:02:11.000Z', 'Europe/Copenhagen')).toBe(
+      'Wed, 25 Nov 2026 08:02:11 +0100',
+    );
+    expect(fullDate('2026-07-01T12:00:00.000Z', 'America/New_York')).toBe(
+      'Wed, 1 Jul 2026 08:00:00 -0400',
+    );
+    expect(fullDate('2026-11-25T07:02:11.000Z', 'Asia/Kathmandu')).toBe(
+      'Wed, 25 Nov 2026 12:47:11 +0545',
+    );
   });
 
   it('shows nothing for a missing or invalid date', () => {

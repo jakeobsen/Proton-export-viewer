@@ -264,5 +264,5 @@
   /* The pane's own background: a plain-text body follows the light or dark
      scheme, and an HTML body, which has no dark scheme, paints its own light
      background. */
-  background: Canvas;
+  background: var(--bg);
 }
