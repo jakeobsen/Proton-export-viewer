@@ -8,6 +8,7 @@
 //                                ShellCheck
 
 import { spawnSync } from 'node:child_process';
+import { removeTestOutput } from './test-output.mjs';
 
 const ALL_STEPS = [
   ['lint', 'npx', ['eslint', '.', '--max-warnings', '0']],
@@ -43,6 +44,10 @@ const LINUX_ONLY = new Set(['shellcheck']);
 const STEPS = linux
   ? ALL_STEPS.slice(0, ALL_STEPS.findIndex(([name]) => name === 'license check') + 1)
   : ALL_STEPS.filter(([name]) => !LINUX_ONLY.has(name));
+
+// Test output from earlier runs, kept by failed tests as evidence, goes
+// before each run, so the folder never grows from run to run.
+removeTestOutput();
 
 const results = [];
 for (const [name, command, args, env] of STEPS) {
