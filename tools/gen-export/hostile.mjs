@@ -357,7 +357,8 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
         `<a href="https://dns-link.${host}/">link</a>`,
         `<meta http-equiv="x-dns-prefetch-control" content="on"><link rel="dns-prefetch" href="//dns-control.${host}">`,
       ),
-      refs(0, [], [`//dns-control.${host}`]),
+      // With prefetching on, the link's host is a DNS hint too.
+      refs(0, [], [`//dns-control.${host}`, `https://dns-link.${host}/`]),
     ],
     'speculation-rules': [
       page(

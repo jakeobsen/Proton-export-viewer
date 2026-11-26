@@ -57,6 +57,8 @@ export type MessageOpenResult =
       url: string;
       format: 'plain' | 'html';
       hasHtml: boolean;
+      /** How many distinct remote images the body refers to; they show as placeholders. */
+      remote: number;
       headers: MessageHeaders;
     }
   | { ok: true; openId: number; outcome: 'fallback' }
