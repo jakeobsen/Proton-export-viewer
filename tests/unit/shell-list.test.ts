@@ -220,6 +220,54 @@ describe('the list model', () => {
     expect(reads.at(-1)?.selected).toBe(10);
   });
 
+  it('after a read with no answer, waits for something new before reading again', async () => {
+    const folder = new Folder();
+    for (let i = 1; i <= 300; i += 1) folder.add(i, i);
+    let mode: 'ok' | 'null' | 'reject' = 'ok';
+    const reads: WindowQuery[] = [];
+    const list = new ListModel(
+      (q) => {
+        reads.push(q);
+        // Replies come in a later task, as they do over IPC.
+        if (mode === 'null') return new Promise((r) => setTimeout(() => r(null), 0));
+        if (mode === 'reject') {
+          return new Promise((_, reject) => setTimeout(() => reject(new Error('ipc')), 0));
+        }
+        return folder.read(q);
+      },
+      () => undefined,
+    );
+    list.reset('5');
+    list.setViewport(0, 9);
+    await settle();
+    const held = list.snapshot.start + list.snapshot.rows.length;
+    expect(held).toBeLessThan(250);
+    const settleMany = async () => {
+      for (let i = 0; i < 10; i += 1) await settle();
+    };
+
+    // The screen moves past the held rows; the index has no answer.
+    mode = 'null';
+    let before = reads.length;
+    list.setViewport(250, 259);
+    await settleMany();
+    expect(reads.length).toBe(before + 1);
+
+    // The call itself fails: no unhandled rejection, and no new read either.
+    mode = 'reject';
+    before = reads.length;
+    list.setViewport(260, 269);
+    await settleMany();
+    expect(reads.length).toBe(before + 1);
+
+    // Something new (the index moved on) reads again, and the screen is covered.
+    mode = 'ok';
+    list.refresh();
+    await settleMany();
+    expect(reads.length).toBe(before + 2);
+    expect(list.rowAt(265)).not.toBeNull();
+  });
+
   it('reads one window at a time, and drops a read made for another folder', async () => {
     const folder = new Folder();
     for (let i = 1; i <= 30; i += 1) folder.add(i, i);

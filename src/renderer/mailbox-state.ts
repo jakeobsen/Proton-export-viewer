@@ -39,13 +39,21 @@ export function useMailbox(): MailboxState {
   return useSyncExternalStore(subscribe, () => state);
 }
 
-/** Runs an index read for the current generation; null if there is no answer for it. */
+/**
+ * Runs an index read for the current generation; null if there is no answer
+ * for it, or the call failed.
+ */
 async function ask<T>(run: (generation: number) => Promise<IndexResult<T>>): Promise<T | null> {
-  const generation = getShellState().generation ?? (await refreshGeneration());
-  if (generation === null) return null;
-  const result = await run(generation);
+  let result: IndexResult<T>;
+  try {
+    const generation = getShellState().generation ?? (await refreshGeneration());
+    if (generation === null) return null;
+    result = await run(generation);
+  } catch {
+    return null;
+  }
   if (!result.ok) {
-    if (result.code === 'stale_generation') await refreshGeneration();
+    if (result.code === 'stale_generation') await refreshGeneration().catch(() => null);
     return null;
   }
   if (state.key === null || keyOf(result.generation) !== state.key) return null;

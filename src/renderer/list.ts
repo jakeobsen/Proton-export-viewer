@@ -126,13 +126,19 @@ export class ListModel {
       return;
     }
     this.reading = true;
-    void this.readOnce().finally(() => {
-      this.reading = false;
-      if (this.again || !this.covered()) {
-        this.again = false;
-        this.refresh();
-      }
-    });
+    void this.readOnce()
+      .catch(() => false)
+      .then((read) => {
+        this.reading = false;
+        if (this.again) {
+          this.again = false;
+          this.refresh();
+        } else if (read && !this.covered()) {
+          this.refresh();
+        }
+        // After a failed read, the next one waits for something new: a
+        // scroll, the index moving on, or another folder or generation.
+      });
   }
 
   /** The anchor: the selected row if it is on screen, else the top row on screen. */
@@ -159,9 +165,10 @@ export class ListModel {
       : { anchor: { index: this.first }, index: this.first };
   }
 
-  private async readOnce(): Promise<void> {
+  /** Reads the window once; false if no answer came. */
+  private async readOnce(): Promise<boolean> {
     const labelId = this.snap.labelId;
-    if (labelId === null) return;
+    if (labelId === null) return true;
     const epoch = this.epoch;
     const { anchor, index } = this.anchor();
     // The answer's selection is for this message, not one picked while it was read.
@@ -175,7 +182,8 @@ export class ListModel {
       after: Math.min(WINDOW_AFTER, screen + 2 * MARGIN + READ_ABOVE),
       selected: asked,
     });
-    if (!answer || epoch !== this.epoch) return;
+    if (!answer) return false;
+    if (epoch !== this.epoch) return true;
     const rows: Row[] = answer.rows.map((row, i) => {
       const details = answer.details[i];
       return { ...row, details: details?.threadId === row.threadId ? details : null };
@@ -203,6 +211,7 @@ export class ListModel {
     // The screen moves with the anchor.
     this.first = Math.max(0, this.first + moved);
     this.last = Math.max(this.first, this.last + moved);
+    return true;
   }
 
   /** Selects a row: the selection holds the row's newest message here. */
