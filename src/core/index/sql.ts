@@ -18,6 +18,8 @@ export interface Statement {
   run(...params: SqlValue[]): RunResult;
   get(...params: SqlValue[]): Row | undefined;
   all(...params: SqlValue[]): Row[];
+  /** The rows one at a time, so a long result is never held whole. */
+  iterate(...params: SqlValue[]): IterableIterator<Row>;
 }
 
 export interface Db {

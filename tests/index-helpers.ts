@@ -6,14 +6,24 @@
 import { closeSync, openSync, writeSync } from 'node:fs';
 import { createSchema } from '../src/core/index/schema';
 import { asNumber, openDb, type Db } from '../src/core/index/sql';
-import { IndexWriter, type Phase1Item, type Phase1Stats } from '../src/core/index/writer';
-import type { MessageRow } from '../src/core/index/metadata';
+import {
+  IndexWriter,
+  type ApplyItem,
+  type PairFiles,
+  type Phase1Item,
+  type Phase1Stats,
+} from '../src/core/index/writer';
+import { conversationKeys, type MessageRow } from '../src/core/index/metadata';
 import { codeOf, threadHandler } from '../src/core/index/ops';
 import { TIMEOUT, ThreadError, type IndexThread, type ThreadRole } from '../src/core/index/pool';
 import type { Stamp } from '../src/shared/sources';
 
 export const STAMP: Stamp = { sourceKey: '00000000-0000-4000-8000-000000000001', generation: 3 };
 
+/**
+ * A message whose conversation keys are `keys`: the first is its Message-ID,
+ * the rest its References.
+ */
 export function message(id: string, keys: string[], extra: Partial<MessageRow> = {}): MessageRow {
   return {
     protonId: id,
@@ -33,27 +43,61 @@ export function message(id: string, keys: string[], extra: Partial<MessageRow> =
     numAttachments: 0,
     mimeType: 'text/plain',
     messageId: keys[0] ?? null,
-    inReplyTo: null,
-    references: [],
+    inReplyTo: [],
+    references: keys.slice(1),
     dmarc: null,
     labelIds: ['5'],
-    keys,
     capped: 0,
     ...extra,
   };
 }
 
-export function item(row: MessageRow): Phase1Item {
+/** A message's conversation keys, as the writer takes them. */
+export const keysOf = (row: MessageRow): string[] => conversationKeys(row);
+
+/** A pair's two files; `version` stands in for a new size and modification time. */
+export function filesOf(id: string, version = 1): PairFiles {
+  const stat = (rel: string) => ({
+    rel,
+    size: version,
+    mtimeNs: BigInt(version),
+    dev: 1n,
+    ino: BigInt(id.length),
+  });
+  return { protonId: id, meta: stat(`${id}.metadata.json`), eml: stat(`${id}.eml`) };
+}
+
+/** Reconcile's change for a pair the index doesn't have yet. */
+export function newPair(id: string, files: PairFiles = filesOf(id)): ApplyItem {
   return {
-    pair: {
-      protonId: row.protonId,
-      meta: { rel: `${row.protonId}.metadata.json`, size: 1, mtimeNs: 0n, dev: 0n, ino: 0n },
-      eml: { rel: `${row.protonId}.eml`, size: 1, mtimeNs: 0n, dev: 0n, ino: 0n },
+    change: {
+      protonId: id,
+      fresh: true,
+      gone: false,
+      meta: files.meta ? 'parse' : 'keep',
+      eml: 'keep',
+      refresh: false,
     },
-    expectedRev: null,
-    row,
-    error: null,
+    files,
   };
+}
+
+/** Registers new pairs and returns the rev each one's metadata is to be read for. */
+export function register(writer: IndexWriter, ids: string[]): Map<string, number> {
+  return new Map(
+    writer.applyChanges(
+      STAMP,
+      ids.map((id) => newPair(id)),
+    ).revs,
+  );
+}
+
+export function item(
+  row: MessageRow,
+  rev: number,
+  files: PairFiles = filesOf(row.protonId),
+): Phase1Item {
+  return { pair: files, expectedRev: rev, row, error: null };
 }
 
 export function fresh(): { db: Db; writer: IndexWriter } {
@@ -82,7 +126,7 @@ export function expected(rows: MessageRow[]): string[][] {
   const owner = new Map<string, string>();
   for (const r of rows) parent.set(r.protonId, r.protonId);
   for (const r of rows)
-    for (const k of r.keys) {
+    for (const k of keysOf(r)) {
       const o = owner.get(k);
       if (o === undefined) owner.set(k, r.protonId);
       else parent.set(find(r.protonId), find(o));
@@ -156,7 +200,7 @@ export function checkAgainstScratch(db: Db, rows: MessageRow[]): void {
     throw new Error('per-label rows differ');
   }
   for (const r of db.stmt('SELECT key, thread_id FROM thread_keys').all()) {
-    const owner = rows.find((m) => m.keys.includes(String(r.key)));
+    const owner = rows.find((m) => keysOf(m).includes(String(r.key)));
     const t = db.stmt('SELECT thread_id FROM messages WHERE proton_id = ?').get(owner!.protonId);
     if (asNumber(t?.thread_id) !== asNumber(r.thread_id)) throw new Error('key points elsewhere');
   }
@@ -173,7 +217,10 @@ export function shuffled<T>(list: T[], seed: number): T[] {
   return out;
 }
 
-/** Writes rows in batches; `after` runs after every batch with the rows written so far. */
+/**
+ * Registers and writes new rows in batches; `after` runs after every batch
+ * with the rows written so far.
+ */
 export function ingest(
   writer: IndexWriter,
   rows: MessageRow[],
@@ -182,7 +229,17 @@ export function ingest(
 ): Phase1Stats[] {
   const stats: Phase1Stats[] = [];
   for (let i = 0; i < rows.length; i += batch) {
-    stats.push(writer.phase1Batch(STAMP, rows.slice(i, i + batch).map(item)));
+    const part = rows.slice(i, i + batch);
+    const revs = register(
+      writer,
+      part.map((r) => r.protonId),
+    );
+    stats.push(
+      writer.phase1Batch(
+        STAMP,
+        part.map((r) => item(r, revs.get(r.protonId)!)),
+      ),
+    );
     after?.(rows.slice(0, i + batch));
   }
   return stats;
