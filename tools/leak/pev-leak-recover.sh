@@ -234,5 +234,5 @@ if [ -n "$ERRORS" ]; then
 	echo "pev-leak-recover: not recovered:$ERRORS" >&2
 	exit 1
 fi
-say done
+say finished
 exit 0

@@ -309,6 +309,7 @@ MADE_ALIAS=0
 PFLOG_PID=''
 STUB_PID=''
 
+# shellcheck disable=SC2317 # runs from the EXIT trap
 cleanup() {
 	_rc=$?
 	trap '' INT TERM HUP
@@ -407,6 +408,7 @@ cleanup() {
 	exit "$_rc"
 }
 
+# shellcheck disable=SC2317 # runs from the signal traps
 on_signal() {
 	if [ -z "$RESULT" ]; then
 		if [ "$1" = TERM ] && [ "$READY" = 1 ]; then

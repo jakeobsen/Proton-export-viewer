@@ -181,11 +181,16 @@ record "program=$DIGEST_OF"
 record "program_digest=$(digest "$DIGEST_OF")"
 record "input_digest=$(digest "$INPUT")"
 
-/bin/mkdir -p -m 0700 "$LEAK_HOME/tmp"
+if [ ! -d "$LEAK_HOME/tmp" ]; then
+	/bin/mkdir -m 0700 "$LEAK_HOME/tmp"
+fi
 case "$TARGET" in
 standard)
 	/bin/rm -rf "$LEAK_HOME/state/standard"
-	/bin/mkdir -p -m 0700 "$LEAK_HOME/state/standard"
+	if [ ! -d "$LEAK_HOME/state" ]; then
+		/bin/mkdir -m 0700 "$LEAK_HOME/state"
+	fi
+	/bin/mkdir -m 0700 "$LEAK_HOME/state/standard"
 	set -- --pev-leak "--pev-user-data=$LEAK_HOME/state/standard"
 	;;
 mas)
