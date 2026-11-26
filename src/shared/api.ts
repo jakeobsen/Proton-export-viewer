@@ -58,6 +58,10 @@ export type MessageOpenResult =
       hasHtml: boolean;
       /** How many distinct remote images the body refers to; they show as placeholders. */
       remote: number;
+      /** HTML was asked for but is too large to show by default; "html-anyway" shows it. */
+      htmlTooLarge: boolean;
+      /** Only the first part of the body's plain text is shown. */
+      truncated: boolean;
       headers: MessageHeaders;
     }
   | { ok: true; openId: number; outcome: 'fallback' }

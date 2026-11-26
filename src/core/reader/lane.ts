@@ -5,6 +5,7 @@
 // ends the worker; the job fails with the reason, and a new worker is spawned
 // for the jobs that follow.
 
+import type { HeapInfo } from 'node:v8';
 import type { Worker } from 'node:worker_threads';
 
 /** Every job gets this long, from the moment it reaches the worker. */
@@ -139,13 +140,24 @@ export class ReaderLane<In extends LaneMessage, Out extends LaneMessage> {
     return this.queue.length;
   }
 
-  /** The current worker's thread id and limits, as the worker itself was started with. */
-  describe(): { threadId: number | null; heapMb: number | null; timeoutMs: number } {
+  /** The current worker's thread id and limits, as the worker itself was started with, and the jobs waiting. */
+  describe(): {
+    threadId: number | null;
+    heapMb: number | null;
+    timeoutMs: number;
+    queued: number;
+  } {
     return {
       threadId: this.worker?.threadId ?? null,
       heapMb: this.worker?.resourceLimits?.maxOldGenerationSizeMb ?? null,
       timeoutMs: this.timeoutMs,
+      queued: this.queue.length,
     };
+  }
+
+  /** The current worker's heap statistics, or null when there is no worker. For measurements. */
+  heapStatistics(): Promise<HeapInfo | null> {
+    return this.worker ? this.worker.getHeapStatistics() : Promise.resolve(null);
   }
 
   async stop(): Promise<void> {

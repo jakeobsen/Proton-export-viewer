@@ -16,8 +16,11 @@ markLoaded();
 /** The core test action that sets the source. */
 export const READER_SOURCE_ACTION = 'pev-reader-test-source';
 
-/** A message, and how long finding it takes (to test opens whose lookups finish out of order). */
-export type SourceEntry = ({ file: string } | { test: TestInput }) & { delayMs?: number };
+/**
+ * A message, and optionally a gate: a lookup waits there until a test opens
+ * it, to test opens whose lookups finish out of order.
+ */
+export type SourceEntry = ({ file: string } | { test: TestInput }) & { gate?: string };
 
 export interface SourcePayload {
   root: string;
@@ -26,11 +29,56 @@ export interface SourcePayload {
 
 const TEST_KINDS = new Set(['generated', 'spin', 'heap', 'throw', 'sleep']);
 
+interface Gate {
+  open: boolean;
+  waiting: number;
+  release: Array<() => void>;
+}
+
+const gates = new Map<string, Gate>();
+
+function gate(name: string): Gate {
+  let found = gates.get(name);
+  if (!found) {
+    found = { open: false, waiting: 0, release: [] };
+    gates.set(name, found);
+  }
+  return found;
+}
+
+/** Waits until the named gate is open. */
+function passGate(name: string): Promise<void> {
+  const found = gate(name);
+  if (found.open) return Promise.resolve();
+  found.waiting += 1;
+  return new Promise((resolve) => {
+    found.release.push(() => {
+      found.waiting -= 1;
+      resolve();
+    });
+  });
+}
+
+/** Opens the named gate for good; returns how many lookups were waiting there. */
+export function openGate(name: string): number {
+  const found = gate(name);
+  found.open = true;
+  const waiting = found.release.splice(0);
+  for (const release of waiting) release();
+  return waiting.length;
+}
+
+/** How many lookups wait at the named gate. */
+export function waitingAt(name: string): number {
+  return gates.get(name)?.waiting ?? 0;
+}
+
 function isEntry(value: unknown): value is SourceEntry {
   if (typeof value !== 'object' || value === null) return false;
-  const entry = value as { file?: unknown; test?: { kind?: unknown }; delayMs?: unknown };
-  const delay = entry.delayMs;
-  if (delay !== undefined && !(Number.isSafeInteger(delay) && (delay as number) >= 0)) return false;
+  const entry = value as { file?: unknown; test?: { kind?: unknown }; gate?: unknown };
+  const name = entry.gate;
+  if (name !== undefined && !(typeof name === 'string' && name.length > 0 && name.length <= 64))
+    return false;
   if (typeof entry.file === 'string') return true;
   return typeof entry.test?.kind === 'string' && TEST_KINDS.has(entry.test.kind);
 }
@@ -105,7 +153,7 @@ export class TestReaderSource implements ReaderSource {
   async open(rowid: number): Promise<OpenedMessage | null> {
     const entry = this.entries.get(rowid);
     if (!entry) return null;
-    if (entry.delayMs) await new Promise((resolve) => setTimeout(resolve, entry.delayMs));
+    if (entry.gate) await passGate(entry.gate);
     if ('test' in entry) {
       return { input: { kind: 'test', input: entry.test }, close: () => Promise.resolve() };
     }

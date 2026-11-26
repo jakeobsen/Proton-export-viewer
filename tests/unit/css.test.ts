@@ -203,11 +203,12 @@ describe('the CSS filter, on style sheets', () => {
       'p{color: }',
       'p{color:green}',
     ].join('');
-    const out = filterStyleSheet(css, rewriter());
-    expect(out).not.toContain('\\');
+    const urls = rewriter();
+    const out = filterStyleSheet(css, urls);
+    // css-tree decodes the escapes, so only the check on the source drops these.
+    expect(out).toBe('p{color:red}p{color:}p{color:green}');
+    expect(urls.handed).toEqual([]);
     expect(cssProblems(out, 'stylesheet')).toEqual([]);
-    expect(out).toContain('p{color:green}');
-    expect(out).not.toContain('a.test');
   });
 
   it('checks escapes in the source, since css-tree decodes them', () => {

@@ -262,6 +262,12 @@ export async function install(ctx: AppContext): Promise<boolean> {
       }),
     readerLimits: (limits: { heapMb?: number; timeoutMs?: number }) =>
       ctx.core.request({ type: 'test', action: 'reader-limits', payload: limits }),
+    /** Opens a gate of the reader's test source; lookups waiting there go on. */
+    readerGate: (name: string) =>
+      ctx.core.request({ type: 'test', action: 'reader-gate', payload: name }),
+    /** How many lookups of the reader's test source wait at a gate. */
+    readerGateWaiting: (name: string) =>
+      ctx.core.request({ type: 'test', action: 'reader-gate-waiting', payload: name }),
     /** The links main keeps for a live view, by id. */
     viewLinks: (windowId: number, token: string) => [
       ...(byId(windowId).views.lookup(token)?.links ?? []),

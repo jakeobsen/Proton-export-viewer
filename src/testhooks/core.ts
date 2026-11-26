@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Core-process test hooks: hold opens to keep them pending, push markers
-// through every logging path, and set the reader's source and limits.
+// through every logging path, set the reader's source and limits, open the
+// source's gates, and report the reader's memory.
 
 import type { ReaderLane } from '../core/reader/lane';
 import type { ReaderSource } from '../core/reader/source';
@@ -16,7 +17,13 @@ import type { LogWriter } from '../shared/log/writer';
 import type { SourceSession } from '../core/source';
 import type { ReadRequest } from '../shared/reader-protocol';
 import { markLoaded } from './marker';
-import { READER_SOURCE_ACTION, TestReaderSource, parsePayload } from './reader-source';
+import {
+  READER_SOURCE_ACTION,
+  TestReaderSource,
+  openGate,
+  parsePayload,
+  waitingAt,
+} from './reader-source';
 
 markLoaded();
 
@@ -152,6 +159,46 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
     }
     case 'reader-lane':
       deps.reply({ type: 'result', reqId: request.reqId, ok: true, data: deps.lane.describe() });
+      return;
+    case 'reader-gate':
+      // Lets the lookups waiting at the named gate go on; it stays open.
+      if (typeof request.payload !== 'string') {
+        deps.reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
+        return;
+      }
+      ok(openGate(request.payload));
+      return;
+    case 'reader-gate-waiting':
+      if (typeof request.payload !== 'string') {
+        deps.reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
+        return;
+      }
+      ok(waitingAt(request.payload));
+      return;
+    case 'reader-memory':
+      // The reader worker's heap, and core's memory, which includes the worker's.
+      void deps.lane.heapStatistics().then((heap) => {
+        const usage = process.memoryUsage();
+        deps.reply({
+          type: 'result',
+          reqId: request.reqId,
+          ok: true,
+          data: {
+            worker: heap && {
+              used: heap.used_heap_size,
+              external: heap.external_memory,
+              total: heap.total_heap_size,
+              limit: heap.heap_size_limit,
+            },
+            core: {
+              rss: usage.rss,
+              heapUsed: usage.heapUsed,
+              external: usage.external,
+              arrayBuffers: usage.arrayBuffers,
+            },
+          },
+        });
+      });
       return;
     case 'source-records': {
       const records = deps.session?.records ?? null;

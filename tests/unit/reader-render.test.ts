@@ -7,7 +7,14 @@ import { randomBytes } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import { MAX_LINKS, linkUrl, plainBody, trimUrl } from '../../src/core/reader/plain';
-import { MAX_SUBJECT, renderMessage } from '../../src/core/reader/render';
+import {
+  FIRST_TEXT_BYTES,
+  HTML_ANYWAY_BYTES,
+  HTML_VIEW_BYTES,
+  MAX_SUBJECT,
+  firstBytes,
+  renderMessage,
+} from '../../src/core/reader/render';
 import { htmlToText } from '../../src/core/text/html-to-text';
 import { hostileMessages } from '../../tools/gen-export/hostile.mjs';
 
@@ -18,7 +25,7 @@ function hrefs(html: string): string[] {
   return [...html.matchAll(HREF_RE)].map((m) => m[1] ?? '');
 }
 
-function render(eml: string | Buffer, mode: 'html' | 'plain' = 'plain') {
+function render(eml: string | Buffer, mode: 'html' | 'plain' | 'html-anyway' = 'plain') {
   const bytes = typeof eml === 'string' ? Buffer.from(eml.replace(/\n/g, '\r\n')) : eml;
   return renderMessage(Readable.from([bytes]), { mode, assetBase: BASE });
 }
@@ -195,6 +202,66 @@ describe('rendering a message', () => {
       ].join('\n'),
     );
     expect(bodyText(message.html)).toBe('see attached');
+  });
+});
+
+/** A single-part message whose body has exactly `bytes` bytes. */
+function sized(type: 'text/html' | 'text/plain', bytes: number, fill = 'x'): Buffer {
+  const head = `Subject: Sized\r\nContent-Type: ${type}; charset=utf-8\r\n\r\n`;
+  const body =
+    type === 'text/html'
+      ? `<p>${fill.repeat(bytes - 7)}</p>`
+      : fill.repeat(bytes / Buffer.byteLength(fill));
+  expect(Buffer.byteLength(body)).toBe(bytes);
+  return Buffer.from(head + body);
+}
+
+describe('the reader ceilings', () => {
+  it('shows HTML up to its size limit, and plain text above it, saying the HTML can be shown anyway', async () => {
+    const within = await render(sized('text/html', HTML_VIEW_BYTES), 'html');
+    expect(within).toMatchObject({ format: 'html', htmlTooLarge: false, truncated: false });
+
+    const over = sized('text/html', HTML_VIEW_BYTES + 1);
+    const asked = await render(over, 'html');
+    expect(asked).toMatchObject({ format: 'plain', hasHtml: true, htmlTooLarge: true });
+    expect(asked.truncated).toBe(false);
+    expect(bodyText(asked.html).trim()).toHaveLength(HTML_VIEW_BYTES + 1 - 7);
+
+    const anyway = await render(over, 'html-anyway');
+    expect(anyway).toMatchObject({ format: 'html', htmlTooLarge: false, truncated: false });
+
+    // Plain text was asked for: nothing to offer.
+    const plain = await render(over, 'plain');
+    expect(plain).toMatchObject({ format: 'plain', htmlTooLarge: false, truncated: false });
+  });
+
+  it('shows HTML anyway up to the hard limit, and above it only the first part of its text', async () => {
+    const atLimit = await render(sized('text/html', HTML_ANYWAY_BYTES), 'html-anyway');
+    expect(atLimit).toMatchObject({ format: 'html', truncated: false });
+
+    const over = sized('text/html', HTML_ANYWAY_BYTES + 1);
+    for (const mode of ['html', 'html-anyway', 'plain'] as const) {
+      const message = await render(over, mode);
+      expect(message).toMatchObject({ format: 'plain', htmlTooLarge: false, truncated: true });
+      expect(bodyText(message.html)).toBe('x'.repeat(FIRST_TEXT_BYTES));
+    }
+  });
+
+  it('shows a text body up to the hard limit whole, and above it only its first part', async () => {
+    const whole = await render(sized('text/plain', HTML_ANYWAY_BYTES));
+    expect(whole.truncated).toBe(false);
+    expect(bodyText(whole.html)).toHaveLength(HTML_ANYWAY_BYTES);
+
+    // Two-byte characters: the cut falls on a character boundary.
+    const over = await render(sized('text/plain', HTML_ANYWAY_BYTES + 2, 'é'));
+    expect(over).toMatchObject({ format: 'plain', truncated: true, hasHtml: false });
+    expect(bodyText(over.html)).toBe('é'.repeat(FIRST_TEXT_BYTES / 2));
+  });
+
+  it('cuts text on a character boundary', () => {
+    expect(firstBytes('aé', 2)).toBe('a');
+    expect(firstBytes('aé', 3)).toBe('aé');
+    expect(firstBytes('😀😀', 5)).toBe('😀');
   });
 });
 
