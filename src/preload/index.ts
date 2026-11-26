@@ -8,6 +8,7 @@ const api: PevApi = {
   state: () => ipcRenderer.invoke(IPC.state),
   ping: (generation) => ipcRenderer.invoke(IPC.ping, { generation }),
   openStub: (id, generation) => ipcRenderer.invoke(IPC.openStub, { id, generation }),
+  open: (rowid, mode, generation) => ipcRenderer.invoke(IPC.open, { rowid, mode, generation }),
   log: (level, code, generation, data) =>
     ipcRenderer.send(
       IPC.log,

@@ -10,6 +10,7 @@ import { z } from 'zod';
 import {
   IPC,
   type ErrorKind,
+  type MessageOpenResult,
   type OpenResult,
   type PingResult,
   type Rejected,
@@ -22,6 +23,7 @@ import type { SourceOutcome } from '../shared/sources';
 import { STALE, type Stale } from './sources/manager';
 import { APP_ORIGIN } from '../shared/constants';
 import { isRendererLogCode } from '../shared/log/codes';
+import { OPEN_MODES } from '../shared/reader-protocol';
 import { CoreUnavailableError } from './core-host';
 import type { AppContext, AppWindow } from './context';
 import { sameFrame } from './navigation';
@@ -37,6 +39,15 @@ const StateArgs = z.tuple([]);
 const PingArgs = z.tuple([z.object({ generation: Generation }).strict()]);
 const OpenArgs = z.tuple([
   z.object({ id: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/), generation: Generation }).strict(),
+]);
+const MessageOpenArgs = z.tuple([
+  z
+    .object({
+      rowid: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      mode: z.enum(OPEN_MODES),
+      generation: Generation,
+    })
+    .strict(),
 ]);
 const LogArgs = z.tuple([
   z
@@ -145,6 +156,79 @@ export function registerIpc(ctx: AppContext): void {
     }
     ctx.log.info('view.installed', { openId, windowId: appWin.id });
     return { ok: true, openId, url: bodyUrl(token) };
+  });
+
+  guarded<MessageOpenResult>(IPC.open, async (appWin, raw) => {
+    const args = MessageOpenArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ rowid, mode, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+
+    const { openId, token, revoked } = appWin.views.accept();
+    if (revoked > 0) {
+      ctx.log.info('view.revoked', { reason: 'replaced', count: revoked, windowId: appWin.id });
+    }
+    let result;
+    try {
+      result = await ctx.core.request({
+        type: 'read',
+        openId,
+        generation,
+        token,
+        rowid,
+        mode,
+        lane: appWin.id,
+      });
+    } catch (err) {
+      if (!(err instanceof CoreUnavailableError)) throw err;
+      appWin.views.abandon(openId);
+      ctx.log.warn('core.unavailable', { openId, windowId: appWin.id });
+      return reject('core_unavailable', appWin);
+    }
+    if (appWin.win.isDestroyed()) return reject('superseded', appWin);
+
+    if (!result.ok) {
+      appWin.views.abandon(openId);
+      if (result.code !== 'reader_failed') {
+        const known = ['no_source', 'not_found', 'superseded'] as const;
+        const code = known.find((c) => c === result.code);
+        return reject(code ?? 'invalid', appWin);
+      }
+      // The fallback stands in for a view, so it follows the same rules.
+      if (generation !== ctx.generation || openId !== appWin.views.latest) {
+        const reason = generation !== ctx.generation ? 'generation' : 'open_id';
+        ctx.log.info('open.stale', { reason, openId, windowId: appWin.id });
+        return reject(reason === 'generation' ? 'stale_generation' : 'superseded', appWin);
+      }
+      ctx.log.info('open.fallback', {
+        reason: result.reason ?? 'crash',
+        openId,
+        windowId: appWin.id,
+      });
+      return { ok: true, openId, outcome: 'fallback' };
+    }
+    const message = result.read;
+    if (!message) return reject('invalid', appWin);
+
+    const outcome = appWin.views.install(openId, token, generation, ctx.generation, {
+      html: message.html,
+      assets: [],
+      links: message.links,
+    });
+    if (!outcome.ok) {
+      ctx.log.info('open.stale', { reason: outcome.reason, openId, windowId: appWin.id });
+      return reject(outcome.reason === 'generation' ? 'stale_generation' : 'superseded', appWin);
+    }
+    ctx.log.info('view.installed', { openId, windowId: appWin.id });
+    return {
+      ok: true,
+      openId,
+      outcome: 'view',
+      url: bodyUrl(token),
+      format: message.format,
+      hasHtml: message.hasHtml,
+      headers: message.headers,
+    };
   });
 
   guarded<SourcesResult>(IPC.sources, (appWin, raw) => {

@@ -15,6 +15,7 @@ import type { CoreResult } from '../shared/core-protocol';
 import { errorData } from '../shared/log/schema';
 import { TESTHOOKS_MARKER, markLoaded } from './marker';
 import { TEST_PAGE, testRoute } from './pages';
+import { READER_SOURCE_ACTION, type SourceEntry } from './reader-source';
 import { runControl, runFolderProof, type OpenDialog } from './proof/main';
 import { killRenderer } from './renderer-kill';
 import { runSelfTest } from './selftest';
@@ -250,6 +251,19 @@ export async function install(ctx: AppContext): Promise<boolean> {
     },
     core,
     corePid: () => ctx.core.pid,
+    /** Sets the reader's message source: rowids mapped to files under `root`, or test inputs. */
+    readerSource: (root: string, entries: Array<[number, SourceEntry]>) =>
+      ctx.core.request({
+        type: 'test',
+        action: READER_SOURCE_ACTION,
+        payload: { root, entries },
+      }),
+    readerLimits: (limits: { heapMb?: number; timeoutMs?: number }) =>
+      ctx.core.request({ type: 'test', action: 'reader-limits', payload: limits }),
+    /** The links main keeps for a live view, by id. */
+    viewLinks: (windowId: number, token: string) => [
+      ...(byId(windowId).views.lookup(token)?.links ?? []),
+    ],
     mainLog: (markers: string) =>
       ctx.log.info('test.log', {
         subject: markers,

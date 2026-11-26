@@ -1,26 +1,63 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Core-process test hooks: hold opens to keep them pending, and push markers
-// through every logging path.
+// Core-process test hooks: hold opens to keep them pending, push markers
+// through every logging path, and set the reader's source and limits.
 
-import type { CoreResult, OpenRequest, TestRequest, WorkerRequest } from '../shared/core-protocol';
+import type { ReaderLane } from '../core/reader/lane';
+import type { ReaderSource } from '../core/reader/source';
+import type {
+  CoreResult,
+  OpenRequest,
+  TestRequest,
+  WorkerMessage,
+  WorkerRequest,
+} from '../shared/core-protocol';
 import { errorData } from '../shared/log/schema';
 import type { LogWriter } from '../shared/log/writer';
 import type { SourceSession } from '../core/source';
+import type { ReadRequest } from '../shared/reader-protocol';
 import { markLoaded } from './marker';
+import { READER_SOURCE_ACTION, TestReaderSource, parsePayload } from './reader-source';
 
 markLoaded();
 
 export interface CoreTestDeps {
   log: LogWriter;
   roots: Array<[string, string]>;
-  state: { holding: boolean; held: OpenRequest[] };
-  open: (request: OpenRequest) => void;
+  state: { holding: boolean; held: Array<OpenRequest | ReadRequest> };
+  open: (request: OpenRequest | ReadRequest) => void;
   toWorker: (message: WorkerRequest) => void;
   reply: (result: CoreResult) => void;
   /** The folder of core's own script, where its worker scripts are. */
   dir: string;
   /** The open source, if core was started with one. */
   session: SourceSession | null;
+  lane: ReaderLane<WorkerRequest, WorkerMessage>;
+  setReaderSource: (source: ReaderSource) => void;
+  readerSource: () => ReaderSource | null;
+}
+
+function limits(payload: unknown): { heapMb?: number; timeoutMs?: number } | null {
+  if (typeof payload !== 'object' || payload === null) return null;
+  const { heapMb, timeoutMs } = payload as { heapMb?: unknown; timeoutMs?: unknown };
+  const ok = (v: unknown, min: number, max: number) =>
+    v === undefined || (Number.isSafeInteger(v) && (v as number) >= min && (v as number) <= max);
+  if (!ok(heapMb, 16, 4096) || !ok(timeoutMs, 100, 60_000)) return null;
+  return {
+    ...(heapMb === undefined ? {} : { heapMb: heapMb as number }),
+    ...(timeoutMs === undefined ? {} : { timeoutMs: timeoutMs as number }),
+  };
+}
+
+/** Sets the reader's source. Its folder is fixed: a second source must use the same one. */
+async function setSource(payload: unknown, deps: CoreTestDeps): Promise<string | null> {
+  const parsed = parsePayload(payload);
+  if (!parsed) return 'payload';
+  const source = await TestReaderSource.create(parsed);
+  if (!source) return 'root';
+  const current = deps.readerSource();
+  if (current instanceof TestReaderSource && current.root !== source.root) return 'root changed';
+  deps.setReaderSource(source);
+  return null;
 }
 
 export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
@@ -90,6 +127,31 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
               detail: String((err as Error)?.message ?? err).slice(0, 200),
             }),
         );
+      return;
+    case READER_SOURCE_ACTION:
+      void setSource(request.payload, deps).then((problem) =>
+        problem === null
+          ? ok()
+          : deps.reply({
+              type: 'result',
+              reqId: request.reqId,
+              ok: false,
+              code: 'invalid',
+              detail: problem,
+            }),
+      );
+      return;
+    case 'reader-limits': {
+      const next = limits(request.payload);
+      if (!next) {
+        deps.reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
+        return;
+      }
+      void deps.lane.setLimits(next).then(() => ok());
+      return;
+    }
+    case 'reader-lane':
+      deps.reply({ type: 'result', reqId: request.reqId, ok: true, data: deps.lane.describe() });
       return;
     case 'source-records': {
       const records = deps.session?.records ?? null;

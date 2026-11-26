@@ -10,17 +10,26 @@ export interface ViewAsset {
   bytes: Uint8Array;
 }
 
+/** A link in a body: the body holds only its id, never the URL. */
+export interface ViewLink {
+  url: string;
+  text: string;
+}
+
 export interface View {
   token: string;
   openId: number;
   generation: number;
   html: string;
   assets: Map<string, ViewAsset>;
+  /** Kept apart from the assets: a link id is never served. */
+  links: Map<string, ViewLink>;
 }
 
 export interface ViewBody {
   html: string;
   assets: Array<{ id: string; contentType: string; bytes: Uint8Array }>;
+  links?: Array<{ id: string; url: string; text: string }>;
 }
 
 export type InstallOutcome =
@@ -70,11 +79,17 @@ export class ViewRegistry {
       assets: new Map(
         body.assets.map((a) => [a.id, { contentType: a.contentType, bytes: a.bytes }]),
       ),
+      links: new Map((body.links ?? []).map((l) => [l.id, { url: l.url, text: l.text }])),
     };
     this.live.set(token, view);
     this.pendingToken = null;
     this.authorized = bodyUrl(token);
     return { ok: true, view };
+  }
+
+  /** Drops the token reserved for `openId` when that open ends without a view. */
+  abandon(openId: number): void {
+    if (openId === this.latestOpenId) this.pendingToken = null;
   }
 
   /** Revokes the live view and any pending open. Returns how many views were live. */

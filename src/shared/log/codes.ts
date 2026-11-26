@@ -49,6 +49,10 @@ export const LOG_CODES = [
   'scan.done',
   'scan.rejected',
   'writer.stale_dropped',
+  'open.fallback',
+  'reader.timeout',
+  'reader.limit',
+  'reader.parse_failed',
 ] as const;
 
 /** Codes that only exist in builds with test hooks. */
@@ -94,6 +98,11 @@ export const REASONS = [
   'unknown_source',
   'unknown_run',
   'no_source',
+  'not_found',
+  'timeout',
+  'limit',
+  'crash',
+  'parse',
   'not_authorized',
   'main_frame',
   'subframe',

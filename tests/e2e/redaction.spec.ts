@@ -5,7 +5,9 @@
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import type { MessageOpenResult } from '../../src/shared/api';
 import { MARKER_TEXT, findMarkers } from '../markers';
+import { testDir } from '../paths';
 import { expect, test } from './app';
 
 test('no marker reaches a log file through any path', async ({ pev }) => {
@@ -32,6 +34,25 @@ test('no marker reaches a log file through any path', async ({ pev }) => {
     .poll(() => pev.logs('core').filter((l) => l.code === 'core.worker_exit').length)
     .toBe(2);
 
+  // Reader lane: a parse failure whose error carries the markers, a timeout
+  // and a heap breach, each ending in the reader's fallback. Lower limits keep
+  // it short; the paths are the same.
+  const source = await pev.main<{ ok: boolean }>('readerSource', testDir('redaction-reader'), [
+    [1, { test: { kind: 'throw', markers: M } }],
+    [2, { test: { kind: 'spin' } }],
+    [3, { test: { kind: 'heap' } }],
+  ]);
+  expect(source.ok).toBe(true);
+  await pev.main('readerLimits', { heapMb: 64, timeoutMs: 500 });
+  for (const rowid of [1, 2, 3]) {
+    const opened = await pev.page.evaluate(async (r) => {
+      const state = await window.pev.state();
+      if (!state.ok) return state;
+      return window.pev.open(r, 'plain', state.generation);
+    }, rowid);
+    expect((opened as MessageOpenResult & { outcome?: string }).outcome).toBe('fallback');
+  }
+
   // Renderer.
   await pev.shell('log', [M]);
   await pev.shell('error', [M]);
@@ -51,6 +72,10 @@ test('no marker reaches a log file through any path', async ({ pev }) => {
     ['worker', 'worker.uncaught'],
     ['worker', 'worker.rejection'],
     ['core', 'core.worker_exit'],
+    ['worker', 'reader.parse_failed'],
+    ['core', 'reader.timeout'],
+    ['core', 'reader.limit'],
+    ['main', 'open.fallback'],
     ['renderer', 'test.log'],
     ['renderer', 'renderer.error'],
     ['renderer', 'renderer.uncaught'],

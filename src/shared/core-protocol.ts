@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Messages between main and the core utility process, and between core and its reader worker.
 
+import type {
+  ReadRequest,
+  ReaderFailure,
+  RenderedMessage,
+  WorkerRender,
+  WorkerRendered,
+} from './reader-protocol';
 import type { RunIdentity, ScanSummary, Stamp } from './sources';
 
 /** The export run core serves. `root` is null while the run is unavailable. */
@@ -127,7 +134,13 @@ export interface ScanRequest {
 }
 
 export type CoreRequest =
-  OpenRequest | PingRequest | TestRequest | ProofRequest | IdentifyRequest | ScanRequest;
+  | OpenRequest
+  | PingRequest
+  | TestRequest
+  | ProofRequest
+  | IdentifyRequest
+  | ScanRequest
+  | ReadRequest;
 
 export type CoreResult =
   | {
@@ -143,12 +156,25 @@ export type CoreResult =
       stamp?: Stamp;
       identity?: RunIdentity;
       scan?: ScanSummary;
+      /** The rendered message of a `read`. */
+      read?: RenderedMessage;
     }
   | {
       type: 'result';
       reqId: number;
       ok: false;
-      code: 'unknown_stub' | 'worker_failed' | 'invalid' | 'stale' | 'no_source' | 'unavailable';
+      code:
+        | 'unknown_stub'
+        | 'worker_failed'
+        | 'invalid'
+        | 'stale'
+        | 'no_source'
+        | 'unavailable'
+        | 'not_found'
+        | 'superseded'
+        | 'reader_failed';
+      /** Why the reader gave no body, for `reader_failed`. */
+      reason?: ReaderFailure;
       /** Test builds only: why a test action failed. */
       detail?: string;
       stamp?: Stamp;
@@ -174,9 +200,10 @@ export interface WorkerProofRead {
   paths: string[];
 }
 
-export type WorkerRequest = WorkerBuild | WorkerTest | WorkerProofRead;
+export type WorkerRequest = WorkerBuild | WorkerTest | WorkerProofRead | WorkerRender;
 
 export type WorkerMessage =
+  | WorkerRendered
   | { type: 'result'; reqId: number; ok: true; body: StubBodyMessage }
   | { type: 'proof-read'; reqId: number; reads: ProofFileRead[] }
   | { type: 'result'; reqId: number; ok: false; code: 'unknown_stub' }

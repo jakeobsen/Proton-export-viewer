@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The typed surface between the shell renderer and the main process.
 
+import type { MessageHeaders, OpenMode } from './reader-protocol';
 import type { SourceOutcome, SourcesView } from './sources';
 
 export const IPC = {
   state: 'pev:state',
   ping: 'pev:ping',
   openStub: 'pev:open-stub',
+  open: 'pev:open',
   log: 'pev:log',
   report: 'pev:report',
   linkDialog: 'pev:link-dialog',
@@ -29,7 +31,8 @@ export type RejectCode =
   | 'core_unavailable'
   | 'unknown_source'
   | 'unknown_run'
-  | 'no_source';
+  | 'no_source'
+  | 'not_found';
 
 export type Rejected = { ok: false; code: RejectCode };
 
@@ -40,6 +43,23 @@ export type SourcesResult = { ok: true; generation: number; sources: SourcesView
 /** The outcome of an open, a switch or a Locate, and the generation it left. */
 export type SourceActionResult =
   { ok: true; outcome: SourceOutcome; generation: number } | Rejected;
+
+/**
+ * The outcome of opening a message: its body view, or the fallback when the
+ * reader couldn't render it.
+ */
+export type MessageOpenResult =
+  | {
+      ok: true;
+      openId: number;
+      outcome: 'view';
+      url: string;
+      format: 'plain' | 'html';
+      hasHtml: boolean;
+      headers: MessageHeaders;
+    }
+  | { ok: true; openId: number; outcome: 'fallback' }
+  | Rejected;
 
 export type ErrorKind = 'uncaught' | 'rejection' | 'error';
 
@@ -54,6 +74,7 @@ export interface PevApi {
   state(): Promise<StateResult>;
   ping(generation: number): Promise<PingResult>;
   openStub(id: string, generation: number): Promise<OpenResult>;
+  open(rowid: number, mode: OpenMode, generation: number): Promise<MessageOpenResult>;
   log(
     level: 'error' | 'warn' | 'info',
     code: string,
