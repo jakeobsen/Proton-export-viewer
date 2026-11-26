@@ -116,17 +116,25 @@ function IndexStatus() {
   const { progress } = useMailbox();
   if (!progress) return null;
   if (progress.phase === 'loading' || progress.phase === 'opening') {
-    const share = progress.total > 0 ? progress.loaded / progress.total : 0;
+    // Until the scan has counted the files, the bar shows without numbers.
+    const counted = progress.total > 0;
+    const share = counted ? progress.loaded / progress.total : 0;
     return (
       <div className="side-foot" role="status">
-        <span className="loading-text">{loadingText(progress.loaded, progress.total)}</span>
+        {counted && (
+          <span className="loading-text">{loadingText(progress.loaded, progress.total)}</span>
+        )}
         <div
           className="bar-track"
           role="progressbar"
           aria-label="Loading"
-          aria-valuemin={0}
-          aria-valuemax={progress.total}
-          aria-valuenow={progress.loaded}
+          {...(counted
+            ? {
+                'aria-valuemin': 0,
+                'aria-valuemax': progress.total,
+                'aria-valuenow': progress.loaded,
+              }
+            : {})}
         >
           <span style={{ width: `${Math.round(share * 100)}%` }} />
         </div>
@@ -178,7 +186,7 @@ function Chips({ row, sidebar }: { row: Row; sidebar: SidebarModel | null }) {
             style={label.color ? { background: label.color } : undefined}
             aria-hidden="true"
           />
-          {label.name}
+          <span className="chip-name">{label.name}</span>
         </span>
       ))}
     </div>
@@ -318,6 +326,11 @@ export function ConversationList() {
   const name = sidebar?.byId.get(folder)?.name ?? '';
   const unread = sidebar?.byId.get(folder)?.unread ?? 0;
   const selectedThread = snap.selected?.threadId ?? null;
+  const items = virtualizer.getVirtualItems();
+  // The selected row takes Tab focus; while it isn't drawn, the list does.
+  const selectedDrawn =
+    selectedThread !== null &&
+    items.some((item) => list.rowAt(item.index)?.threadId === selectedThread);
   return (
     <section className="list" aria-label="Conversations">
       <div className="list-head">
@@ -334,12 +347,12 @@ export function ConversationList() {
         className="list-scroll"
         role="listbox"
         aria-label={name}
-        tabIndex={selectedThread === null ? 0 : -1}
+        tabIndex={selectedDrawn ? -1 : 0}
         onScroll={reportViewport}
         onKeyDown={onKeyDown}
       >
         <div className="list-inner" style={{ height: virtualizer.getTotalSize() }}>
-          {virtualizer.getVirtualItems().map((item) => {
+          {items.map((item) => {
             const row = list.rowAt(item.index);
             return (
               <div

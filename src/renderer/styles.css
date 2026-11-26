@@ -582,9 +582,13 @@ body,
   transform: rotate(35deg);
 }
 
+/* Chips that don't fit wrap to a second line, which is hidden: only whole
+   chips show, and a name too long for the row ends in an ellipsis. */
 .chips {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
+  height: 19px;
   margin-top: 5px;
   min-width: 0;
   overflow: hidden;
@@ -592,18 +596,23 @@ body,
 
 .chip {
   display: inline-flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 5px;
   max-width: 100%;
   height: 19px;
   padding: 0 7px;
-  overflow: hidden;
   border-radius: 10px;
   background: var(--panel-3);
   color: var(--fg-2);
   font-size: 11px;
-  text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.chip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .chip .dot {
