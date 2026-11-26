@@ -456,6 +456,10 @@ test('"Show HTML anyway" near 20 MB ends in a view or the fallback, and plain te
   }
   // The lane's limit is 3 s per job; past it, the result is the fallback.
   expect(anyway.ms).toBeLessThan(5000);
+  // A worker left holding that much is replaced after the job (or was ended by the limit).
+  if (anyway.result.ok && anyway.result.outcome === 'view') {
+    await expect.poll(() => pev.hasLog('reader.worker_retired', { proc: 'core' })).toBe(true);
+  }
   const plain = await measured(pev, 'HTML near 20 MB', 2, 'plain');
   expect(plain.result).toMatchObject({ outcome: 'view', format: 'plain', truncated: false });
 });

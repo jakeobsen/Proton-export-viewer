@@ -6,6 +6,9 @@
 //   HTML is shown up to HTML_ANYWAY_BYTES.
 // - A body over HTML_ANYWAY_BYTES shows only the first FIRST_TEXT_BYTES of
 //   its plain text.
+// Each limit applies to the body being shown, and counts its encoded bytes
+// (before base64 or quoted-printable is undone), so an encoded body counts as
+// larger than its decoded text.
 
 import type { Readable } from 'node:stream';
 import type { AddressObject, HeaderLines, HeaderValue, Headers } from 'mailparser';

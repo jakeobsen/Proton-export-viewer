@@ -95,7 +95,10 @@ export interface WorkerRender {
   assetBase: string;
 }
 
-/** reader worker -> core. */
+/**
+ * reader worker -> core. `heldBytes` is the memory the worker holds once the
+ * job is done: its JS heap and the buffers outside it.
+ */
 export type WorkerRendered =
-  | { type: 'rendered'; reqId: number; ok: true; message: RenderedMessage }
-  | { type: 'rendered'; reqId: number; ok: false; code: 'parse' };
+  | { type: 'rendered'; reqId: number; heldBytes: number; ok: true; message: RenderedMessage }
+  | { type: 'rendered'; reqId: number; heldBytes: number; ok: false; code: 'parse' };
