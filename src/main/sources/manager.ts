@@ -13,7 +13,7 @@
 // for, and main drops any that isn't current.
 
 import { randomBytes, randomUUID } from 'node:crypto';
-import { lstat } from 'node:fs/promises';
+import { lstat, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { CoreRequest, CoreResult } from '../../shared/core-protocol';
 import type { Logger } from '../../shared/log/writer';
@@ -45,7 +45,12 @@ type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : n
 export interface CoreControl {
   readonly running: boolean;
   setSource(source: (Stamp & { root: string | null }) | null): void;
-  start(): Promise<void>;
+  /**
+   * Makes sure core runs with exactly this source: a core started with
+   * another one in the meantime (by a request) is stopped first. Resolves
+   * true if it had to stop one.
+   */
+  startWith(source: Stamp & { root: string | null }): Promise<boolean>;
   stop(): Promise<void>;
   request(call: DistributiveOmit<CoreRequest, 'reqId'>): Promise<CoreResult>;
 }
@@ -99,11 +104,23 @@ interface Target {
   runs?: FoundRun[];
 }
 
+/** The answer to an operation made for a generation that has moved on before it ran. */
+export const STALE = 'stale_generation';
+export type Stale = typeof STALE;
+
+/**
+ * Account folder names agree unless both are known and differ: a run picked by
+ * its own folder has no account folder in the pick.
+ */
+function accountsAgree(a: string | null, b: string | null): boolean {
+  return a === null || b === null || a === b;
+}
+
 /** A known source and a run found on disk are the same run only if all of this matches. */
 export function sameRun(source: SourceRecord, run: FoundRun, identity: RunIdentity): boolean {
   return (
     source.runName === run.runName &&
-    source.accountName === run.accountName &&
+    accountsAgree(source.accountName, run.accountName) &&
     source.labelsSha256 === identity.labelsSha256 &&
     source.namesSha256 === identity.namesSha256
   );
@@ -174,8 +191,17 @@ export class SourceManager {
 
   // --- Operations (serialized) --------------------------------------------------
 
-  private serial<T>(op: () => Promise<T>): Promise<T> {
-    const next = this.queue.then(op, op);
+  /**
+   * Runs operations one at a time. One made for a generation (from the shell)
+   * is checked again when its turn comes: if an earlier one moved the
+   * generation meanwhile, it does nothing and reports that it's stale.
+   */
+  private serial<T>(op: () => Promise<T>): Promise<T>;
+  private serial<T>(op: () => Promise<T>, expected: number): Promise<T | Stale>;
+  private serial<T>(op: () => Promise<T>, expected?: number): Promise<T | Stale> {
+    const run = (): Promise<T | Stale> =>
+      expected !== undefined && this.deps.generation() !== expected ? Promise.resolve(STALE) : op();
+    const next = this.queue.then(run, run);
     this.queue = next.catch(() => undefined);
     return next;
   }
@@ -205,7 +231,10 @@ export class SourceManager {
   }
 
   /** Shows the folder dialog and opens the newest run found in the folder. */
-  chooseFolder(win: Electron.BrowserWindow | null): Promise<SourceOutcome> {
+  chooseFolder(
+    win: Electron.BrowserWindow | null,
+    expected: number,
+  ): Promise<SourceOutcome | Stale> {
     return this.serial(async () => {
       const picked = await this.deps.picker(win);
       if (!picked) return 'canceled';
@@ -227,11 +256,11 @@ export class SourceManager {
         onMismatch: 'open',
         runs: found.runs,
       });
-    });
+    }, expected);
   }
 
   /** Opens a source from the recent list. */
-  openRecent(sourceKey: string): Promise<SourceOutcome | null> {
+  openRecent(sourceKey: string, expected: number): Promise<SourceOutcome | null | Stale> {
     return this.serial(async () => {
       const source = this.registry.source(sourceKey);
       const pick = source && this.registry.pick(source.pickId);
@@ -243,11 +272,11 @@ export class SourceManager {
         verify: source.offline,
         onMismatch: 'offline',
       });
-    });
+    }, expected);
   }
 
   /** Switches to another run of the open pick. */
-  switchRun(runId: string): Promise<SourceOutcome | null> {
+  switchRun(runId: string, expected: number): Promise<SourceOutcome | null | Stale> {
     return this.serial(async () => {
       const current = this.active;
       const run = current?.runs.find((r) => r.runId === runId);
@@ -261,7 +290,7 @@ export class SourceManager {
         onMismatch: 'open',
         runs: current.runs,
       });
-    });
+    }, expected);
   }
 
   /**
@@ -269,7 +298,10 @@ export class SourceManager {
    * same source only if its names and identity all match; anything else opens
    * as a new source and leaves the old one as it is.
    */
-  locate(win: Electron.BrowserWindow | null): Promise<SourceOutcome | null> {
+  locate(
+    win: Electron.BrowserWindow | null,
+    expected: number,
+  ): Promise<SourceOutcome | null | Stale> {
     return this.serial(async () => {
       const lost = this.active?.source;
       if (!lost) return null;
@@ -282,7 +314,7 @@ export class SourceManager {
       }
       const pick = this.registry.addPick(found.root, picked.bookmark);
       const candidate = found.runs.find(
-        (r) => r.runName === lost.runName && r.accountName === lost.accountName,
+        (r) => r.runName === lost.runName && accountsAgree(r.accountName, lost.accountName),
       );
       if (candidate) {
         const outcome = await this.activate({
@@ -305,7 +337,7 @@ export class SourceManager {
         runs: found.runs,
       });
       return outcome === 'opened' ? 'new_source' : outcome;
-    });
+    }, expected);
   }
 
   /** At quit: releases the folder scope. */
@@ -328,6 +360,14 @@ export class SourceManager {
     if (!this.deps.core.running) return;
     await this.deps.core.stop();
     this.record('core.stop', { generation, sourceKey: this.active?.source.sourceKey ?? null });
+  }
+
+  /** Starts core for the source; a core some request started meanwhile with another is replaced. */
+  private async spawnCore(source: Stamp & { root: string | null }, pickId: string): Promise<void> {
+    const replaced = await this.deps.core.startWith(source);
+    const fields = { pickId, sourceKey: source.sourceKey, generation: source.generation };
+    if (replaced) this.record('core.stop', fields);
+    this.record('core.spawn', fields);
   }
 
   private releaseScope(generation: number, reason: 'switch' | 'quit' = 'switch'): void {
@@ -366,14 +406,12 @@ export class SourceManager {
       }
     }
     const root = join(target.pick.path, target.run.rel);
-    const online = scoped && (await isDirectory(root));
+    const online = scoped && (await isRunFolder(root));
     if (scoped && !online) this.releaseScope(generation);
 
     const sourceKey = target.known?.sourceKey ?? randomUUID();
     const stamp: Stamp = { sourceKey, generation };
-    this.deps.core.setSource({ ...stamp, root: online ? root : null });
-    await this.deps.core.start();
-    this.record('core.spawn', { pickId, sourceKey, generation });
+    await this.spawnCore({ ...stamp, root: online ? root : null }, pickId);
 
     let source = target.known;
     if (online && (source === null || target.verify)) {
@@ -437,9 +475,7 @@ export class SourceManager {
       .find((s) => s.sourceKey !== target.known?.sourceKey && sameRun(s, target.run, identity));
     const source = match ?? this.registry.addSource(fields);
     const stamp: Stamp = { sourceKey: source.sourceKey, generation };
-    this.deps.core.setSource({ ...stamp, root: join(target.pick.path, target.run.rel) });
-    await this.deps.core.start();
-    this.record('core.spawn', { pickId, sourceKey: source.sourceKey, generation });
+    await this.spawnCore({ ...stamp, root: join(target.pick.path, target.run.rel) }, pickId);
     const outcome = await this.settle({ ...target, known: source }, source, stamp, true);
     return outcome === 'opened' && !match ? 'new_source' : outcome;
   }
@@ -452,13 +488,7 @@ export class SourceManager {
   ): Promise<SourceOutcome> {
     await this.stopCore(stamp.generation);
     this.releaseScope(stamp.generation);
-    this.deps.core.setSource({ ...stamp, root: null });
-    await this.deps.core.start();
-    this.record('core.spawn', {
-      pickId: target.pick.pickId,
-      sourceKey: stamp.sourceKey,
-      generation: stamp.generation,
-    });
+    await this.spawnCore({ ...stamp, root: null }, target.pick.pickId);
     return this.settle(target, source, stamp, false);
   }
 
@@ -483,6 +513,8 @@ export class SourceManager {
     this.registry.updateSource(source.sourceKey, {
       pickId: target.pick.pickId,
       rel: target.run.rel,
+      // The account folder's name, once a pick shows it.
+      accountName: target.run.accountName ?? source.accountName,
       openedAt: this.now(),
       offline: !online,
     });
@@ -573,9 +605,15 @@ function runOf(source: SourceRecord): FoundRun {
   return { rel: source.rel, runName: source.runName, accountName: source.accountName };
 }
 
-async function isDirectory(path: string): Promise<boolean> {
+/**
+ * True if `path` is a directory reached without any link: its canonical path
+ * is the path itself. The picked folder's path is stored canonical, so a link
+ * put anywhere on the way to a saved run (an account folder replaced by a
+ * link, say) makes the run unavailable instead of redirecting it.
+ */
+async function isRunFolder(path: string): Promise<boolean> {
   try {
-    return (await lstat(path)).isDirectory();
+    return (await realpath(path)) === path && (await lstat(path)).isDirectory();
   } catch {
     return false;
   }

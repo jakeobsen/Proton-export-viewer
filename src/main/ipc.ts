@@ -19,6 +19,7 @@ import {
   type StateResult,
 } from '../shared/api';
 import type { SourceOutcome } from '../shared/sources';
+import { STALE, type Stale } from './sources/manager';
 import { APP_ORIGIN } from '../shared/constants';
 import { isRendererLogCode } from '../shared/log/codes';
 import { CoreUnavailableError } from './core-host';
@@ -153,12 +154,16 @@ export function registerIpc(ctx: AppContext): void {
     return { ok: true, generation: ctx.generation, sources: ctx.sources.view() };
   });
 
-  /** An open, a switch or a Locate: the outcome and the generation it left. */
+  /**
+   * An open, a switch or a Locate: the outcome and the generation it left.
+   * The generation is checked here and again when the action's turn comes,
+   * since an action queued behind another may find it moved on.
+   */
   const sourceAction = <A extends { generation: number }>(
     channel: string,
     schema: z.ZodType<[A]>,
     missing: RejectCode,
-    run: (appWin: AppWindow, args: A) => Promise<SourceOutcome | null>,
+    run: (appWin: AppWindow, args: A) => Promise<SourceOutcome | null | Stale>,
   ) =>
     guarded<SourceActionResult>(channel, async (appWin, raw) => {
       const args = schema.safeParse(raw);
@@ -166,20 +171,21 @@ export function registerIpc(ctx: AppContext): void {
       if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
       const outcome = await run(appWin, args.data[0]);
       if (outcome === null) return reject(missing, appWin);
+      if (outcome === STALE) return reject('stale_generation', appWin);
       return { ok: true, outcome, generation: ctx.generation };
     });
 
-  sourceAction(IPC.chooseFolder, GenerationArgs, 'invalid', (appWin) =>
-    ctx.sources.chooseFolder(appWin.win),
+  sourceAction(IPC.chooseFolder, GenerationArgs, 'invalid', (appWin, { generation }) =>
+    ctx.sources.chooseFolder(appWin.win, generation),
   );
-  sourceAction(IPC.openExport, SourceArgs, 'unknown_source', (_appWin, { sourceKey }) =>
-    ctx.sources.openRecent(sourceKey),
+  sourceAction(IPC.openExport, SourceArgs, 'unknown_source', (_appWin, { sourceKey, generation }) =>
+    ctx.sources.openRecent(sourceKey, generation),
   );
-  sourceAction(IPC.switchRun, RunArgs, 'unknown_run', (_appWin, { runId }) =>
-    ctx.sources.switchRun(runId),
+  sourceAction(IPC.switchRun, RunArgs, 'unknown_run', (_appWin, { runId, generation }) =>
+    ctx.sources.switchRun(runId, generation),
   );
-  sourceAction(IPC.locateExport, GenerationArgs, 'no_source', (appWin) =>
-    ctx.sources.locate(appWin.win),
+  sourceAction(IPC.locateExport, GenerationArgs, 'no_source', (appWin, { generation }) =>
+    ctx.sources.locate(appWin.win, generation),
   );
 
   /** Like `guarded`, for one-way sends; also drops a send made for a stale generation. */

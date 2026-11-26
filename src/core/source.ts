@@ -61,10 +61,15 @@ export class SourceSession {
     if (!source) return;
     this.gate.set({ sourceKey: source.sourceKey, generation: source.generation });
     if (source.root !== null) {
+      // Main hands over the canonical path of the run. If it resolves anywhere
+      // else now, a link was put on the way, and the run isn't used.
       try {
-        this.root = resolveRoot(source.root);
+        const root = resolveRoot(source.root);
+        if (root === source.root) this.root = root;
       } catch (err) {
         if (!(err instanceof ContainmentError)) throw err;
+      }
+      if (this.root === null) {
         this.log.warn('source.unavailable', { reason: 'unknown' }, { src: source.sourceKey });
       }
     }

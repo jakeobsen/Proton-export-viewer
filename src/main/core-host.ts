@@ -34,6 +34,8 @@ export class CoreHost {
   private seq = 0;
   private readonly pending = new Map<number, Pending>();
   private source: CoreSource | null = null;
+  /** The source the running core was started with. */
+  private childSource: CoreSource | null = null;
 
   constructor(private readonly options: CoreHostOptions) {}
 
@@ -50,9 +52,26 @@ export class CoreHost {
     this.source = source ? { ...source } : null;
   }
 
+  /**
+   * Starts core with this source. A core that was started with another one
+   * (a request can start core while a switch is under way) is stopped first.
+   * Resolves true if one was stopped.
+   */
+  async startWith(source: CoreSource): Promise<boolean> {
+    this.setSource(source);
+    let replaced = false;
+    if (this.child && !sameSource(this.childSource, this.source)) {
+      await this.stop();
+      replaced = true;
+    }
+    await this.start();
+    return replaced;
+  }
+
   start(): Promise<void> {
     if (this.starting) return this.starting;
     const source = this.source;
+    this.childSource = source;
     this.starting = new Promise<void>((resolve, reject) => {
       const child = utilityProcess.fork(this.options.corePath, [], {
         serviceName: 'Core',
@@ -121,4 +140,9 @@ export class CoreHost {
     child.kill();
     return exited;
   }
+}
+
+function sameSource(a: CoreSource | null, b: CoreSource | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.sourceKey === b.sourceKey && a.generation === b.generation && a.root === b.root;
 }

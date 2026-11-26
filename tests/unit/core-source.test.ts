@@ -92,6 +92,16 @@ describe('SourceSession', () => {
     expect(none.gate.current).toBeNull();
   });
 
+  it('takes no root that resolves anywhere but itself', async () => {
+    const written = writeExport(realpathSync(testDir('core-src-link')), { seed: 1, messages: 2 });
+    const via = join(realpathSync(testDir('core-src-link-via')), 'run');
+    symlinkSync(written.run, via);
+    const t = session(via);
+    expect(t.s.hasRoot).toBe(false);
+    expect(t.lines.map((l) => l.code)).toEqual(['source.unavailable']);
+    expect(session(written.run).s.hasRoot).toBe(true);
+  });
+
   it('reports a run that went away during the work as unavailable', async () => {
     const written = writeExport(realpathSync(testDir('core-src-vanish')), { seed: 1, messages: 2 });
     const t = session(written.run);

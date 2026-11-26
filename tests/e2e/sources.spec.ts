@@ -5,12 +5,15 @@
 // unavailable exports and Locate.
 
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   readFileSync,
   realpathSync,
   renameSync,
+  rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
@@ -273,6 +276,74 @@ test('an unavailable export opens offline, and Locate takes the same run back', 
   } finally {
     await closeChecked(gone);
   }
+});
+
+test('a link put on the way to the open export makes it unavailable at the next launch', async () => {
+  const { root, newer } = twoRuns('src-linked');
+  const first = await launch('src-linked-1');
+  try {
+    await first.main('queuePick', root, 'bm1');
+    await act(first, 'chooseFolder');
+  } finally {
+    await closeChecked(first);
+  }
+  // The account folder becomes a link to a copy elsewhere.
+  const elsewhere = realpathSync(testDir('src-linked-elsewhere'));
+  const account = join(root, newer.account);
+  cpSync(account, join(elsewhere, 'copy'), { recursive: true });
+  rmSync(account, { recursive: true });
+  symlinkSync(join(elsewhere, 'copy'), account);
+
+  const again = await launch('src-linked-2', { userData: first.userData });
+  try {
+    await expect.poll(async () => (await view(again)).active?.status).toBe('offline');
+    expect(steps(await again.main<Step[]>('sourceOrder'))).toEqual([
+      'scope.start',
+      'scope.release',
+      'core.spawn',
+    ]);
+    expect(await coreRecords(again)).toMatchObject({ hasRoot: false, scans: 0 });
+    expect(await again.main('liveScopes')).toEqual([]);
+  } finally {
+    await closeChecked(again);
+  }
+});
+
+test('actions made for the same generation run one at a time, and the later ones are refused', async ({
+  pev,
+}) => {
+  const { root } = twoRuns('src-queue');
+  const other = realpathSync(testDir('src-queue-other'));
+  writeExport(other, { seed: 2, messages: 3 });
+  await pev.main('queuePick', root, 'bm1');
+  await act(pev, 'chooseFolder');
+  const older = (await view(pev)).active!.runs[1]!;
+  await pev.main('queuePick', other, 'bm2');
+  await pev.main('clearSourceOrder');
+  const generation = (await pev.main<Stamp>('sourceStamp')).generation;
+
+  const results = await pev.page.evaluate(
+    ([g, runId]) =>
+      Promise.all([
+        window.pev.chooseFolder(g),
+        window.pev.switchRun(runId, g),
+        window.pev.locateExport(g),
+      ]),
+    [generation, older.runId] as const,
+  );
+  expect(results).toEqual([
+    { ok: true, outcome: 'opened', generation: generation + 1 },
+    { ok: false, code: 'stale_generation' },
+    { ok: false, code: 'stale_generation' },
+  ]);
+  expect(await pev.main('pickerCalls')).toBe(2);
+  expect(steps(await pev.main<Step[]>('sourceOrder'))).toEqual([
+    'core.stop',
+    'scope.release',
+    'scope.start',
+    'core.spawn',
+  ]);
+  expect((await pev.main<Stamp>('sourceStamp')).generation).toBe(generation + 1);
 });
 
 test('Locate: another run with the same run name, account and labels is a new source, and the first index is untouched', async ({

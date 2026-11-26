@@ -3,14 +3,27 @@
 // steps, generations, unavailable sources and Locate. Core is a stand-in that
 // computes the real run identity.
 
-import { cpSync, mkdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  cpSync,
+  mkdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { runIdentity } from '../../src/core/identity';
 import type { CoreRequest, CoreResult, CoreSource } from '../../src/shared/core-protocol';
 import type { Logger } from '../../src/shared/log/writer';
 import type { ScanSummary } from '../../src/shared/sources';
-import { SourceManager, type CoreControl, type OrderStep } from '../../src/main/sources/manager';
+import {
+  STALE,
+  SourceManager,
+  type CoreControl,
+  type OrderStep,
+} from '../../src/main/sources/manager';
 import { ScopeError, type Picked, type Scopes } from '../../src/main/sources/scope';
 import { testDir } from '../paths';
 
@@ -63,6 +76,14 @@ class FakeCore implements CoreControl {
     return Promise.resolve();
   }
 
+  async startWith(source: CoreSource) {
+    this.setSource(source);
+    const stray = this.running && JSON.stringify(this.current) !== JSON.stringify(this.next);
+    if (stray) await this.stop();
+    await this.start();
+    return stray;
+  }
+
   async request(call: Call): Promise<CoreResult> {
     await this.start();
     const src = this.current;
@@ -102,8 +123,10 @@ function setup(name: string) {
   const push = (code: string, data?: unknown, meta?: unknown) =>
     lines.push(JSON.stringify({ code, data, meta }));
   const log: Logger = { log: (_l, c, d, m) => push(c, d, m), error: push, warn: push, info: push };
+  const hooks: { onScopeStart?: () => void } = {};
   const scopes: Scopes = {
     start(bookmark) {
+      hooks.onScopeStart?.();
       if (bookmark === null || failing.has(bookmark)) throw new ScopeError('test');
       seq += 1;
       const id = seq;
@@ -132,6 +155,7 @@ function setup(name: string) {
     return make();
   };
   return {
+    hooks,
     userData,
     core,
     order,
@@ -175,7 +199,7 @@ describe('opening a source', () => {
     const root = tool('mgr-open-tool');
     expect(t.core.started).toEqual([]);
     t.picks.push({ path: root, bookmark: 'bm1' });
-    expect(await t.manager.chooseFolder(null)).toBe('opened');
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('opened');
     expect(steps(t.order)).toEqual(['scope.start', 'core.spawn']);
     expect(t.order.every((s) => s.generation === 2)).toBe(true);
     const run = join(root, 'secret.account@example.com', 'mail_20250630_120000');
@@ -211,9 +235,9 @@ describe('opening a source', () => {
     const t = setup('mgr-none');
     expect(await t.manager.restore()).toBeNull();
     expect(t.manager.view()).toEqual({ restoring: false, active: null, recent: [] });
-    expect(await t.manager.chooseFolder(null)).toBe('canceled');
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('canceled');
     t.picks.push({ path: realpathSync(testDir('mgr-none-empty')), bookmark: 'bm' });
-    expect(await t.manager.chooseFolder(null)).toBe('no_export');
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('no_export');
     expect(t.order).toEqual([]);
     expect(t.core.started).toEqual([]);
     expect(t.generation()).toBe(1);
@@ -225,11 +249,11 @@ describe('switching', () => {
     const t = setup('mgr-sibling');
     const root = tool('mgr-sibling-tool');
     t.picks.push({ path: root, bookmark: 'bm1' });
-    await t.manager.chooseFolder(null);
+    await t.manager.chooseFolder(null, t.generation());
     const first = t.manager.stamp()!;
     t.order.length = 0;
     const older = t.manager.view().active!.runs[1]!;
-    expect(await t.manager.switchRun(older.runId)).toBe('opened');
+    expect(await t.manager.switchRun(older.runId, t.generation())).toBe('opened');
     expect(steps(t.order)).toEqual(['core.stop', 'scope.keep', 'core.spawn']);
     const second = t.manager.stamp()!;
     expect(second.generation).toBe(first.generation + 1);
@@ -243,7 +267,7 @@ describe('switching', () => {
     // Back to the first run: the same source, without a new identity check.
     t.core.calls.length = 0;
     const newer = t.manager.view().active!.runs[0]!;
-    expect(await t.manager.switchRun(newer.runId)).toBe('opened');
+    expect(await t.manager.switchRun(newer.runId, t.generation())).toBe('opened');
     expect(t.manager.stamp()).toEqual({
       sourceKey: first.sourceKey,
       generation: second.generation + 1,
@@ -257,11 +281,11 @@ describe('switching', () => {
     // The second pick is a run folder by itself.
     const two = runAt(join(realpathSync(testDir('mgr-picks-2')), 'mail_20250701_090000'), ['x']);
     t.picks.push({ path: one, bookmark: 'bm1' }, { path: two, bookmark: 'bm2' });
-    await t.manager.chooseFolder(null);
+    await t.manager.chooseFolder(null, t.generation());
     const first = t.manager.stamp()!;
     const firstPick = t.order[0]!.pickId;
     t.order.length = 0;
-    expect(await t.manager.chooseFolder(null)).toBe('opened');
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('opened');
     expect(steps(t.order)).toEqual(['core.stop', 'scope.release', 'scope.start', 'core.spawn']);
     expect(t.order[1]!.pickId).toBe(firstPick);
     expect(t.order[2]!.pickId).not.toBe(firstPick);
@@ -274,16 +298,41 @@ describe('switching', () => {
     expect(t.manager.view().recent.length).toBe(2);
   });
 
+  it('replaces a core that a request started with the old source during a switch', async () => {
+    const t = setup('mgr-stray');
+    const one = tool('mgr-stray-1');
+    const two = runAt(join(realpathSync(testDir('mgr-stray-2')), 'mail_20250701_090000'), ['x']);
+    t.picks.push({ path: one, bookmark: 'bm1' }, { path: two, bookmark: 'bm2' });
+    await t.manager.chooseFolder(null, t.generation());
+    const first = t.manager.stamp()!;
+    // A request arrives after core stopped and before the new one starts.
+    t.hooks.onScopeStart = () => void t.core.request({ type: 'ping' });
+    t.order.length = 0;
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('opened');
+    expect(t.core.started.at(-2)).toMatchObject({ sourceKey: first.sourceKey });
+    expect(steps(t.order)).toEqual([
+      'core.stop',
+      'scope.release',
+      'scope.start',
+      'core.stop',
+      'core.spawn',
+    ]);
+    expect(t.core.started.at(-1)).toEqual({ ...t.manager.stamp()!, root: two });
+    expect(t.core.calls).toContain('identify');
+    await settle();
+    expect(t.manager.scanSummary()).toEqual(SUMMARY);
+  });
+
   it('drops a scan result that arrives in main after a switch', async () => {
     const t = setup('mgr-late');
     const root = tool('mgr-late-tool');
     t.core.holdScans = true;
     t.picks.push({ path: root, bookmark: 'bm1' });
-    await t.manager.chooseFolder(null);
+    await t.manager.chooseFolder(null, t.generation());
     await settle();
     expect(t.core.heldScans.length).toBe(1);
     const older = t.manager.view().active!.runs[1]!;
-    await t.manager.switchRun(older.runId);
+    await t.manager.switchRun(older.runId, t.generation());
     await settle();
     // The first run's scan, from the core that was stopped, comes back late.
     t.core.heldScans.shift()!();
@@ -302,7 +351,7 @@ describe('an unavailable source', () => {
     const t = setup('mgr-stale');
     const root = tool('mgr-stale-tool');
     t.picks.push({ path: root, bookmark: 'bm1' });
-    await t.manager.chooseFolder(null);
+    await t.manager.chooseFolder(null, t.generation());
     const key = t.manager.stamp()!.sourceKey;
 
     // The next launch: the bookmark no longer resolves.
@@ -325,11 +374,11 @@ describe('an unavailable source', () => {
     const t = setup('mgr-gone');
     const root = tool('mgr-gone-tool');
     t.picks.push({ path: root, bookmark: 'bm1' });
-    await t.manager.chooseFolder(null);
+    await t.manager.chooseFolder(null, t.generation());
     const key = t.manager.stamp()!.sourceKey;
     renameSync(join(root, 'secret.account@example.com'), join(root, 'moved'));
     t.order.length = 0;
-    expect(await t.manager.openRecent(key)).toBe('offline');
+    expect(await t.manager.openRecent(key, t.generation())).toBe('offline');
     expect(steps(t.order)).toEqual(['core.stop', 'scope.keep', 'scope.release', 'core.spawn']);
     expect(t.core.started.at(-1)?.root).toBeNull();
     expect([...t.live.values()]).toEqual([]);
@@ -339,7 +388,7 @@ describe('an unavailable source', () => {
     const t = setup('mgr-back');
     const root = tool('mgr-back-tool');
     t.picks.push({ path: root, bookmark: 'bm1' });
-    await t.manager.chooseFolder(null);
+    await t.manager.chooseFolder(null, t.generation());
     const key = t.manager.stamp()!.sourceKey;
 
     // A plain reopen computes no identity.
@@ -352,7 +401,7 @@ describe('an unavailable source', () => {
     expect(t.core.calls).not.toContain('identify');
 
     renameSync(join(root, 'secret.account@example.com'), join(root, 'away'));
-    expect(await app.openRecent(key)).toBe('offline');
+    expect(await app.openRecent(key, t.generation())).toBe('offline');
     renameSync(join(root, 'away'), join(root, 'secret.account@example.com'));
     t.core.calls.length = 0;
     app = await t.relaunch(app);
@@ -361,15 +410,42 @@ describe('an unavailable source', () => {
     expect(app.stamp()?.sourceKey).toBe(key);
   });
 
+  it('is offline at launch when a link was put on the way to it', async () => {
+    const t = setup('mgr-linked');
+    const root = tool('mgr-linked-tool');
+    t.picks.push({ path: root, bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    const key = t.manager.stamp()!.sourceKey;
+    // Between launches the account folder becomes a link to a copy elsewhere.
+    const elsewhere = realpathSync(testDir('mgr-linked-elsewhere'));
+    const account = join(root, 'secret.account@example.com');
+    cpSync(account, join(elsewhere, 'copy'), { recursive: true });
+    rmSync(account, { recursive: true });
+    symlinkSync(join(elsewhere, 'copy'), account);
+
+    const later = await t.relaunch(t.manager);
+    t.order.length = 0;
+    t.core.calls.length = 0;
+    expect(await later.restore()).toBe('offline');
+    expect(steps(t.order)).toEqual(['scope.start', 'scope.release', 'core.spawn']);
+    expect(t.core.started.at(-1)).toEqual({
+      sourceKey: key,
+      generation: t.generation(),
+      root: null,
+    });
+    expect(t.core.calls).toEqual([]);
+    expect([...t.live.values()]).toEqual([]);
+  });
+
   it('stays offline at launch when another run took its place', async () => {
     const t = setup('mgr-replaced');
     const root = tool('mgr-replaced-tool');
     t.picks.push({ path: root, bookmark: 'bm1' });
-    await t.manager.chooseFolder(null);
+    await t.manager.chooseFolder(null, t.generation());
     const key = t.manager.stamp()!.sourceKey;
     const run = join(root, 'secret.account@example.com', 'mail_20250630_120000');
     renameSync(run, `${run}-old`);
-    expect(await t.manager.openRecent(key)).toBe('offline');
+    expect(await t.manager.openRecent(key, t.generation())).toBe('offline');
     runAt(run, ['other']);
     const later = await t.relaunch(t.manager);
     expect(await later.restore()).toBe('offline');
@@ -378,21 +454,50 @@ describe('an unavailable source', () => {
   });
 });
 
+describe('queued actions', () => {
+  it('refuse to run when an earlier one moved the generation first', async () => {
+    const t = setup('mgr-queue');
+    const root = tool('mgr-queue-tool');
+    const other = runAt(join(realpathSync(testDir('mgr-queue-other')), 'mail_20250701_090000'), [
+      'x',
+    ]);
+    t.picks.push({ path: root, bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    const generation = t.generation();
+    const older = t.manager.view().active!.runs[1]!;
+    t.picks.push({ path: other, bookmark: 'bm2' }, { path: other, bookmark: 'bm3' });
+    t.order.length = 0;
+
+    // Three actions made for the same generation, at once.
+    const [chosen, switched, located] = await Promise.all([
+      t.manager.chooseFolder(null, generation),
+      t.manager.switchRun(older.runId, generation),
+      t.manager.locate(null, generation),
+    ]);
+    expect([chosen, switched, located]).toEqual(['opened', STALE, STALE]);
+    expect(t.generation()).toBe(generation + 1);
+    expect(t.order.filter((s) => s.step === 'core.spawn')).toHaveLength(1);
+    // Only the first one used the picker.
+    expect(t.picks).toEqual([{ path: other, bookmark: 'bm3' }]);
+    expect(t.manager.view().active).toMatchObject({ runName: 'mail_20250701_090000' });
+  });
+});
+
 describe('Locate', () => {
   it('takes the same run back as the same source, at its new place', async () => {
     const t = setup('mgr-locate');
     const root = tool('mgr-locate-tool');
     t.picks.push({ path: root, bookmark: 'bm1' });
-    await t.manager.chooseFolder(null);
+    await t.manager.chooseFolder(null, t.generation());
     const key = t.manager.stamp()!.sourceKey;
     const account = join(root, 'secret.account@example.com');
     const moved = realpathSync(testDir('mgr-locate-moved'));
     cpSync(account, join(moved, 'secret.account@example.com'), { recursive: true });
     rmSync(account, { recursive: true });
-    expect(await t.manager.openRecent(key)).toBe('offline');
+    expect(await t.manager.openRecent(key, t.generation())).toBe('offline');
 
     t.picks.push({ path: moved, bookmark: 'bm2' });
-    expect(await t.manager.locate(null)).toBe('opened');
+    expect(await t.manager.locate(null, t.generation())).toBe('opened');
     expect(t.manager.stamp()!.sourceKey).toBe(key);
     const source = t.manager.registry.source(key)!;
     expect(t.manager.registry.pick(source.pickId)).toMatchObject({ path: moved, bookmark: 'bm2' });
@@ -405,19 +510,19 @@ describe('Locate', () => {
     const first = realpathSync(testDir('mgr-collide-1'));
     runAt(join(first, 'secret.account@example.com', 'mail_20250630_120000'), ['a', 'b']);
     t.picks.push({ path: first, bookmark: 'bm1' });
-    await t.manager.chooseFolder(null);
+    await t.manager.chooseFolder(null, t.generation());
     const key = t.manager.stamp()!.sourceKey;
     const index = join(t.userData, 'index');
     mkdirSync(index, { recursive: true });
     writeFileSync(join(index, `${key}.sqlite`), 'the first index');
 
     rmSync(first, { recursive: true });
-    expect(await t.manager.openRecent(key)).toBe('offline');
+    expect(await t.manager.openRecent(key, t.generation())).toBe('offline');
     const before = { ...t.manager.registry.source(key)! };
     const second = realpathSync(testDir('mgr-collide-2'));
     runAt(join(second, 'secret.account@example.com', 'mail_20250630_120000'), ['a', 'c']);
     t.picks.push({ path: second, bookmark: 'bm2' });
-    expect(await t.manager.locate(null)).toBe('new_source');
+    expect(await t.manager.locate(null, t.generation())).toBe('new_source');
 
     const now = t.manager.stamp()!.sourceKey;
     expect(now).not.toBe(key);
@@ -432,14 +537,34 @@ describe('Locate', () => {
     expect(readFileSync(join(index, `${key}.sqlite`), 'utf8')).toBe('the first index');
   });
 
+  it('takes a run picked by its own folder back from its account folder, as the same source', async () => {
+    const t = setup('mgr-levels');
+    const root = tool('mgr-levels-tool');
+    const run = join(root, 'secret.account@example.com', 'mail_20250630_120000');
+    // Picked by the run folder itself: no account folder in the pick.
+    t.picks.push({ path: run, bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    const key = t.manager.stamp()!.sourceKey;
+    expect(t.manager.registry.source(key)?.accountName).toBeNull();
+
+    const moved = realpathSync(testDir('mgr-levels-moved'));
+    renameSync(join(root, 'secret.account@example.com'), join(moved, 'secret.account@example.com'));
+    expect(await t.manager.openRecent(key, t.generation())).toBe('offline');
+    t.picks.push({ path: moved, bookmark: 'bm2' });
+    expect(await t.manager.locate(null, t.generation())).toBe('opened');
+    expect(t.manager.stamp()!.sourceKey).toBe(key);
+    expect(t.manager.registry.source(key)?.accountName).toBe('secret.account@example.com');
+    expect(t.manager.view().recent).toHaveLength(1);
+  });
+
   it('is only for the open source, and a cancelled dialog changes nothing', async () => {
     const t = setup('mgr-locate-none');
-    expect(await t.manager.locate(null)).toBeNull();
+    expect(await t.manager.locate(null, t.generation())).toBeNull();
     const root = tool('mgr-locate-none-tool');
     t.picks.push({ path: root, bookmark: 'bm1' });
-    await t.manager.chooseFolder(null);
+    await t.manager.chooseFolder(null, t.generation());
     const stamp = t.manager.stamp();
-    expect(await t.manager.locate(null)).toBe('canceled');
+    expect(await t.manager.locate(null, t.generation())).toBe('canceled');
     expect(t.manager.stamp()).toEqual(stamp);
   });
 });
@@ -449,13 +574,13 @@ describe('the logs', () => {
     const t = setup('mgr-logs');
     const root = tool('mgr-logs-tool');
     t.picks.push({ path: root, bookmark: 'bm1' });
-    await t.manager.chooseFolder(null);
+    await t.manager.chooseFolder(null, t.generation());
     const key = t.manager.stamp()!.sourceKey;
-    await t.manager.switchRun(t.manager.view().active!.runs[1]!.runId);
+    await t.manager.switchRun(t.manager.view().active!.runs[1]!.runId, t.generation());
     rmSync(root, { recursive: true });
-    await t.manager.openRecent(key);
+    await t.manager.openRecent(key, t.generation());
     t.picks.push({ path: realpathSync(testDir('mgr-logs-empty')), bookmark: 'bm2' });
-    await t.manager.locate(null);
+    await t.manager.locate(null, t.generation());
     t.manager.close();
     await settle();
     expect(t.lines.length).toBeGreaterThan(0);
