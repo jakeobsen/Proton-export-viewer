@@ -8,7 +8,7 @@ export function project(
   profile: ProfileName,
   options: { seed: number; nonce?: string | null },
   blockSize?: number,
-): { files: number; bytes: number; disk: number; summary: Summary };
+): { files: number; bytes: number; disk: number; folders: number; summary: Summary };
 export function checkBudget(sizes: {
   projected: number;
   corporaBytes: number;

@@ -11,8 +11,11 @@
 // Before writing, it prints the projected size and refuses (exit 75) when all
 // corpora in that parent folder would pass 600 MiB, counting 40 MiB kept for
 // scratch and container copies, or when less than 20 GiB of disk would stay
-// free. While writing, it stops at the same limit, removes what it wrote and
-// exits 75. The 10 MB and 50 MB messages and the 200 MB parts are never
+// free. The projection rounds each file up to whole blocks and allows each
+// folder a block plus twice the bytes of its entries, so it is never below
+// what ext4 or APFS allocates. While writing, it counts each entry's
+// allocated blocks and its share of its folder the same way, stops at the
+// same limit, removes what it wrote and exits 75. The 10 MB and 50 MB messages and the 200 MB parts are never
 // written: tests stream them with largeMessage() from stream.mjs.
 //
 // File times: folders and labels.json carry the export start
@@ -46,26 +49,53 @@ export const COPIES_RESERVE = 40 * MIB;
 /** Disk space that must stay free. */
 export const MIN_FREE = 20 * 1024 * MIB;
 
-/** The corpus's size before writing: {files, bytes, disk, summary}. */
+/** Bytes an entry named `name` takes in its folder on ext4: 8 plus the name, in 4-byte units. */
+function entryBytes(name) {
+  return 8 + Math.ceil(Buffer.byteLength(name) / 4) * 4;
+}
+
+/**
+ * A folder's size on disk, at most: a block, plus twice its entries' bytes in
+ * whole blocks, since a large folder's index blocks are often half empty.
+ * (APFS folders take no blocks at all.)
+ */
+function folderBytes(entriesBytes, blockSize) {
+  return blockSize * (1 + Math.ceil((2 * entriesBytes) / blockSize));
+}
+
+/**
+ * The corpus's size before writing: {files, bytes, disk, folders, summary}.
+ * `disk` rounds each file up to whole blocks and adds `folders`, the folders'
+ * share, the output folder included.
+ */
 export function project(profile, options, blockSize = 4096) {
   let files = 0;
   let bytes = 0;
   let disk = 0;
   let summary = null;
+  // Bytes of the entries in each folder; '' is the output folder.
+  const inFolder = new Map([['', 0]]);
   for (const entry of entries(profile, options)) {
     if (entry.meta) {
       summary = entry;
       continue;
     }
     files += 1;
-    if (entry.type === 'file') {
+    const slash = entry.path.lastIndexOf('/');
+    const parent = slash === -1 ? '' : entry.path.slice(0, slash);
+    inFolder.set(parent, (inFolder.get(parent) ?? 0) + entryBytes(entry.path.slice(slash + 1)));
+    if (entry.type === 'dir') {
+      if (!inFolder.has(entry.path)) inFolder.set(entry.path, 0);
+    } else if (entry.type === 'file') {
       bytes += entry.data.length;
       disk += Math.ceil(entry.data.length / blockSize) * blockSize;
     } else {
       disk += blockSize;
     }
   }
-  return { files, bytes, disk, summary };
+  let folders = 0;
+  for (const used of inFolder.values()) folders += folderBytes(used, blockSize);
+  return { files, bytes, disk: disk + folders, folders, summary };
 }
 
 /** Whether a corpus of `projected` bytes fits; with the reason when not. */
@@ -119,7 +149,8 @@ function write(profile, options, out, allowance) {
       if (made.status !== 0) throw new Error(`mkfifo failed: ${made.stderr}`);
       utimesSync(path, entry.mtime, entry.mtime);
     }
-    written += lstatSync(path).blocks * 512;
+    // Its blocks, and its share of its folder's growth.
+    written += lstatSync(path).blocks * 512 + 2 * entryBytes(basename(path));
     if (written > allowance) throw new LimitReached();
   }
   // Folder times last, deepest first, because writing into a folder moves its time.
