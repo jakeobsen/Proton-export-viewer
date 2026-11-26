@@ -64,16 +64,20 @@ export interface CoreControl {
   readonly running: boolean;
   setSource(source: (Stamp & { root: string | null }) | null): void;
   /**
-   * Makes sure core runs with exactly this source: a core started with
-   * another one in the meantime (by a request) is stopped first. Resolves
-   * true if it had to stop one.
+   * Makes sure core runs with exactly this source, or with none: a core
+   * started with another one in the meantime (by a request) is stopped
+   * first. Resolves true if it had to stop one.
    */
-  startWith(source: Stamp & { root: string | null }): Promise<boolean>;
+  startWith(source: (Stamp & { root: string | null }) | null): Promise<boolean>;
   stop(): Promise<void>;
   request(call: DistributiveOmit<CoreRequest, 'reqId'>): Promise<CoreResult>;
-  /** A request only for a core already up for the call's source and generation. */
+  /**
+   * A request only for a core already started for this stamp (null: no
+   * source open). It never starts one.
+   */
   requestRunning(
-    call: DistributiveOmit<CoreRequest, 'reqId'> & { stamp: Stamp },
+    call: DistributiveOmit<CoreRequest, 'reqId'>,
+    stamp: Stamp | null,
   ): Promise<CoreResult>;
 }
 
@@ -244,7 +248,14 @@ export class SourceManager {
     const key = this.registry.active;
     const source = key ? this.registry.source(key) : undefined;
     const pick = source && this.registry.pick(source.pickId);
-    if (!source || !pick) return Promise.resolve(null);
+    if (!source || !pick) {
+      // Nothing to open: core starts without a source, so the calls the
+      // shell makes, which never start core, find one up.
+      return this.serial(async () => {
+        if (this.admitting) await this.deps.core.startWith(null).catch(() => false);
+        return null;
+      });
+    }
     // The shell waits for it instead of showing the welcome screen first.
     this.restoring = true;
     return this.serial(async () => {
@@ -846,7 +857,7 @@ export class SourceManager {
     try {
       // A read never starts core: during a switch it would start one with
       // the old source, which the switch then has to stop again.
-      result = await this.deps.core.requestRunning({ type: 'index-query', stamp, query });
+      result = await this.deps.core.requestRunning({ type: 'index-query', stamp, query }, stamp);
     } catch {
       return null;
     }

@@ -187,7 +187,12 @@ export function registerIpc(ctx: AppContext): void {
     }
     let result;
     try {
-      result = await ctx.core.request({ type: 'open', openId, generation, token, stubId: id });
+      // Only a core already up for the open source: a call from the shell
+      // never starts one.
+      result = await ctx.core.requestRunning(
+        { type: 'open', openId, generation, token, stubId: id },
+        ctx.sources.stamp(),
+      );
     } catch (err) {
       if (!(err instanceof CoreUnavailableError)) throw err;
       ctx.log.warn('core.unavailable', { openId, windowId: appWin.id });
@@ -218,15 +223,10 @@ export function registerIpc(ctx: AppContext): void {
     }
     let result;
     try {
-      result = await ctx.core.request({
-        type: 'read',
-        openId,
-        generation,
-        token,
-        rowid,
-        mode,
-        lane: appWin.id,
-      });
+      result = await ctx.core.requestRunning(
+        { type: 'read', openId, generation, token, rowid, mode, lane: appWin.id },
+        ctx.sources.stamp(),
+      );
     } catch (err) {
       if (!(err instanceof CoreUnavailableError)) throw err;
       appWin.views.abandon(openId);

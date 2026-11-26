@@ -102,7 +102,7 @@ class FakeCore implements CoreControl {
     return Promise.resolve();
   }
 
-  async startWith(source: CoreSource) {
+  async startWith(source: CoreSource | null) {
     this.setSource(source);
     const stray = this.running && JSON.stringify(this.current) !== JSON.stringify(this.next);
     if (stray) await this.stop();
@@ -110,17 +110,16 @@ class FakeCore implements CoreControl {
     return stray;
   }
 
-  /** Read requests made while no core was up for their stamp. */
+  /** Calls made while no core was up for their stamp. */
   refused = 0;
 
-  requestRunning(call: Call & { stamp: Stamp }): Promise<CoreResult> {
+  requestRunning(call: Call, stamp: Stamp | null): Promise<CoreResult> {
     const src = this.current;
-    if (
-      !this.running ||
-      !src ||
-      src.sourceKey !== call.stamp.sourceKey ||
-      src.generation !== call.stamp.generation
-    ) {
+    const same =
+      src === null || stamp === null
+        ? src === stamp
+        : src.sourceKey === stamp.sourceKey && src.generation === stamp.generation;
+    if (!this.running || !same) {
       this.refused += 1;
       return Promise.reject(new Error('core unavailable'));
     }
@@ -302,11 +301,13 @@ describe('opening a source', () => {
     const t = setup('mgr-none');
     expect(await t.manager.restore()).toBeNull();
     expect(t.manager.view()).toEqual({ restoring: false, active: null, recent: [] });
+    // With nothing to open, launch starts core without a source.
+    expect(t.core.started).toEqual([null]);
     expect(await t.manager.chooseFolder(null, t.generation())).toBe('canceled');
     t.picks.push({ path: realpathSync(testDir('mgr-none-empty')), bookmark: 'bm' });
     expect(await t.manager.chooseFolder(null, t.generation())).toBe('no_export');
     expect(t.order).toEqual([]);
-    expect(t.core.started).toEqual([]);
+    expect(t.core.started).toEqual([null]);
     expect(t.generation()).toBe(1);
   });
 });
@@ -720,6 +721,44 @@ describe('a damaged index', () => {
     expect(second).not.toBe(first);
     expect(t.manager.view().active?.index).toBe('rebuilding');
     expect(t.lines.some((l) => l.includes('"index.rebuild"'))).toBe(true);
+  });
+
+  it('is rebuilt while the shell keeps reading, and only the rebuild starts core', async () => {
+    const t = setup('mgr-rebuild-reads');
+    t.picks.push({ path: tool('mgr-rebuild-reads-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await settle();
+    const stamp = t.manager.stamp()!;
+    const first = t.manager.registry.source(stamp.sourceKey)!.dbUuid;
+    const started = t.core.started.length;
+
+    // Reads come in all through the rebuild, also while core is stopped.
+    const reads: Array<Promise<unknown>> = [];
+    const read = () => {
+      reads.push(t.manager.queryIndex({ op: 'sidebar' }));
+    };
+    t.core.onStop = read;
+    const timer = setInterval(read, 0);
+    t.order.length = 0;
+    try {
+      t.manager.handleCoreEvent(damaged(stamp));
+      read();
+      await settle();
+    } finally {
+      clearInterval(timer);
+    }
+    await Promise.all(reads);
+
+    const now = t.manager.stamp()!;
+    expect(now).toEqual({ sourceKey: stamp.sourceKey, generation: stamp.generation + 1 });
+    expect(t.core.refused).toBeGreaterThan(0);
+    // No read started a core: the rebuild started one, with the new generation.
+    expect(steps(t.order)).toEqual(['core.stop', 'scope.keep', 'core.spawn']);
+    expect(t.core.started.length).toBe(started + 1);
+    expect(t.core.started.at(-1)).toMatchObject(now);
+    // The index is made afresh.
+    expect(t.core.indexCalls.at(-1)).toEqual({ stamp: now, dbUuid: null, rebuild: true });
+    expect(t.manager.registry.source(stamp.sourceKey)!.dbUuid).not.toBe(first);
   });
 
   it('drops a report made for an earlier generation', async () => {
