@@ -10,11 +10,13 @@
 //   http or https) become `<assetBase>/r<n>`, one id per distinct URL;
 // - `cid:` references become `<assetBase>/c<n>`, one id per distinct cid;
 // - any other URL is removed, `data:` images included.
-// All CSS is removed as well.
+// Style sheets and style attributes keep the subset the CSS filter allows,
+// with their image URLs rewritten the same way.
 
 import createDOMPurify, { type Config, type UponSanitizeAttributeHookEvent } from 'dompurify';
 import { JSDOM } from 'jsdom';
 import type { BodyLink } from '../../shared/reader-protocol';
+import { filterStyleAttribute, filterStyleSheet, type UrlRewriter } from './css';
 import { MAX_LINKS, MAX_URL_LENGTH, linkUrl } from './plain';
 
 /** The longest link text kept for the link dialog, in characters. */
@@ -45,7 +47,6 @@ export const DROPPED_ELEMENTS = [
   'meta',
   'base',
   'link',
-  'style',
   'svg',
   'math',
   'noscript',
@@ -62,7 +63,6 @@ export const DROPPED_ELEMENTS = [
 
 /** Attributes removed wherever they are; event handlers go as well. */
 export const DROPPED_ATTRIBUTES = [
-  'style',
   'ping',
   'srcdoc',
   'formaction',
@@ -135,14 +135,13 @@ class References {
     return `${this.base}/${id}`;
   }
 
-  /** The id URL an image or media reference gets, or null if it goes. */
-  resource(value: string): string | null {
+  /** Which map and key an image or media reference has, or null if it goes. */
+  private key(value: string): { map: Map<string, string>; key: string; prefix: string } | null {
     const raw = value.trim();
     if (raw.length > MAX_URL_LENGTH) return null;
     if (/^cid:/i.test(raw)) {
       const cid = raw.slice(4).trim().toLowerCase();
-      if (cid === '') return null;
-      return this.idFor(this.cids, cid, 'c');
+      return cid === '' ? null : { map: this.cids, key: cid, prefix: 'c' };
     }
     let url: URL;
     try {
@@ -151,7 +150,19 @@ class References {
       return null;
     }
     if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.hostname === '') return null;
-    return this.idFor(this.remote, url.href, 'r');
+    return { map: this.remote, key: url.href, prefix: 'r' };
+  }
+
+  /** True if the reference would get an id; hands none out. */
+  accepts(value: string): boolean {
+    const found = this.key(value);
+    return found !== null && (found.map.has(found.key) || found.map.size < MAX_REFERENCES);
+  }
+
+  /** The id URL an image or media reference gets, or null if it goes. */
+  resource(value: string): string | null {
+    const found = this.key(value);
+    return found === null ? null : this.idFor(found.map, found.key, found.prefix);
   }
 
   /** A `srcset` with each candidate's URL replaced, or null if none is left. */
@@ -275,6 +286,31 @@ function linkText(node: Element): string {
   return text.length <= MAX_LINK_TEXT ? text : `${text.slice(0, MAX_LINK_TEXT - 1)}…`;
 }
 
+/** Runs every style sheet and style attribute through the CSS filter; what is left empty goes. */
+function filterCss(root: Element, refs: References): void {
+  const urls: UrlRewriter = {
+    accepts: (url) => refs.accepts(url),
+    rewrite: (url) => refs.resource(url),
+  };
+  const safely = (filter: () => string): string => {
+    try {
+      return filter();
+    } catch {
+      return '';
+    }
+  };
+  for (const style of [...root.querySelectorAll('style')]) {
+    const css = safely(() => filterStyleSheet(style.textContent ?? '', urls));
+    if (css === '') style.remove();
+    else style.textContent = css;
+  }
+  for (const element of [...root.querySelectorAll('[style]')]) {
+    const css = safely(() => filterStyleAttribute(element.getAttribute('style') ?? '', urls));
+    if (css === '') element.removeAttribute('style');
+    else element.setAttribute('style', css);
+  }
+}
+
 /** Sanitizes an HTML body for the view whose asset URLs start with `assetBase`. */
 export function sanitizeHtml(html: string, assetBase: string): SanitizedBody {
   const purify = instance();
@@ -290,6 +326,7 @@ export function sanitizeHtml(html: string, assetBase: string): SanitizedBody {
     const link = refs.links[index];
     if (link) link.text = linkText(node);
   }
+  filterCss(root as Element, refs);
   const outer = (root as Element).outerHTML ?? '';
   return {
     html: `<!doctype html>${outer}`,

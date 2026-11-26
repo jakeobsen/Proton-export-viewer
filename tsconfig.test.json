@@ -4,5 +4,10 @@
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "types": ["node"]
   },
-  "include": ["tests/**/*.ts", "src/shared/env.d.ts", "playwright.config.ts"]
+  "include": [
+    "tests/**/*.ts",
+    "src/shared/env.d.ts",
+    "src/core/reader/css-tree-modules.d.ts",
+    "playwright.config.ts"
+  ]
 }

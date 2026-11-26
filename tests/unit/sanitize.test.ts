@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// The HTML sanitizer: every hostile message loses everything on the drop list
-// and has its remote references rewritten as declared, with no network call;
-// known mutation-XSS forms stay inert; links and references get view ids.
+// The HTML sanitizer and the CSS filter behind it: every hostile message loses
+// everything on the drop list and has its remote references rewritten as
+// declared, with no network call; known mutation-XSS forms stay inert; links
+// and references get view ids; the CSS left parses back clean.
 
 import dns from 'node:dns';
 import http from 'node:http';
@@ -12,6 +13,7 @@ import { randomBytes } from 'node:crypto';
 import { JSDOM } from 'jsdom';
 import { simpleParser } from 'mailparser';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { cssProblems } from '../../src/core/reader/css';
 import {
   DROPPED_ATTRIBUTES,
   DROPPED_ELEMENTS,
@@ -25,13 +27,6 @@ const BASE = `mail-asset://v/${TOKEN}`;
 const ID_RE = new RegExp(`^mail-asset://v/${TOKEN}/([rcl])(\\d+)$`);
 const URL_ATTRIBUTES = ['href', 'src', 'background', 'poster', 'srcset'];
 
-/** Remote references the CSS filter rewrites; the sanitizer alone removes all CSS. */
-const CSS_REWRITES: Record<string, number> = {
-  'script_markup/css-url': 2,
-  'script_markup/css-image-set': 2,
-  'css/media-url': 1,
-};
-
 /** The distinct ids of one kind used in the body's URL attributes, sorted. */
 function usedIds(doc: Document, kind: 'r' | 'l' | 'c'): string[] {
   const ids = new Set<string>();
@@ -44,6 +39,11 @@ function usedIds(doc: Document, kind: 'r' | 'l' | 'c'): string[] {
         const m = ID_RE.exec(url);
         if (m && m[1] === kind) ids.add(`${kind}${m[2]}`);
       }
+    }
+    const css = el.localName === 'style' ? el.textContent : el.getAttribute('style');
+    for (const m of (css ?? '').matchAll(/url\(["']?([^"')]+)/g)) {
+      const id = ID_RE.exec(m[1] ?? '');
+      if (id && id[1] === kind) ids.add(`${kind}${id[2]}`);
     }
   }
   return [...ids].sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)));
@@ -63,9 +63,16 @@ function problems(doc: Document): string[] {
   for (const tag of DROPPED_ELEMENTS) {
     if (doc.getElementsByTagName(tag).length > 0) found.push(`<${tag}>`);
   }
+  for (const style of doc.querySelectorAll('style')) {
+    for (const p of cssProblems(style.textContent ?? '', 'stylesheet')) found.push(`<style> ${p}`);
+  }
   for (const el of doc.querySelectorAll('*')) {
     for (const attr of el.getAttributeNames()) {
       const value = el.getAttribute(attr) ?? '';
+      if (attr === 'style') {
+        for (const p of cssProblems(value, 'declarationList')) found.push(`style ${p}`);
+        continue;
+      }
       if (/^on/i.test(attr)) found.push(`${attr} on <${el.localName}>`);
       if (
         (DROPPED_ATTRIBUTES as readonly string[]).includes(attr) &&
@@ -149,7 +156,7 @@ describe('the sanitizer on the hostile corpus', () => {
       const out = sanitizeHtml(html, BASE);
       const doc = parse(out.html);
       expect(problems(doc), name(plan)).toEqual([]);
-      expect(out.remote, name(plan)).toBe(plan.refs.rewrite - (CSS_REWRITES[name(plan)] ?? 0));
+      expect(out.remote, name(plan)).toBe(plan.refs.rewrite);
       // Every id handed out is in the body: r1..rN and l1..lN, none lost.
       expect(usedIds(doc, 'r'), name(plan)).toEqual(range('r', out.remote));
       expect(usedIds(doc, 'l'), name(plan)).toEqual(range('l', out.links.length));
@@ -189,6 +196,10 @@ describe('known mutation-XSS forms', () => {
     '<div id="x"><a href="https://a.test/" id="cookie">c</a></div><form id="f"><input name="attributes"></form>',
     '<!--<img src="--><img src=x onerror=alert(1)//">',
     '<?xml version="1.0"?><img src=x onerror=alert(1)>',
+    // CSS escapes that decode to markup must not close the style element.
+    String.raw`<style>a{content:"\3c/style>\3c img src=x onerror=alert(1)>"}</style>`,
+    String.raw`<style>p{font-family:"\3c/STYLE>\3c link rel=dns-prefetch href=//a.test>"}</style>`,
+    String.raw`<p style='font-family:"\22>\3c img src=x onerror=alert(1)>"'>x</p>`,
   ];
   for (const form of forms) {
     it(form.slice(0, 60), () => {
@@ -272,19 +283,31 @@ describe('links and references', () => {
     expect(doc.querySelector('td')?.getAttribute('background')).toBe(`${BASE}/r6`);
   });
 
-  it('removes all CSS and keeps the text and ordinary attributes', () => {
+  it('keeps the CSS the filter allows, with its image URLs rewritten, and ordinary attributes', () => {
     const out = sanitizeHtml(
-      '<html><head><style>p{color:red}</style></head><body><p style="color:blue" class="c" align="center" width="10">Hi &amp; bye</p></body></html>',
+      [
+        '<html><head><style>@import url(https://a.test/i.css); p{color:red;background:url(https://a.test/bg.png)}',
+        '@font-face{font-family:F;src:url(https://a.test/f.woff2)} div{position:fixed;top:0}</style></head>',
+        '<body><p style="color:blue;behavior:url(https://a.test/b.htc)" class="c" align="center" width="10">Hi &amp; bye</p>',
+        '<div style="background-image:url(https://a.test/bg.png);cursor:url(https://a.test/c.cur),auto">x</div></body></html>',
+      ].join(''),
       BASE,
     );
     const doc = parse(out.html);
     expect(out.html.startsWith('<!doctype html><html>')).toBe(true);
-    expect(doc.querySelector('style')).toBeNull();
+    expect(problems(doc)).toEqual([]);
+    expect(out.remote).toBe(1);
+    expect(doc.querySelector('style')?.textContent).toBe(
+      `p{color:red;background:url(${BASE}/r1)}div{top:0}`,
+    );
     const p = doc.querySelector('p');
-    expect(p?.getAttribute('style')).toBeNull();
+    expect(p?.getAttribute('style')).toBe('color:blue');
     expect(p?.getAttribute('class')).toBe('c');
     expect(p?.getAttribute('align')).toBe('center');
     expect(p?.textContent).toBe('Hi & bye');
+    expect(doc.querySelector('div')?.getAttribute('style')).toBe(
+      `background-image:url(${BASE}/r1)`,
+    );
   });
 
   it('parses srcset like the HTML rules do', () => {

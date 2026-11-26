@@ -182,6 +182,7 @@ const HTML = [
   '<html><head><style>p{color:red}</style><link rel="stylesheet" href="https://leak-reader.test/s.css">',
   '<meta http-equiv="refresh" content="0;url=https://leak-reader.test/r"></head>',
   '<body><p id="p" style="color:blue">Hello</p>',
+  '<div id="bg" style="background-image:url(https://leak-reader.test/bg.png);width:4px;height:4px"></div>',
   '<img id="remote" src="https://leak-reader.test/pixel.png" width="1" height="1">',
   '<img id="inline" src="cid:part1@example.org">',
   '<a id="link" href="https://leak-reader.test/page">a page</a>',
@@ -212,7 +213,7 @@ test('an HTML message opens sanitized, with placeholders, and requests nothing r
     outcome: 'view',
     format: 'html',
     hasHtml: true,
-    remote: 1,
+    remote: 2,
   });
   const url = viewUrl(opened);
   const token = tokenOf(url);
@@ -233,7 +234,9 @@ test('an HTML message opens sanitized, with placeholders, and requests nothing r
     target: document.getElementById('link')?.getAttribute('target'),
     style: document.getElementById('p')?.getAttribute('style') ?? null,
     color: getComputedStyle(document.getElementById('p') as HTMLElement).color,
-    dropped: document.querySelectorAll('script, style, link, meta, iframe').length,
+    background: getComputedStyle(document.getElementById('bg') as HTMLElement).backgroundImage,
+    sheets: [...document.querySelectorAll('style')].map((e) => e.textContent),
+    dropped: document.querySelectorAll('script, link, meta, iframe').length,
     ran: document.documentElement.getAttribute('data-pev-script'),
   }));
   expect(dom).toEqual({
@@ -241,11 +244,22 @@ test('an HTML message opens sanitized, with placeholders, and requests nothing r
     inline: `mail-asset://v/${token}/c1`,
     link: `mail-asset://v/${token}/l1`,
     target: '_blank',
-    style: null,
-    color: 'rgb(0, 0, 0)',
+    // The style sheet and the style attributes stay, filtered, and render.
+    style: 'color:blue',
+    color: 'rgb(0, 0, 255)',
+    background: `url("mail-asset://v/${token}/r2")`,
+    sheets: ['p{color:red}'],
     dropped: 0,
     ran: null,
   });
+
+  await expect
+    .poll(async () =>
+      (await pev.main<{ asset: string[] }>('requests', 1)).asset.includes(
+        `mail-asset://v/${token}/r2`,
+      ),
+    )
+    .toBe(true);
 
   // The placeholder serves; a cid and a link id serve nothing for now.
   const asset = (id: string) =>
@@ -272,6 +286,37 @@ test('an HTML message opens sanitized, with placeholders, and requests nothing r
     .slice(before)
     .filter((m) => /Content Security Policy/i.test(m.text));
   expect(reports).toEqual([]);
+});
+
+test('the huge-style and regex-heavy messages open in time or fall back', async ({ pev }) => {
+  const { plans } = hostileMessages({
+    seed: 1,
+    nonce: randomBytes(6).toString('hex'),
+    labelInfo: { file: { Payload: [] } },
+    owner: { Name: 'Owner', Address: 'owner@example.com' },
+  });
+  const chosen = plans.filter((p) =>
+    ['pathological/huge-style', 'pathological/regex-heavy-css'].includes(
+      p.key.split('/').slice(3).join('/'),
+    ),
+  );
+  expect(chosen).toHaveLength(2);
+  await source(
+    pev,
+    Object.fromEntries(chosen.map((p, i) => [`p${i}.eml`, p.emlData])),
+    chosen.map((_p, i) => [i + 1, { file: `p${i}.eml` }] as [number, Entry]),
+  );
+  for (const [i, plan] of chosen.entries()) {
+    const started = Date.now();
+    const result = await openRow(pev, i + 1, 'html');
+    const ms = Date.now() - started;
+    console.log(
+      `${plan.key.split('/').slice(3).join('/')}: ${result.ok ? result.outcome : result.code} in ${ms} ms`,
+    );
+    expect(result.ok).toBe(true);
+    // The lane's own limit is 3 s per job; past it, the result is the fallback.
+    expect(ms).toBeLessThan(5000);
+  }
 });
 
 test('a stale openId or generation installs no view', async ({ pev }) => {
