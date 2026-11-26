@@ -12,7 +12,7 @@
 
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createConnection, createServer } from 'node:net';
 import { homedir } from 'node:os';
@@ -231,9 +231,11 @@ async function main() {
   listener.server.close();
 
   if (failures.length > 0) {
-    console.error(`check-sandbox: ${failures.length} failure(s)`);
+    console.error(`check-sandbox: ${failures.length} failure(s); evidence in ${outDir}`);
     process.exit(1);
   }
+  // A passing run leaves nothing behind; a failing one keeps its folder.
+  rmSync(outDir, { recursive: true, force: true });
   console.log('check-sandbox: ok');
 }
 
