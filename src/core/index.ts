@@ -15,6 +15,7 @@ import type {
 } from '../shared/core-protocol';
 import { errorData } from '../shared/log/schema';
 import { LogWriter, type Logger } from '../shared/log/writer';
+import { SourceSession } from './source';
 
 process.umask(0o077);
 
@@ -23,6 +24,7 @@ let workerLog: Logger | null = null;
 let roots: Array<[string, string]> = [];
 let port: MessagePortMain | null = null;
 let worker: Worker | null = null;
+let session: SourceSession | null = null;
 const waiting = new Map<number, (message: WorkerMessage) => void>();
 
 /** Test builds can hold opens in core to keep them pending. */
@@ -113,6 +115,7 @@ function handle(request: CoreRequest): void {
             toWorker,
             reply,
             dir: import.meta.dirname,
+            session,
           }),
         );
         return;
@@ -131,6 +134,14 @@ function handle(request: CoreRequest): void {
       }
       reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
       return;
+    case 'identify':
+    case 'scan':
+      if (!session) {
+        reply({ type: 'result', reqId: request.reqId, ok: false, code: 'no_source' });
+        return;
+      }
+      session.handle(request);
+      return;
   }
 }
 
@@ -139,6 +150,7 @@ process.parentPort.once('message', (event) => {
   roots = [[init.appRoot + sep, '']];
   log = new LogWriter(init.logsDir, 'core', 'core');
   workerLog = log.forProc('worker');
+  session = new SourceSession(init.source, log, reply);
   const p = event.ports[0];
   if (!p) return;
   port = p;

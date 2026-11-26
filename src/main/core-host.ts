@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Starts the core utility process and talks to it over a MessagePort.
 // Core is started on demand and restarted on the next request after it exits.
+// It starts with the source set at that moment, and keeps it until it exits:
+// changing the source takes a stop and a new start.
 
 import {
   MessageChannelMain,
@@ -8,7 +10,7 @@ import {
   type MessagePortMain,
   type UtilityProcess,
 } from 'electron';
-import type { CoreInit, CoreRequest, CoreResult } from '../shared/core-protocol';
+import type { CoreInit, CoreRequest, CoreResult, CoreSource } from '../shared/core-protocol';
 import type { Logger } from '../shared/log/writer';
 
 type Pending = { resolve: (r: CoreResult) => void; reject: (e: Error) => void };
@@ -31,6 +33,7 @@ export class CoreHost {
   private starting: Promise<void> | null = null;
   private seq = 0;
   private readonly pending = new Map<number, Pending>();
+  private source: CoreSource | null = null;
 
   constructor(private readonly options: CoreHostOptions) {}
 
@@ -38,8 +41,18 @@ export class CoreHost {
     return this.child?.pid;
   }
 
+  get running(): boolean {
+    return this.child !== null;
+  }
+
+  /** The source the next start of core gets; a running core keeps its own. */
+  setSource(source: CoreSource | null): void {
+    this.source = source ? { ...source } : null;
+  }
+
   start(): Promise<void> {
     if (this.starting) return this.starting;
+    const source = this.source;
     this.starting = new Promise<void>((resolve, reject) => {
       const child = utilityProcess.fork(this.options.corePath, [], {
         serviceName: 'Core',
@@ -70,6 +83,7 @@ export class CoreHost {
           type: 'init',
           logsDir: this.options.logsDir,
           appRoot: this.options.appRoot,
+          source,
         };
         child.postMessage(init, [port2]);
       });
