@@ -13,10 +13,14 @@ export const SHM_HEADROOM = 1024 * 1024;
  */
 export const WRITER_CACHE_BYTES = 8 * 1024 * 1024;
 /**
- * The most one bounded unit of work (a message whose metadata fills a
- * transaction's input, a chunk of a merge, a body, a merge step) plus a cache
- * flush can add to the WAL. A test measures each kind at its worst on a
- * populated index (largest: about 14 MiB) against this.
+ * The most the WAL can grow between two of the writer's checks: one bounded
+ * unit of work (a message, whose rows are capped and whose metadata fills at
+ * most a transaction's input; a chunk of a merge; a chunk of labels; a body; a
+ * merge step) plus a full writer cache of pages dirtied before the check, which
+ * a spill or the commit writes. SQLite writes a page once per transaction, so
+ * a unit adds at most its own pages. A test measures each kind at its worst on
+ * a populated index (largest: about 14 MiB) and checks it plus the cache
+ * against this.
  */
 export const STEP_SLACK = 24 * 1024 * 1024;
 /** Before each unit of work the writer stops if the WAL is above this. */

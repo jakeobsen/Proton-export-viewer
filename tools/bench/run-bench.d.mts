@@ -2,6 +2,15 @@
 export const INDEX_CAP: number;
 export const TRANSIENT_RESERVE: number;
 export const MIN_FREE: number;
+export const LABEL: RegExp;
+export function checkLabel(label: string): string;
+export function reportName(
+  label: string,
+  scenario: string,
+  engine: string,
+  pool: number,
+  nonce: string,
+): string;
 export function parseLarge(spec: string | undefined): Array<{ kind: string; bytes: number }>;
 export function freeSpace(dir: string): { freeBytes: number };
 export function removeContainerFile(folder: string, file: string, nonce: string): boolean;
@@ -31,6 +40,20 @@ export function findTestData(
   options?: { containers?: string[]; captureDir?: string | null; maxDepth?: number },
 ): string[];
 export function diskBytes(path: string): number;
+export function treeBytes(root: string, skip?: string[]): number;
+export function watchTransient(
+  measure: () => number,
+  options?: { limit?: number; baseline?: number },
+): {
+  record: {
+    limitBytes: number;
+    baselineBytes: number;
+    peakBytes: number;
+    samples: number;
+    exceeded: string | null;
+  };
+  sample: () => boolean;
+};
 export function budgetCheck(
   folders: string[],
   indexCap?: number,

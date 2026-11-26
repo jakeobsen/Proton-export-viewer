@@ -103,6 +103,23 @@ export function checkEmptyFolder(workspace, path) {
 }
 
 /**
+ * Throws unless `file` can be created as a new file inside this run's
+ * workspace: every folder on the way, its own folder included, is real (not a
+ * link), and nothing is at `file` yet.
+ */
+export function checkNewFile(workspace, nonce, file) {
+  checkWorkspace(workspace, nonce);
+  const folder = dirname(file);
+  if (folder !== workspace) {
+    const stat = checkInside(workspace, folder);
+    if (!stat || stat.isSymbolicLink() || !stat.isDirectory())
+      throw new Error(`${folder} is not a real folder`);
+  }
+  if (checkInside(workspace, file) !== null) throw new Error(`${file} already exists`);
+  return file;
+}
+
+/**
  * Removes `path` inside this run's workspace. A link is removed itself, never
  * followed; a folder must be a real folder.
  */

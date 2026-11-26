@@ -4,6 +4,15 @@
 
 export const MAX_ID_LENGTH = 998;
 export const MAX_REFERENCES = 100;
+/**
+ * The most rows one message stores: its first 200 labels (IDs of at most 256
+ * characters), its first 1,000 attachments and the first 1,000 addresses of
+ * each address list. So one message is a bounded unit of work for the writer.
+ */
+export const MAX_LABELS = 200;
+export const MAX_LABEL_ID_LENGTH = 256;
+export const MAX_ATTACHMENTS = 1000;
+export const MAX_RECIPIENTS = 1000;
 
 /** The values of every `name:` field in a raw header block, unfolded. */
 export function headerValues(block: string, name: string): string[] {
@@ -103,7 +112,8 @@ function address(v: unknown): Address {
   return { name: str(o.Name), address: str(o.Address) };
 }
 
-const addresses = (v: unknown): Address[] => (Array.isArray(v) ? v.map(address) : []);
+const addresses = (v: unknown): Address[] =>
+  Array.isArray(v) ? v.slice(0, MAX_RECIPIENTS).map(address) : [];
 
 export class MetadataError extends Error {
   constructor(readonly code: string) {
@@ -125,10 +135,17 @@ export function parseMetadata(protonId: string, text: string): MessageRow {
   if (str(p.ID) !== protonId) throw new MetadataError('META_ID');
   const headers = threadHeaders(str(p.Headers), str(p.ExternalID));
   const labelIds = Array.isArray(p.LabelIDs)
-    ? [...new Set(p.LabelIDs.filter((v): v is string => typeof v === 'string'))]
+    ? [
+        ...new Set(
+          p.LabelIDs.filter(
+            (v): v is string =>
+              typeof v === 'string' && v.length > 0 && v.length <= MAX_LABEL_ID_LENGTH,
+          ),
+        ),
+      ].slice(0, MAX_LABELS)
     : [];
   const attachments = Array.isArray(p.Attachments)
-    ? p.Attachments.map((a) => {
+    ? p.Attachments.slice(0, MAX_ATTACHMENTS).map((a) => {
         const o = (a ?? {}) as Record<string, unknown>;
         return { name: str(o.Name), mime: str(o.MIMEType), size: int(o.Size) };
       })

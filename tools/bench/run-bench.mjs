@@ -43,7 +43,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { APP_ID, PRODUCT_NAME, appPath } from '../../scripts/package.mjs';
-import { createWorkspace, removeInside } from './workspace.mjs';
+import { WORKSPACE_MARK, checkNewFile, createWorkspace, removeInside } from './workspace.mjs';
 
 export const INDEX_CAP = 300 * 1000 * 1000;
 /** Room kept for a run's other output: results, logs and the app's profile. */
@@ -71,11 +71,31 @@ export function parseLarge(spec) {
   });
 }
 
+/** A run label: lowercase letters, digits and dashes, so it can name a file. */
+export const LABEL = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
+export function checkLabel(label) {
+  if (typeof label !== 'string' || !LABEL.test(label))
+    throw new Error('--label must be 1-32 lowercase letters, digits or dashes');
+  return label;
+}
+
+/** The kept report's file name. Every part is checked, so it is a plain name. */
+export function reportName(label, scenario, engine, pool, nonce) {
+  checkLabel(label);
+  if (!['perf', 'stress', 'sandbox'].includes(scenario))
+    throw new Error(`bad scenario ${scenario}`);
+  if (!['node:sqlite', 'better-sqlite3'].includes(engine)) throw new Error(`bad engine ${engine}`);
+  if (!Number.isSafeInteger(pool) || pool < 1 || pool > 64) throw new Error(`bad pool ${pool}`);
+  if (!/^[0-9a-f]{16}$/.test(nonce)) throw new Error('bad nonce');
+  return `${label}-${scenario}-${engine.replace(':', '-')}-pool${pool}-${nonce}.json`;
+}
+
 /**
  * Every folder of generated test data under the scan roots: generator exports
  * (the folder next to each `<name>.manifest.json`), every `test-output/` folder
- * and every bench output folder; plus the app's container data and the
- * capture folder. Nested finds are counted once.
+ * and every bench workspace (marked, or holding a run's config); plus the app's
+ * container data and the capture folder. Nested finds are counted once.
  */
 export function findTestData(
   scanRoots,
@@ -92,7 +112,14 @@ export function findTestData(
         cause: err,
       });
     }
-    if (entries.some((e) => e.isFile() && /^config-[0-9a-f]{16}\.json$/.test(e.name))) {
+    // A bench workspace: marked by the runner (every scenario), or an older
+    // output folder holding a run's config.
+    if (
+      entries.some(
+        (e) =>
+          e.isFile() && (e.name === WORKSPACE_MARK || /^config-[0-9a-f]{16}\.json$/.test(e.name)),
+      )
+    ) {
       found.add(dir);
       return;
     }
@@ -136,6 +163,64 @@ export function budgetCheck(folders, indexCap = INDEX_CAP, measure = diskBytes) 
       `test data is ${total} B; with ${reserved} B reserved for this run it would pass ${TEST_DATA_LIMIT} B`,
     );
   return { total, reserved, withRun: total + reserved, limit: TEST_DATA_LIMIT, parts };
+}
+
+/**
+ * Allocated bytes of everything under `root`, as the disk counts them, without
+ * following links and leaving out the folders in `skip`. A file that goes away
+ * while it's counted is left out; any other read error throws.
+ */
+export function treeBytes(root, skip = []) {
+  let total = 0;
+  const walk = (path) => {
+    if (skip.includes(path)) return;
+    let stat;
+    let names = [];
+    try {
+      stat = lstatSync(path);
+      if (stat.isDirectory()) names = readdirSync(path);
+    } catch (err) {
+      if (err.code === 'ENOENT') return;
+      throw err;
+    }
+    total += stat.blocks * 512;
+    for (const name of names) walk(join(path, name));
+  };
+  walk(root);
+  return total;
+}
+
+/**
+ * Holds the reserve for a run's other output while it runs: each sample
+ * measures it (growth over `baseline`), and the first sample past `limit`, or
+ * one that can't be measured, returns false so the runner stops the app.
+ */
+export function watchTransient(measure, { limit = TRANSIENT_RESERVE, baseline = 0 } = {}) {
+  const record = {
+    limitBytes: limit,
+    baselineBytes: baseline,
+    peakBytes: 0,
+    samples: 0,
+    exceeded: null,
+  };
+  const sample = () => {
+    if (record.exceeded) return false;
+    let grown;
+    try {
+      grown = measure() - baseline;
+    } catch (err) {
+      record.exceeded = `can't measure the run's other output (${err.code ?? err.message})`;
+      return false;
+    }
+    record.samples += 1;
+    record.peakBytes = Math.max(record.peakBytes, grown);
+    if (grown > limit) {
+      record.exceeded = `the run's other output reached ${grown} B, past the ${limit} B reserved`;
+      return false;
+    }
+    return true;
+  };
+  return { record, sample };
 }
 
 /** Refuses to start when less than 20 GiB of disk would stay free. */
@@ -330,6 +415,8 @@ async function main() {
 
   const out = values.out;
   if (resolve(out) !== out) throw new Error('--out must be a normalized absolute path');
+  // The kept report's name is built from these, so they are checked before anything runs.
+  reportName(values.label, scenario, values.engine, Number(values.pool), '0'.repeat(16));
   if (!values['scan-data']?.length)
     throw new Error('--scan-data is required: the folders where generated test data lives');
   const indexDir = join(out, 'index');
@@ -392,7 +479,23 @@ async function main() {
     ? [`--pev-bench-inline=${Buffer.from(JSON.stringify(config)).toString('base64url')}`]
     : [`--pev-bench=${join(out, `config-${nonce}.json`)}`, `--pev-user-data=${userData}`];
   if (!sandbox)
-    writeFileSync(join(out, `config-${nonce}.json`), JSON.stringify(config, null, 2) + '\n');
+    writeFileSync(
+      checkNewFile(out, nonce, join(out, `config-${nonce}.json`)),
+      JSON.stringify(config, null, 2) + '\n',
+      { flag: 'wx' },
+    );
+
+  // The run's output other than the index stays within its reserve while it
+  // runs: the workspace without index/, or, for the sandboxed build, what its
+  // container grows by, without that workspace's index/.
+  const containerData = join(homedir(), 'Library', 'Containers', APP_ID, 'Data');
+  const appSupport = join(containerData, 'Library', 'Application Support', PRODUCT_NAME);
+  const measureTransient = sandbox
+    ? () => treeBytes(containerData, [join(appSupport, `bench-${nonce}`, 'index')])
+    : () => treeBytes(out, [indexDir]);
+  const transient = watchTransient(measureTransient, {
+    baseline: sandbox ? measureTransient() : 0,
+  });
 
   const seen = new Map();
   const note = () => {
@@ -403,6 +506,7 @@ async function main() {
   const sampler = setInterval(note, 1000);
   const footprints = [];
   let footprintTimer = null;
+  let transientTimer = null;
   const started = Date.now();
   console.log(
     `bench: ${scenario} ${values.label} ${values.engine} pool ${config.poolSize} (${build}), nonce ${nonce}`,
@@ -413,6 +517,9 @@ async function main() {
       const s = footprintOf(child.pid);
       if (s) footprints.push(s);
     }, 500);
+    transientTimer = setInterval(() => {
+      if (!transient.sample()) child.kill('SIGKILL');
+    }, 1000);
     const timer = setTimeout(
       () => {
         child.kill('SIGKILL');
@@ -422,15 +529,16 @@ async function main() {
     );
     child.once('exit', (code, signal) => {
       clearTimeout(timer);
-      done({ code, signal, timedOut: false });
+      done({ code, signal, timedOut: false, stopped: transient.record.exceeded });
     });
   });
   clearInterval(sampler);
   clearInterval(footprintTimer);
+  clearInterval(transientTimer);
   note();
+  // Once more after the app quit, for what it wrote last.
+  transient.sample();
 
-  const containerData = join(homedir(), 'Library', 'Containers', APP_ID, 'Data');
-  const appSupport = join(containerData, 'Library', 'Application Support', PRODUCT_NAME);
   const resultFile = sandbox ? join(appSupport, `bench-result-${nonce}.json`) : resultPath;
   const result = existsSync(resultFile) ? JSON.parse(readFileSync(resultFile, 'utf8')) : null;
   // Anything left in the run's index folder is the run's own; links are removed, never followed.
@@ -454,6 +562,7 @@ async function main() {
       budget,
       warmUp,
       indexLeftover: leftover,
+      transient: transient.record,
       quarantine: quarantineOf(downloaded),
       footprint: result?.phaseLog
         ? footprintByPhase(footprints, result.phaseLog, result.processTypes ?? {})
@@ -483,9 +592,18 @@ async function main() {
     removeContainerFile(appSupport, resultFile, nonce);
     if (downloaded) removeContainerFile(join(appSupport, 'downloads'), downloaded, nonce);
   }
-  const name = `${values.label}-${scenario}-${values.engine.replace(':', '-')}-pool${config.poolSize}-${nonce}.json`;
-  writeFileSync(join(out, name), JSON.stringify(report, null, 2) + '\n');
-  console.log(`bench: wrote ${join(out, name)}`);
+  const reportPath = join(
+    out,
+    reportName(values.label, scenario, values.engine, config.poolSize, nonce),
+  );
+  // A new file, directly inside this run's workspace: never one that already exists.
+  checkNewFile(out, nonce, reportPath);
+  writeFileSync(reportPath, JSON.stringify(report, null, 2) + '\n', { flag: 'wx' });
+  console.log(`bench: wrote ${reportPath}`);
+  if (transient.record.exceeded) {
+    console.error(`bench: run stopped: ${transient.record.exceeded}`);
+    process.exit(1);
+  }
   if (!report.result?.ok) {
     console.error(`bench: run failed: ${report.result?.error ?? 'no result'}`);
     process.exit(1);

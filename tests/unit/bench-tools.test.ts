@@ -19,9 +19,13 @@ import {
   footprintByPhase,
   parseFootprint,
   parseLarge,
+  reportName,
+  treeBytes,
+  watchTransient,
 } from '../../tools/bench/run-bench.mjs';
 import {
   checkEmptyFolder,
+  checkNewFile,
   checkWorkspace,
   createWorkspace,
   removeInside,
@@ -52,6 +56,19 @@ describe('bench runner checks', () => {
     expect(parseLarge('')).toEqual([]);
     expect(() => parseLarge('video:1')).toThrow('bad --large');
     expect(() => parseLarge('text:1e9')).toThrow('bad --large');
+  });
+
+  it('names the kept report only from checked parts', () => {
+    const n = '0123456789abcdef';
+    expect(reportName('warm', 'perf', 'node:sqlite', 2, n)).toBe(
+      `warm-perf-node-sqlite-pool2-${n}.json`,
+    );
+    for (const label of ['', '../x', 'a/b', 'Warm', '.hidden', '-x', 'a'.repeat(33), 'a b'])
+      expect(() => reportName(label, 'perf', 'node:sqlite', 2, n), label).toThrow('--label');
+    expect(() => reportName('warm', 'perf/..', 'node:sqlite', 2, n)).toThrow('scenario');
+    expect(() => reportName('warm', 'perf', '../sqlite', 2, n)).toThrow('engine');
+    expect(() => reportName('warm', 'perf', 'node:sqlite', 2.5, n)).toThrow('pool');
+    expect(() => reportName('warm', 'perf', 'node:sqlite', 2, '../x')).toThrow('nonce');
   });
 });
 
@@ -97,6 +114,30 @@ describe('the run workspace', () => {
     expect(readFileSync(join(outside, 'keep.txt'), 'utf8')).toBe('outside data');
   });
 
+  it('writes only new files, in real folders inside it', () => {
+    const root = testDir('bench-ws-newfile');
+    const ws = join(root, 'run');
+    createWorkspace(ws, nonce);
+    const download = join(ws, 'downloads', `quarantine-${nonce}.bin`);
+    expect(checkNewFile(ws, nonce, download)).toBe(download);
+    expect(checkNewFile(ws, nonce, join(ws, 'result.json'))).toBe(join(ws, 'result.json'));
+    // An existing file, or a link where the file would go, is refused.
+    writeFileSync(join(ws, 'result.json'), '{}');
+    expect(() => checkNewFile(ws, nonce, join(ws, 'result.json'))).toThrow('already exists');
+    mkdirSync(join(root, 'outside'));
+    symlinkSync(join(root, 'outside', 'x'), join(ws, 'dangling.json'));
+    expect(() => checkNewFile(ws, nonce, join(ws, 'dangling.json'))).toThrow('already exists');
+    // A download folder swapped for a link is refused before anything saves through it.
+    rmSync(join(ws, 'downloads'), { recursive: true });
+    symlinkSync(join(root, 'outside'), join(ws, 'downloads'));
+    expect(() => checkNewFile(ws, nonce, download)).toThrow('not a real folder');
+    expect(() => checkNewFile(ws, nonce, join(root, 'outside', 'x'))).toThrow('not inside');
+    expect(() => checkNewFile(ws, 'fedcba9876543210', join(ws, 'r.json'))).toThrow(
+      "not this run's workspace",
+    );
+    expect(readdirSync(join(root, 'outside'))).toEqual([]);
+  });
+
   it('refuses an index folder that already holds anything, or is a link', () => {
     const root = testDir('bench-ws-index');
     const ws = join(root, 'run');
@@ -122,6 +163,8 @@ describe('the test data budget', () => {
     mk('b/clone/node_modules/pkg/test-output');
     mk('c/bench/run1/index');
     writeFileSync(join(root, 'c/bench/run1/config-0123456789abcdef.json'), '{}');
+    // A sandboxed run's workspace holds no config, only the mark.
+    createWorkspace(join(root, 'c/bench/run2'), '0123456789abcdef', []);
     mk('d/container');
     const found = findTestData([root], {
       containers: [join(root, 'd/container')],
@@ -131,8 +174,43 @@ describe('the test data budget', () => {
       'a/corpora/perf1',
       'b/clone/test-output',
       'c/bench/run1',
+      'c/bench/run2',
       'd/container',
     ]);
+  });
+
+  it('measures a folder without following links or entering the folders it skips', () => {
+    const root = testDir('bench-tree-bytes');
+    mkdirSync(join(root, 'ws/index'), { recursive: true });
+    mkdirSync(join(root, 'outside'));
+    writeFileSync(join(root, 'outside/big.bin'), Buffer.alloc(1024 * 1024));
+    writeFileSync(join(root, 'ws/index/pev-bench.db'), Buffer.alloc(1024 * 1024));
+    symlinkSync(join(root, 'outside'), join(root, 'ws/link'));
+    const empty = treeBytes(join(root, 'ws'), [join(root, 'ws/index')]);
+    expect(empty).toBeLessThan(64 * 1024);
+    writeFileSync(join(root, 'ws/result.json'), Buffer.alloc(256 * 1024));
+    expect(treeBytes(join(root, 'ws'), [join(root, 'ws/index')]) - empty).toBeGreaterThanOrEqual(
+      256 * 1024,
+    );
+    expect(treeBytes(join(root, 'ws'))).toBeGreaterThan(1024 * 1024);
+    expect(treeBytes(join(root, 'missing'))).toBe(0);
+  });
+
+  it('stops the run once its other output passes the reserve, or cannot be measured', () => {
+    const sizes = [10, 40e6, 20e6 + 5e6, 60e6];
+    const watch = watchTransient(() => sizes.shift()!, { baseline: 5e6 });
+    expect(watch.sample()).toBe(true);
+    expect(watch.sample()).toBe(true);
+    expect(watch.sample()).toBe(true);
+    expect(watch.record.peakBytes).toBe(35e6);
+    expect(watch.sample()).toBe(false);
+    expect(watch.record.exceeded).toContain(`past the ${TRANSIENT_RESERVE} B reserved`);
+    expect(watch.sample()).toBe(false);
+    const failing = watchTransient(() => {
+      throw Object.assign(new Error('denied'), { code: 'EACCES' });
+    });
+    expect(failing.sample()).toBe(false);
+    expect(failing.record.exceeded).toContain('EACCES');
   });
 
   it('refuses when the data plus a full index and the run output would reach the limit', () => {
@@ -209,8 +287,11 @@ function fakeRun(phase1Ms: number) {
       addonSha256: null,
       frontmost: { loginwindow: 3 },
       quarantine: { present: false, value: null },
-      footprint: { peakPhase2: 800, idle: 400, idlePoolAlive: 500, idleShrunk: 300 },
+      footprint: { peakPhase2: 800, idle: 400, idlePoolAlive: 500, idleShrunk: 300, samples: 9 },
       footprintPeakByProcess: [{ name: 'Browser', peakMiB: 50 }],
+      exit: { code: 0, signal: null, timedOut: false, stopped: null } as Record<string, unknown>,
+      indexLeftover: [] as string[],
+      transient: { samples: 5, peakBytes: 1000, exceeded: null as string | null },
     },
     result: {
       ok: true,
@@ -218,7 +299,19 @@ function fakeRun(phase1Ms: number) {
       label: 'warm',
       build: { electron: '45.5.0', node: '24' },
       machine: { cpuModel: 'M', cpus: 10, totalMemGb: 32 },
-      config: { poolSize: 4, oldGenMb: 512 },
+      config: {
+        poolSize: 4,
+        oldGenMb: 512,
+        term: 'check',
+        searchRepeats: 20,
+        opens: 200,
+        reopens: 2,
+        large: [{ kind: 'text', bytes: 1 }],
+        window: true,
+        quarantine: true,
+        loadIntervalMs: 20,
+        indexCapBytes: 300e6,
+      } as Record<string, unknown>,
       engine: {
         engine: 'node:sqlite',
         sqliteVersion: '3',
@@ -227,8 +320,10 @@ function fakeRun(phase1Ms: number) {
       },
       phase1: { pairs: 20000, phase1Ms, firstRowsMs: 400, batches: [] },
       phase2: { ms: 60000, writerMs: summary(5), jobMs: summary(2) },
-      large: [{ kind: 'text', bytes: 1, extract: { ms: 5000 }, generateOnly: { ms: 1 } }],
-      reopen: [{ mainMs: 300 }, { mainMs: 500 }],
+      large: [
+        { kind: 'text', bytes: 1, extract: { ms: 5000, rssGrowth: 1 }, generateOnly: { ms: 1 } },
+      ] as unknown[],
+      reopen: [{ mainMs: 300 }, { mainMs: 500 }] as unknown[],
       idle: {
         dateP1: summary(40),
         dateP2: summary(120),
@@ -248,6 +343,8 @@ function fakeRun(phase1Ms: number) {
       memoryIdlePoolAlive: { mb: 600 },
       memoryPeakPhase2: { mb: 900, byTypeMb: {} },
       quarantine: { method: 'webContents.downloadURL', state: 'completed' },
+      indexRemoved: true,
+      cleanupError: undefined as string | undefined,
     },
   };
 }
@@ -286,9 +383,57 @@ describe('bench report', () => {
     const missing = fakeRun(3000) as { result: Record<string, unknown> };
     delete missing.result.reopen;
     writeFileSync(other, JSON.stringify(missing));
-    expect(() => buildReport({ primary: [other] })).toThrow('reopen is missing');
+    expect(() => buildReport({ primary: [other] })).toThrow('reopen has 0 of 2');
     const md = markdown(report);
     expect(md).toContain('| deferred |');
     expect(md).toContain('×10 to 200k');
+  });
+
+  it('refuses runs with another workload, missing samples, a failed exit or a failed cleanup', () => {
+    const root = testDir('bench-report-refuse');
+    const good = join(root, 'good.json');
+    writeFileSync(good, JSON.stringify(fakeRun(3000)));
+    const bad = join(root, 'bad.json');
+    const refuse = (change: (run: ReturnType<typeof fakeRun>) => void, message: string) => {
+      const run = fakeRun(3000);
+      change(run);
+      writeFileSync(bad, JSON.stringify(run));
+      expect(() => buildReport({ primary: [good, bad] }), message).toThrow(message);
+    };
+    expect(() => buildReport({ primary: [good, good] })).not.toThrow();
+    // Another workload.
+    refuse((r) => (r.result.config.term = 'other'), 'term "other"');
+    refuse((r) => (r.result.config.opens = 10), 'opens 10');
+    refuse((r) => (r.result.config.searchRepeats = 5), 'searchRepeats 5');
+    refuse((r) => (r.result.config.reopens = 0), 'reopens 0');
+    refuse((r) => (r.result.config.large = []), 'large []');
+    refuse((r) => (r.result.config.window = false), 'window false');
+    refuse((r) => (r.result.config.quarantine = false), 'quarantine false');
+    refuse((r) => (r.result.config.loadIntervalMs = 0), 'loadIntervalMs 0');
+    // Missing, empty or non-finite measurements.
+    refuse((r) => (r.result.reopen = []), 'reopen has 0 of 2');
+    refuse((r) => (r.result.large = []), 'large has 0 of 1');
+    refuse(
+      (r) => (r.result.large = [{ kind: 'text', bytes: 1, extract: { state: 'failed' } }]),
+      'large part 0 was not measured',
+    );
+    refuse((r) => (r.result.reopen = [{ mainMs: null }, { mainMs: 1 }]), 'reopen time');
+    refuse((r) => (r.result.idle.dateP1 = { n: 0, p50: 0, p95: 0, max: 0 }), 'no samples');
+    refuse(
+      (r) => (r.result.duringPhase2.list = { n: 3, p50: 1, p95: null, max: 1 } as never),
+      'p95',
+    );
+    refuse((r) => (r.result.phase1.firstRowsMs = null as never), 'firstRowsMs');
+    refuse((r) => (r.result.termMatches = undefined as never), 'termMatches');
+    refuse((r) => (r.runner.footprint.samples = 0), 'no footprint samples');
+    // A failed exit, a stop or a failed cleanup.
+    refuse((r) => (r.runner.exit.code = 1), 'did not exit cleanly');
+    refuse((r) => (r.runner.exit.timedOut = true), 'did not exit cleanly');
+    refuse((r) => (r.runner.exit.stopped = 'past the reserve'), 'did not exit cleanly');
+    refuse((r) => (r.result.indexRemoved = false), 'index was not removed');
+    refuse((r) => (r.result.cleanupError = 'EBUSY'), 'cleanup failed (EBUSY)');
+    refuse((r) => (r.runner.indexLeftover = ['pev-bench.db-wal']), 'not empty');
+    refuse((r) => (r.runner.transient.exceeded = 'reached 60 MB'), 'reached 60 MB');
+    refuse((r) => (r.runner.transient.samples = 0), 'not watched');
   });
 });

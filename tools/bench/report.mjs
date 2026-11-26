@@ -89,29 +89,40 @@ function load(file) {
   return { file, ...doc };
 }
 
-const PRIMARY_FIELDS = [
-  'phase1.firstRowsMs',
-  'phase1.phase1Ms',
-  'phase2.ms',
-  'idle.dateP1',
-  'idle.relevanceP1',
-  'idle.open',
-  'duringPhase2.searchDateP1',
-  'duringPhase2.open',
-  'reopen',
+const at = (obj, path) => path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
+
+/** The settings that decide what a run measures; runs compared side by side share them. */
+export const WORKLOAD = [
+  'term',
+  'searchRepeats',
+  'opens',
+  'reopens',
   'large',
-  'totals.size',
-  'memoryIdle',
+  'window',
+  'quarantine',
+  'loadIntervalMs',
+  'oldGenMb',
+  'indexCapBytes',
 ];
 
-const at = (obj, path) => path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
+/**
+ * The settings that decide what a comparison row measures (indexing, search,
+ * open and memory during indexing). Reopens, large parts and the quarantine
+ * check all run after those are measured.
+ */
+export const COMPARISON_WORKLOAD = WORKLOAD.filter(
+  (k) => !['reopens', 'large', 'quarantine'].includes(k),
+);
 
 /**
  * Throws unless every run measured the same thing: the same scenario, corpus
- * size, label and (for the primary runs) engine and pool, with every
- * measurement the report needs present.
+ * size, workload, label and (for the primary runs) engine and pool.
  */
-export function checkCompatible(docs, { sameEngine = true, sameLabel = true } = {}) {
+export function checkCompatible(
+  docs,
+  { sameEngine = true, sameLabel = true, workload = WORKLOAD } = {},
+) {
+  if (docs.length === 0) throw new Error('no runs');
   const base = docs[0].result;
   for (const doc of docs) {
     const r = doc.result;
@@ -121,6 +132,11 @@ export function checkCompatible(docs, { sameEngine = true, sameLabel = true } = 
       throw new Error(`${name}: ${r.phase1?.pairs} messages, not ${base.phase1?.pairs}`);
     if (r.config?.maxMessages || r.config?.ftsPrefix !== undefined)
       throw new Error(`${name}: a size-analysis run, not a full one`);
+    for (const key of workload)
+      if (JSON.stringify(r.config?.[key]) !== JSON.stringify(base.config?.[key]))
+        throw new Error(
+          `${name}: ${key} ${JSON.stringify(r.config?.[key])}, not ${JSON.stringify(base.config?.[key])}`,
+        );
     if (sameLabel && r.label !== base.label)
       throw new Error(`${name}: label ${r.label}, not ${base.label}`);
     if (
@@ -128,16 +144,105 @@ export function checkCompatible(docs, { sameEngine = true, sameLabel = true } = 
       (r.engine?.engine !== base.engine?.engine || r.config?.poolSize !== base.config?.poolSize)
     )
       throw new Error(`${name}: a different engine or pool`);
-    if (!doc.runner?.footprint?.peakPhase2) throw new Error(`${name}: no memory footprint`);
   }
   return docs;
 }
 
-function checkComplete(docs) {
-  for (const doc of docs)
-    for (const field of PRIMARY_FIELDS)
-      if (at(doc.result, field) == null)
-        throw new Error(`${doc.file ?? 'a run'}: ${field} is missing`);
+const finite = (x) => typeof x === 'number' && Number.isFinite(x);
+
+/** Single measurements every full run has, each a finite number. */
+const NUMBERS = [
+  'phase1.firstRowsMs',
+  'phase1.phase1Ms',
+  'phase2.ms',
+  'memoryIdle.mb',
+  'totals.size.pages',
+  'totals.size.pageSize',
+];
+/** Latency summaries every full run has, each with samples. */
+const SUMMARIES = [
+  'idle.dateP1',
+  'idle.relevanceP1',
+  'idle.open',
+  'idle.list',
+  'duringPhase2.searchDateP1',
+  'duringPhase2.open',
+  'phase2.writerMs',
+  'phase2.jobMs',
+];
+const RUNNER_NUMBERS = ['footprint.peakPhase2', 'footprint.idle', 'footprint.samples'];
+
+function checkSummary(name, field, s) {
+  if (!s || !finite(s.n) || s.n <= 0) throw new Error(`${name}: ${field} has no samples`);
+  for (const k of ['p50', 'p95', 'max'])
+    if (!finite(s[k])) throw new Error(`${name}: ${field}.${k} is not a finite number`);
+}
+
+/**
+ * Throws unless the run finished cleanly: the runner saw the app exit 0
+ * without a timeout or a stop, and the index was removed with no cleanup
+ * error. `transient` also requires the record that the run's other output
+ * stayed within its reserve.
+ */
+export function checkClean(doc, { transient = true } = {}) {
+  const r = doc.result;
+  const name = doc.file ?? 'a run';
+  const exit = doc.runner?.exit;
+  if (!exit || exit.code !== 0 || exit.timedOut || exit.stopped)
+    throw new Error(`${name}: the app did not exit cleanly (${JSON.stringify(exit ?? null)})`);
+  if (r.indexRemoved !== true) throw new Error(`${name}: the index was not removed`);
+  if (r.cleanupError) throw new Error(`${name}: cleanup failed (${r.cleanupError})`);
+  if ((doc.runner.indexLeftover ?? []).length > 0)
+    throw new Error(`${name}: the index folder was not empty after the run`);
+  if (transient) {
+    const t = doc.runner.transient;
+    if (!t || !finite(t.samples) || t.samples <= 0)
+      throw new Error(`${name}: the run's other output was not watched`);
+    if (t.exceeded) throw new Error(`${name}: ${t.exceeded}`);
+  }
+  return doc;
+}
+
+/**
+ * Throws unless each run finished cleanly and measured everything the report
+ * uses: every number is finite and every summary has samples; for a primary
+ * run (`full`) also the term's match count, and every reopen and large part
+ * configured.
+ */
+export function checkComplete(docs, { transient = true, full = true } = {}) {
+  for (const doc of docs) {
+    const r = doc.result;
+    const name = doc.file ?? 'a run';
+    checkClean(doc, { transient });
+    for (const field of NUMBERS)
+      if (!finite(at(r, field))) throw new Error(`${name}: ${field} is missing or not finite`);
+    for (const field of RUNNER_NUMBERS)
+      if (!finite(at(doc.runner, field)))
+        throw new Error(`${name}: runner ${field} is missing or not finite`);
+    if (doc.runner.footprint.samples <= 0) throw new Error(`${name}: no footprint samples`);
+    for (const field of SUMMARIES) checkSummary(name, field, at(r, field));
+    // Any other summary taken must have samples too.
+    for (const group of ['idle', 'duringPhase2'])
+      for (const [key, s] of Object.entries(r[group] ?? {}))
+        checkSummary(name, `${group}.${key}`, s);
+    if (!full) continue;
+    if (!finite(r.termMatches)) throw new Error(`${name}: termMatches is missing or not finite`);
+    const reopens = r.reopen ?? [];
+    if (!Array.isArray(r.reopen) || reopens.length === 0 || reopens.length !== r.config?.reopens)
+      throw new Error(`${name}: reopen has ${reopens.length} of ${r.config?.reopens} measurements`);
+    for (const x of reopens)
+      if (!finite(x?.mainMs)) throw new Error(`${name}: a reopen time is not finite`);
+    const large = r.large ?? [];
+    const planned = r.config?.large ?? [];
+    if (!Array.isArray(r.large) || large.length === 0 || large.length !== planned.length)
+      throw new Error(`${name}: large has ${large.length} of ${planned.length} parts`);
+    for (const [i, l] of large.entries()) {
+      if (l?.kind !== planned[i]?.kind || l?.bytes !== planned[i]?.bytes)
+        throw new Error(`${name}: large part ${i} is not the one configured`);
+      if (!finite(l.extract?.ms) || !finite(l.extract?.rssGrowth))
+        throw new Error(`${name}: large part ${i} was not measured`);
+    }
+  }
   return docs;
 }
 
@@ -329,6 +434,14 @@ export function buildReport({
   exportMessages,
 }) {
   const docs = checkComplete(checkCompatible(primary.map(load)));
+  // Comparisons check the settings and measures their rows use. Runs from
+  // before the reserve was watched during the run are accepted there; each
+  // row is labelled with its executable digest.
+  const comparison = (list) =>
+    checkComplete(checkCompatible(list, { sameEngine: false, workload: COMPARISON_WORKLOAD }), {
+      transient: false,
+      full: false,
+    });
   const metrics = combine(docs.map(metricsOf));
   const peaks = docs.map((d) => metricsOf(d).peakFamilyBytes).filter((x) => typeof x === 'number');
   const first = docs[0];
@@ -398,23 +511,23 @@ export function buildReport({
     footprintByPhase: first.runner.footprint?.peakByPhase ?? null,
     frontmost: docs.map((d) => d.runner.frontmost),
   };
-  if (stress) report.stress = stressOf(load(stress));
+  if (stress) report.stress = stressOf(checkClean(load(stress)));
   if (engine) {
-    const pair = checkCompatible([load(engineBase ?? first.file), load(engine)], {
-      sameEngine: false,
-    });
+    const pair = comparison([load(engineBase ?? first.file), load(engine)]);
     if (pair[0].result.config.poolSize !== pair[1].result.config.poolSize)
       throw new Error('the engine comparison needs the same pool size on both sides');
     report.engines = pair.map(engineRow);
   }
   if (pools?.length) {
-    const sweep = checkCompatible(pools.map(load), { sameEngine: false });
+    const sweep = comparison(pools.map(load));
     if (new Set(sweep.map((d) => d.result.engine.engine)).size !== 1)
       throw new Error('the pool sweep needs one engine');
     report.pools = sweep.map(poolRow).sort((a, b) => a.pool - b.pool);
   }
   if (sandbox) {
-    const s = load(sandbox);
+    const s = checkClean(load(sandbox));
+    if (s.result.corpusRemoved !== true || s.result.workspaceRemoved !== true)
+      throw new Error(`${sandbox}: the sandboxed workspace was not removed`);
     report.sandbox = {
       flavor: s.runner.build,
       ok: s.result.ok,

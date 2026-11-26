@@ -22,7 +22,7 @@ import type { AppContext } from '../../main/context';
 import { createAppWindow } from '../../main/windows';
 import {
   checkEmptyFolder,
-  checkInside,
+  checkNewFile,
   checkWorkspace,
   createWorkspace,
   removeInside,
@@ -208,7 +208,6 @@ async function writeSmallCorpus(root: string): Promise<string> {
  * quarantine attribute from outside the app.
  */
 async function quarantineCheck(dir: string, nonce: string): Promise<Record<string, unknown>> {
-  mkdirSync(dir, { recursive: true });
   const ses = session.fromPartition(`bench-download-${nonce}`);
   ses.protocol.handle(
     'mail-asset',
@@ -492,7 +491,8 @@ export async function runBench(ctx: AppContext, argv: string[]): Promise<void> {
       // The runner reads the saved file's attribute afterwards, so it stays
       // outside the sandboxed build's workspace, which is removed at the end.
       const downloads = sandboxed ? join(userData, 'downloads') : join(workspace, 'downloads');
-      if (!sandboxed) checkInside(workspace, downloads);
+      if (sandboxed) mkdirSync(downloads, { recursive: true });
+      else checkNewFile(workspace, config.nonce, join(downloads, `quarantine-${config.nonce}.bin`));
       result.quarantine = await quarantineCheck(downloads, config.nonce);
     }
     result.ok = true;
@@ -535,6 +535,7 @@ export async function runBench(ctx: AppContext, argv: string[]): Promise<void> {
     result.processTypes = sampler.types;
     result.finishedAt = new Date().toISOString();
     try {
+      if (!sandboxed) checkNewFile(workspace, config.nonce, resultPath);
       writeFileSync(resultPath, JSON.stringify(result, null, 2) + '\n', { flag: 'wx' });
     } catch {
       // No place for the result: the runner reports the run as failed.

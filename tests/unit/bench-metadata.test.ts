@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { describe, expect, it } from 'vitest';
 import {
+  MAX_ATTACHMENTS,
+  MAX_LABEL_ID_LENGTH,
+  MAX_LABELS,
+  MAX_RECIPIENTS,
   conversationKeys,
   headerValues,
   msgIds,
@@ -78,5 +82,34 @@ describe('parseMetadata', () => {
     expect(() => parseMetadata('ID2', doc({ ID: 'ID1' }))).toThrow('META_ID');
     expect(() => parseMetadata('ID1', '{')).toThrow('META_JSON');
     expect(() => parseMetadata('ID1', '[]')).toThrow('META_SHAPE');
+  });
+
+  it('keeps at most the per-message limits of labels, attachments and addresses', () => {
+    const many = (n: number, f: (i: number) => unknown) =>
+      Array.from({ length: n }, (_, i) => f(i));
+    const row = parseMetadata(
+      'ID1',
+      JSON.stringify({
+        Payload: {
+          ID: 'ID1',
+          LabelIDs: [
+            '',
+            'x'.repeat(MAX_LABEL_ID_LENGTH + 1),
+            ...many(MAX_LABELS + 5, (i) => `L${i}`),
+          ],
+          Attachments: many(MAX_ATTACHMENTS + 5, (i) => ({ Name: `${i}` })),
+          NumAttachments: MAX_ATTACHMENTS + 5,
+          ToList: many(MAX_RECIPIENTS + 5, (i) => ({ Address: `${i}@x` })),
+          CCList: many(3, (i) => ({ Address: `${i}@x` })),
+        },
+      }),
+    );
+    // Empty and over-long label IDs are left out, then the first MAX_LABELS kept.
+    expect(row.labelIds).toHaveLength(MAX_LABELS);
+    expect(row.labelIds[0]).toBe('L0');
+    expect(row.attachments).toHaveLength(MAX_ATTACHMENTS);
+    expect(row.numAttachments).toBe(MAX_ATTACHMENTS + 5);
+    expect(row.to).toHaveLength(MAX_RECIPIENTS);
+    expect(row.cc).toHaveLength(3);
   });
 });

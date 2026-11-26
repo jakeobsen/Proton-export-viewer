@@ -7,7 +7,7 @@
 import { randomBytes } from 'node:crypto';
 import { BODY_STATE } from './schema';
 import { asNumber, type Db } from './sql';
-import { addressText, type MessageRow } from './metadata';
+import { MAX_ATTACHMENTS, MAX_LABELS, addressText, type MessageRow } from './metadata';
 
 export interface PairInfo {
   protonId: string;
@@ -83,8 +83,10 @@ interface ThreadAgg {
   last_time: number;
 }
 
-/** Rows one statement may re-point when a merge moves members or keys. */
+/** Rows one statement may re-point when a merge moves members, keys or per-label rows. */
 export const REPOINT_CHUNK = 500;
+/** Labels written per checked chunk when labels.json is stored. */
+export const LABEL_CHUNK = 500;
 
 export class IndexWriter {
   private revSeq: number;
@@ -121,13 +123,24 @@ export class IndexWriter {
     }
   }
 
+  /**
+   * Stores labels.json, in chunks of LABEL_CHUNK labels, each checked first.
+   * The labels written before are removed in chunks too.
+   */
   writeLabels(labels: LabelEntry[]): void {
     this.transaction(() => {
-      this.db.exec('DELETE FROM labels');
+      const drop = this.db.stmt(
+        'DELETE FROM labels WHERE proton_id IN (SELECT proton_id FROM labels LIMIT ?)',
+      );
+      for (;;) {
+        this.step();
+        if (asNumber(drop.run(LABEL_CHUNK).changes) < LABEL_CHUNK) break;
+      }
       const put = this.db.stmt(
         'INSERT OR REPLACE INTO labels(proton_id, name, path, parent_id, color, type, kind) VALUES (?, ?, ?, ?, ?, ?, ?)',
       );
-      for (const l of labels) {
+      for (const [i, l] of labels.entries()) {
+        if (i % LABEL_CHUNK === 0) this.step();
         const kind =
           /^\d+$/.test(l.id) && Number(l.id) <= 16 ? 'system' : l.type === 3 ? 'folder' : 'label';
         put.run(
@@ -277,20 +290,37 @@ export class IndexWriter {
          WHERE thread_id = ?`,
       )
       .run(a.msg_count, a.unread_count, a.attach_count, a.first_time, a.last_time, into);
-    stats.repointedLabelRows += asNumber(
-      this.db
-        .stmt(
-          `INSERT INTO thread_labels(label_id, thread_id, last_time, msg_count, unread_count)
-           SELECT label_id, ?, last_time, msg_count, unread_count FROM thread_labels WHERE thread_id = ?
-           ON CONFLICT(label_id, thread_id) DO UPDATE SET
-             last_time = max(last_time, excluded.last_time),
-             msg_count = msg_count + excluded.msg_count,
-             unread_count = unread_count + excluded.unread_count`,
-        )
-        .run(into, from).changes,
-    );
-    this.db.stmt('DELETE FROM thread_labels WHERE thread_id = ?').run(from);
+    stats.repointedLabelRows += this.moveThreadLabels(into, from);
     this.db.stmt('DELETE FROM threads WHERE thread_id = ?').run(from);
+  }
+
+  /**
+   * Moves `from`'s per-label rows onto `into`, REPOINT_CHUNK rows at a time,
+   * each chunk checked first: the same first rows (by label) are added to
+   * `into` and then removed from `from`.
+   */
+  private moveThreadLabels(into: number, from: number): number {
+    const add = this.db.stmt(
+      `INSERT INTO thread_labels(label_id, thread_id, last_time, msg_count, unread_count)
+       SELECT label_id, ?, last_time, msg_count, unread_count FROM thread_labels
+         WHERE thread_id = ? ORDER BY label_id LIMIT ?
+       ON CONFLICT(label_id, thread_id) DO UPDATE SET
+         last_time = max(last_time, excluded.last_time),
+         msg_count = msg_count + excluded.msg_count,
+         unread_count = unread_count + excluded.unread_count`,
+    );
+    const drop = this.db.stmt(
+      `DELETE FROM thread_labels WHERE thread_id = ? AND label_id IN
+         (SELECT label_id FROM thread_labels WHERE thread_id = ? ORDER BY label_id LIMIT ?)`,
+    );
+    let moved = 0;
+    for (;;) {
+      this.step();
+      add.run(into, from, REPOINT_CHUNK);
+      const n = asNumber(drop.run(from, from, REPOINT_CHUNK).changes);
+      moved += n;
+      if (n < REPOINT_CHUNK) return moved;
+    }
   }
 
   private insertMessage(row: MessageRow, stats: Phase1Stats): void {
@@ -320,6 +350,8 @@ export class IndexWriter {
         this.merge(threadId, other.id, size, stats);
         size += other.n;
       }
+      // The message's own rows are a unit of their own after the merges.
+      if (sized.length > 1) this.step();
     }
     const keyPut = this.db.stmt(
       'INSERT INTO thread_keys(key, thread_id) VALUES (?, ?) ON CONFLICT(key) DO NOTHING',
@@ -368,14 +400,17 @@ export class IndexWriter {
        ON CONFLICT(label_id, thread_id) DO UPDATE SET last_time = max(last_time, excluded.last_time),
          msg_count = msg_count + 1, unread_count = unread_count + excluded.unread_count`,
     );
-    for (const label of row.labelIds) {
+    // At most MAX_LABELS labels and MAX_ATTACHMENTS attachments per message, as parsed.
+    for (const label of row.labelIds.slice(0, MAX_LABELS)) {
       labelPut.run(rowid, label);
       threadLabelPut.run(label, threadId, row.time, row.unread);
     }
     const attachPut = this.db.stmt(
       'INSERT INTO attachments(message_rowid, idx, filename, mime, size, content_id, source) VALUES (?, ?, ?, ?, ?, NULL, ?)',
     );
-    row.attachments.forEach((a, i) => attachPut.run(rowid, i, a.name, a.mime, a.size, 'meta'));
+    row.attachments
+      .slice(0, MAX_ATTACHMENTS)
+      .forEach((a, i) => attachPut.run(rowid, i, a.name, a.mime, a.size, 'meta'));
     this.db
       .stmt(
         `UPDATE threads SET msg_count = msg_count + 1, unread_count = unread_count + ?,
