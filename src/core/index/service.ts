@@ -254,7 +254,8 @@ export class IndexService {
   private readonly idleMs: number;
   private readonly capBytes: number | null;
   private readonly batchPairs: number;
-  private lastReport = 0;
+  /** When progress was last reported, on the monotonic clock. */
+  private lastReport = -Infinity;
   private reportTimer: ReturnType<typeof setTimeout> | null = null;
   private endClosing: () => void = () => {};
   /** Resolves when the teardown begins. */
@@ -305,7 +306,7 @@ export class IndexService {
    */
   private report(now = false): void {
     if (this.closed || !this.deps.onChange) return;
-    const wait = this.lastReport + PROGRESS_MS - Date.now();
+    const wait = this.lastReport + PROGRESS_MS - performance.now();
     if (!now && wait > 0) {
       this.reportTimer ??= setTimeout(() => {
         this.reportTimer = null;
@@ -315,7 +316,7 @@ export class IndexService {
     }
     if (this.reportTimer) clearTimeout(this.reportTimer);
     this.reportTimer = null;
-    this.lastReport = Date.now();
+    this.lastReport = performance.now();
     this.deps.onChange();
   }
 
