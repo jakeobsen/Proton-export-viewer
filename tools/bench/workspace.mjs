@@ -120,6 +120,19 @@ export function checkNewFile(workspace, nonce, file) {
 }
 
 /**
+ * Makes a new folder at `path` for one saved file, marked with the run's nonce
+ * like a workspace (so `path` must not exist yet and its parent must be a real
+ * folder reached without links), and returns the file's path in it after the
+ * same checks as `checkNewFile`. `name` must be a plain file name.
+ */
+export function createFileFolder(path, nonce, name) {
+  if (typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))
+    throw new Error(`${name} is not a plain file name`);
+  createWorkspace(path, nonce, []);
+  return checkNewFile(path, nonce, join(path, name));
+}
+
+/**
  * Removes `path` inside this run's workspace. A link is removed itself, never
  * followed; a folder must be a real folder.
  */

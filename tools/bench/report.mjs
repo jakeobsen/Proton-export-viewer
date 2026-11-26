@@ -162,10 +162,13 @@ const NUMBERS = [
 /** Latency summaries every full run has, each with samples. */
 const SUMMARIES = [
   'idle.dateP1',
+  'idle.dateP2',
   'idle.relevanceP1',
+  'idle.relevanceP2',
   'idle.open',
   'idle.list',
   'duringPhase2.searchDateP1',
+  'duringPhase2.searchDateP2',
   'duringPhase2.open',
   'phase2.writerMs',
   'phase2.jobMs',

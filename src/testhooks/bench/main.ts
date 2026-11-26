@@ -24,6 +24,7 @@ import {
   checkEmptyFolder,
   checkNewFile,
   checkWorkspace,
+  createFileFolder,
   createWorkspace,
   removeInside,
   removeWorkspace,
@@ -207,7 +208,7 @@ async function writeSmallCorpus(root: string): Promise<string> {
  * the save path set (so no dialog). The runner then reads the file's
  * quarantine attribute from outside the app.
  */
-async function quarantineCheck(dir: string, nonce: string): Promise<Record<string, unknown>> {
+async function quarantineCheck(target: string, nonce: string): Promise<Record<string, unknown>> {
   const ses = session.fromPartition(`bench-download-${nonce}`);
   ses.protocol.handle(
     'mail-asset',
@@ -221,7 +222,6 @@ async function quarantineCheck(dir: string, nonce: string): Promise<Record<strin
   );
   // A download needs a WebContents in that partition. The window is never shown.
   const win = new BrowserWindow({ show: false, webPreferences: { session: ses, sandbox: true } });
-  const target = join(dir, `quarantine-${nonce}.bin`);
   try {
     const done = new Promise<string>((resolve) => {
       ses.once('will-download', (_event, item) => {
@@ -488,12 +488,15 @@ export async function runBench(ctx: AppContext, argv: string[]): Promise<void> {
 
     if (config.quarantine) {
       sampler.phase = 'quarantine';
-      // The runner reads the saved file's attribute afterwards, so it stays
-      // outside the sandboxed build's workspace, which is removed at the end.
-      const downloads = sandboxed ? join(userData, 'downloads') : join(workspace, 'downloads');
-      if (sandboxed) mkdirSync(downloads, { recursive: true });
-      else checkNewFile(workspace, config.nonce, join(downloads, `quarantine-${config.nonce}.bin`));
-      result.quarantine = await quarantineCheck(downloads, config.nonce);
+      // The saved file goes only into a real folder (not a link), as a new
+      // file. The runner reads its attribute afterwards, so the sandboxed
+      // build saves it outside its workspace (removed at the end), in a new
+      // folder of its own marked with the nonce, which the runner removes.
+      const file = `quarantine-${config.nonce}.bin`;
+      const target = sandboxed
+        ? createFileFolder(join(userData, `bench-download-${config.nonce}`), config.nonce, file)
+        : checkNewFile(workspace, config.nonce, join(workspace, 'downloads', file));
+      result.quarantine = await quarantineCheck(target, config.nonce);
     }
     result.ok = true;
   } catch (err) {

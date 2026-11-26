@@ -27,8 +27,10 @@ import {
   checkEmptyFolder,
   checkNewFile,
   checkWorkspace,
+  createFileFolder,
   createWorkspace,
   removeInside,
+  removeWorkspace,
 } from '../../tools/bench/workspace.mjs';
 import { REPO_ROOT, testDir } from '../paths';
 
@@ -136,6 +138,28 @@ describe('the run workspace', () => {
       "not this run's workspace",
     );
     expect(readdirSync(join(root, 'outside'))).toEqual([]);
+  });
+
+  it('makes a new marked folder for one saved file, and refuses a link in its place', () => {
+    const root = testDir('bench-ws-filefolder');
+    const name = `quarantine-${nonce}.bin`;
+    const folder = join(root, `bench-download-${nonce}`);
+    expect(createFileFolder(folder, nonce, name)).toBe(join(folder, name));
+    expect(readdirSync(folder)).toEqual(['.pev-bench-workspace']);
+    // Made only once: a second run with the same folder is refused.
+    expect(() => createFileFolder(folder, nonce, name)).toThrow('already exists');
+    // A link where the folder would go is refused, and nothing is saved through it.
+    mkdirSync(join(root, 'outside'));
+    const linked = join(root, 'linked');
+    symlinkSync(join(root, 'outside'), linked);
+    expect(() => createFileFolder(linked, nonce, name)).toThrow('already exists');
+    // So is a folder whose parent is reached through a link.
+    expect(() => createFileFolder(join(linked, 'inner'), nonce, name)).toThrow('without links');
+    for (const bad of ['../x', 'a/b', '', '.hidden'])
+      expect(() => createFileFolder(join(root, 'other'), nonce, bad), bad).toThrow('plain file');
+    expect(readdirSync(join(root, 'outside'))).toEqual([]);
+    removeWorkspace(folder, nonce);
+    expect(readdirSync(root).sort()).toEqual(['linked', 'outside']);
   });
 
   it('refuses an index folder that already holds anything, or is a link', () => {
@@ -328,6 +352,7 @@ function fakeRun(phase1Ms: number) {
         dateP1: summary(40),
         dateP2: summary(120),
         relevanceP1: summary(30),
+        relevanceP2: summary(25),
         open: summary(20),
         list: summary(3),
       },
@@ -419,6 +444,16 @@ describe('bench report', () => {
     );
     refuse((r) => (r.result.reopen = [{ mainMs: null }, { mainMs: 1 }]), 'reopen time');
     refuse((r) => (r.result.idle.dateP1 = { n: 0, p50: 0, p95: 0, max: 0 }), 'no samples');
+    // Page 2 counts towards the search targets, so a run without it is refused.
+    refuse((r) => delete (r.result.idle as Record<string, unknown>).dateP2, 'idle.dateP2 has no');
+    refuse(
+      (r) => delete (r.result.idle as Record<string, unknown>).relevanceP2,
+      'idle.relevanceP2 has no',
+    );
+    refuse(
+      (r) => delete (r.result.duringPhase2 as Record<string, unknown>).searchDateP2,
+      'duringPhase2.searchDateP2 has no',
+    );
     refuse(
       (r) => (r.result.duringPhase2.list = { n: 3, p50: 1, p95: null, max: 1 } as never),
       'p95',

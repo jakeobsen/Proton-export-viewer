@@ -22,8 +22,10 @@
 // of disk is free, or when all generated test data it finds (under each
 // --scan-data folder, in the app's containers and the capture folder; a folder
 // it can't read fails the check) plus a full index and 50 MB for the run's
-// other output would reach 1 GB. The app keeps the index (with -wal and -shm)
-// under 300 MB and empties it when it's done; this script checks that it did.
+// other output would reach 1 GB. While the app runs, that other output is
+// sampled once a second and the app is stopped once it passes its 50 MB. The
+// app keeps the index (with -wal and -shm) under 300 MB and empties it when
+// it's done; this script checks that it did.
 // The frontmost app is sampled throughout, and the downloaded file's quarantine
 // attribute is read here, outside the app.
 
@@ -43,7 +45,13 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { APP_ID, PRODUCT_NAME, appPath } from '../../scripts/package.mjs';
-import { WORKSPACE_MARK, checkNewFile, createWorkspace, removeInside } from './workspace.mjs';
+import {
+  WORKSPACE_MARK,
+  checkNewFile,
+  createWorkspace,
+  removeInside,
+  removeWorkspace,
+} from './workspace.mjs';
 
 export const INDEX_CAP = 300 * 1000 * 1000;
 /** Room kept for a run's other output: results, logs and the app's profile. */
@@ -191,9 +199,10 @@ export function treeBytes(root, skip = []) {
 }
 
 /**
- * Holds the reserve for a run's other output while it runs: each sample
- * measures it (growth over `baseline`), and the first sample past `limit`, or
- * one that can't be measured, returns false so the runner stops the app.
+ * Samples a run's other output against its reserve: each sample measures it
+ * (growth over `baseline`), and the first sample past `limit`, or one that
+ * can't be measured, returns false so the runner stops the app. Between two
+ * samples the output isn't watched.
  */
 export function watchTransient(measure, { limit = TRANSIENT_RESERVE, baseline = 0 } = {}) {
   const record = {
@@ -221,6 +230,15 @@ export function watchTransient(measure, { limit = TRANSIENT_RESERVE, baseline = 
     return true;
   };
   return { record, sample };
+}
+
+function lstatOrNull(path) {
+  try {
+    return lstatSync(path);
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
 }
 
 /** Refuses to start when less than 20 GiB of disk would stay free. */
@@ -485,9 +503,10 @@ async function main() {
       { flag: 'wx' },
     );
 
-  // The run's output other than the index stays within its reserve while it
-  // runs: the workspace without index/, or, for the sandboxed build, what its
-  // container grows by, without that workspace's index/.
+  // The run's output other than the index is sampled once a second while the
+  // app runs, and the app is stopped once it passes its reserve: the workspace
+  // without index/, or, for the sandboxed build, what its container grows by,
+  // without that workspace's index/.
   const containerData = join(homedir(), 'Library', 'Containers', APP_ID, 'Data');
   const appSupport = join(containerData, 'Library', 'Application Support', PRODUCT_NAME);
   const measureTransient = sandbox
@@ -588,9 +607,11 @@ async function main() {
   // The app's own profile (logs, caches) isn't kept; the result holds what counts.
   if (!sandbox) removeInside(out, nonce, userData);
   if (sandbox) {
-    // The result and the downloaded check file are this run's only files left in the container.
+    // The result and the download's own folder (marked with the nonce, the
+    // saved file inside) are this run's only things left in the container.
     removeContainerFile(appSupport, resultFile, nonce);
-    if (downloaded) removeContainerFile(join(appSupport, 'downloads'), downloaded, nonce);
+    const downloadFolder = join(appSupport, `bench-download-${nonce}`);
+    if (lstatOrNull(downloadFolder)) removeWorkspace(downloadFolder, nonce);
   }
   const reportPath = join(
     out,
