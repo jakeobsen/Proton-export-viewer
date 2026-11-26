@@ -90,6 +90,7 @@ fail() {
 	exit "$_code"
 }
 
+# shellcheck disable=SC2317 # also called from cleanup, which the EXIT trap runs
 add_reason() {
 	REASON="${REASON:+$REASON; }$1"
 }
@@ -328,6 +329,7 @@ expected_rules() {
 
 # Stops one tcpdump and checks how it ended: a clean exit, and statistics
 # with no packets dropped. Adds a reason to the phase when not.
+# shellcheck disable=SC2317 # called from cleanup, which the EXIT trap runs
 stop_capture() {
 	_pid=$1
 	_log=$2
