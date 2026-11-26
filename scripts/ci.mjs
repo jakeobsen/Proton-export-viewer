@@ -4,7 +4,7 @@
 //   node scripts/ci.mjs          the full suite; needs macOS (packaging,
 //                                code signing, the sandboxed build)
 //   node scripts/ci.mjs linux    the checks that run on Linux: everything up to
-//                                the license check, without packaging, plus
+//                                the license checks, without packaging, plus
 //                                ShellCheck
 
 import { spawnSync } from 'node:child_process';
@@ -23,6 +23,7 @@ const ALL_STEPS = [
   ['e2e tests', 'npx', ['playwright', 'test']],
   ['release build', 'npx', ['electron-vite', 'build']],
   ['license check', 'node', ['scripts/check-licenses.mjs', 'out']],
+  ['license check (test build)', 'node', ['scripts/check-licenses.mjs', 'out-test']],
   ['package release', 'node', ['scripts/package.mjs', 'release']],
   ['package mas-release', 'node', ['scripts/package.mjs', 'mas-release']],
   ['release checks (T10)', 'node', ['scripts/check-release.mjs']],
@@ -42,7 +43,7 @@ if (!linux && process.platform !== 'darwin') {
 // ShellCheck isn't installed on the Mac, so only the Linux job runs it.
 const LINUX_ONLY = new Set(['shellcheck']);
 const STEPS = linux
-  ? ALL_STEPS.slice(0, ALL_STEPS.findIndex(([name]) => name === 'license check') + 1)
+  ? ALL_STEPS.slice(0, ALL_STEPS.findIndex(([name]) => name === 'license check (test build)') + 1)
   : ALL_STEPS.filter(([name]) => !LINUX_ONLY.has(name));
 
 // Test output from earlier runs, kept by failed tests as evidence, goes

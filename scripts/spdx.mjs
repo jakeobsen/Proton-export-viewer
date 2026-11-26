@@ -11,6 +11,7 @@ export const ALLOWED_LICENSES = [
   'Zlib',
   'CC0-1.0',
   'BlueOak-1.0.0',
+  'MIT-0',
 ];
 
 function tokenize(expression) {

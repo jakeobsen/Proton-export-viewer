@@ -12,6 +12,7 @@ describe('isAllowedExpression', () => {
     'MIT OR GPL-3.0-only',
     '(MIT AND BSD-3-Clause)',
     'BlueOak-1.0.0',
+    'MIT-0',
   ])('allows %s', (expr) => {
     expect(isAllowedExpression(expr)).toBe(true);
   });

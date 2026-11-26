@@ -4,6 +4,7 @@
 //   release       standard Electron, fuses applied, no test hooks      (from out/)
 //   mas-release   Mac App Store flavor, sandboxed, no test hooks       (from out/)
 //   mas-selftest  Mac App Store flavor, sandboxed, with test hooks     (from out-test/)
+//   test          standard Electron, fuses applied, with test hooks    (from out-test/)
 //   mas-folderproof  Mac App Store flavor, sandboxed, the folder-access proof
 //                 (from out-proof/), with its own bundle ID. It shows the
 //                 system folder picker, so tests never launch it.
@@ -34,6 +35,7 @@ const FLAVORS = {
   release: { out: 'out', mas: false },
   'mas-release': { out: 'out', mas: true },
   'mas-selftest': { out: 'out-test', mas: true },
+  test: { out: 'out-test', mas: false },
   'mas-folderproof': { out: 'out-proof', mas: true, appId: FOLDER_PROOF_APP_ID },
 };
 
