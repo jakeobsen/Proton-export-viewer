@@ -53,7 +53,15 @@ export const networkBan = {
 
 export default tseslint.config(
   {
-    ignores: ['out/**', 'out-test/**', 'dist/**', 'build/**', 'node_modules/**', 'test-output/**'],
+    ignores: [
+      'out/**',
+      'out-test/**',
+      'out-proof/**',
+      'dist/**',
+      'build/**',
+      'node_modules/**',
+      'test-output/**',
+    ],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,

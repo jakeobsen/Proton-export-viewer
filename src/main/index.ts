@@ -15,8 +15,9 @@ import { createAppWindow } from './windows';
 
 process.umask(0o077);
 
-if (__PEV_TEST_HOOKS__ && process.platform === 'darwin') {
-  // Test runs stay in the background: no Dock icon and no activation.
+if (__PEV_TEST_HOOKS__ && !__PEV_FOLDER_PROOF__ && process.platform === 'darwin') {
+  // Test runs stay in the background: no Dock icon and no activation. The
+  // folder-proof build is the exception: it shows the system folder picker.
   app.setActivationPolicy('accessory');
 }
 

@@ -13,6 +13,7 @@ import type { CoreResult } from '../shared/core-protocol';
 import { errorData } from '../shared/log/schema';
 import { TESTHOOKS_MARKER, markLoaded } from './marker';
 import { TEST_PAGE, testRoute } from './pages';
+import { runControl, runFolderProof, type OpenDialog } from './proof/main';
 import { runSelfTest } from './selftest';
 
 markLoaded();
@@ -59,6 +60,9 @@ function seccompMode(pid: number): string | null {
 }
 
 export async function install(ctx: AppContext): Promise<boolean> {
+  // Only the folder-proof build uses the real folder picker; it is kept
+  // before the stubs replace it.
+  const realOpenDialog = dialog.showOpenDialog.bind(dialog) as OpenDialog;
   const dialogCalls: string[] = [];
   stubDialogs(dialogCalls);
   const windowEvents: string[] = [];
@@ -217,9 +221,14 @@ export async function install(ctx: AppContext): Promise<boolean> {
     mainReject: (markers: string) => {
       void Promise.reject(new Error(markers));
     },
+    folderProofControl: (first: string, second: string) => runControl(ctx, first, second),
   };
   (globalThis as { __pevTest?: typeof api }).__pevTest = api;
 
+  if (__PEV_FOLDER_PROOF__) {
+    await runFolderProof(ctx, realOpenDialog, () => [...dialogCalls]);
+    return true;
+  }
   const bench = await import('./bench/main');
   if (bench.benchRequested(process.argv)) {
     void bench.runBench(ctx, process.argv);

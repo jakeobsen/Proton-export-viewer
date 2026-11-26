@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The removal guard, on stand-in repositories under test-output/runs/.
 
-import { existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { chmodSync, existsSync, lstatSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { removeOutputDir, removeTestOutput } from '../../scripts/test-output.mjs';
 import { testDir } from '../paths';
@@ -111,4 +111,28 @@ describe('removeTestOutput', () => {
     expect(() => removeTestOutput(root)).not.toThrow();
     expect(existsSync(canary)).toBe(true);
   });
+
+  it.skipIf(process.getuid?.() === 0)(
+    'removes folders a failed test left read-only, never following a link',
+    () => {
+      const { root, outside, canary } = stage('read-only');
+      const output = join(root, 'test-output');
+      const deep = join(output, 'scratch', 'copy', 'run');
+      mkdirSync(deep, { recursive: true });
+      writeFileSync(join(deep, 'a.eml'), 'a');
+      symlinkSync(outside, join(deep, 'link'));
+      chmodSync(join(deep, 'a.eml'), 0o444);
+      for (const dir of [deep, dirname(deep), dirname(dirname(deep)), outside]) {
+        chmodSync(dir, 0o555);
+      }
+      try {
+        removeTestOutput(root);
+        expect(existsSync(output)).toBe(false);
+        expect(lstatSync(outside).mode & 0o777).toBe(0o555);
+        expect(existsSync(canary)).toBe(true);
+      } finally {
+        chmodSync(outside, 0o755);
+      }
+    },
+  );
 });
