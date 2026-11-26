@@ -19,6 +19,12 @@
 # records the digests of the program and the input it was given, the start
 # and end times, and the exit status.
 #
+# results/ and the test user's home (its state, temporary files and app
+# containers) share one size limit. It is checked before the launch, with
+# room kept for the launch's output, and every 5 seconds while the program
+# runs. Reaching it, or the time limit, stops the program and makes the
+# launch invalid: launch.txt says why, and the launcher exits 75.
+#
 # A test build is started with --pev-leak; the standard build also gets an
 # empty user data directory in the test user's home.
 
@@ -53,12 +59,14 @@ LEAK_HOME=/usr/local/var/pev-leak/home
 NODE=/opt/homebrew/bin/node
 # Limits: 10 minutes per launch, then SIGTERM and 10 s later SIGKILL; 64 KiB
 # of input; 8 MiB per file the program writes (ulimit -f counts 512-byte
-# blocks); the newest 60 result directories, at most 20 MiB in all.
+# blocks); the newest 60 result directories; 40 MiB for results/ and the test
+# user's home together, with 16 MiB of it free before each launch.
 MAX_SECONDS=600
 MAX_INPUT_BYTES=65536
 FILE_BLOCKS=16384
 KEEP_RESULTS=60
-RESULTS_CAP_KB=20480
+TRANSIENT_CAP_KB=40960
+HEADROOM_KB=16384
 
 fail() {
 	_code=$1
@@ -102,8 +110,28 @@ digest() {
 	fi
 }
 
-# Keeps the newest KEEP_RESULTS - 1 result directories, fewer if they pass
-# RESULTS_CAP_KB, so that the new one fits.
+# KiB used by results/ and the test user's home together. Fails when du
+# can't measure both.
+transient_kb() {
+	_out=$(/usr/bin/du -sk "$RESULTS_DIR" "$LEAK_HOME" 2>/dev/null || true)
+	_sum=0
+	_seen=0
+	while read -r _kb _path; do
+		case "$_kb" in
+		'' | *[!0-9]*) continue ;;
+		esac
+		_sum=$((_sum + _kb))
+		_seen=$((_seen + 1))
+	done <<EOF
+$_out
+EOF
+	[ "$_seen" -eq 2 ] || return 1
+	echo "$_sum"
+}
+
+# Keeps the newest KEEP_RESULTS - 1 result directories, fewer while results/
+# and the home together leave less than HEADROOM_KB below the limit, then
+# refuses if that room still isn't there.
 prune_results() {
 	set -f
 	_names=$(/bin/ls -1 "$RESULTS_DIR" | LC_ALL=C /usr/bin/sort)
@@ -114,9 +142,8 @@ prune_results() {
 	done
 	# shellcheck disable=SC2086 # one name per line, globbing is off
 	for _name in $_names; do
-		_kb=$(/usr/bin/du -sk "$RESULTS_DIR")
-		_kb=${_kb%%[!0-9]*}
-		if [ "$_count" -lt "$KEEP_RESULTS" ] && [ "$_kb" -le "$RESULTS_CAP_KB" ]; then
+		_kb=$(transient_kb) || fail 75 "can't measure $RESULTS_DIR and $LEAK_HOME"
+		if [ "$_count" -lt "$KEEP_RESULTS" ] && [ $((_kb + HEADROOM_KB)) -le "$TRANSIENT_CAP_KB" ]; then
 			break
 		fi
 		case "$_name" in
@@ -126,9 +153,10 @@ prune_results() {
 		_count=$((_count - 1))
 	done
 	set +f
-	_kb=$(/usr/bin/du -sk "$RESULTS_DIR")
-	_kb=${_kb%%[!0-9]*}
-	[ "$_kb" -le "$RESULTS_CAP_KB" ] || fail 75 "$RESULTS_DIR is over its size limit"
+	_kb=$(transient_kb) || fail 75 "can't measure $RESULTS_DIR and $LEAK_HOME"
+	if [ $((_kb + HEADROOM_KB)) -gt "$TRANSIENT_CAP_KB" ]; then
+		fail 75 "$RESULTS_DIR and $LEAK_HOME use $_kb KiB; a launch needs them under $((TRANSIENT_CAP_KB - HEADROOM_KB)) KiB"
+	fi
 }
 
 require_file() {
@@ -232,13 +260,25 @@ if [ "$STOP" = 1 ]; then
 	kill -TERM "$CHILD" 2>/dev/null || true
 fi
 
-# Stops the program at the time limit. It polls once a second and ends as
-# soon as the program has, so it leaves no process behind.
+# Stops the program at the time limit or the size limit and writes which one
+# to $OUT/invalid. It polls once a second, measures every 5 seconds, and ends
+# as soon as the program has, so it leaves no process behind.
 STARTED=$(/bin/date +%s)
 (
+	_tick=0
 	while alive "$CHILD"; do
+		_why=''
 		if [ $(($(/bin/date +%s) - STARTED)) -ge "$MAX_SECONDS" ]; then
-			: >"$OUT/timed-out"
+			_why='time limit reached'
+		elif [ $((_tick % 5)) -eq 4 ]; then
+			if ! _kb=$(transient_kb); then
+				_why='size limit could not be measured'
+			elif [ "$_kb" -gt "$TRANSIENT_CAP_KB" ]; then
+				_why="size limit reached ($_kb KiB)"
+			fi
+		fi
+		if [ -n "$_why" ]; then
+			echo "$_why" >"$OUT/invalid"
 			kill -TERM "$CHILD" 2>/dev/null
 			_m=0
 			while alive "$CHILD" && [ "$_m" -lt 10 ]; do
@@ -249,6 +289,7 @@ STARTED=$(/bin/date +%s)
 			exit 0
 		fi
 		/bin/sleep 1
+		_tick=$((_tick + 1))
 	done
 ) &
 WATCHDOG=$!
@@ -268,13 +309,14 @@ fi
 wait "$WATCHDOG" 2>/dev/null || true
 trap - TERM INT HUP
 
-if [ -e "$OUT/timed-out" ]; then
-	/bin/rm -f "$OUT/timed-out"
-	record timed_out=1
-else
-	record timed_out=0
-fi
 record "exit=$STATUS"
 record "ended=$(stamp)"
+if [ -f "$OUT/invalid" ]; then
+	_why=$(/bin/cat "$OUT/invalid")
+	/bin/rm -f "$OUT/invalid"
+	record "invalid=$_why"
+	echo "$NAME: invalid ($_why)"
+	exit 75
+fi
 echo "$NAME: exit $STATUS"
 exit "$STATUS"

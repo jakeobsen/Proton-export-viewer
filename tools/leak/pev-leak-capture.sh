@@ -7,6 +7,8 @@
 #   pev-leak-capture controls|zero|consent
 #
 # Runs as root through sudo, one capture at a time. For the phase it:
+#   - ends system agents that launchd left running as the test user, and
+#     refuses to start while any other process of that user runs;
 #   - loads a pf sub-anchor under com.apple/* that blocks and logs every TCP
 #     and UDP packet of the test user on every interface, loopback included
 #     (consent: TCP to the test address on port 80 is passed and logged);
@@ -14,10 +16,19 @@
 #     into pcap files in a root-owned directory, readable in place;
 #   - sends every .test name to the DNS stub at 127.0.0.1:5354;
 #   - consent only: adds the test address to lo0.
-# It prints "ready" once all of that is in place and runs until SIGTERM, which
-# completes the phase. Then it undoes every change it made. The time limit,
-# the capture size limit, a capture that stops, or anything else that goes
-# wrong marks the phase invalid in its status file.
+# It prints "ready" once all of that is in place and runs until SIGTERM. The
+# phase is complete only if, when SIGTERM arrives, it is within its time and
+# size limits and both captures still run, and if neither capture then
+# reports dropped packets. Anything else marks it invalid in its status file.
+#
+# Teardown first ends every process of the test user and lists them in the
+# phase directory. System agents (parent launchd, executable under
+# /usr/libexec, /usr/sbin or /System) are expected; any other process makes
+# the phase invalid. If a process survives, the block, the resolver file,
+# the address and the lock all stay in place for pev-leak-recover.
+#
+# Each change is recorded under run/ before it is made, with the phase it
+# belongs to, and its record is removed only once the change is undone.
 #
 # The argument only selects one of three fixed settings. It never becomes part
 # of a path or a command line.
@@ -79,11 +90,15 @@ fail() {
 	exit "$_code"
 }
 
+add_reason() {
+	REASON="${REASON:+$REASON; }$1"
+}
+
 [ "$(/usr/bin/id -u)" = "$ROOT_UID" ] || fail 77 'must run as root, through sudo'
 
 # Fails unless $1 exists as type $2 ("d" for a directory, "-" for a regular
-# file, so never a symbolic link), is owned by root and is not writable by
-# group or others.
+# file, so never a symbolic link), is owned by root, is not writable by
+# group or others, and has no access control list.
 require_root_owned() {
 	_entry=$(/bin/ls -ldn "$1" 2>/dev/null) || fail 78 "missing: $1"
 	set -f
@@ -96,6 +111,7 @@ require_root_owned() {
 	esac
 	case "$3" in
 	?????w* | ????????w*) fail 78 "writable by group or others: $1" ;;
+	*+) fail 78 "has an access control list: $1" ;;
 	esac
 	[ "$5" = "$ROOT_UID" ] || fail 78 "not owned by root: $1"
 }
@@ -191,6 +207,39 @@ read_test_address() {
 		fail 78 "$CONFIG_FILE: not a global unicast IP address"
 }
 
+# The test user's processes, one "pid ppid executable" line each.
+leak_processes() {
+	/bin/ps -U "$LEAK_USER" -o pid=,ppid=,comm= 2>/dev/null || true
+}
+
+# True when every line of $1 is a system agent: launchd (pid 1) is its
+# parent and its executable is under /usr/libexec, /usr/sbin or /System.
+only_system_agents() {
+	while read -r _pid _ppid _exe; do
+		[ -n "$_pid" ] || continue
+		[ "$_ppid" = 1 ] || return 1
+		case "$_exe" in
+		/usr/libexec/* | /usr/sbin/* | /System/*) ;;
+		*) return 1 ;;
+		esac
+	done <<EOF
+$1
+EOF
+	return 0
+}
+
+# Ends every process of the test user. Fails if one is still running after
+# 10 seconds.
+end_leak_processes() {
+	/usr/bin/pkill -KILL -U "$LEAK_USER" 2>/dev/null
+	_i=0
+	while [ -n "$(leak_processes)" ] && [ "$_i" -lt 10 ]; do
+		/bin/sleep 1
+		_i=$((_i + 1))
+	done
+	[ -z "$(leak_processes)" ]
+}
+
 # Sum of the phase's pcap sizes, in bytes.
 pcap_bytes() {
 	_total=0
@@ -232,6 +281,12 @@ note() {
 	echo "$1" >>"$PHASE_DIR/status"
 }
 
+# Records a change under run/ before it is made: the record holds the phase
+# (or the value pev-leak-recover needs to undo it).
+record() {
+	echo "$2" >"$RUN_DIR/$1"
+}
+
 wait_for_listening() {
 	_i=0
 	while [ "$_i" -lt "$READY_WAIT" ]; do
@@ -271,6 +326,39 @@ expected_rules() {
 	if [ "$CONSENT" = 1 ]; then echo 3; else echo 2; fi
 }
 
+# Stops one tcpdump and checks how it ended: a clean exit, and statistics
+# with no packets dropped. Adds a reason to the phase when not.
+stop_capture() {
+	_pid=$1
+	_log=$2
+	_name=$3
+	kill -TERM "$_pid" 2>/dev/null
+	_i=0
+	while alive "$_pid" && [ "$_i" -lt 5 ]; do
+		/bin/sleep 1
+		_i=$((_i + 1))
+	done
+	_killed=0
+	if alive "$_pid"; then
+		kill -KILL "$_pid" 2>/dev/null
+		_killed=1
+	fi
+	_status=0
+	wait "$_pid" 2>/dev/null || _status=$?
+	if [ "$_killed" = 1 ] || [ "$_status" != 0 ]; then
+		RESULT=invalid
+		add_reason "the $_name capture did not stop cleanly"
+	fi
+	_dropped=$(/usr/bin/sed -n 's/^\([0-9][0-9]*\) packets\{0,1\} dropped by kernel$/\1/p' "$_log" 2>/dev/null)
+	if [ -z "$_dropped" ]; then
+		RESULT=invalid
+		add_reason "the $_name capture reported no statistics"
+	elif [ "$_dropped" != 0 ]; then
+		RESULT=invalid
+		add_reason "the $_name capture dropped $_dropped packets"
+	fi
+}
+
 # --- Checks that change nothing ------------------------------------------
 
 require_root_owned "${BASE_DIR%/*/*}" d
@@ -299,7 +387,10 @@ echo "$$" >"$LOCK_DIR/pid"
 # Everything below is undone by cleanup(), which reverts only what this run
 # changed.
 READY=0
+STOP=''
+STARTED=$(/bin/date +%s)
 PHASE_DIR=''
+PHASE_ID=''
 PF_TOKEN=''
 ANCHOR_LOADED=0
 MADE_PFLOG=0
@@ -315,75 +406,98 @@ cleanup() {
 	trap '' INT TERM HUP
 	trap - EXIT
 	set +e
+	_errors=''
+
+	# A stop request completes the phase only within its limits and with both
+	# captures still running.
+	if [ -z "$RESULT" ] && [ "$STOP" = TERM ]; then
+		if [ $(($(/bin/date +%s) - STARTED)) -ge "$MAX_SECONDS" ]; then
+			add_reason 'time limit reached'
+		elif [ "$(pcap_bytes)" -ge "$PHASE_CAP_BYTES" ]; then
+			add_reason 'capture size limit reached'
+		elif ! alive "$PFLOG_PID" || ! alive "$STUB_PID"; then
+			add_reason 'a capture stopped before the end of the phase'
+		else
+			RESULT=complete
+		fi
+	fi
 	if [ -z "$RESULT" ]; then
 		RESULT=invalid
 		[ -n "$REASON" ] || REASON="stopped with exit status $_rc"
 	fi
-	_errors=''
 
-	# The block must stay until the test user runs nothing, or its traffic
-	# would leave unlogged once the anchor is gone.
-	if [ "$ANCHOR_LOADED" = 1 ] && /usr/bin/pgrep -U "$LEAK_USER" >/dev/null 2>&1; then
-		RESULT=invalid
-		REASON="${REASON:+$REASON; }$LEAK_USER still ran processes at teardown"
-		/usr/bin/pkill -KILL -U "$LEAK_USER"
-		_i=0
-		while /usr/bin/pgrep -U "$LEAK_USER" >/dev/null 2>&1 && [ "$_i" -lt 10 ]; do
-			/bin/sleep 1
-			_i=$((_i + 1))
-		done
-		if /usr/bin/pgrep -U "$LEAK_USER" >/dev/null 2>&1; then
-			_errors="$_errors $LEAK_USER-processes"
+	# The block stays until the test user runs nothing, or its traffic would
+	# leave unlogged once the anchor is gone.
+	_keep=0
+	if [ "$ANCHOR_LOADED" = 1 ]; then
+		_left=$(leak_processes)
+		if [ -n "$_left" ]; then
+			printf '%s\n' "$_left" >>"$PHASE_DIR/leftovers"
+			if ! only_system_agents "$_left"; then
+				RESULT=invalid
+				add_reason "$LEAK_USER ran processes other than system agents at teardown"
+			fi
+			if ! end_leak_processes; then
+				_keep=1
+				RESULT=invalid
+				add_reason "$LEAK_USER processes survived; the block stays until pev-leak-recover"
+			fi
 		fi
 	fi
 
-	for _pid in "$PFLOG_PID" "$STUB_PID"; do
-		[ -n "$_pid" ] || continue
-		kill -TERM "$_pid" 2>/dev/null
-	done
-	for _pid in "$PFLOG_PID" "$STUB_PID"; do
-		[ -n "$_pid" ] || continue
-		_i=0
-		while alive "$_pid" && [ "$_i" -lt 5 ]; do
-			/bin/sleep 1
-			_i=$((_i + 1))
-		done
-		if alive "$_pid"; then
-			kill -KILL "$_pid" 2>/dev/null
-		fi
-		wait "$_pid" 2>/dev/null
-	done
+	if [ -n "$PFLOG_PID" ]; then
+		stop_capture "$PFLOG_PID" "$PHASE_DIR/pflog0.log" pflog0
+	fi
+	if [ -n "$STUB_PID" ]; then
+		stop_capture "$STUB_PID" "$PHASE_DIR/stub.log" lo0
+	fi
 	/bin/rm -f "$RUN_DIR/tcpdump-pids"
 
-	if [ "$ANCHOR_LOADED" = 1 ]; then
-		/sbin/pfctl -a "$ANCHOR" -F rules >/dev/null 2>&1 || _errors="$_errors anchor"
-	fi
-	if [ -n "$PF_TOKEN" ]; then
-		if /sbin/pfctl -X "$PF_TOKEN" >/dev/null 2>&1; then
-			/bin/rm -f "$RUN_DIR/pf-token"
-		else
-			_errors="$_errors pf-token"
+	if [ "$_keep" = 1 ]; then
+		_errors=' test-user-processes'
+	else
+		if [ "$ANCHOR_LOADED" = 1 ]; then
+			if /sbin/pfctl -a "$ANCHOR" -F rules >/dev/null 2>&1; then
+				/bin/rm -f "$RUN_DIR/anchor"
+			else
+				_errors="$_errors anchor"
+			fi
 		fi
-	fi
-	if [ "$MADE_ALIAS" = 1 ]; then
-		if /sbin/ifconfig lo0 "$FAMILY" "$TEST_ADDRESS" -alias; then
-			/bin/rm -f "$RUN_DIR/alias"
-		else
-			_errors="$_errors alias"
+		if [ -n "$PF_TOKEN" ]; then
+			if /sbin/pfctl -X "$PF_TOKEN" >/dev/null 2>&1; then
+				/bin/rm -f "$RUN_DIR/pf-token"
+			else
+				_errors="$_errors pf-token"
+			fi
 		fi
-	fi
-	if [ "$MADE_RESOLVER" = 1 ]; then
-		/bin/rm -f "$RESOLVER_FILE" || _errors="$_errors resolver-file"
-	fi
-	if [ "$MADE_RESOLVER_DIR" = 1 ]; then
-		/bin/rmdir "$RESOLVER_DIR" 2>/dev/null
-		/bin/rm -f "$RUN_DIR/created-resolver-dir"
-	fi
-	if [ "$MADE_PFLOG" = 1 ]; then
-		if /sbin/ifconfig pflog0 destroy; then
-			/bin/rm -f "$RUN_DIR/created-pflog0"
-		else
-			_errors="$_errors pflog0"
+		if [ "$MADE_ALIAS" = 1 ]; then
+			if /sbin/ifconfig lo0 "$FAMILY" "$TEST_ADDRESS" -alias; then
+				/bin/rm -f "$RUN_DIR/alias"
+			else
+				_errors="$_errors alias"
+			fi
+		fi
+		if [ "$MADE_RESOLVER" = 1 ]; then
+			if /bin/rm -f "$RESOLVER_FILE"; then
+				/bin/rm -f "$RUN_DIR/created-resolver-file"
+			else
+				_errors="$_errors resolver-file"
+			fi
+		fi
+		if [ "$MADE_RESOLVER_DIR" = 1 ]; then
+			/bin/rmdir "$RESOLVER_DIR" 2>/dev/null
+			if [ -d "$RESOLVER_DIR" ] && [ -z "$(/bin/ls -A "$RESOLVER_DIR")" ]; then
+				_errors="$_errors resolver-dir"
+			else
+				/bin/rm -f "$RUN_DIR/created-resolver-dir"
+			fi
+		fi
+		if [ "$MADE_PFLOG" = 1 ]; then
+			if /sbin/ifconfig pflog0 destroy; then
+				/bin/rm -f "$RUN_DIR/created-pflog0"
+			else
+				_errors="$_errors pflog0"
+			fi
 		fi
 	fi
 
@@ -394,11 +508,12 @@ cleanup() {
 		note "ended=$(stamp)"
 		/bin/chmod 0644 "$PHASE_DIR"/* 2>/dev/null
 	fi
-	/bin/rm -f "$RUN_DIR/phase-dir"
-	/bin/rm -rf "$LOCK_DIR"
 
 	if [ -n "$_errors" ]; then
-		echo "pev-leak-capture: cleanup failed for:$_errors; run pev-leak-recover" >&2
+		echo "pev-leak-capture: cleanup left:$_errors; run pev-leak-recover" >&2
+	else
+		/bin/rm -f "$RUN_DIR/phase-dir"
+		/bin/rm -rf "$LOCK_DIR"
 	fi
 	echo "pev-leak-capture: $RESULT${REASON:+ ($REASON)}"
 	if [ "$RESULT" = complete ] && [ -z "$_errors" ]; then
@@ -412,7 +527,7 @@ cleanup() {
 on_signal() {
 	if [ -z "$RESULT" ]; then
 		if [ "$1" = TERM ] && [ "$READY" = 1 ]; then
-			RESULT=complete
+			STOP=TERM
 		else
 			RESULT=invalid
 			REASON="SIG$1 before the phase completed"
@@ -432,7 +547,8 @@ fi
 if [ -e "$RESOLVER_FILE" ] || [ -L "$RESOLVER_FILE" ]; then
 	fail 75 "$RESOLVER_FILE exists; remove it or run pev-leak-recover"
 fi
-if /usr/bin/pgrep -U "$LEAK_USER" >/dev/null 2>&1; then
+BEFORE=$(leak_processes)
+if [ -n "$BEFORE" ] && ! only_system_agents "$BEFORE"; then
 	fail 75 "$LEAK_USER is running processes; a phase starts with none"
 fi
 if [ "$CONSENT" = 1 ] && /sbin/ifconfig -a | /usr/bin/grep -Fq "$FAMILY $TEST_ADDRESS "; then
@@ -443,14 +559,21 @@ if ! /sbin/pfctl -s rules 2>/dev/null | /usr/bin/grep -Fqx 'anchor "com.apple/*"
 fi
 
 prune_captures
-PHASE_DIR=$CAPTURE_DIR/$(/bin/date -u +%Y%m%dT%H%M%SZ)-$PHASE-$$
+PHASE_ID=$(/bin/date -u +%Y%m%dT%H%M%SZ)-$PHASE-$$
+PHASE_DIR=$CAPTURE_DIR/$PHASE_ID
 /bin/mkdir -m 0755 "$PHASE_DIR"
-echo "$PHASE_DIR" >"$RUN_DIR/phase-dir"
+record phase-dir "$PHASE_DIR"
 note "phase=$PHASE"
 note "started=$(stamp)"
 STARTED=$(/bin/date +%s)
 
-# --- Changes, each recorded under RUN_DIR for pev-leak-recover -------------
+# System agents from an earlier launch end before the phase starts.
+if [ -n "$BEFORE" ]; then
+	printf '%s\n' "$BEFORE" >>"$PHASE_DIR/ended-before-start"
+	end_leak_processes || fail 75 "$LEAK_USER system agents did not end"
+fi
+
+# --- Changes, each recorded under run/ for pev-leak-recover ----------------
 
 _out=$(/sbin/pfctl -E 2>&1) || fail 1 "pfctl -E failed: $_out"
 PF_TOKEN=$(printf '%s\n' "$_out" | /usr/bin/sed -n 's/^Token *: *\([0-9][0-9]*\) *$/\1/p')
@@ -460,13 +583,14 @@ case "$PF_TOKEN" in
 	fail 1 'pfctl -E printed no token'
 	;;
 esac
-echo "$PF_TOKEN" >"$RUN_DIR/pf-token"
+record pf-token "$PF_TOKEN"
 
 RULES="block out log quick proto { tcp udp } from any to any user $LEAK_USER"
 if [ "$CONSENT" = 1 ]; then
 	RULES="pass out log quick $FAMILY proto tcp from any to $TEST_ADDRESS port 80 user $LEAK_USER
 $RULES"
 fi
+record anchor "$PHASE_ID"
 ANCHOR_LOADED=1
 if ! printf '%s\n' "$RULES" | /sbin/pfctl -a "$ANCHOR" -f - 2>>"$PHASE_DIR/pfctl.log"; then
 	fail 1 'loading the anchor failed'
@@ -477,24 +601,29 @@ if [ "$_loaded" != "$(expected_rules)" ]; then
 fi
 
 if ! /sbin/ifconfig pflog0 >/dev/null 2>&1; then
-	: >"$RUN_DIR/created-pflog0"
+	record created-pflog0 "$PHASE_ID"
 	MADE_PFLOG=1
 	/sbin/ifconfig pflog0 create
 fi
 
 if [ ! -d "$RESOLVER_DIR" ]; then
-	: >"$RUN_DIR/created-resolver-dir"
+	record created-resolver-dir "$PHASE_ID"
 	MADE_RESOLVER_DIR=1
 	/bin/mkdir -m 0755 "$RESOLVER_DIR"
 fi
-(
+record created-resolver-file "$PHASE_ID"
+if (
 	set -C
 	printf 'nameserver 127.0.0.1\nport %s\n' "$STUB_PORT" >"$RESOLVER_FILE"
-)
-MADE_RESOLVER=1
+); then
+	MADE_RESOLVER=1
+else
+	/bin/rm -f "$RUN_DIR/created-resolver-file"
+	fail 75 "$RESOLVER_FILE appeared while the phase was starting"
+fi
 
 if [ "$CONSENT" = 1 ]; then
-	echo "$TEST_ADDRESS" >"$RUN_DIR/alias"
+	record alias "$TEST_ADDRESS"
 	MADE_ALIAS=1
 	if [ "$FAMILY" = inet ]; then
 		/sbin/ifconfig lo0 inet "$TEST_ADDRESS" netmask 255.255.255.255 alias
@@ -509,7 +638,7 @@ PFLOG_PID=$!
 /usr/sbin/tcpdump -n -p -U -s "$SNAPLEN" -c "$MAX_PACKETS" -i lo0 \
 	-w "$PHASE_DIR/stub.pcap" "port $STUB_PORT" 2>"$PHASE_DIR/stub.log" &
 STUB_PID=$!
-echo "$PFLOG_PID $STUB_PID" >"$RUN_DIR/tcpdump-pids"
+record tcpdump-pids "$PFLOG_PID $STUB_PID"
 
 # --- Readiness --------------------------------------------------------------
 
