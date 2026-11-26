@@ -174,7 +174,10 @@ test('a message opens as plain text, served by mail-body: with its body headers'
 test('a stale openId or generation installs no view', async ({ pev }) => {
   await source(pev, { 'plain.eml': PLAIN }, [
     [1, { file: 'plain.eml' }],
-    [2, { file: 'plain.eml' }],
+    // Found a little later, so the older open's result always reaches main
+    // first and main's own check discards it. (When the newer one is found
+    // first, the reader lane drops the older one; another test covers that.)
+    [2, { file: 'plain.eml', delayMs: 300 }],
   ]);
   const held = async () => (await pev.main<{ value: number }>('core', 'held')).value;
 
