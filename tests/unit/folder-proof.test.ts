@@ -3,6 +3,7 @@
 
 import { createHash } from 'node:crypto';
 import {
+  chmodSync,
   existsSync,
   lutimesSync,
   mkdirSync,
@@ -13,6 +14,8 @@ import {
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  allAsExpected,
+  asExpected,
   changeOps,
   exportTargets,
   isDenial,
@@ -85,26 +88,65 @@ describe('readFile', () => {
 });
 
 describe('changeOps', () => {
-  it('changes the files where it may, and gives the error code where it fails', () => {
+  const targetsIn = (run: string) => ({
+    write: join(run, 'a.eml'),
+    create: join(run, 'new.created'),
+    rename: join(run, 'a.metadata.json'),
+    remove: join(run, 'a.eml'),
+  });
+  const ok = { ok: true, code: null };
+
+  it('changes the files where it may, and ends at the first change that fails', () => {
     const run = testDir('proof-ops');
     pairs(run, ['a']);
-    const targets = {
-      write: join(run, 'a.eml'),
-      create: join(run, 'new.created'),
-      rename: join(run, 'a.metadata.json'),
-      remove: join(run, 'a.eml'),
-    };
-    const ok = { ok: true, code: null };
-    expect(changeOps(targets)).toEqual({ write: ok, create: ok, rename: ok, remove: ok });
+    const targets = targetsIn(run);
+    expect(changeOps(targets, 'allowed')).toEqual({
+      write: ok,
+      create: ok,
+      rename: ok,
+      remove: ok,
+    });
     expect(existsSync(targets.create)).toBe(true);
     expect(existsSync(`${targets.rename}.renamed`)).toBe(true);
     expect(existsSync(targets.remove)).toBe(false);
-    expect(changeOps(targets)).toEqual({
+    expect(changeOps(targets, 'allowed')).toEqual({
       write: { ok: false, code: 'ENOENT' },
-      create: { ok: false, code: 'EEXIST' },
-      rename: { ok: false, code: 'ENOENT' },
-      remove: { ok: false, code: 'ENOENT' },
+      create: null,
+      rename: null,
+      remove: null,
     });
+  });
+
+  it('ends at the first change that is not denied, before trying the others', () => {
+    const run = testDir('proof-ops-open');
+    pairs(run, ['a']);
+    const targets = targetsIn(run);
+    expect(changeOps(targets, 'denied')).toEqual({
+      write: ok,
+      create: null,
+      rename: null,
+      remove: null,
+    });
+    expect(existsSync(targets.create)).toBe(false);
+    expect(existsSync(targets.rename)).toBe(true);
+    expect(existsSync(targets.remove)).toBe(true);
+  });
+
+  it.skipIf(process.getuid?.() === 0)('gives every denial with its own code', () => {
+    const run = testDir('proof-ops-denied');
+    pairs(run, ['a']);
+    const targets = targetsIn(run);
+    chmodSync(targets.write, 0o444);
+    chmodSync(run, 0o555);
+    try {
+      const denied = { ok: false, code: 'EACCES' };
+      const ops = changeOps(targets, 'denied');
+      expect(ops).toEqual({ write: denied, create: denied, rename: denied, remove: denied });
+      expect(allAsExpected(ops, 'denied')).toBe(true);
+      expect(allAsExpected(ops, 'allowed')).toBe(false);
+    } finally {
+      chmodSync(run, 0o755);
+    }
   });
 
   it('counts only EPERM and EACCES as a denial', () => {
@@ -113,6 +155,18 @@ describe('changeOps', () => {
     expect(isDenial({ ok: false, code: 'ENOENT' })).toBe(false);
     expect(isDenial({ ok: false, code: 'EROFS' })).toBe(false);
     expect(isDenial({ ok: true, code: null })).toBe(false);
+    expect(isDenial(null)).toBe(false);
+  });
+
+  it('counts a check that never ran as not as expected', () => {
+    const denied = { ok: false, code: 'EPERM' };
+    expect(asExpected(null, 'denied')).toBe(false);
+    expect(asExpected(null, 'allowed')).toBe(false);
+    expect(asExpected(ok, 'allowed')).toBe(true);
+    expect(asExpected(denied, 'allowed')).toBe(false);
+    expect(
+      allAsExpected({ write: denied, create: denied, rename: denied, remove: null }, 'denied'),
+    ).toBe(false);
   });
 });
 

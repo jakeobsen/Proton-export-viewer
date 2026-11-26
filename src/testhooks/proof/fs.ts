@@ -20,7 +20,9 @@ import {
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type {
+  ProofExpect,
   ProofFileRead,
+  ProofOpName,
   ProofOps,
   ProofOutcome,
   ProofScan,
@@ -54,9 +56,18 @@ export function attempt(fn: () => void): ProofOutcome {
 }
 
 /** True for the errors a sandbox denial gives: EPERM or EACCES. */
-export function isDenial(outcome: ProofOutcome): boolean {
-  return !outcome.ok && (outcome.code === 'EPERM' || outcome.code === 'EACCES');
+export function isDenial(outcome: ProofOutcome | null): boolean {
+  return outcome !== null && !outcome.ok && (outcome.code === 'EPERM' || outcome.code === 'EACCES');
 }
+
+/** True if `outcome` is what `expect` asks for: a denial, or a success. */
+export function asExpected(outcome: ProofOutcome | null, expect: ProofExpect): boolean {
+  if (outcome === null) return false;
+  return expect === 'denied' ? isDenial(outcome) : outcome.ok;
+}
+
+/** The change checks, in the order they run. */
+export const PROOF_OPS: readonly ProofOpName[] = ['write', 'create', 'rename', 'remove'];
 
 /**
  * Every entry below `root`, depth first, names in byte order. Symbolic links
@@ -131,25 +142,39 @@ export function readFile(path: string): ProofFileRead {
 }
 
 /**
- * The four changes the proof expects the sandbox to deny inside an export:
- * append to an existing file, create a new file, rename a file and delete a
- * file. Where they succeed (the unsandboxed control), they really change the
+ * The four changes the proof expects the sandbox to deny inside an export, in
+ * this order: append to an existing file, create a new file, rename a file and
+ * delete a file. They run one at a time, and the first outcome that is not
+ * what `expect` asks for ends them: the later ones stay null and never run.
+ * Where they succeed (the unsandboxed control), they really change the
  * folder, so they only ever run on a sacrificial pair or a scratch copy.
  */
-export function changeOps(targets: ProofTargets): ProofOps {
-  return {
-    write: attempt(() => {
+export function changeOps(targets: ProofTargets, expect: ProofExpect): ProofOps {
+  const run: Record<ProofOpName, () => void> = {
+    write: () => {
       const fd = openSync(targets.write, 'r+');
       try {
         writeSync(fd, '\n', fstatSync(fd).size);
       } finally {
         closeSync(fd);
       }
-    }),
-    create: attempt(() => writeFileSync(targets.create, 'created\n', { flag: 'wx' })),
-    rename: attempt(() => renameSync(targets.rename, `${targets.rename}.renamed`)),
-    remove: attempt(() => unlinkSync(targets.remove)),
+    },
+    create: () => writeFileSync(targets.create, 'created\n', { flag: 'wx' }),
+    rename: () => renameSync(targets.rename, `${targets.rename}.renamed`),
+    remove: () => unlinkSync(targets.remove),
   };
+  const ops: ProofOps = { write: null, create: null, rename: null, remove: null };
+  for (const name of PROOF_OPS) {
+    const outcome = attempt(run[name]);
+    ops[name] = outcome;
+    if (!asExpected(outcome, expect)) break;
+  }
+  return ops;
+}
+
+/** True if every change check ran and gave what `expect` asks for. */
+export function allAsExpected(ops: ProofOps, expect: ProofExpect): boolean {
+  return PROOF_OPS.every((name) => asExpected(ops[name], expect));
 }
 
 export interface ExportTargets {

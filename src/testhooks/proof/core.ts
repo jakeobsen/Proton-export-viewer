@@ -33,7 +33,7 @@ export async function handleProof(request: ProofRequest, deps: CoreProofDeps): P
       };
       break;
     case 'ops':
-      proof = { action: 'ops', pid: process.pid, ops: changeOps(call.targets) };
+      proof = { action: 'ops', pid: process.pid, ops: changeOps(call.targets, call.expect) };
       break;
     case 'read':
       proof = { action: 'read', pid: process.pid, read: readFile(call.path) };

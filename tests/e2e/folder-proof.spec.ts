@@ -7,37 +7,45 @@
 // PEV_PROOF_EXPORTS="<first>:<second>" names two generated exports, each with
 // its manifest next to it (<export>.manifest.json). They are copied into one
 // fixed scratch folder, replaced on every run, and must match their manifests
-// before and after. Without it, the test makes two small exports itself.
+// before and after, whatever the outcome. Without it, the test makes two
+// small exports itself.
 
 import { createHash } from 'node:crypto';
-import {
-  cpSync,
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs';
-import { basename, join } from 'node:path';
-import { scanTree } from '../../src/testhooks/proof/fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { basename, join, sep } from 'node:path';
+import { overlaps } from '../../scripts/folder-proof-exports.mjs';
+import { removeOutputDir } from '../../scripts/test-output.mjs';
 import type { ProofFileRead, ProofOps, ProofScan } from '../../src/shared/core-protocol';
+import { scanTree } from '../../src/testhooks/proof/fs';
+import { copyTree } from '../copy-tree';
 import { TEST_OUTPUT, testDir } from '../paths';
 import { expect, test } from './app';
 
 const SCRATCH = join(TEST_OUTPUT, 'folder-proof-control');
+/** Bytes of file content per scratch copy. */
+const COPY_CAP = 20_000_000;
+
+interface Read {
+  corePid: number;
+  scan: ProofScan;
+  worker: ProofFileRead[] | null;
+  main: ProofFileRead[];
+}
+
+interface Change {
+  targets: { main: Record<string, string>; core: Record<string, string> };
+  main: ProofOps;
+  core: ProofOps | null;
+}
 
 interface ControlResult {
-  read: { corePid: number; scan: ProofScan; worker: ProofFileRead[] | null };
-  change: {
-    targets: { main: Record<string, string>; core: Record<string, string> };
-    main: ProofOps;
-    core: ProofOps;
-  };
+  read: Read;
+  change: Change;
   corePidBefore: number | undefined;
   corePidAfter: number | undefined;
-  secondRead: { corePid: number; scan: ProofScan; worker: ProofFileRead[] | null };
+  secondRead: Read;
   firstExport: { file: string; core: ProofFileRead; main: ProofFileRead };
+  secondChange: Change;
 }
 
 /** A small export: one account, one run folder, labels and `pairs` messages. */
@@ -67,57 +75,90 @@ function manifestDigest(original: string): string {
   return manifest.digest;
 }
 
-test('the proof operations all succeed without the sandbox', async ({ pev }) => {
-  const named = process.env.PEV_PROOF_EXPORTS?.split(':');
-  const originals = named
-    ? named
-    : (() => {
-        const dir = testDir('folder-proof-originals');
-        return [makeExport(join(dir, 'first'), 4), makeExport(join(dir, 'second'), 5)];
-      })();
-  expect(originals).toHaveLength(2);
-  const expected = named ? originals.map(manifestDigest) : originals.map((o) => scanTree(o).digest);
-  expect(originals.map((o) => scanTree(o).digest)).toEqual(expected);
+const digestOf = (folder: string) => scanTree(folder).digest;
 
-  // One fixed scratch folder, replaced on every run. A link there is refused.
-  if (existsSync(SCRATCH)) {
-    expect(lstatSync(SCRATCH).isSymbolicLink()).toBe(false);
-    rmSync(SCRATCH, { recursive: true, force: true });
-  }
-  const copies = originals.map((o, i) => join(SCRATCH, `${i + 1}-${basename(o)}`));
-  originals.forEach((o, i) => cpSync(o, copies[i]!, { recursive: true, preserveTimestamps: true }));
-  const copyDigests = copies.map((c) => scanTree(c).digest);
-
-  const result = await pev.main<ControlResult>('folderProofControl', copies[0], copies[1]);
-
-  // Step 1: core walked and read the whole first copy; its worker read a pair.
-  expect(result.read.scan).toMatchObject({ ok: true, digest: copyDigests[0] });
-  expect(result.read.worker?.map((r) => [r.ok, r.sha256])).toEqual(
-    result.read.worker?.map((r) => [true, sha256(r.path)]),
-  );
-  expect(result.read.worker).toHaveLength(2);
-
-  // Step 2: every change succeeds, from main and from core, and really happened.
-  for (const ops of [result.change.main, result.change.core]) {
-    expect(Object.values(ops)).toEqual(Array(4).fill({ ok: true, code: null }));
-  }
-  for (const targets of [result.change.targets.main, result.change.targets.core]) {
+/** Every change succeeded, from main and core, really happened, and stayed in `copy`. */
+function expectChanged(change: Change, copy: string) {
+  const ok = { ok: true, code: null };
+  expect(change.main).toEqual({ write: ok, create: ok, rename: ok, remove: ok });
+  expect(change.core).toEqual({ write: ok, create: ok, rename: ok, remove: ok });
+  for (const targets of [change.targets.main, change.targets.core]) {
+    for (const target of Object.values(targets)) expect(target.startsWith(copy + sep)).toBe(true);
     expect(existsSync(targets.create!)).toBe(true);
     expect(existsSync(`${targets.rename}.renamed`)).toBe(true);
     expect(existsSync(targets.remove!)).toBe(false);
   }
+}
 
-  // Step 4: after a core restart, core reads the second copy and a file of the first.
-  expect(result.corePidBefore).toBeGreaterThan(0);
-  expect(result.corePidAfter).toBeGreaterThan(0);
-  expect(result.corePidAfter).not.toBe(result.corePidBefore);
-  expect(result.secondRead.scan).toMatchObject({ ok: true, digest: copyDigests[1] });
-  expect(result.firstExport.core).toMatchObject({
-    ok: true,
-    sha256: sha256(result.firstExport.file),
-  });
-  expect(result.firstExport.main.ok).toBe(true);
+/** Core read the whole copy, and its worker read the pair as main did. */
+function expectRead(read: Read, digest: string | null) {
+  expect(read.scan).toMatchObject({ ok: true, digest });
+  expect(read.worker).toHaveLength(2);
+  expect(read.worker?.map((r) => [r.ok, r.sha256])).toEqual(
+    read.main.map((r) => [true, sha256(r.path)]),
+  );
+}
 
-  // The originals are untouched.
-  expect(originals.map((o) => scanTree(o).digest)).toEqual(expected);
+test('the proof operations all succeed without the sandbox', async ({ pev }) => {
+  const named = process.env.PEV_PROOF_EXPORTS?.split(':');
+  const originals = (
+    named ??
+    (() => {
+      const dir = testDir('folder-proof-originals');
+      return [makeExport(join(dir, 'first'), 4), makeExport(join(dir, 'second'), 5)];
+    })()
+  ).map((o) => realpathSync(o));
+  expect(originals).toHaveLength(2);
+  const [first, second] = originals as [string, string];
+  const expected = named ? named.map(manifestDigest) : originals.map(digestOf);
+
+  // Nothing here may touch an original: neither lies in or around the scratch
+  // folder (checked before it is removed), nor in or around the other.
+  mkdirSync(TEST_OUTPUT, { recursive: true });
+  const physicalScratch = join(realpathSync(TEST_OUTPUT), basename(SCRATCH));
+  for (const original of originals) {
+    expect(overlaps(original, physicalScratch), `${original} and the scratch folder`).toBe(false);
+  }
+  expect(overlaps(first, second), 'the two originals').toBe(false);
+  expect(originals.map(digestOf)).toEqual(expected);
+
+  try {
+    // One fixed scratch folder, replaced on every run, removed only through
+    // the guard that refuses links on the way.
+    removeOutputDir(TEST_OUTPUT, SCRATCH);
+    expect(existsSync(SCRATCH)).toBe(false);
+    mkdirSync(SCRATCH);
+    const [copyA, copyB] = originals.map((o, i) => join(SCRATCH, `${i + 1}-${basename(o)}`)) as [
+      string,
+      string,
+    ];
+    copyTree(first, copyA, COPY_CAP);
+    copyTree(second, copyB, COPY_CAP);
+    expect([copyA, copyB].map(digestOf)).toEqual(expected);
+
+    const result = await pev.main<ControlResult>('folderProofControl', copyA, copyB);
+
+    // Steps 1 and 2 on copy A.
+    expectRead(result.read, expected[0]!);
+    expectChanged(result.change, copyA);
+
+    // Step 4: after a core restart, core reads copy B and a file of copy A,
+    // and main and core change copy B too.
+    expect(result.corePidBefore).toBeGreaterThan(0);
+    expect(result.corePidAfter).toBeGreaterThan(0);
+    expect(result.corePidAfter).not.toBe(result.corePidBefore);
+    expectRead(result.secondRead, expected[1]!);
+    expect(result.firstExport.file.startsWith(copyA + sep)).toBe(true);
+    expect(result.firstExport.core).toMatchObject({
+      ok: true,
+      sha256: sha256(result.firstExport.file),
+    });
+    expect(result.firstExport.main.ok).toBe(true);
+    expectChanged(result.secondChange, copyB);
+  } finally {
+    expect
+      .soft(originals.map(digestOf), 'the originals still match their manifests')
+      .toEqual(expected);
+  }
+  if (test.info().errors.length === 0) removeOutputDir(TEST_OUTPUT, SCRATCH);
 });

@@ -10,6 +10,13 @@ declare const __PEV_TEST_HOOKS__: boolean;
  */
 declare const __PEV_FOLDER_PROOF__: boolean;
 
+/**
+ * The folder-proof build's accepted exports, as JSON: [{ path, digest }] with
+ * each folder's physical path and manifest digest, first and second. "[]" in
+ * every other build.
+ */
+declare const __PEV_FOLDER_PROOF_EXPORTS__: string;
+
 /** True only when running under the Vite dev server. */
 declare const __PEV_DEV__: boolean;
 

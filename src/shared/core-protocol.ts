@@ -64,12 +64,18 @@ export interface ProofTargets {
   remove: string;
 }
 
-export interface ProofOps {
-  write: ProofOutcome;
-  create: ProofOutcome;
-  rename: ProofOutcome;
-  remove: ProofOutcome;
-}
+/** The change checks; they run in this order. */
+export type ProofOpName = 'write' | 'create' | 'rename' | 'remove';
+
+/**
+ * What the change checks expect: the sandbox denies them, or (in the
+ * unsandboxed control) they succeed. The first outcome that differs ends the
+ * checks.
+ */
+export type ProofExpect = 'denied' | 'allowed';
+
+/** Each change check's outcome; null for the checks after the first unexpected one. */
+export type ProofOps = Record<ProofOpName, ProofOutcome | null>;
 
 /** A walk of a whole folder, with the digest of every entry (see the proof tree module). */
 export interface ProofScan extends ProofOutcome {
@@ -81,7 +87,7 @@ export interface ProofScan extends ProofOutcome {
 /** Folder-access proof calls, handled by core in builds with test hooks only. */
 export type ProofCall =
   | { action: 'scan'; root: string; reads: string[] }
-  | { action: 'ops'; targets: ProofTargets }
+  | { action: 'ops'; targets: ProofTargets; expect: ProofExpect }
   | { action: 'read'; path: string };
 
 export type ProofReply =
