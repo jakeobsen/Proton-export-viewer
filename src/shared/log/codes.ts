@@ -45,6 +45,7 @@ export const TEST_LOG_CODES = [
   'test.error',
   'test.selftest',
   'test.folder_proof',
+  'test.crash_refused',
 ] as const;
 
 export type LogCode = (typeof LOG_CODES)[number] | (typeof TEST_LOG_CODES)[number];

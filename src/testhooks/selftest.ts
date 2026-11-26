@@ -6,6 +6,11 @@
 //            --pev-selftest-nonce=<hex value echoed into the result>
 // The result goes to selftest-result-<nonce>.json, so concurrent runs that share
 // a sandbox container never overwrite each other's result.
+//
+// Besides the end state (shownWindows), the result carries the record of every
+// show and focus event during the run (windowEvents, which must be empty), and
+// a probe of the recorder on the self-test's own window (recorderProbe: one
+// show and one focus for that window), which proves the record was connected.
 
 import { once } from 'node:events';
 import { writeFileSync } from 'node:fs';
@@ -16,6 +21,7 @@ import type { AppContext } from '../main/context';
 import { bodyUrl } from '../main/views';
 import { createAppWindow } from '../main/windows';
 import { markLoaded } from './marker';
+import type { WindowEvent, WindowEventRecorder } from './window-events';
 
 markLoaded();
 
@@ -62,7 +68,11 @@ export function resultFileName(nonce: string | null): string {
     : 'selftest-result.json';
 }
 
-export async function runSelfTest(ctx: AppContext, argv: string[]): Promise<void> {
+export async function runSelfTest(
+  ctx: AppContext,
+  argv: string[],
+  recorder: WindowEventRecorder,
+): Promise<void> {
   const result = {
     nonce: argValue(argv, 'pev-selftest-nonce') ?? null,
     sandboxed: process.mas === true,
@@ -74,9 +84,12 @@ export async function runSelfTest(ctx: AppContext, argv: string[]): Promise<void
     connect: { ok: false, code: 'NOT_RUN' } as Outcome,
     error: null as string | null,
     shownWindows: 0,
+    windowEvents: [] as WindowEvent[],
+    recorderProbe: [] as WindowEvent[],
   };
   try {
     const appWin = createAppWindow(ctx, { show: false });
+    result.recorderProbe = recorder.probe(appWin.win);
     if (appWin.win.webContents.isLoading()) await once(appWin.win.webContents, 'did-finish-load');
 
     const ping = await ctx.core.request({ type: 'ping' });
@@ -105,6 +118,7 @@ export async function runSelfTest(ctx: AppContext, argv: string[]): Promise<void
   result.shownWindows = BrowserWindow.getAllWindows().filter(
     (w) => w.isVisible() || w.isFocused(),
   ).length;
+  result.windowEvents = recorder.events();
   writeFileSync(
     join(app.getPath('userData'), resultFileName(result.nonce)),
     JSON.stringify(result, null, 2),
