@@ -1,0 +1,268 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+.rp {
+  --rp-warn: #94570a;
+  --rp-warn-soft: #fff5e0;
+  --rp-warn-border: #efcf93;
+  --rp-danger: #c0262e;
+  --rp-danger-soft: #fdeeee;
+  --rp-danger-border: #f0c0c3;
+  --rp-accent-soft: #ece8ff;
+  --rp-accent-text: #5b3fd9;
+  --rp-hover: #ececf1;
+  --rp-box: #f0f0f4;
+
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+@media (prefers-color-scheme: dark) {
+  .rp {
+    --rp-warn: #f2b85c;
+    --rp-warn-soft: #30250f;
+    --rp-warn-border: #5d4821;
+    --rp-danger: #ff8a90;
+    --rp-danger-soft: #371b20;
+    --rp-danger-border: #6b3038;
+    --rp-accent-soft: #2a2356;
+    --rp-accent-text: #b8a8ff;
+    --rp-hover: #2a2933;
+    --rp-box: #18171d;
+  }
+}
+
+.rp-icon {
+  flex: none;
+}
+
+.rp-head {
+  padding: 16px 22px 4px;
+}
+
+.rp-subject {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 650;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.rp-sender {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 22px 0;
+}
+
+.rp-avatar {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.rp-name {
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rp-date {
+  flex: none;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rp-actbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 10px;
+  padding: 7px 14px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+/* Without a header (fallback, or while opening) the bar starts the pane. */
+.rp-actbar:first-child {
+  margin-top: 0;
+  border-top: 0;
+}
+
+.rp-actbar + .rp-line {
+  margin-top: 12px;
+}
+
+.rp-seg {
+  display: inline-flex;
+  flex: none;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+
+.rp-seg button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.rp-seg button + button {
+  border-left: 1px solid var(--line);
+}
+
+.rp-seg button[aria-pressed='true'] {
+  background: var(--rp-accent-soft);
+  color: var(--rp-accent-text);
+  font-weight: 650;
+  cursor: default;
+}
+
+.rp-seg button:disabled:not([aria-pressed='true']) {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.rp-who {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px 22px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.rp-addr {
+  overflow-wrap: anywhere;
+}
+
+.rp-to {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rp-linkish {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--rp-accent-text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.rp-linkish:hover {
+  text-decoration: underline;
+}
+
+.rp-details {
+  display: grid;
+  flex-basis: 100%;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 14px;
+  margin: 4px 0 0;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--rp-box);
+  color: var(--fg);
+}
+
+.rp-details dt {
+  color: var(--muted);
+}
+
+.rp-details dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.rp-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 0 22px 12px;
+  padding: 8px 10px 8px 12px;
+  border: 1px solid var(--rp-warn-border);
+  border-radius: 9px;
+  background: var(--rp-warn-soft);
+  font-size: 12.5px;
+}
+
+.rp-line > .rp-icon {
+  color: var(--rp-warn);
+}
+
+.rp-line b {
+  font-weight: 650;
+}
+
+.rp-fallback {
+  border-color: var(--rp-danger-border);
+  background: var(--rp-danger-soft);
+}
+
+.rp-fallback > .rp-icon {
+  color: var(--rp-danger);
+}
+
+.rp-btn {
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.rp-btn:hover {
+  background: var(--rp-hover);
+}
+
+.rp-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.rp-frame {
+  flex: 1;
+  border: 0;
+  /* The pane's own background: a plain-text body follows the light or dark
+     scheme, and an HTML body, which has no dark scheme, paints its own light
+     background. */
+  background: Canvas;
+}

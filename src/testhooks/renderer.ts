@@ -13,6 +13,8 @@ import {
   refreshSources,
   switchRun,
 } from '../renderer/shell';
+import { closeReader, getReaderState, openInReader } from '../renderer/reader';
+import type { OpenMode } from '../shared/reader-protocol';
 import { markLoaded } from './marker';
 
 markLoaded();
@@ -26,6 +28,10 @@ export function install(): void {
     state: () => getShellState(),
     refreshGeneration,
     open: (id: string) => openMessage(id),
+    /** Opens a message in the reader pane. */
+    openInReader: (rowid: number, mode?: OpenMode) => openInReader(rowid, mode),
+    closeReader,
+    reader: () => getReaderState(),
     refreshSources,
     chooseFolder,
     openExport,

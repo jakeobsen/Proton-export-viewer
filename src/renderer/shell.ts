@@ -133,6 +133,11 @@ export function showLink(prompt: LinkPrompt): void {
   update({ link: prompt });
 }
 
+/** Closes the link dialog without a choice. Main refuses its choices once its view is gone. */
+export function clearLink(): void {
+  if (state.link !== null) update({ link: null });
+}
+
 /** Closes the link dialog and tells main the user's choice. */
 export async function answerLink(action: LinkAction): Promise<LinkActionResult | null> {
   const prompt = state.link;
