@@ -71,6 +71,10 @@ export interface CoreControl {
   startWith(source: Stamp & { root: string | null }): Promise<boolean>;
   stop(): Promise<void>;
   request(call: DistributiveOmit<CoreRequest, 'reqId'>): Promise<CoreResult>;
+  /** A request only for a core already up for the call's source and generation. */
+  requestRunning(
+    call: DistributiveOmit<CoreRequest, 'reqId'> & { stamp: Stamp },
+  ): Promise<CoreResult>;
 }
 
 export interface SourceManagerDeps {
@@ -840,7 +844,9 @@ export class SourceManager {
     if (!stamp) return null;
     let result: CoreResult;
     try {
-      result = await this.deps.core.request({ type: 'index-query', stamp, query });
+      // A read never starts core: during a switch it would start one with
+      // the old source, which the switch then has to stop again.
+      result = await this.deps.core.requestRunning({ type: 'index-query', stamp, query });
     } catch {
       return null;
     }

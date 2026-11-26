@@ -19,6 +19,7 @@ import type {
   CoreTestInit,
 } from '../shared/core-protocol';
 import type { Logger } from '../shared/log/writer';
+import type { Stamp } from '../shared/sources';
 
 type Pending = { resolve: (r: CoreResult) => void; reject: (e: Error) => void };
 
@@ -45,6 +46,8 @@ export class CoreHost {
   private source: CoreSource | null = null;
   /** The source the running core was started with. */
   private childSource: CoreSource | null = null;
+  /** The running core has said it is ready. */
+  private childReady = false;
   /** Receives what core reports without being asked. */
   onEvent: ((event: CoreEvent) => void) | null = null;
   /** The run folders of the exports the app knows, for the next start of core. */
@@ -95,6 +98,7 @@ export class CoreHost {
       const { port1, port2 } = new MessageChannelMain();
       this.child = child;
       this.port = port1;
+      this.childReady = false;
       let ready = false;
       port1.on('message', (event) => {
         const message = event.data as CoreResult | CoreEvent | { type: 'ready' };
@@ -105,6 +109,7 @@ export class CoreHost {
         }
         if (message.type === 'ready') {
           ready = true;
+          if (this.child === child) this.childReady = true;
           this.options.log.info('core.ready');
           resolve();
           return;
@@ -132,6 +137,7 @@ export class CoreHost {
       child.once('exit', (code) => {
         this.options.log.warn('core.exit', { exitCode: code });
         this.child = null;
+        this.childReady = false;
         this.port?.close();
         this.port = null;
         this.starting = null;
@@ -141,6 +147,25 @@ export class CoreHost {
       });
     });
     return this.starting;
+  }
+
+  /**
+   * A request only for the core that is up and ready for this source and
+   * generation: it never starts one, so a read made while the source is
+   * being switched can't start a core in the middle of the switch.
+   */
+  requestRunning(call: CoreCall & { stamp: Stamp }): Promise<CoreResult> {
+    const source = this.childSource;
+    if (
+      !this.child ||
+      !this.childReady ||
+      !source ||
+      source.sourceKey !== call.stamp.sourceKey ||
+      source.generation !== call.stamp.generation
+    ) {
+      return Promise.reject(new CoreUnavailableError());
+    }
+    return this.request(call);
   }
 
   async request(call: CoreCall): Promise<CoreResult> {

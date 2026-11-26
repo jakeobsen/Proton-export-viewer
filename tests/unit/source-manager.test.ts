@@ -110,6 +110,23 @@ class FakeCore implements CoreControl {
     return stray;
   }
 
+  /** Read requests made while no core was up for their stamp. */
+  refused = 0;
+
+  requestRunning(call: Call & { stamp: Stamp }): Promise<CoreResult> {
+    const src = this.current;
+    if (
+      !this.running ||
+      !src ||
+      src.sourceKey !== call.stamp.sourceKey ||
+      src.generation !== call.stamp.generation
+    ) {
+      this.refused += 1;
+      return Promise.reject(new Error('core unavailable'));
+    }
+    return this.request(call);
+  }
+
   async request(call: Call): Promise<CoreResult> {
     await this.start();
     const src = this.current;
@@ -346,6 +363,30 @@ describe('switching', () => {
       runName: 'mail_20250701_090000',
     });
     expect(t.manager.view().recent.length).toBe(2);
+  });
+
+  it('never starts core for an index read made during a switch', async () => {
+    const t = setup('mgr-read-switch');
+    const one = tool('mgr-read-switch-1');
+    const two = runAt(join(realpathSync(testDir('mgr-read-switch-2')), 'mail_20250701_090000'), [
+      'x',
+    ]);
+    t.picks.push({ path: one, bookmark: 'bm1' }, { path: two, bookmark: 'bm2' });
+    await t.manager.chooseFolder(null, t.generation());
+    const started = t.core.started.length;
+    // The shell reads the list after core stopped and before the new one starts.
+    let read: Promise<unknown> | null = null;
+    t.hooks.onScopeStart = () => {
+      read = t.manager.queryIndex({ op: 'sidebar' });
+    };
+    t.order.length = 0;
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('opened');
+    expect(await read).toBeNull();
+    expect(t.core.refused).toBe(1);
+    // Only the switch started a core, with the new source; none was stopped as a stray.
+    expect(t.core.started.length).toBe(started + 1);
+    expect(t.core.started.at(-1)).toEqual({ ...t.manager.stamp()!, root: two });
+    expect(steps(t.order)).toEqual(['core.stop', 'scope.release', 'scope.start', 'core.spawn']);
   });
 
   it('replaces a core that a request started with the old source during a switch', async () => {
