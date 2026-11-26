@@ -6,7 +6,16 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
+import {
+  cpSync,
+  existsSync,
+  lstatSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
 import {
@@ -30,7 +39,7 @@ import {
   dimensionBombPng,
   gif,
 } from '../../tools/gen-export/hostile.mjs';
-import { largeMessage } from '../../tools/gen-export/stream.mjs';
+import { attachmentPartBytes, largeMessage } from '../../tools/gen-export/stream.mjs';
 import { diskBytes, digest, walk } from '../../tools/gen-export/tree.mjs';
 import { REPO_ROOT, testDir } from '../paths';
 
@@ -93,7 +102,7 @@ describe('a small corpus', () => {
     const made = gen(['small', '--seed', '1', '--out', out]);
     expect(made.stderr).toBe('');
     expect(made.status).toBe(0);
-    expect(made.stdout).toMatch(/MiB on disk \(projected\)/);
+    expect(made.stdout).toMatch(/MB on disk \(projected\)/);
     run = join(out, 'small1@example.com', RUN_FOLDER);
   });
 
@@ -192,6 +201,12 @@ describe('a small corpus', () => {
     expect(manifest.counts.messages).toBe(
       readdirSync(run).filter((n) => n.endsWith('.eml')).length,
     );
+    // The measured range of metadata sizes, next to the range they're drawn from.
+    const sizes = readdirSync(run)
+      .filter((n) => n.endsWith('.metadata.json'))
+      .map((n) => lstatSync(join(run, n)).size);
+    expect(manifest.metadata_bytes).toEqual({ min: Math.min(...sizes), max: Math.max(...sizes) });
+    expect(manifest.metadata_target_bytes).toEqual(METADATA_BYTES);
     expect(existsSync(join(run, `${manifest.probe_pair}.eml`))).toBe(true);
     expect(manifest.disk_bytes).toBeGreaterThan(0);
   });
@@ -211,6 +226,7 @@ describe('a small corpus', () => {
 
   it('sets file times from the export start, 20 pairs a second in name order', () => {
     const start = Date.UTC(2025, 5, 30, 12, 0, 0) / 1000;
+    expect(Math.floor(lstatSync(out).mtimeMs / 1000)).toBe(start);
     const list = walk(out);
     for (const e of list.filter((x) => x.type === 'dir' || x.path.endsWith('labels.json'))) {
       expect(e.mtime).toBe(start);
@@ -433,9 +449,46 @@ describe('the command line and the disk guard', () => {
     expect(gen(['small', '--seed', '1', '--out', join(dir, 'x'), '--extra']).status).toBe(64);
     const dry = gen(['small', '--seed', '1', '--out', join(dir, 'x'), '--dry-run']);
     expect(dry.status).toBe(0);
-    expect(dry.stdout).toMatch(/of 600\.0 MiB/);
+    expect(dry.stdout).toMatch(/of 600\.0 MB/);
     expect(existsSync(join(dir, 'x'))).toBe(false);
     expect(gen(['small', '--seed', '1', '--out', dir]).status).toBe(73);
+  });
+
+  it('removes only what it created', () => {
+    const dir = testDir('gen-owner');
+    const theirs = join(dir, 'theirs.txt');
+    writeFileSync(theirs, 'not ours\n');
+    // A manifest that is already there.
+    writeFileSync(join(dir, 'a.manifest.json'), '{}\n');
+    expect(gen(['small', '--seed', '1', '--out', join(dir, 'a')]).status).toBe(73);
+    expect(existsSync(join(dir, 'a'))).toBe(false);
+    expect(readFileSync(join(dir, 'a.manifest.json'), 'utf8')).toBe('{}\n');
+    // A path that appears after the first check: a dangling link passes
+    // existsSync, then makes mkdir fail. It stays.
+    symlinkSync(theirs + '.gone', join(dir, 'b'));
+    expect(gen(['small', '--seed', '1', '--out', join(dir, 'b')]).status).toBe(73);
+    expect(lstatSync(join(dir, 'b')).isSymbolicLink()).toBe(true);
+    // A manifest that appears while the corpus is written: the corpus goes,
+    // so none stays without a manifest, and the other manifest stays.
+    symlinkSync(theirs + '.gone', join(dir, 'c.manifest.json'));
+    const run = gen(['small', '--seed', '1', '--out', join(dir, 'c')]);
+    expect(run.status).toBe(73);
+    expect(run.stderr).toContain('appeared while writing; nothing was kept');
+    expect(existsSync(join(dir, 'c'))).toBe(false);
+    expect(lstatSync(join(dir, 'c.manifest.json')).isSymbolicLink()).toBe(true);
+    expect(readFileSync(theirs, 'utf8')).toBe('not ours\n');
+  });
+
+  it('runs from a path that needs escaping in a URL', () => {
+    const dir = join(testDir('gen-path'), 'a folder #1');
+    cpSync(join(REPO_ROOT, 'tools', 'gen-export'), dir, { recursive: true });
+    const run = spawnSync(
+      process.execPath,
+      [join(dir, 'gen-export.mjs'), 'small', '--seed', '1', '--out', join(dir, 'x'), '--dry-run'],
+      { encoding: 'utf8' },
+    );
+    expect(run.status).toBe(0);
+    expect(run.stdout).toMatch(/MB on disk \(projected\)/);
   });
 
   it('builds attachment entries in one place', () => {
@@ -477,4 +530,39 @@ describe('very large messages, streamed at run time', () => {
       if (kind === 'attachment') expect(first.tail.endsWith('--\r\n')).toBe(true);
     },
   );
+
+  // Asked sizes with every remainder modulo 4, line boundaries, and the
+  // 10 MB and 50 MB messages.
+  it.each([1000, 1001, 1002, 1003, 77, 78, 79, 84, 10_000_000, 50_000_000])(
+    'streams an attachment of %i bytes as valid base64 in whole lines',
+    async (bytes) => {
+      const stream = largeMessage({ kind: 'attachment', bytes });
+      const chunks: Buffer[] = [];
+      for await (const chunk of stream) chunks.push(chunk as Buffer);
+      const text = Buffer.concat(chunks).toString('latin1');
+      const head = 'Content-Transfer-Encoding: base64\r\n\r\n';
+      const tail = '\r\n--=_large_1--\r\n';
+      expect(text.endsWith(tail)).toBe(true);
+      const body = text.slice(text.indexOf(head) + head.length, text.length - tail.length);
+      expect(body.length).toBe(stream.partBytes);
+      expect(stream.partBytes).toBe(attachmentPartBytes(bytes));
+      expect(stream.partBytes).toBeLessThanOrEqual(bytes);
+      expect(stream.partBytes).toBeGreaterThanOrEqual(bytes - 5);
+      expect(body === '' || body.endsWith('\r\n')).toBe(true);
+      const lines = body.split('\r\n').slice(0, -1);
+      for (const [i, line] of lines.entries()) {
+        if (i < lines.length - 1) expect(line.length).toBe(76);
+        expect(line.length % 4).toBe(0);
+        expect(line).toMatch(/^[A-Za-z0-9+/]*$/);
+      }
+      const encoded = lines.join('');
+      const decoded = Buffer.from(encoded, 'base64');
+      expect(decoded.length).toBe((encoded.length / 4) * 3);
+      expect(decoded.toString('base64')).toBe(encoded);
+    },
+  );
+
+  it.each(['text', 'html'] as const)('streams a %s part of exactly the asked size', (kind) => {
+    expect(largeMessage({ kind, bytes: 1001 }).partBytes).toBe(1001);
+  });
 });

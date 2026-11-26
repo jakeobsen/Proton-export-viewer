@@ -36,8 +36,10 @@ const FIRST_TIME = Date.UTC(2012, 0, 1) / 1000;
 const LAST_TIME = Date.UTC(2025, 5, 29) / 1000;
 
 /**
- * Size of a metadata file, in bytes. Every file stays under 8,192 bytes, so
- * it takes two 4 KiB blocks on disk.
+ * The range each metadata file's size is drawn from, in bytes. Files land
+ * close to their target, not on it (a few land just below the minimum), so
+ * each manifest also states the measured range. Every file stays under
+ * 8,192 bytes, so it takes two 4 KiB blocks on disk.
  */
 export const METADATA_BYTES = { min: 7680, max: 8150 };
 
