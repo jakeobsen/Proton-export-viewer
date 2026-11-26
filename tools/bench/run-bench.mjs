@@ -20,8 +20,8 @@
 // run's nonce) and writes everything inside it, and removes only things inside
 // it, never following links. Before the run it refuses when less than 20 GiB
 // of disk is free, or when all generated test data it finds (under each
-// --scan-data folder, in the app's containers and the capture folder; a folder
-// it can't read fails the check) plus a full index and 50 MB for the run's
+// --scan-data folder and in the app's containers; a folder it can't read
+// fails the check) plus a full index and 50 MB for the run's
 // other output would reach 1 GB. While the app runs, that other output is
 // sampled once a second and the app is stopped once it passes its 50 MB. The
 // app keeps the index (with -wal and -shm) under 300 MB and empties it when
@@ -58,8 +58,6 @@ export const INDEX_CAP = 300 * 1000 * 1000;
 export const TRANSIENT_RESERVE = 50 * 1000 * 1000;
 /** All generated test data on this machine stays under this. */
 export const TEST_DATA_LIMIT = 1000 * 1000 * 1000;
-/** Where the leak harness keeps its packet captures. */
-export const CAPTURE_DIR = '/usr/local/var/pev-leak/captures';
 const PRUNE = new Set(['node_modules', '.git', 'dist', 'out', 'out-test', 'build']);
 export const MIN_FREE = 20 * 2 ** 30;
 
@@ -103,12 +101,9 @@ export function reportName(label, scenario, engine, pool, nonce) {
  * Every folder of generated test data under the scan roots: generator exports
  * (the folder next to each `<name>.manifest.json`), every `test-output/` folder
  * and every bench workspace (marked, or holding a run's config); plus the app's
- * container data and the capture folder. Nested finds are counted once.
+ * container data. Nested finds are counted once.
  */
-export function findTestData(
-  scanRoots,
-  { containers = [], captureDir = CAPTURE_DIR, maxDepth = 6 } = {},
-) {
+export function findTestData(scanRoots, { containers = [], maxDepth = 6 } = {}) {
   const found = new Set();
   const walk = (dir, depth) => {
     let entries;
@@ -144,7 +139,6 @@ export function findTestData(
   };
   for (const root of scanRoots) walk(root, 0);
   for (const c of containers) if (existsSync(c)) found.add(c);
-  if (captureDir && existsSync(captureDir)) found.add(captureDir);
   const sorted = [...found].sort();
   return sorted.filter((p) => !sorted.some((q) => q !== p && p.startsWith(q + '/')));
 }

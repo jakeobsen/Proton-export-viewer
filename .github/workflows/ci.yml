@@ -33,8 +33,5 @@ jobs:
       # end-to-end tests run with the sandbox on.
       - name: Allow user namespaces for the Chromium sandbox
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      # ci:linux runs ShellCheck on the shell scripts.
-      - name: Install ShellCheck
-        run: command -v shellcheck || (sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck)
       - name: npm run ci:linux
         run: xvfb-run --auto-servernum npm run ci:linux

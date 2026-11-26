@@ -34,10 +34,9 @@ export function footprintByPhase(
   idleShrunkByProcess: Array<{ name: string; mib: number }>;
 };
 export const TEST_DATA_LIMIT: number;
-export const CAPTURE_DIR: string;
 export function findTestData(
   scanRoots: string[],
-  options?: { containers?: string[]; captureDir?: string | null; maxDepth?: number },
+  options?: { containers?: string[]; maxDepth?: number },
 ): string[];
 export function diskBytes(path: string): number;
 export function treeBytes(root: string, skip?: string[]): number;

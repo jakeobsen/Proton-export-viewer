@@ -190,10 +190,7 @@ describe('the test data budget', () => {
     // A sandboxed run's workspace holds no config, only the mark.
     createWorkspace(join(root, 'c/bench/run2'), '0123456789abcdef', []);
     mk('d/container');
-    const found = findTestData([root], {
-      containers: [join(root, 'd/container')],
-      captureDir: null,
-    });
+    const found = findTestData([root], { containers: [join(root, 'd/container')] });
     expect(found.map((p) => p.slice(root.length + 1))).toEqual([
       'a/corpora/perf1',
       'b/clone/test-output',
@@ -252,7 +249,7 @@ describe('the test data budget', () => {
     mkdirSync(locked);
     chmodSync(locked, 0o000);
     try {
-      expect(() => findTestData([root], { captureDir: null })).toThrow("can't read");
+      expect(() => findTestData([root])).toThrow("can't read");
     } finally {
       chmodSync(locked, 0o700);
     }
