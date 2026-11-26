@@ -17,6 +17,7 @@ import type {
 import { errorData } from '../shared/log/schema';
 import { LogWriter, type Logger } from '../shared/log/writer';
 import type { ReadRequest, ReaderFailure } from '../shared/reader-protocol';
+import { WorkerThread, type ThreadRole } from './index/pool';
 import { ReaderLane } from './reader/lane';
 import type { ReaderSource } from './reader/source';
 import { SourceSession } from './source';
@@ -57,6 +58,20 @@ process.on('unhandledRejection', (reason) =>
 
 function reply(result: CoreResult): void {
   port?.postMessage(result);
+}
+
+/** Old-generation heap limit of the index's threads, in MB. */
+const INDEX_THREAD_HEAP_MB = 128;
+
+/** Starts one of the index's threads: the writer, the query thread or a pool thread. */
+function indexThread(role: ThreadRole): WorkerThread {
+  return new WorkerThread(
+    () =>
+      new Worker(join(import.meta.dirname, 'index-worker.js'), {
+        workerData: { role },
+        resourceLimits: { maxOldGenerationSizeMb: INDEX_THREAD_HEAP_MB },
+      }),
+  );
 }
 
 /** Folder-access proof (test builds): has the worker read files, as request `reqId`. */
@@ -168,6 +183,8 @@ function handle(request: CoreRequest): void {
       return;
     case 'identify':
     case 'scan':
+    case 'index':
+    case 'index-query':
       if (!session) {
         reply({ type: 'result', reqId: request.reqId, ok: false, code: 'no_source' });
         return;
@@ -182,7 +199,10 @@ process.parentPort.once('message', (event) => {
   roots = [[init.appRoot + sep, '']];
   log = new LogWriter(init.logsDir, 'core', 'core');
   workerLog = log.forProc('worker');
-  session = new SourceSession(init.source, log, reply);
+  session = new SourceSession(init.source, log, reply, {
+    dir: init.indexDir,
+    thread: indexThread,
+  });
   const p = event.ports[0];
   if (!p) return;
   port = p;

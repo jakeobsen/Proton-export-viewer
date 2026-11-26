@@ -16,6 +16,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { lstat, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { CoreRequest, CoreResult } from '../../shared/core-protocol';
+import type { IndexAnswer, IndexProgress, IndexQuery } from '../../shared/index-types';
 import type { Logger } from '../../shared/log/writer';
 import {
   sameStamp,
@@ -532,6 +533,9 @@ export class SourceManager {
     if (online) {
       if (!target.runs) void this.listRuns(stamp);
       void this.scan(stamp);
+    } else if (fresh.dbUuid) {
+      // An unavailable export can still be browsed from its index.
+      void this.openIndex(stamp);
     }
     return online ? 'opened' : 'offline';
   }
@@ -594,10 +598,61 @@ export class SourceManager {
     const scan = result.scan;
     if (!scan) return;
     const accept = () => {
-      if (this.current(result, stamp, true) && this.active) this.active.scan = scan;
+      if (this.current(result, stamp, true) && this.active) {
+        this.active.scan = scan;
+        void this.openIndex(stamp);
+      }
     };
     if (this.deps.hold) this.deps.hold(accept);
     else accept();
+  }
+
+  /**
+   * Has core open the source's index; phase 1 starts there. A new index's
+   * identity goes into the source's registry entry.
+   */
+  private async openIndex(stamp: Stamp): Promise<void> {
+    const source = this.active?.source;
+    if (!source || source.sourceKey !== stamp.sourceKey) return;
+    let result: CoreResult;
+    try {
+      result = await this.deps.core.request({
+        type: 'index',
+        stamp,
+        dbUuid: source.dbUuid ?? null,
+      });
+    } catch {
+      return;
+    }
+    if (!result.ok || !result.index || !this.current(result, stamp, true)) return;
+    if (result.index.dbUuid !== source.dbUuid) {
+      this.registry.updateSource(source.sourceKey, { dbUuid: result.index.dbUuid });
+      this.registry.save();
+      if (this.active?.source.sourceKey === source.sourceKey) {
+        this.active.source = this.registry.source(source.sourceKey)!;
+      }
+    }
+    this.deps.log.info('index.opened', { generation: stamp.generation }, { src: stamp.sourceKey });
+  }
+
+  /**
+   * Reads from the open source's index. Null when no source is open, the
+   * index isn't open yet, or the answer came back for another generation.
+   */
+  async queryIndex(
+    query: IndexQuery,
+  ): Promise<{ answer: IndexAnswer; progress: IndexProgress } | null> {
+    const stamp = this.stamp();
+    if (!stamp) return null;
+    let result: CoreResult;
+    try {
+      result = await this.deps.core.request({ type: 'index-query', stamp, query });
+    } catch {
+      return null;
+    }
+    if (!result.ok || result.answer === undefined || !result.progress) return null;
+    if (!sameStamp(result.stamp, stamp) || !sameStamp(this.stamp(), stamp)) return null;
+    return { answer: result.answer, progress: result.progress };
   }
 }
 

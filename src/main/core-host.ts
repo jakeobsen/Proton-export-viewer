@@ -18,6 +18,8 @@ type Pending = { resolve: (r: CoreResult) => void; reject: (e: Error) => void };
 export interface CoreHostOptions {
   corePath: string;
   logsDir: string;
+  /** `<userData>/index`. */
+  indexDir: string;
   appRoot: string;
   log: Logger;
 }
@@ -102,6 +104,7 @@ export class CoreHost {
           type: 'init',
           logsDir: this.options.logsDir,
           appRoot: this.options.appRoot,
+          indexDir: this.options.indexDir,
           source,
         };
         child.postMessage(init, [port2]);

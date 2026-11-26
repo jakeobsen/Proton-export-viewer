@@ -89,7 +89,13 @@ log.info('app.start', {
 });
 
 async function start(): Promise<void> {
-  const core = new CoreHost({ corePath: paths.corePath, logsDir, appRoot: outRoot, log });
+  const core = new CoreHost({
+    corePath: paths.corePath,
+    logsDir,
+    indexDir: join(app.getPath('userData'), 'index'),
+    appRoot: outRoot,
+    log,
+  });
   // The manager calls back into the context only after start() has built it.
   const sources = new SourceManager({
     userData: app.getPath('userData'),
