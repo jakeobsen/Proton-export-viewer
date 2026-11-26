@@ -19,11 +19,12 @@
 # records the digests of the program and the input it was given, the start
 # and end times, and the exit status.
 #
-# results/ and the test user's home (its state, temporary files and app
-# containers) share one size limit. It is checked before the launch, with
-# room kept for the launch's output, and every 5 seconds while the program
-# runs. Reaching it, or the time limit, stops the program and makes the
-# launch invalid: launch.txt says why, and the launcher exits 75.
+# results/, the test user's home (its state, temporary files and app
+# containers) and its per-user folder under /var/folders share one size
+# limit. It is checked before the launch, with room kept for the launch's
+# output, every 5 seconds while the program runs, and once more when it ends.
+# Reaching it, or the time limit, stops the program and makes the launch
+# invalid: launch.txt says why, and the launcher exits 75.
 #
 # A test build is started with --pev-leak; the standard build also gets an
 # empty user data directory in the test user's home.
@@ -77,6 +78,17 @@ fail() {
 
 [ "$(/usr/bin/id -un)" = "$LEAK_USER" ] || fail 77 "must run as $LEAK_USER, through sudo"
 
+# The test user's per-user folder under /var/folders: Chromium keeps its
+# temporary files there whatever TMPDIR says, so it counts toward the limit.
+USER_TEMP=$(/usr/bin/getconf DARWIN_USER_DIR 2>/dev/null) ||
+	fail 75 "can't find the per-user folder of $LEAK_USER"
+case "$USER_TEMP" in
+/?*/) ;;
+*) fail 75 "unexpected per-user folder for $LEAK_USER: $USER_TEMP" ;;
+esac
+USER_TEMP=${USER_TEMP%/}
+USER_TEMP=${USER_TEMP%/*}
+
 # True while process $1 exists and is not a zombie.
 alive() {
 	_stat=$(/bin/ps -o stat= -p "$1" 2>/dev/null) || return 1
@@ -110,10 +122,10 @@ digest() {
 	fi
 }
 
-# KiB used by results/ and the test user's home together. Fails when du
-# can't measure both.
+# KiB used by results/, the test user's home and its per-user temporary
+# folder together. Fails when du can't measure all three.
 transient_kb() {
-	_out=$(/usr/bin/du -sk "$RESULTS_DIR" "$LEAK_HOME" 2>/dev/null || true)
+	_out=$(/usr/bin/du -sk "$RESULTS_DIR" "$LEAK_HOME" "$USER_TEMP" 2>/dev/null || true)
 	_sum=0
 	_seen=0
 	while read -r _kb _path; do
@@ -125,7 +137,7 @@ transient_kb() {
 	done <<EOF
 $_out
 EOF
-	[ "$_seen" -eq 2 ] || return 1
+	[ "$_seen" -eq 3 ] || return 1
 	echo "$_sum"
 }
 
@@ -142,7 +154,7 @@ prune_results() {
 	done
 	# shellcheck disable=SC2086 # one name per line, globbing is off
 	for _name in $_names; do
-		_kb=$(transient_kb) || fail 75 "can't measure $RESULTS_DIR and $LEAK_HOME"
+		_kb=$(transient_kb) || fail 75 "can't measure $RESULTS_DIR, $LEAK_HOME and $USER_TEMP"
 		if [ "$_count" -lt "$KEEP_RESULTS" ] && [ $((_kb + HEADROOM_KB)) -le "$TRANSIENT_CAP_KB" ]; then
 			break
 		fi
@@ -153,9 +165,9 @@ prune_results() {
 		_count=$((_count - 1))
 	done
 	set +f
-	_kb=$(transient_kb) || fail 75 "can't measure $RESULTS_DIR and $LEAK_HOME"
+	_kb=$(transient_kb) || fail 75 "can't measure $RESULTS_DIR, $LEAK_HOME and $USER_TEMP"
 	if [ $((_kb + HEADROOM_KB)) -gt "$TRANSIENT_CAP_KB" ]; then
-		fail 75 "$RESULTS_DIR and $LEAK_HOME use $_kb KiB; a launch needs them under $((TRANSIENT_CAP_KB - HEADROOM_KB)) KiB"
+		fail 75 "$RESULTS_DIR, $LEAK_HOME and $USER_TEMP use $_kb KiB; a launch needs them under $((TRANSIENT_CAP_KB - HEADROOM_KB)) KiB"
 	fi
 }
 
@@ -226,6 +238,9 @@ record "input_digest=$(digest "$INPUT")"
 if [ ! -d "$LEAK_HOME/tmp" ]; then
 	/bin/mkdir -m 0700 "$LEAK_HOME/tmp"
 fi
+# The standard build's Chromium also keeps its temporary files in the home.
+# The sandboxed build keeps them in its container instead.
+CHROMIUM_TEMP=''
 case "$TARGET" in
 standard)
 	/bin/rm -rf "$LEAK_HOME/state/standard"
@@ -234,6 +249,7 @@ standard)
 	fi
 	/bin/mkdir -m 0700 "$LEAK_HOME/state/standard"
 	set -- --pev-leak "--pev-user-data=$LEAK_HOME/state/standard"
+	CHROMIUM_TEMP="MAC_CHROMIUM_TMPDIR=$LEAK_HOME/tmp"
 	;;
 mas)
 	set -- --pev-leak
@@ -253,7 +269,7 @@ fi
 ulimit -f "$FILE_BLOCKS"
 /usr/bin/env -i \
 	HOME="$LEAK_HOME" TMPDIR="$LEAK_HOME/tmp/" PATH="$PATH" \
-	USER="$LEAK_USER" LOGNAME="$LEAK_USER" \
+	USER="$LEAK_USER" LOGNAME="$LEAK_USER" ${CHROMIUM_TEMP:+"$CHROMIUM_TEMP"} \
 	"$PROGRAM" "$@" <"$INPUT" >"$OUT/stdout.txt" 2>"$OUT/stderr.txt" &
 CHILD=$!
 if [ "$STOP" = 1 ]; then
@@ -273,7 +289,7 @@ STARTED=$(/bin/date +%s)
 		elif [ $((_tick % 5)) -eq 4 ]; then
 			if ! _kb=$(transient_kb); then
 				_why='size limit could not be measured'
-			elif [ "$_kb" -gt "$TRANSIENT_CAP_KB" ]; then
+			elif [ "$_kb" -ge "$TRANSIENT_CAP_KB" ]; then
 				_why="size limit reached ($_kb KiB)"
 			fi
 		fi
@@ -308,6 +324,15 @@ if [ "$STATUS" -gt 128 ]; then
 fi
 wait "$WATCHDOG" 2>/dev/null || true
 trap - TERM INT HUP
+
+# A program can end between two measurements, so measure once more.
+if [ ! -f "$OUT/invalid" ]; then
+	if ! _kb=$(transient_kb); then
+		echo 'size limit could not be measured' >"$OUT/invalid"
+	elif [ "$_kb" -ge "$TRANSIENT_CAP_KB" ]; then
+		echo "size limit reached ($_kb KiB)" >"$OUT/invalid"
+	fi
+fi
 
 record "exit=$STATUS"
 record "ended=$(stamp)"

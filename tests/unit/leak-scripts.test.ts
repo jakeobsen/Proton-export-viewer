@@ -153,6 +153,7 @@ const REAL_PATHS = [
   '/usr/sbin/tcpdump',
   '/usr/sbin/scutil',
   '/usr/bin/id',
+  '/usr/bin/getconf',
   '/bin/ps',
   '/usr/bin/pkill',
   '/usr/libexec/PlistBuddy',
@@ -186,7 +187,9 @@ case "$*" in
 	: >"$S/pf-enabled" ;;
 '-X 4242') rm -f "$S/pf-enabled"; echo 'pf disabled' >&2 ;;
 -X*) echo 'pfctl: invalid token' >&2; exit 1 ;;
-'-s References') if [ -e "$S/pf-enabled" ]; then echo 'PID      Process Name   TOKEN      TIMESTAMP'; echo '123      capture        4242       1'; fi ;;
+'-s References')
+	[ ! -e "$S/references-fails" ] || exit 1
+	if [ -e "$S/pf-enabled" ]; then echo 'PID      Process Name   TOKEN      TIMESTAMP'; echo '123      capture        4242       1'; fi ;;
 '-s info') if [ -e "$S/pf-enabled" ]; then echo 'Status: Enabled for 0 days 00:00:01'; else echo 'Status: Disabled'; fi ;;
 '-s rules') [ -e "$S/no-apple-anchor" ] || echo 'anchor "com.apple/*" all' ;;
 '-a com.apple/pev-leak -f -') cat >"$S/anchor" ;;
@@ -208,6 +211,7 @@ esac
 S="$PEV_MOCK_STATE"
 echo "ifconfig $*" >>"$S/calls"
 case "$*" in
+-l) if [ -e "$S/pflog0" ]; then echo 'lo0 en0 pflog0'; else echo 'lo0 en0'; fi ;;
 pflog0) [ -e "$S/pflog0" ] || { echo 'ifconfig: interface pflog0 does not exist' >&2; exit 1; } ;;
 'pflog0 create') : >"$S/pflog0" ;;
 'pflog0 destroy') rm "$S/pflog0" ;;
@@ -240,7 +244,7 @@ stats() {
 	echo "$(cat "$S/drops-$iface" 2>/dev/null || echo 0) packets dropped by kernel" >&2
 	exit 0
 }
-trap stats TERM
+if [ -e "$S/tcpdump-ignores-term" ]; then trap '' TERM; else trap stats TERM; fi
 printf '0123456789abcdef01234567' >"$out"
 if [ -e "$S/tcpdump-fails-$iface" ]; then echo 'tcpdump: syntax error' >&2; exit 1; fi
 echo "tcpdump: listening on $iface, link-type NULL, snapshot length 1024 bytes" >&2
@@ -280,7 +284,12 @@ exec /bin/ps "$@"
 `,
     pkill: `#!/bin/sh
 echo "pkill $*" >>"$PEV_MOCK_STATE/calls"
+[ ! -e "$PEV_MOCK_STATE/slow-pkill" ] || sleep 1
 [ -e "$PEV_MOCK_STATE/survivors" ] || rm -f "$PEV_MOCK_STATE/leak-procs"
+`,
+    getconf: `#!/bin/sh
+[ "$*" = DARWIN_USER_DIR ] || exit 1
+echo "$PEV_MOCK_ROOT/var/folders/zz/test_user/0/"
 `,
     PlistBuddy: `#!/bin/sh
 if [ -f "$PEV_MOCK_STATE/executable" ]; then cat "$PEV_MOCK_STATE/executable"; else echo 'Test App'; fi
@@ -312,6 +321,8 @@ class FakeSystem {
   readonly home: string;
   readonly resolver: string;
   readonly config: string;
+  /** The test user's per-user folder, as the getconf stand-in reports it. */
+  readonly userTemp: string;
 
   constructor(name: string) {
     this.root = testDir(name);
@@ -325,6 +336,7 @@ class FakeSystem {
     this.home = join(this.base, 'home');
     this.resolver = join(this.root, 'etc', 'resolver', 'test');
     this.config = join(this.root, 'usr', 'local', 'etc', 'pev-leak', 'test-address');
+    this.userTemp = join(this.root, 'var', 'folders', 'zz', 'test_user');
     const dirs = [
       this.state,
       join(this.root, 'libexec'),
@@ -341,6 +353,8 @@ class FakeSystem {
       join(this.stage, 'input'),
       this.results,
       this.home,
+      join(this.userTemp, '0'),
+      join(this.userTemp, 'T'),
     ];
     for (const dir of dirs) {
       mkdirSync(dir, { recursive: true });
@@ -372,6 +386,7 @@ class FakeSystem {
       ['/usr/sbin/scutil', `${this.bin}/scutil`],
       ['/usr/bin/id', `${this.bin}/id`],
       ['/bin/ps', `${this.bin}/ps`],
+      ['/usr/bin/getconf', `${this.bin}/getconf`],
       ['/usr/bin/pkill', `${this.bin}/pkill`],
       ['/usr/libexec/PlistBuddy', `${this.bin}/PlistBuddy`],
       ['/opt/homebrew/bin/node', process.execPath],
@@ -454,6 +469,13 @@ function start(script: string, args: string[] = [], env = process.env): Running 
   };
 }
 
+/** A live process whose command line names pev-leak-capture, as a lock holder. */
+function fakeHolder(): number {
+  const child = spawn('/bin/sh', ['-c', 'sleep 30; :', 'pev-leak-capture'], { stdio: 'ignore' });
+  started.push(child.pid ?? -1);
+  return child.pid ?? -1;
+}
+
 function alive(pid: number): boolean {
   const ps = spawnSync('/bin/ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' });
   return ps.status === 0 && !ps.stdout.includes('Z');
@@ -507,11 +529,13 @@ describe('pev-leak-capture', () => {
     );
     expect(fake.has('pf-enabled')).toBe(true);
     expect(fake.has('pflog0')).toBe(true);
-    expect(read(join(fake.runDir, 'pf-token'))).toBe('4242\n');
     expect(read(join(fake.runDir, 'lock', 'pid'))).toBe(`${run.pid}\n`);
     expect(read(join(fake.runDir, 'phase-dir'))).toBe(`${dir}\n`);
     // Each change is recorded with the phase it belongs to.
-    const phaseId = `${dir.split('/').at(-1)}\n`;
+    const phase = dir.split('/').at(-1);
+    const phaseId = `${phase}\n`;
+    expect(read(join(fake.runDir, 'pf-token'))).toBe(`${phase} 4242\n`);
+    expect(read(join(fake.runDir, 'tcpdump-pids'))).toMatch(new RegExp(`^${phase} \\d+ \\d+\\n$`));
     for (const record of [
       'anchor',
       'created-pflog0',
@@ -582,7 +606,8 @@ describe('pev-leak-capture', () => {
         'block out log quick proto { tcp udp } from any to any user pevleak\n',
     );
     expect(read(join(fake.state, 'alias'))).toBe(`${family} ${address}\n`);
-    expect(read(join(fake.runDir, 'alias'))).toBe(`${address}\n`);
+    const phase = phaseDir(run.out()).split('/').at(-1);
+    expect(read(join(fake.runDir, 'alias'))).toBe(`${phase} ${address}\n`);
     run.signal('SIGTERM');
     expect(await run.exited).toBe(0);
     expect(fake.calls()).toContain(`ifconfig lo0 ${family} ${address} -alias`);
@@ -778,16 +803,21 @@ done
     const fake = new FakeSystem('capture-lock');
     const script = fake.install(CAPTURE, 'pev-leak-capture');
     mkdirSync(join(fake.runDir, 'lock'));
-    writeFileSync(join(fake.runDir, 'lock', 'pid'), `${process.pid}\n`);
+    const holder = fakeHolder();
+    writeFileSync(join(fake.runDir, 'lock', 'pid'), `${holder}\n`);
     let run = fake.sh(script, ['zero']);
     expect(run.status).toBe(75);
-    expect(run.stderr).toContain(`another capture is running (pid ${process.pid})`);
+    expect(run.stderr).toContain(`another capture or a recovery is running (pid ${holder})`);
 
+    // A dead pid, or a live one that isn't a capture (a pid reused after a
+    // restart), is a stale lock.
     const gone = spawnSync('/bin/sh', ['-c', 'echo $$']).stdout.toString().trim();
-    writeFileSync(join(fake.runDir, 'lock', 'pid'), `${gone}\n`);
-    run = fake.sh(script, ['zero']);
-    expect(run.status).toBe(75);
-    expect(run.stderr).toContain('run pev-leak-recover');
+    for (const pid of [gone, String(process.pid)]) {
+      writeFileSync(join(fake.runDir, 'lock', 'pid'), `${pid}\n`);
+      run = fake.sh(script, ['zero']);
+      expect(run.status).toBe(75);
+      expect(run.stderr).toContain('left its lock behind; run pev-leak-recover');
+    }
     expect(existsSync(join(fake.runDir, 'lock', 'pid'))).toBe(true);
     expect(fake.calls()).not.toContain('pfctl -E');
   });
@@ -987,6 +1017,44 @@ done
     expectRestored(fake);
   });
 
+  it('refuses to start while an earlier phase left records', () => {
+    const fake = new FakeSystem('capture-stale-records');
+    writeFileSync(join(fake.runDir, 'anchor'), '20250101T000000Z-zero-9\n');
+    const run = fake.sh(fake.install(CAPTURE, 'pev-leak-capture'), ['zero']);
+    expect(run.status).toBe(75);
+    expect(run.stderr).toContain('an earlier phase left');
+    expect(readdirSync(fake.runDir)).toEqual(['anchor']);
+    expect(fake.calls()).not.toContain('pfctl -E');
+  });
+
+  it('never reports a phase complete when its cleanup failed', async () => {
+    const fake = new FakeSystem('capture-cleanup-error');
+    fake.setAddress('100.128.0.1\n');
+    fake.set('alias-remove-fails');
+    const run = fake.start(fake.install(CAPTURE, 'pev-leak-capture'), ['consent']);
+    await run.waitFor('ready');
+    const dir = phaseDir(run.out());
+    run.signal('SIGTERM');
+    expect(await run.exited).toBe(1);
+    expect(status(dir)).toMatchObject({ result: 'invalid', cleanup: 'failed: alias' });
+    expect(status(dir).reason).toContain('cleanup failed: alias');
+    expect(existsSync(join(fake.runDir, 'alias'))).toBe(true);
+    expect(existsSync(join(fake.runDir, 'lock'))).toBe(true);
+  });
+
+  it('kills a capture that ignores SIGTERM, and marks the phase invalid', async () => {
+    const fake = new FakeSystem('capture-stubborn');
+    fake.set('tcpdump-ignores-term');
+    const run = fake.start(fake.install(CAPTURE, 'pev-leak-capture'), ['zero']);
+    await run.waitFor('ready');
+    const dir = phaseDir(run.out());
+    run.signal('SIGTERM');
+    expect(await run.exited).toBe(1);
+    expect(status(dir)).toMatchObject({ result: 'invalid', cleanup: 'ok' });
+    expect(status(dir).reason).toContain('capture did not stop cleanly');
+    expectRestored(fake);
+  });
+
   it('marks the phase invalid on SIGINT, and undoes everything', async () => {
     const fake = new FakeSystem('capture-int');
     const run = fake.start(fake.install(CAPTURE, 'pev-leak-capture'), ['controls']);
@@ -1026,16 +1094,19 @@ done
 
 // --- pev-leak-recover ----------------------------------------------------
 
+/** The phase a killed capture left its records for. */
+const PHASE = '20260101T000000Z-zero-1';
+
 describe('pev-leak-recover', () => {
   function killedCapture(fake: FakeSystem): { dir: string; bystander: number } {
-    const dir = join(fake.captures, '20260101T000000Z-zero-1');
+    const dir = join(fake.captures, PHASE);
     mkdirSync(dir);
     writeFileSync(join(dir, 'status'), 'phase=zero\n');
     const gone = spawnSync('/bin/sh', ['-c', 'echo $$']).stdout.toString().trim();
     mkdirSync(join(fake.runDir, 'lock'));
     writeFileSync(join(fake.runDir, 'lock', 'pid'), `${gone}\n`);
-    writeFileSync(join(fake.runDir, 'pf-token'), '4242\n');
-    writeFileSync(join(fake.runDir, 'alias'), '100.128.0.1\n');
+    writeFileSync(join(fake.runDir, 'pf-token'), `${PHASE} 4242\n`);
+    writeFileSync(join(fake.runDir, 'alias'), `${PHASE} 100.128.0.1\n`);
     writeFileSync(join(fake.runDir, 'phase-dir'), `${dir}\n`);
     for (const record of [
       'anchor',
@@ -1043,12 +1114,12 @@ describe('pev-leak-recover', () => {
       'created-resolver-dir',
       'created-resolver-file',
     ]) {
-      writeFileSync(join(fake.runDir, record), '20260101T000000Z-zero-1\n');
+      writeFileSync(join(fake.runDir, record), `${PHASE}\n`);
     }
     // A process that is not tcpdump must survive, even if its pid is listed.
     const bystander = spawn('/bin/sleep', ['30'], { stdio: 'ignore' });
     started.push(bystander.pid ?? -1);
-    writeFileSync(join(fake.runDir, 'tcpdump-pids'), `${bystander.pid} 1\n`);
+    writeFileSync(join(fake.runDir, 'tcpdump-pids'), `${PHASE} ${bystander.pid} 1\n`);
     fake.set('pf-enabled');
     fake.set('pflog0');
     fake.set('anchor', 'block out log quick proto { tcp udp } from any to any user pevleak\n');
@@ -1087,16 +1158,58 @@ describe('pev-leak-recover', () => {
     const fake = new FakeSystem('recover-running');
     killedCapture(fake);
     const recover = fake.install(RECOVER, 'pev-leak-recover');
-    writeFileSync(join(fake.runDir, 'lock', 'pid'), `${process.pid}\n`);
+    writeFileSync(join(fake.runDir, 'lock', 'pid'), `${fakeHolder()}\n`);
     let run = fake.sh(recover);
     expect(run.status).toBe(75);
-    expect(run.stderr).toContain('a capture is running');
+    expect(run.stderr).toContain('a capture or recovery is running');
     rmSync(join(fake.runDir, 'lock', 'pid'));
     run = fake.sh(recover);
     expect(run.status).toBe(75);
-    expect(run.stderr).toContain('a capture is starting');
+    expect(run.stderr).toContain('a capture or recovery is starting');
     expect(fake.calls()).toEqual([]);
     expect(existsSync(fake.resolver)).toBe(true);
+  });
+
+  it('lets only one of two recoveries take over a stale lock', async () => {
+    const fake = new FakeSystem('recover-twice');
+    killedCapture(fake);
+    fake.set('slow-pkill');
+    const recover = fake.install(RECOVER, 'pev-leak-recover');
+    const first = fake.start(recover);
+    // The first one holds the lock while its slow pkill runs.
+    const until = Date.now() + 10_000;
+    while (!fake.calls().includes('pkill -KILL -U pevleak')) {
+      if (Date.now() > until) throw new Error('the first recovery did not start');
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    const second = fake.sh(recover);
+    expect(second.status).toBe(75);
+    expect(second.stderr).toContain('a capture or recovery is running');
+    expect(await first.exited).toBe(0);
+    expect(fake.calls().filter((c) => c === 'pfctl -X 4242')).toHaveLength(1);
+    expectRestored(fake);
+  });
+
+  it('refuses while another recovery is taking over the lock', () => {
+    const fake = new FakeSystem('recover-takeover');
+    killedCapture(fake);
+    mkdirSync(join(fake.runDir, 'lock', 'takeover'));
+    const run = fake.sh(fake.install(RECOVER, 'pev-leak-recover'));
+    expect(run.status).toBe(75);
+    expect(run.stderr).toContain('another recovery is taking over the lock');
+    expect(fake.calls()).toEqual([]);
+  });
+
+  it('keeps the pf token record when pf cannot list its references', () => {
+    const fake = new FakeSystem('recover-references');
+    killedCapture(fake);
+    fake.set('references-fails');
+    const run = fake.sh(fake.install(RECOVER, 'pev-leak-recover'));
+    expect(run.status).toBe(1);
+    expect(run.stderr).toContain('not recovered: pf-token');
+    expect(read(join(fake.runDir, 'pf-token'))).toBe(`${PHASE} 4242\n`);
+    expect(existsSync(join(fake.runDir, 'lock'))).toBe(true);
+    expect(fake.calls()).not.toContain('pfctl -X 4242');
   });
 
   it('keeps a record, and the lock, until its change is undone', () => {
@@ -1107,7 +1220,7 @@ describe('pev-leak-recover', () => {
     let run = fake.sh(recover);
     expect(run.status).toBe(1);
     expect(run.stderr).toContain('not recovered: alias');
-    expect(read(join(fake.runDir, 'alias'))).toBe('100.128.0.1\n');
+    expect(read(join(fake.runDir, 'alias'))).toBe(`${PHASE} 100.128.0.1\n`);
     expect(existsSync(join(fake.runDir, 'lock'))).toBe(true);
     expect(existsSync(join(fake.runDir, 'pf-token'))).toBe(false);
     rmSync(join(fake.state, 'alias-remove-fails'));
@@ -1160,14 +1273,11 @@ describe('pev-leak-recover', () => {
     expectRestored(fake);
   });
 
-  it('has nothing to do on a clean system', () => {
+  it('has nothing to do on a clean system, and leaves an unrecorded anchor alone', () => {
     const fake = new FakeSystem('recover-clean');
     const run = fake.sh(fake.install(RECOVER, 'pev-leak-recover'));
     expect(run.status).toBe(0);
-    expect(fake.calls()).toEqual([
-      'ps -U pevleak -o pid=,ppid=,comm=',
-      'pfctl -a com.apple/pev-leak -F rules',
-    ]);
+    expect(fake.calls()).toEqual(['ps -U pevleak -o pid=,ppid=,comm=']);
     expect(readdirSync(fake.runDir)).toEqual([]);
   });
 });
@@ -1264,6 +1374,8 @@ console.log(JSON.stringify({ input: Buffer.concat(chunks).toString('utf8'), env:
       `arg=--pev-leak\narg=--pev-user-data=${fake.home}/state/standard\ninput={"nonce":"abc"}\n`,
     );
     expect(stdout).not.toContain('LEAK_TEST_MARKER');
+    // Chromium's temporary files go to the home, not to /var/folders.
+    expect(stdout).toContain(`\nMAC_CHROMIUM_TMPDIR=${fake.home}/tmp\n`);
     expect(existsSync(stale)).toBe(false);
     expect(fields.program_digest).toBe(sh(DIGEST, [bundle]).stdout.trim());
     expect(fields.program).toBe(bundle);
@@ -1274,7 +1386,19 @@ console.log(JSON.stringify({ input: Buffer.concat(chunks).toString('utf8'), env:
     app(fake, 'mas');
     const { run, out } = launch(fake, 'mas');
     expect(run.status).toBe(0);
-    expect(read(join(out, 'stdout.txt'))).toMatch(/^arg=--pev-leak\ninput=/);
+    const stdout = read(join(out, 'stdout.txt'));
+    expect(stdout).toMatch(/^arg=--pev-leak\ninput=/);
+    expect(stdout).not.toContain('MAC_CHROMIUM_TMPDIR');
+  });
+
+  it('counts the per-user folder under /var/folders toward the size limit', () => {
+    const fake = new FakeSystem('run-user-temp');
+    writeFileSync(join(fake.stage, 'probe.mjs'), '');
+    writeFileSync(join(fake.stage, 'input', 'probe.json'), '{}\n');
+    writeFileSync(join(fake.userTemp, 'T', 'chromium-left'), Buffer.alloc(1800 * 1024));
+    const { run } = launch(fake, 'probe', SMALL_LIMIT);
+    expect(run.status).toBe(75);
+    expect(run.stderr).toContain(fake.userTemp);
   });
 
   it('stops the program at the time limit and leaves nothing running', () => {
@@ -1310,6 +1434,21 @@ setInterval(() => {}, 1000);
     expect(fields.invalid).toMatch(/^size limit reached \(\d+ KiB\)$/);
     const left = spawnSync('/usr/bin/pgrep', ['-f', join(fake.stage, 'probe.mjs')]);
     expect(left.status).toBe(1);
+  });
+
+  it('marks a short launch invalid when it ends over the size limit', () => {
+    const fake = new FakeSystem('run-size-short');
+    writeFileSync(
+      join(fake.stage, 'probe.mjs'),
+      `import { writeFileSync } from 'node:fs';
+for (let i = 0; i < 3; i++) writeFileSync(\`\${process.env.TMPDIR}/fill-\${i}\`, Buffer.alloc(1024 * 1024));
+`,
+    );
+    writeFileSync(join(fake.stage, 'input', 'probe.json'), '{}\n');
+    const { run, fields } = launch(fake, 'probe', SMALL_LIMIT);
+    expect(run.status).toBe(75);
+    expect(fields.exit).toBe('0');
+    expect(fields.invalid).toMatch(/^size limit reached \(\d+ KiB\)$/);
   });
 
   it('refuses to launch when the home leaves no room under the size limit', () => {

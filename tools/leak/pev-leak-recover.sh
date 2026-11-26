@@ -87,6 +87,16 @@ alive() {
 	return 0
 }
 
+# True when process $1 is alive and is a capture or a recovery, so a pid
+# reused after a restart doesn't count as the lock's holder.
+holder_alive() {
+	alive "$1" || return 1
+	case "$(/bin/ps -o command= -p "$1" 2>/dev/null)" in
+	*pev-leak-capture* | *pev-leak-recover*) return 0 ;;
+	esac
+	return 1
+}
+
 leak_processes() {
 	/bin/ps -U "$LEAK_USER" -o pid=,ppid=,comm= 2>/dev/null || true
 }
@@ -97,20 +107,31 @@ require_root_owned "$BASE_DIR" d
 require_root_owned "$CAPTURE_DIR" d
 require_root_owned "$RUN_DIR" d
 
-# The capture lock: refuse while a capture is starting (no pid yet) or
-# running; take over the lock of one that has ended.
+# The capture lock: refuse while a capture or another recovery is starting
+# (no pid yet) or running. The lock of one that has ended is taken over under
+# lock/takeover, which only one caller can create; that caller checks the pid
+# again before it writes its own, so two recoveries never both proceed.
 LOCK_DIR=$RUN_DIR/lock
 if ! /bin/mkdir "$LOCK_DIR" 2>/dev/null; then
 	_holder=$(/bin/cat "$LOCK_DIR/pid" 2>/dev/null || true)
 	case "$_holder" in
-	'' | *[!0-9]*) fail 75 'a capture is starting; try again when it has started or ended' ;;
+	'' | *[!0-9]*) fail 75 'a capture or recovery is starting; try again when it has started or ended' ;;
 	esac
-	if alive "$_holder"; then
-		fail 75 "a capture is running (pid $_holder); stop it with SIGTERM instead"
+	if holder_alive "$_holder"; then
+		fail 75 "a capture or recovery is running (pid $_holder); stop a capture with SIGTERM instead"
 	fi
+	/bin/mkdir "$LOCK_DIR/takeover" 2>/dev/null ||
+		fail 75 "another recovery is taking over the lock; if none runs, remove $LOCK_DIR/takeover"
+	if [ "$(/bin/cat "$LOCK_DIR/pid" 2>/dev/null || true)" != "$_holder" ]; then
+		/bin/rmdir "$LOCK_DIR/takeover"
+		fail 75 'another recovery took over the lock'
+	fi
+	echo "$$" >"$LOCK_DIR/pid.new"
+	/bin/mv -f "$LOCK_DIR/pid.new" "$LOCK_DIR/pid"
+	/bin/rmdir "$LOCK_DIR/takeover"
+else
+	echo "$$" >"$LOCK_DIR/pid"
 fi
-echo "$$" >"$LOCK_DIR/pid.new"
-/bin/mv -f "$LOCK_DIR/pid.new" "$LOCK_DIR/pid"
 
 set +e
 ERRORS=''
@@ -124,9 +145,17 @@ if [ -n "$PHASE_ID" ] && [ "$PHASE_DIR" != "$CAPTURE_DIR/$PHASE_ID" ]; then
 	PHASE_ID=''
 fi
 
-# True when the record $1 exists and belongs to the recorded phase.
+# True when the record $1 exists and its first word is the recorded phase.
+# Sets VALUE to the rest of the record.
 owned() {
-	[ -f "$RUN_DIR/$1" ] && [ -n "$PHASE_ID" ] && [ "$(/bin/cat "$RUN_DIR/$1")" = "$PHASE_ID" ]
+	VALUE=''
+	[ -f "$RUN_DIR/$1" ] && [ -n "$PHASE_ID" ] || return 1
+	_line=$(/bin/cat "$RUN_DIR/$1")
+	[ "${_line%% *}" = "$PHASE_ID" ] || return 1
+	case "$_line" in
+	*' '*) VALUE=${_line#* } ;;
+	esac
+	return 0
 }
 
 # A record that exists but names another phase, or no phase, is left alone.
@@ -154,10 +183,14 @@ if [ -n "$_left" ]; then
 	say "ended the processes of $LEAK_USER"
 fi
 
-if [ -f "$RUN_DIR/tcpdump-pids" ]; then
+check_scope tcpdump-pids
+if owned tcpdump-pids; then
 	_stopped=1
-	# shellcheck disable=SC2013 # one pid per word
-	for _pid in $(/bin/cat "$RUN_DIR/tcpdump-pids"); do
+	set -f
+	# shellcheck disable=SC2086 # one pid per word, globbing is off
+	set -- $VALUE
+	set +f
+	for _pid do
 		case "$_pid" in
 		'' | *[!0-9]*) continue ;;
 		esac
@@ -189,22 +222,31 @@ if [ -f "$RUN_DIR/tcpdump-pids" ]; then
 	fi
 fi
 
-if /sbin/pfctl -a "$ANCHOR" -F rules >/dev/null 2>&1; then
-	say "flushed the pf anchor $ANCHOR"
-	/bin/rm -f "$RUN_DIR/anchor"
-else
-	ERRORS="$ERRORS anchor"
+check_scope anchor
+if owned anchor; then
+	if /sbin/pfctl -a "$ANCHOR" -F rules >/dev/null 2>&1; then
+		say "flushed the pf anchor $ANCHOR"
+		/bin/rm -f "$RUN_DIR/anchor"
+	else
+		ERRORS="$ERRORS anchor"
+	fi
 fi
 
-if [ -f "$RUN_DIR/pf-token" ]; then
-	_token=$(/bin/cat "$RUN_DIR/pf-token")
+check_scope pf-token
+if owned pf-token; then
+	_token=$VALUE
 	case "$_token" in
 	'' | *[!0-9]*)
 		say 'left a malformed pf token record'
 		ERRORS="$ERRORS pf-token"
 		;;
 	*)
-		if ! /sbin/pfctl -s References 2>/dev/null | /usr/bin/grep -Eq "(^|[^0-9])$_token([^0-9]|\$)"; then
+		# A token pf no longer lists (after a restart) is gone; if pf can't
+		# be asked, the record stays.
+		if ! _references=$(/sbin/pfctl -s References 2>/dev/null); then
+			say 'left the pf token record: pf could not list its references'
+			ERRORS="$ERRORS pf-token"
+		elif ! printf '%s\n' "$_references" | /usr/bin/grep -Eq "(^|[^0-9])$_token([^0-9]|\$)"; then
 			say 'the pf reference was no longer held (expected after a restart)'
 			/bin/rm -f "$RUN_DIR/pf-token"
 		elif /sbin/pfctl -X "$_token" >/dev/null 2>&1; then
@@ -217,8 +259,9 @@ if [ -f "$RUN_DIR/pf-token" ]; then
 	esac
 fi
 
-if [ -f "$RUN_DIR/alias" ]; then
-	_address=$(/bin/cat "$RUN_DIR/alias")
+check_scope alias
+if owned alias; then
+	_address=$VALUE
 	_family=''
 	case "$_address" in
 	'' | *[!0-9a-f.:]*) ;;
@@ -228,7 +271,10 @@ if [ -f "$RUN_DIR/alias" ]; then
 	if [ -z "$_family" ]; then
 		say 'left a malformed address record'
 		ERRORS="$ERRORS alias"
-	elif ! /sbin/ifconfig lo0 | /usr/bin/grep -Fq "$_family $_address "; then
+	elif ! _lo0=$(/sbin/ifconfig lo0); then
+		say 'left the address record: lo0 could not be read'
+		ERRORS="$ERRORS alias"
+	elif ! printf '%s\n' "$_lo0" | /usr/bin/grep -Fq "$_family $_address "; then
 		/bin/rm -f "$RUN_DIR/alias"
 	elif /sbin/ifconfig lo0 "$_family" "$_address" -alias; then
 		say "removed $_address from lo0"
@@ -271,7 +317,10 @@ fi
 
 check_scope created-pflog0
 if owned created-pflog0; then
-	if ! /sbin/ifconfig pflog0 >/dev/null 2>&1; then
+	if ! _interfaces=$(/sbin/ifconfig -l); then
+		say 'left the pflog0 record: the interfaces could not be listed'
+		ERRORS="$ERRORS pflog0"
+	elif ! printf ' %s \n' "$_interfaces" | /usr/bin/grep -Fq ' pflog0 '; then
 		/bin/rm -f "$RUN_DIR/created-pflog0"
 	elif /sbin/ifconfig pflog0 destroy; then
 		say 'destroyed pflog0'
@@ -296,6 +345,8 @@ if [ -n "$PHASE_ID" ] && [ -d "$PHASE_DIR" ]; then
 	say "marked $PHASE_DIR invalid"
 fi
 /bin/rm -f "$RUN_DIR/phase-dir"
-/bin/rm -rf "$LOCK_DIR"
+if [ "$(/bin/cat "$LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ]; then
+	/bin/rm -rf "$LOCK_DIR"
+fi
 say finished
 exit 0

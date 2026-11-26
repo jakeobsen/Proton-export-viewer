@@ -126,6 +126,16 @@ alive() {
 	return 0
 }
 
+# True when process $1 is alive and is a capture or a recovery, so a pid
+# reused after a restart doesn't count as the lock's holder.
+holder_alive() {
+	alive "$1" || return 1
+	case "$(/bin/ps -o command= -p "$1" 2>/dev/null)" in
+	*pev-leak-capture* | *pev-leak-recover*) return 0 ;;
+	esac
+	return 1
+}
+
 stamp() {
 	/bin/date -u +%Y-%m-%dT%H:%M:%SZ
 }
@@ -328,7 +338,8 @@ expected_rules() {
 }
 
 # Stops one tcpdump and checks how it ended: a clean exit, and statistics
-# with no packets dropped. Adds a reason to the phase when not.
+# with no packets dropped. Adds a reason to the phase when not. Waits at
+# most 10 seconds, and fails if the process is still there.
 # shellcheck disable=SC2317 # called from cleanup, which the EXIT trap runs
 stop_capture() {
 	_pid=$1
@@ -344,6 +355,16 @@ stop_capture() {
 	if alive "$_pid"; then
 		kill -KILL "$_pid" 2>/dev/null
 		_killed=1
+		_i=0
+		while alive "$_pid" && [ "$_i" -lt 5 ]; do
+			/bin/sleep 1
+			_i=$((_i + 1))
+		done
+	fi
+	if alive "$_pid"; then
+		RESULT=invalid
+		add_reason "the $_name capture did not stop"
+		return 1
 	fi
 	_status=0
 	wait "$_pid" 2>/dev/null || _status=$?
@@ -359,6 +380,13 @@ stop_capture() {
 		RESULT=invalid
 		add_reason "the $_name capture dropped $_dropped packets"
 	fi
+	# tcpdump prints this line only when the interface dropped packets.
+	_dropped=$(/usr/bin/sed -n 's/^\([0-9][0-9]*\) packets\{0,1\} dropped by interface$/\1/p' "$_log" 2>/dev/null)
+	if [ -n "$_dropped" ] && [ "$_dropped" != 0 ]; then
+		RESULT=invalid
+		add_reason "the $_name interface dropped $_dropped packets"
+	fi
+	return 0
 }
 
 # --- Checks that change nothing ------------------------------------------
@@ -379,12 +407,21 @@ if ! /bin/mkdir "$LOCK_DIR" 2>/dev/null; then
 	case "$_holder" in
 	'' | *[!0-9]*) fail 75 'another capture is starting, or a stopped one left its lock (then run pev-leak-recover)' ;;
 	esac
-	if alive "$_holder"; then
-		fail 75 "another capture is running (pid $_holder)"
+	if holder_alive "$_holder"; then
+		fail 75 "another capture or a recovery is running (pid $_holder)"
 	fi
 	fail 75 'a stopped capture left its lock behind; run pev-leak-recover'
 fi
 echo "$$" >"$LOCK_DIR/pid"
+
+# Records left by an earlier phase mean its changes may still be in place.
+for _record in phase-dir anchor pf-token alias tcpdump-pids created-pflog0 \
+	created-resolver-dir created-resolver-file; do
+	if [ -e "$RUN_DIR/$_record" ] || [ -L "$RUN_DIR/$_record" ]; then
+		/bin/rm -rf "$LOCK_DIR"
+		fail 75 "an earlier phase left $RUN_DIR/$_record; run pev-leak-recover"
+	fi
+done
 
 # Everything below is undone by cleanup(), which reverts only what this run
 # changed.
@@ -447,16 +484,21 @@ cleanup() {
 		fi
 	fi
 
+	_stopped=1
 	if [ -n "$PFLOG_PID" ]; then
-		stop_capture "$PFLOG_PID" "$PHASE_DIR/pflog0.log" pflog0
+		stop_capture "$PFLOG_PID" "$PHASE_DIR/pflog0.log" pflog0 || _stopped=0
 	fi
 	if [ -n "$STUB_PID" ]; then
-		stop_capture "$STUB_PID" "$PHASE_DIR/stub.log" lo0
+		stop_capture "$STUB_PID" "$PHASE_DIR/stub.log" lo0 || _stopped=0
 	fi
-	/bin/rm -f "$RUN_DIR/tcpdump-pids"
+	if [ "$_stopped" = 1 ]; then
+		/bin/rm -f "$RUN_DIR/tcpdump-pids"
+	else
+		_errors="$_errors tcpdump"
+	fi
 
 	if [ "$_keep" = 1 ]; then
-		_errors=' test-user-processes'
+		_errors="$_errors test-user-processes"
 	else
 		if [ "$ANCHOR_LOADED" = 1 ]; then
 			if /sbin/pfctl -a "$ANCHOR" -F rules >/dev/null 2>&1; then
@@ -503,6 +545,12 @@ cleanup() {
 		fi
 	fi
 
+	# A phase whose cleanup failed is never complete.
+	if [ -n "$_errors" ]; then
+		RESULT=invalid
+		add_reason "cleanup failed:$_errors"
+	fi
+
 	if [ -n "$PHASE_DIR" ] && [ -d "$PHASE_DIR" ]; then
 		note "result=$RESULT"
 		[ -z "$REASON" ] || note "reason=$REASON"
@@ -514,7 +562,9 @@ cleanup() {
 	if [ -n "$_errors" ]; then
 		echo "pev-leak-capture: cleanup left:$_errors; run pev-leak-recover" >&2
 	else
-		/bin/rm -f "$RUN_DIR/phase-dir"
+		if [ -n "$PHASE_DIR" ]; then
+			/bin/rm -f "$RUN_DIR/phase-dir"
+		fi
 		/bin/rm -rf "$LOCK_DIR"
 	fi
 	echo "pev-leak-capture: $RESULT${REASON:+ ($REASON)}"
@@ -585,7 +635,7 @@ case "$PF_TOKEN" in
 	fail 1 'pfctl -E printed no token'
 	;;
 esac
-record pf-token "$PF_TOKEN"
+record pf-token "$PHASE_ID $PF_TOKEN"
 
 RULES="block out log quick proto { tcp udp } from any to any user $LEAK_USER"
 if [ "$CONSENT" = 1 ]; then
@@ -625,7 +675,7 @@ else
 fi
 
 if [ "$CONSENT" = 1 ]; then
-	record alias "$TEST_ADDRESS"
+	record alias "$PHASE_ID $TEST_ADDRESS"
 	MADE_ALIAS=1
 	if [ "$FAMILY" = inet ]; then
 		/sbin/ifconfig lo0 inet "$TEST_ADDRESS" netmask 255.255.255.255 alias
@@ -640,7 +690,7 @@ PFLOG_PID=$!
 /usr/sbin/tcpdump -n -p -U -s "$SNAPLEN" -c "$MAX_PACKETS" -i lo0 \
 	-w "$PHASE_DIR/stub.pcap" "port $STUB_PORT" 2>"$PHASE_DIR/stub.log" &
 STUB_PID=$!
-record tcpdump-pids "$PFLOG_PID $STUB_PID"
+record tcpdump-pids "$PHASE_ID $PFLOG_PID $STUB_PID"
 
 # --- Readiness --------------------------------------------------------------
 
