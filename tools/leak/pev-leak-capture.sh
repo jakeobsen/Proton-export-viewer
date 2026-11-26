@@ -29,6 +29,15 @@
 #
 # Each change is recorded under run/ before it is made, with the phase it
 # belongs to, and its record is removed only once the change is undone.
+# While the phase is being set up, SIGTERM, SIGINT and SIGHUP are only noted;
+# the capture acts on them after each change and its record, so a signal
+# never leaves a change without its record. The output of "pfctl -E" goes to
+# a file under run/ first, so even after SIGKILL the reference can be
+# released; only if pfctl itself is killed before printing its token does
+# pev-leak-recover report a pf reference it can't identify.
+#
+# The lock is built under a temporary name with the pid inside, then renamed
+# into place, so a lock always names its holder.
 #
 # The argument only selects one of three fixed settings. It never becomes part
 # of a path or a command line.
@@ -173,9 +182,10 @@ valid_ipv4() {
 	FAMILY=inet
 }
 
-# Accepts one IPv6 address in lowercase hex without leading zeros in a group
-# (the form ifconfig prints), inside 2000::/3 and outside 2001::/23,
-# 2001:db8::/32, 2002::/16 and 3fff::/20. Sets FAMILY to inet6.
+# Accepts one IPv6 address in lowercase hex without leading zeros in a group,
+# inside 2000::/3 and outside 2001::/23, 2001:db8::/32, 2002::/16 and
+# 3fff::/20. Sets FAMILY to inet6. read_test_address also requires the form
+# ifconfig prints (see ipv6_canonical).
 valid_ipv6() {
 	case "$1" in
 	'' | *[!0-9a-f:]*) return 1 ;;
@@ -202,6 +212,73 @@ valid_ipv6() {
 	FAMILY=inet6
 }
 
+# Prints an address that valid_ipv6 accepted in the form ifconfig prints
+# (RFC 5952): all eight groups, with the longest run of two or more zero
+# groups (the first one, on a tie) written as "::".
+ipv6_canonical() {
+	_head=$1
+	_tail=''
+	case "$1" in
+	*::*)
+		_head=${1%%::*}
+		_tail=${1#*::}
+		;;
+	esac
+	IFS=:
+	set -f
+	# shellcheck disable=SC2086 # split into groups
+	set -- $_head
+	_groups="$*"
+	_count=$#
+	# shellcheck disable=SC2086 # split into groups
+	set -- $_tail
+	_count=$((_count + $#))
+	while [ "$_count" -lt 8 ]; do
+		_groups="${_groups:+$_groups:}0"
+		_count=$((_count + 1))
+	done
+	_groups="$_groups${_tail:+:$_tail}"
+	# shellcheck disable=SC2086 # split into groups
+	set -- $_groups
+	set +f
+	IFS=$(printf ' \t\n.')
+	IFS=${IFS%.}
+	_best_at=0
+	_best_len=0
+	_run_at=0
+	_run_len=0
+	_i=1
+	for _group do
+		if [ "$_group" = 0 ]; then
+			[ "$_run_len" -gt 0 ] || _run_at=$_i
+			_run_len=$((_run_len + 1))
+			if [ "$_run_len" -gt "$_best_len" ]; then
+				_best_at=$_run_at
+				_best_len=$_run_len
+			fi
+		else
+			_run_len=0
+		fi
+		_i=$((_i + 1))
+	done
+	_left=''
+	_right=''
+	_i=1
+	for _group do
+		if [ "$_best_len" -lt 2 ] || [ "$_i" -lt "$_best_at" ]; then
+			_left="${_left:+$_left:}$_group"
+		elif [ "$_i" -ge $((_best_at + _best_len)) ]; then
+			_right="${_right:+$_right:}$_group"
+		fi
+		_i=$((_i + 1))
+	done
+	if [ "$_best_len" -lt 2 ]; then
+		echo "$_left"
+	else
+		echo "$_left::$_right"
+	fi
+}
+
 # Reads the test address: one line in a root-owned file, never sourced.
 read_test_address() {
 	require_root_owned "${CONFIG_DIR%/*}" d
@@ -214,8 +291,15 @@ read_test_address() {
 	case "$TEST_ADDRESS" in
 	*[!0-9a-f.:]*) fail 78 "$CONFIG_FILE: not a single IP address" ;;
 	esac
-	valid_ipv4 "$TEST_ADDRESS" || valid_ipv6 "$TEST_ADDRESS" ||
-		fail 78 "$CONFIG_FILE: not a global unicast IP address"
+	if valid_ipv4 "$TEST_ADDRESS"; then
+		return 0
+	fi
+	valid_ipv6 "$TEST_ADDRESS" || fail 78 "$CONFIG_FILE: not a global unicast IP address"
+	# The alias checks compare text with what ifconfig prints, so only that
+	# spelling is accepted.
+	_canonical=$(ipv6_canonical "$TEST_ADDRESS")
+	[ "$_canonical" = "$TEST_ADDRESS" ] ||
+		fail 78 "$CONFIG_FILE: write the address as $_canonical (the form ifconfig prints)"
 }
 
 # The test user's processes, one "pid ppid executable" line each.
@@ -301,6 +385,7 @@ record() {
 wait_for_listening() {
 	_i=0
 	while [ "$_i" -lt "$READY_WAIT" ]; do
+		checkpoint
 		alive "$2" || return 1
 		if /usr/bin/grep -q 'listening on' "$1" 2>/dev/null; then
 			return 0
@@ -320,6 +405,7 @@ resolver_active() {
 wait_for_resolver() {
 	_i=0
 	while [ "$_i" -lt "$READY_WAIT" ]; do
+		checkpoint
 		if resolver_active; then
 			return 0
 		fi
@@ -337,6 +423,44 @@ expected_rules() {
 	if [ "$CONSENT" = 1 ]; then echo 3; else echo 2; fi
 }
 
+# Sends process $1 SIGTERM, and SIGKILL if it is still there 5 seconds later.
+# Fails if it is still there 5 seconds after that. Sets KILLED to 1 when
+# SIGKILL was needed.
+# shellcheck disable=SC2317 # called from cleanup, which the EXIT trap runs
+end_process() {
+	KILLED=0
+	kill -TERM "$1" 2>/dev/null
+	_i=0
+	while alive "$1" && [ "$_i" -lt 5 ]; do
+		/bin/sleep 1
+		_i=$((_i + 1))
+	done
+	if alive "$1"; then
+		KILLED=1
+		kill -KILL "$1" 2>/dev/null
+		_i=0
+		while alive "$1" && [ "$_i" -lt 5 ]; do
+			/bin/sleep 1
+			_i=$((_i + 1))
+		done
+	fi
+	! alive "$1"
+}
+
+# Prints the pid of every root tcpdump that writes into the phase directory,
+# recorded or not. Fails if the process list can't be read.
+# shellcheck disable=SC2317 # called from cleanup, which the EXIT trap runs
+phase_tcpdumps() {
+	[ -n "$PHASE_DIR" ] || return 0
+	_list=$(/bin/ps -axww -o pid=,uid=,command=) || return 1
+	printf '%s\n' "$_list" | while read -r _pid _uid _command; do
+		[ "$_uid" = "$ROOT_UID" ] || continue
+		case "$_command" in
+		*"/usr/sbin/tcpdump "*" -w $PHASE_DIR/"*) echo "$_pid" ;;
+		esac
+	done
+}
+
 # Stops one tcpdump and checks how it ended: a clean exit, and statistics
 # with no packets dropped. Adds a reason to the phase when not. Waits at
 # most 10 seconds, and fails if the process is still there.
@@ -345,30 +469,14 @@ stop_capture() {
 	_pid=$1
 	_log=$2
 	_name=$3
-	kill -TERM "$_pid" 2>/dev/null
-	_i=0
-	while alive "$_pid" && [ "$_i" -lt 5 ]; do
-		/bin/sleep 1
-		_i=$((_i + 1))
-	done
-	_killed=0
-	if alive "$_pid"; then
-		kill -KILL "$_pid" 2>/dev/null
-		_killed=1
-		_i=0
-		while alive "$_pid" && [ "$_i" -lt 5 ]; do
-			/bin/sleep 1
-			_i=$((_i + 1))
-		done
-	fi
-	if alive "$_pid"; then
+	if ! end_process "$_pid"; then
 		RESULT=invalid
 		add_reason "the $_name capture did not stop"
 		return 1
 	fi
 	_status=0
 	wait "$_pid" 2>/dev/null || _status=$?
-	if [ "$_killed" = 1 ] || [ "$_status" != 0 ]; then
+	if [ "$KILLED" = 1 ] || [ "$_status" != 0 ]; then
 		RESULT=invalid
 		add_reason "the $_name capture did not stop cleanly"
 	fi
@@ -401,22 +509,30 @@ if [ -e "$RESOLVER_DIR" ]; then
 fi
 /usr/bin/id -u "$LEAK_USER" >/dev/null 2>&1 || fail 78 "no user $LEAK_USER"
 
+# The lock is built as lock.<pid>/lock with the pid inside, then moved into
+# run/. The move is a rename, which fails while a lock holds anything, so a
+# lock always names its holder.
 LOCK_DIR=$RUN_DIR/lock
-if ! /bin/mkdir "$LOCK_DIR" 2>/dev/null; then
+NEW_LOCK=$RUN_DIR/lock.$$
+/bin/rm -rf "$NEW_LOCK"
+/bin/mkdir -m 0755 "$NEW_LOCK" "$NEW_LOCK/lock"
+echo "$$" >"$NEW_LOCK/lock/pid"
+if ! /bin/mv -f "$NEW_LOCK/lock" "$RUN_DIR/" 2>/dev/null; then
+	/bin/rm -rf "$NEW_LOCK"
 	_holder=$(/bin/cat "$LOCK_DIR/pid" 2>/dev/null || true)
 	case "$_holder" in
-	'' | *[!0-9]*) fail 75 'another capture is starting, or a stopped one left its lock (then run pev-leak-recover)' ;;
+	'' | *[!0-9]*) fail 75 'a stopped capture or recovery left its lock behind; run pev-leak-recover' ;;
 	esac
 	if holder_alive "$_holder"; then
 		fail 75 "another capture or a recovery is running (pid $_holder)"
 	fi
 	fail 75 'a stopped capture left its lock behind; run pev-leak-recover'
 fi
-echo "$$" >"$LOCK_DIR/pid"
+/bin/rmdir "$NEW_LOCK"
 
 # Records left by an earlier phase mean its changes may still be in place.
-for _record in phase-dir anchor pf-token alias tcpdump-pids created-pflog0 \
-	created-resolver-dir created-resolver-file; do
+for _record in phase-dir anchor pf-token pf-token.out alias tcpdump-pids \
+	created-pflog0 created-resolver-dir created-resolver-file; do
 	if [ -e "$RUN_DIR/$_record" ] || [ -L "$RUN_DIR/$_record" ]; then
 		/bin/rm -rf "$LOCK_DIR"
 		fail 75 "an earlier phase left $RUN_DIR/$_record; run pev-leak-recover"
@@ -431,6 +547,7 @@ STARTED=$(/bin/date +%s)
 PHASE_DIR=''
 PHASE_ID=''
 PF_TOKEN=''
+PF_PENDING=0
 ANCHOR_LOADED=0
 MADE_PFLOG=0
 MADE_RESOLVER_DIR=0
@@ -438,6 +555,9 @@ MADE_RESOLVER=0
 MADE_ALIAS=0
 PFLOG_PID=''
 STUB_PID=''
+# While SETTING_UP is 1, a signal is only noted in SIGNALLED.
+SETTING_UP=1
+SIGNALLED=''
 
 # shellcheck disable=SC2317 # runs from the EXIT trap
 cleanup() {
@@ -491,6 +611,26 @@ cleanup() {
 	if [ -n "$STUB_PID" ]; then
 		stop_capture "$STUB_PID" "$PHASE_DIR/stub.log" lo0 || _stopped=0
 	fi
+	# Any other root tcpdump that writes into the phase directory is stopped
+	# too, and makes the phase invalid.
+	if _others=$(phase_tcpdumps); then
+		set -f
+		# shellcheck disable=SC2086 # one pid per line, globbing is off
+		set -- $_others
+		set +f
+		for _pid do
+			if [ "$_pid" = "$PFLOG_PID" ] || [ "$_pid" = "$STUB_PID" ]; then
+				continue
+			fi
+			RESULT=invalid
+			add_reason "an unrecorded capture (pid $_pid) was running"
+			end_process "$_pid" || _stopped=0
+		done
+	else
+		_stopped=0
+		RESULT=invalid
+		add_reason 'the process list could not be read'
+	fi
 	if [ "$_stopped" = 1 ]; then
 		/bin/rm -f "$RUN_DIR/tcpdump-pids"
 	else
@@ -513,6 +653,10 @@ cleanup() {
 			else
 				_errors="$_errors pf-token"
 			fi
+		elif [ "$PF_PENDING" = 1 ]; then
+			# pfctl -E succeeded without printing a token: its reference is
+			# left to pev-leak-recover, which reports it.
+			_errors="$_errors pf-token"
 		fi
 		if [ "$MADE_ALIAS" = 1 ]; then
 			if /sbin/ifconfig lo0 "$FAMILY" "$TEST_ADDRESS" -alias; then
@@ -575,8 +719,14 @@ cleanup() {
 	exit "$_rc"
 }
 
+# During setup a signal is only noted; checkpoint acts on it once the change
+# in progress and its record are both in place.
 # shellcheck disable=SC2317 # runs from the signal traps
 on_signal() {
+	if [ "$SETTING_UP" = 1 ]; then
+		[ -n "$SIGNALLED" ] || SIGNALLED=$1
+		return 0
+	fi
 	if [ -z "$RESULT" ]; then
 		if [ "$1" = TERM ] && [ "$READY" = 1 ]; then
 			STOP=TERM
@@ -586,6 +736,13 @@ on_signal() {
 		fi
 	fi
 	exit 1
+}
+
+checkpoint() {
+	if [ -n "$SIGNALLED" ]; then
+		SETTING_UP=0
+		on_signal "$SIGNALLED"
+	fi
 }
 
 trap cleanup EXIT
@@ -611,6 +768,7 @@ if ! /sbin/pfctl -s rules 2>/dev/null | /usr/bin/grep -Fqx 'anchor "com.apple/*"
 fi
 
 prune_captures
+checkpoint
 PHASE_ID=$(/bin/date -u +%Y%m%dT%H%M%SZ)-$PHASE-$$
 PHASE_DIR=$CAPTURE_DIR/$PHASE_ID
 /bin/mkdir -m 0755 "$PHASE_DIR"
@@ -618,24 +776,42 @@ record phase-dir "$PHASE_DIR"
 note "phase=$PHASE"
 note "started=$(stamp)"
 STARTED=$(/bin/date +%s)
+checkpoint
 
 # System agents from an earlier launch end before the phase starts.
 if [ -n "$BEFORE" ]; then
 	printf '%s\n' "$BEFORE" >>"$PHASE_DIR/ended-before-start"
 	end_leak_processes || fail 75 "$LEAK_USER system agents did not end"
 fi
+checkpoint
 
 # --- Changes, each recorded under run/ for pev-leak-recover ----------------
 
-_out=$(/sbin/pfctl -E 2>&1) || fail 1 "pfctl -E failed: $_out"
-PF_TOKEN=$(printf '%s\n' "$_out" | /usr/bin/sed -n 's/^Token *: *\([0-9][0-9]*\) *$/\1/p')
+# The record names the phase before pf holds a reference; pfctl writes its
+# token to pf-token.out, which outlives this shell.
+record pf-token "$PHASE_ID"
+PF_PENDING=1
+_status=0
+/sbin/pfctl -E >"$RUN_DIR/pf-token.out" 2>&1 || _status=$?
+PF_TOKEN=$(/usr/bin/sed -n 's/^Token *: *\([0-9][0-9]*\) *$/\1/p' "$RUN_DIR/pf-token.out")
 case "$PF_TOKEN" in
-'' | *[!0-9]*)
-	PF_TOKEN=''
-	fail 1 'pfctl -E printed no token'
-	;;
+*[!0-9]*) PF_TOKEN='' ;;
 esac
-record pf-token "$PHASE_ID $PF_TOKEN"
+if [ -n "$PF_TOKEN" ]; then
+	record pf-token "$PHASE_ID $PF_TOKEN"
+	PF_PENDING=0
+	/bin/rm -f "$RUN_DIR/pf-token.out"
+	[ "$_status" = 0 ] || fail 1 "pfctl -E exited with status $_status"
+elif [ "$_status" -ne 0 ] && [ "$_status" -le 128 ]; then
+	# pfctl -E failed, so pf holds no reference for it.
+	_out=$(/bin/cat "$RUN_DIR/pf-token.out")
+	/bin/rm -f "$RUN_DIR/pf-token" "$RUN_DIR/pf-token.out"
+	PF_PENDING=0
+	fail 1 "pfctl -E failed: $_out"
+else
+	fail 1 'pfctl -E printed no token'
+fi
+checkpoint
 
 RULES="block out log quick proto { tcp udp } from any to any user $LEAK_USER"
 if [ "$CONSENT" = 1 ]; then
@@ -651,12 +827,14 @@ _loaded=$(/sbin/pfctl -a "$ANCHOR" -s rules 2>>"$PHASE_DIR/pfctl.log" | /usr/bin
 if [ "$_loaded" != "$(expected_rules)" ]; then
 	fail 1 "the anchor holds $_loaded rules, expected $(expected_rules)"
 fi
+checkpoint
 
 if ! /sbin/ifconfig pflog0 >/dev/null 2>&1; then
 	record created-pflog0 "$PHASE_ID"
 	MADE_PFLOG=1
 	/sbin/ifconfig pflog0 create
 fi
+checkpoint
 
 if [ ! -d "$RESOLVER_DIR" ]; then
 	record created-resolver-dir "$PHASE_ID"
@@ -673,6 +851,7 @@ else
 	/bin/rm -f "$RUN_DIR/created-resolver-file"
 	fail 75 "$RESOLVER_FILE appeared while the phase was starting"
 fi
+checkpoint
 
 if [ "$CONSENT" = 1 ]; then
 	record alias "$PHASE_ID $TEST_ADDRESS"
@@ -683,7 +862,11 @@ if [ "$CONSENT" = 1 ]; then
 		/sbin/ifconfig lo0 inet6 "$TEST_ADDRESS" prefixlen 128 alias
 	fi
 fi
+checkpoint
 
+# Until the pids are recorded, the record names only the phase; cleanup and
+# pev-leak-recover find the captures by the phase directory they write into.
+record tcpdump-pids "$PHASE_ID"
 /usr/sbin/tcpdump -n -p -U -s "$SNAPLEN" -c "$MAX_PACKETS" -i pflog0 \
 	-w "$PHASE_DIR/pflog0.pcap" "ruleset $ANCHOR_NAME" 2>"$PHASE_DIR/pflog0.log" &
 PFLOG_PID=$!
@@ -691,6 +874,7 @@ PFLOG_PID=$!
 	-w "$PHASE_DIR/stub.pcap" "port $STUB_PORT" 2>"$PHASE_DIR/stub.log" &
 STUB_PID=$!
 record tcpdump-pids "$PHASE_ID $PFLOG_PID $STUB_PID"
+checkpoint
 
 # --- Readiness --------------------------------------------------------------
 
@@ -704,6 +888,9 @@ if [ "$CONSENT" = 1 ] && ! alias_present; then
 	fail 1 'the test address is not on lo0'
 fi
 
+# From here a signal acts at once; one noted during setup acts now.
+SETTING_UP=0
+checkpoint
 READY=1
 note "ready=$(stamp)"
 echo "pev-leak-capture: ready $PHASE_DIR"
