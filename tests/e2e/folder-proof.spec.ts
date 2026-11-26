@@ -8,16 +8,27 @@
 // its manifest next to it (<export>.manifest.json). They are copied into one
 // fixed scratch folder, replaced on every run, and must match their manifests
 // before and after, whatever the outcome. Without it, the test makes two
-// small exports itself.
+// small exports itself. The copies keep the originals' file permissions: a
+// second test shows that a read-only original gives a read-only copy, where
+// the changes fail.
 
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+} from 'node:fs';
 import { basename, join, sep } from 'node:path';
 import { overlaps } from '../../scripts/folder-proof-exports.mjs';
 import { removeOutputDir } from '../../scripts/test-output.mjs';
 import type { ProofFileRead, ProofOps, ProofScan } from '../../src/shared/core-protocol';
-import { scanTree } from '../../src/testhooks/proof/fs';
-import { copyTree } from '../copy-tree';
+import { scanTree, walk } from '../../src/testhooks/proof/fs';
+import { copyTree, unlockFolders } from '../copy-tree';
+import { permissionDenials } from '../permission-check';
 import { TEST_OUTPUT, testDir } from '../paths';
 import { expect, test } from './app';
 
@@ -76,6 +87,7 @@ function manifestDigest(original: string): string {
 }
 
 const digestOf = (folder: string) => scanTree(folder).digest;
+const modeOf = (path: string) => lstatSync(path).mode & 0o777;
 
 /** Every change succeeded, from main and core, really happened, and stayed in `copy`. */
 function expectChanged(change: Change, copy: string) {
@@ -99,6 +111,47 @@ function expectRead(read: Read, digest: string | null) {
   );
 }
 
+/**
+ * Removes the scratch folder, a read-only copy included: owner access to the
+ * folders inside it is restored first (no link is followed), then the
+ * test-output guard removes it.
+ */
+function removeScratch() {
+  unlockFolders(TEST_OUTPUT, SCRATCH);
+  removeOutputDir(TEST_OUTPUT, SCRATCH);
+  expect(existsSync(SCRATCH)).toBe(false);
+}
+
+/**
+ * Replaces the scratch folder with bounded copies of the two originals.
+ * Neither may lie in or around the scratch folder (checked before it is
+ * removed), nor in or around the other.
+ */
+function copyIntoScratch(originals: string[]): [string, string] {
+  mkdirSync(TEST_OUTPUT, { recursive: true });
+  const physicalScratch = join(realpathSync(TEST_OUTPUT), basename(SCRATCH));
+  for (const original of originals) {
+    expect(overlaps(original, physicalScratch), `${original} and the scratch folder`).toBe(false);
+  }
+  expect(overlaps(originals[0]!, originals[1]!), 'the two originals').toBe(false);
+  removeScratch();
+  mkdirSync(SCRATCH);
+  const copies = originals.map((original, i) => {
+    const copy = join(SCRATCH, `${i + 1}-${basename(original)}`);
+    copyTree(original, copy, COPY_CAP);
+    return copy;
+  });
+  return copies as [string, string];
+}
+
+/** Gives every folder (`dirs`) and file (`files`) in `root`, and `root`, that mode. */
+function setModes(root: string, dirs: number, files: number) {
+  for (const entry of walk(root).reverse()) {
+    chmodSync(entry.full, entry.type === 'dir' ? dirs : files);
+  }
+  chmodSync(root, dirs);
+}
+
 test('the proof operations all succeed without the sandbox', async ({ pev }) => {
   const named = process.env.PEV_PROOF_EXPORTS?.split(':');
   const originals = (
@@ -109,32 +162,17 @@ test('the proof operations all succeed without the sandbox', async ({ pev }) => 
     })()
   ).map((o) => realpathSync(o));
   expect(originals).toHaveLength(2);
-  const [first, second] = originals as [string, string];
   const expected = named ? named.map(manifestDigest) : originals.map(digestOf);
-
-  // Nothing here may touch an original: neither lies in or around the scratch
-  // folder (checked before it is removed), nor in or around the other.
-  mkdirSync(TEST_OUTPUT, { recursive: true });
-  const physicalScratch = join(realpathSync(TEST_OUTPUT), basename(SCRATCH));
-  for (const original of originals) {
-    expect(overlaps(original, physicalScratch), `${original} and the scratch folder`).toBe(false);
-  }
-  expect(overlaps(first, second), 'the two originals').toBe(false);
   expect(originals.map(digestOf)).toEqual(expected);
+  // Ordinary permissions must allow every read and change in the originals,
+  // and the copies keep them: so the denials of the sandboxed build can only
+  // come from the sandbox.
+  expect(originals.map(permissionDenials)).toEqual([[], []]);
 
   try {
-    // One fixed scratch folder, replaced on every run, removed only through
-    // the guard that refuses links on the way.
-    removeOutputDir(TEST_OUTPUT, SCRATCH);
-    expect(existsSync(SCRATCH)).toBe(false);
-    mkdirSync(SCRATCH);
-    const [copyA, copyB] = originals.map((o, i) => join(SCRATCH, `${i + 1}-${basename(o)}`)) as [
-      string,
-      string,
-    ];
-    copyTree(first, copyA, COPY_CAP);
-    copyTree(second, copyB, COPY_CAP);
+    const [copyA, copyB] = copyIntoScratch(originals);
     expect([copyA, copyB].map(digestOf)).toEqual(expected);
+    expect([copyA, copyB].map(permissionDenials)).toEqual([[], []]);
 
     const result = await pev.main<ControlResult>('folderProofControl', copyA, copyB);
 
@@ -160,5 +198,39 @@ test('the proof operations all succeed without the sandbox', async ({ pev }) => 
       .soft(originals.map(digestOf), 'the originals still match their manifests')
       .toEqual(expected);
   }
-  if (test.info().errors.length === 0) removeOutputDir(TEST_OUTPUT, SCRATCH);
+  if (test.info().errors.length === 0) removeScratch();
+});
+
+test('a read-only original gives a read-only copy, where the changes fail', async ({ pev }) => {
+  test.skip(process.getuid?.() === 0, 'file modes do not bind root');
+  const dir = testDir('folder-proof-read-only');
+  const locked = realpathSync(makeExport(join(dir, 'locked'), 4));
+  const open = realpathSync(makeExport(join(dir, 'open'), 4));
+  setModes(locked, 0o555, 0o444);
+  try {
+    expect(permissionDenials(locked)).not.toEqual([]);
+    const [copyA, copyB] = copyIntoScratch([locked, open]);
+    for (const entry of [{ full: locked, path: '' }, ...walk(locked)]) {
+      const copy = join(copyA, ...entry.path.split('/'));
+      expect([entry.path, modeOf(copy)]).toEqual([entry.path, modeOf(entry.full)]);
+    }
+
+    const result = await pev.main<ControlResult>('folderProofControl', copyA, copyB);
+
+    // The first change on copy A fails with the copy's own permissions, so
+    // the checks end there and core never tries; copy B still changes.
+    expect(result.change.main).toEqual({
+      write: { ok: false, code: 'EACCES' },
+      create: null,
+      rename: null,
+      remove: null,
+    });
+    expect(result.change.core).toBeNull();
+    expectChanged(result.secondChange, copyB);
+
+    // The read-only copy is removed with the rest of the scratch folder.
+    removeScratch();
+  } finally {
+    setModes(locked, 0o755, 0o644);
+  }
 });

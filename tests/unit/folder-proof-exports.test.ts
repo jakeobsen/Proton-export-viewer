@@ -3,6 +3,7 @@
 // positive control uses.
 
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -11,14 +12,35 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { expectedExports, overlaps } from '../../scripts/folder-proof-exports.mjs';
-import { scanTree } from '../../src/testhooks/proof/fs';
-import { copyTree } from '../copy-tree';
+import { scanTree, walk } from '../../src/testhooks/proof/fs';
+import { copyTree, unlockFolders } from '../copy-tree';
+import { permissionDenials } from '../permission-check';
 import { testDir } from '../paths';
 
 const DIGEST = 'ab'.repeat(32);
+const asRoot = process.getuid?.() === 0;
+const modeOf = (path: string) => lstatSync(path).mode & 0o777;
+
+/** Gives every folder and file below and including `root` the owner's full access again. */
+function unlock(root: string) {
+  if (!existsSync(root)) return;
+  chmodSync(root, 0o755);
+  for (const entry of walk(root)) chmodSync(entry.full, entry.type === 'dir' ? 0o755 : 0o644);
+}
+
+/** A small export with three message pairs; returns the root and its run folder. */
+function smallExport(root: string) {
+  const run = join(root, 'acct@example.com', 'mail_20250101_000000');
+  mkdirSync(run, { recursive: true });
+  for (const id of ['a', 'b', 'c']) {
+    writeFileSync(join(run, `${id}.metadata.json`), `{"ID":"${id}"}`);
+    writeFileSync(join(run, `${id}.eml`), `Subject: ${id}\r\n\r\n`);
+  }
+  return { root, run };
+}
 
 /** A folder with a manifest next to it, as the generator writes them. */
 function generated(root: string, name: string, manifest: Record<string, unknown> = {}) {
@@ -117,11 +139,107 @@ describe('copyTree', () => {
     expect(existsSync(join(root, 'copy'))).toBe(false);
   });
 
+  it.skipIf(asRoot)('keeps permission bits, so a read-only source gives a read-only copy', () => {
+    const root = testDir('copy-tree-modes');
+    const src = source(root);
+    const copy = join(root, 'copy');
+    chmodSync(join(src, 'acct', 'run', 'a.eml'), 0o444);
+    chmodSync(join(src, 'acct', 'run'), 0o555);
+    try {
+      copyTree(src, copy, 1_000);
+      for (const p of ['acct/run/a.eml', 'acct/run/b.eml', 'acct/run', 'acct']) {
+        expect([p, modeOf(join(copy, p))]).toEqual([p, modeOf(join(src, p))]);
+      }
+      expect(modeOf(join(copy, 'acct', 'run'))).toBe(0o555);
+      expect(scanTree(copy).digest).toBe(scanTree(src).digest);
+    } finally {
+      unlock(src);
+      unlock(copy);
+    }
+  });
+
   it('copies into a new folder only', () => {
     const root = testDir('copy-tree-exists');
     const src = source(root);
     mkdirSync(join(root, 'copy'));
     expect(() => copyTree(src, join(root, 'copy'), 1_000)).toThrow('EEXIST');
     expect(lstatSync(join(root, 'copy')).isDirectory()).toBe(true);
+  });
+});
+
+describe('permissionDenials', () => {
+  it('is empty when ordinary permissions allow every read and change', () => {
+    const { root } = smallExport(testDir('permissions-open'));
+    expect(permissionDenials(root)).toEqual([]);
+  });
+
+  it.skipIf(asRoot)('lists what a read-only export denies, and its copy denies the same', () => {
+    const base = testDir('permissions-locked');
+    const { root, run } = smallExport(join(base, 'src'));
+    const copy = join(base, 'copy');
+    for (const entry of walk(root).reverse()) {
+      chmodSync(entry.full, entry.type === 'dir' ? 0o555 : 0o444);
+    }
+    try {
+      const denied = permissionDenials(root);
+      expect(denied).toEqual([
+        `folder ${dirname(run)}: EACCES`,
+        `folder ${run}: EACCES`,
+        `write ${join(run, 'b.eml')}: EACCES`,
+        `write ${join(run, 'c.eml')}: EACCES`,
+      ]);
+      copyTree(root, copy, 1_000);
+      expect(permissionDenials(copy)).toEqual(denied.map((d) => d.replaceAll(root, copy)));
+    } finally {
+      unlock(root);
+      unlock(copy);
+    }
+  });
+});
+
+describe('unlockFolders', () => {
+  it.skipIf(asRoot)('restores owner access to every folder inside, never through a link', () => {
+    const root = testDir('unlock');
+    const parent = join(root, 'parent');
+    const dir = join(parent, 'scratch');
+    const outside = join(root, 'outside');
+    mkdirSync(join(dir, 'sub'), { recursive: true });
+    mkdirSync(outside);
+    writeFileSync(join(dir, 'sub', 'a.eml'), 'a');
+    symlinkSync(outside, join(dir, 'link'));
+    chmodSync(join(dir, 'sub', 'a.eml'), 0o444);
+    for (const p of [join(dir, 'sub'), dir, outside]) chmodSync(p, 0o555);
+    try {
+      unlockFolders(parent, dir);
+      expect(modeOf(dir)).toBe(0o755);
+      expect(modeOf(join(dir, 'sub'))).toBe(0o755);
+      expect(modeOf(join(dir, 'sub', 'a.eml'))).toBe(0o444);
+      expect(modeOf(outside)).toBe(0o555);
+    } finally {
+      chmodSync(outside, 0o755);
+    }
+  });
+
+  it.skipIf(asRoot)('refuses a link or a folder elsewhere, and accepts a missing one', () => {
+    const root = testDir('unlock-refuse');
+    const parent = join(root, 'parent');
+    const outside = join(root, 'outside');
+    mkdirSync(parent);
+    mkdirSync(join(outside, 'deep'), { recursive: true });
+    chmodSync(outside, 0o555);
+    try {
+      symlinkSync(outside, join(parent, 'scratch'));
+      expect(() => unlockFolders(parent, join(parent, 'scratch'))).toThrow('is not a folder');
+      expect(() => unlockFolders(parent, join(outside, 'deep'))).toThrow(
+        'not a folder directly inside',
+      );
+      expect(() => unlockFolders(join(parent, 'scratch'), join(parent, 'scratch', 'deep'))).toThrow(
+        'is not a folder',
+      );
+      expect(modeOf(outside)).toBe(0o555);
+      expect(() => unlockFolders(parent, join(parent, 'none'))).not.toThrow();
+    } finally {
+      chmodSync(outside, 0o755);
+    }
   });
 });
