@@ -167,12 +167,15 @@ describe('a small corpus', () => {
 
   it('projects the allocated size it then writes', () => {
     // The guard counts allocated blocks; the projection rounds each file up
-    // to whole blocks and counts a block per folder.
+    // to whole blocks and counts a block per folder. File systems that keep
+    // small files inside their metadata allocate less for them, so there the
+    // projection is higher by up to a block per small file, never lower.
     const written = diskBytes(out);
     expect(json(`${out}.manifest.json`).disk_bytes).toBe(written);
     const projected = project('small', { seed: 1 }).disk;
+    const small = walk(out).filter((e) => e.type === 'file' && e.size > 0 && e.size < 4096);
     expect(projected).toBeGreaterThanOrEqual(written - 16 * 1024);
-    expect(projected).toBeLessThanOrEqual(written + 16 * 1024);
+    expect(projected).toBeLessThanOrEqual(written + small.length * 4096 + 16 * 1024);
   });
 
   it('writes a manifest with the digest of what it wrote', () => {
