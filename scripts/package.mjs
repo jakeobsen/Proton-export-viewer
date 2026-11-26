@@ -4,6 +4,9 @@
 //   release       standard Electron, fuses applied, no test hooks      (from out/)
 //   mas-release   Mac App Store flavor, sandboxed, no test hooks       (from out/)
 //   mas-selftest  Mac App Store flavor, sandboxed, with test hooks     (from out-test/)
+//   mas-folderproof  Mac App Store flavor, sandboxed, the folder-access proof
+//                 (from out-proof/), with its own bundle ID. It shows the
+//                 system folder picker, so tests never launch it.
 
 import { existsSync, readdirSync, rmSync, rmdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -12,6 +15,9 @@ import { signAdHoc } from './sign-adhoc.mjs';
 import { appName } from './vite-plugins.mjs';
 
 export const APP_ID = 'com.example.pev';
+// The app group in the entitlements, APP_ID, is a prefix of this bundle ID, as
+// the Mac App Store build of Electron requires.
+export const FOLDER_PROOF_APP_ID = `${APP_ID}.folderproof`;
 export const PRODUCT_NAME = appName();
 
 export const FUSES = {
@@ -28,6 +34,7 @@ const FLAVORS = {
   release: { out: 'out', mas: false },
   'mas-release': { out: 'out', mas: true },
   'mas-selftest': { out: 'out-test', mas: true },
+  'mas-folderproof': { out: 'out-proof', mas: true, appId: FOLDER_PROOF_APP_ID },
 };
 
 export function appPath(flavor) {
@@ -59,7 +66,7 @@ export async function packageFlavor(flavor) {
     targets: Platform.MAC.createTarget([spec.mas ? 'mas' : 'dir'], arch),
     publish: 'never',
     config: {
-      appId: APP_ID,
+      appId: spec.appId ?? APP_ID,
       productName: PRODUCT_NAME,
       directories: { output: join('dist', flavor), buildResources: 'build' },
       files: [`${spec.out}/**/*`, `!${spec.out}/bundled-*.json`, `!${spec.out}/package.json`],

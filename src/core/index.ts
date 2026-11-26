@@ -9,6 +9,7 @@ import type {
   CoreRequest,
   CoreResult,
   OpenRequest,
+  ProofFileRead,
   WorkerMessage,
   WorkerRequest,
 } from '../shared/core-protocol';
@@ -69,6 +70,14 @@ function toWorker(message: WorkerRequest): void {
   worker.postMessage(message);
 }
 
+/** Folder-access proof (test builds): has the worker read files, as request `reqId`. */
+function workerRead(reqId: number, paths: string[]): Promise<ProofFileRead[] | null> {
+  return new Promise((resolve) => {
+    waiting.set(reqId, (message) => resolve(message.type === 'proof-read' ? message.reads : null));
+    toWorker({ type: 'proof-read', reqId, paths });
+  });
+}
+
 function open(request: OpenRequest): void {
   waiting.set(request.reqId, (message) => {
     if (message.type !== 'result') return;
@@ -103,6 +112,18 @@ function handle(request: CoreRequest): void {
             open,
             toWorker,
             reply,
+          }),
+        );
+        return;
+      }
+      reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
+      return;
+    case 'proof':
+      if (__PEV_TEST_HOOKS__) {
+        void import('../testhooks/proof/core').then((hooks) =>
+          hooks.handleProof(request, {
+            reply,
+            workerRead: (paths) => workerRead(request.reqId, paths),
           }),
         );
         return;

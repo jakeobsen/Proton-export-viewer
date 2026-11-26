@@ -40,7 +40,12 @@ export const LOG_CODES = [
 ] as const;
 
 /** Codes that only exist in builds with test hooks. */
-export const TEST_LOG_CODES = ['test.log', 'test.error', 'test.selftest'] as const;
+export const TEST_LOG_CODES = [
+  'test.log',
+  'test.error',
+  'test.selftest',
+  'test.folder_proof',
+] as const;
 
 export type LogCode = (typeof LOG_CODES)[number] | (typeof TEST_LOG_CODES)[number];
 
