@@ -54,7 +54,6 @@ export const LOG_CODES = [
   'reader.limit',
   'reader.parse_failed',
   'index.created',
-  'index.replaced',
   'index.opened',
   'index.phase1_done',
   'index.phase1_failed',
@@ -63,6 +62,19 @@ export const LOG_CODES = [
   'index.timeout',
   'index.capped',
   'index.idle_release',
+  'index.verified',
+  'index.unverified',
+  'index.damaged',
+  'index.deleted',
+  'index.delete_refused',
+  'index.stale_dropped',
+  'index.rebuild',
+  'source.forgotten',
+  'source.forget_refused',
+  'source.refused',
+  'index.open_refused',
+  'app.reset',
+  'app.reset_refused',
 ] as const;
 
 /** Codes that only exist in builds with test hooks. */
@@ -151,6 +163,13 @@ export const REASONS = [
   'worker_failed',
   'index_full',
   'wal',
+  'identity',
+  'quick_check',
+  'corrupt',
+  'schema',
+  'in_use',
+  'overlap',
+  'app_data',
 ] as const;
 
 /** The lists of a message whose entries can be cut to a limit when indexed. */

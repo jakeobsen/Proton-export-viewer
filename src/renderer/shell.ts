@@ -87,9 +87,12 @@ export async function refreshSources(): Promise<SourcesView | null> {
 const NOTICES: Partial<Record<string, string>> = {
   no_export: 'No export found',
   unavailable: 'Export not found.',
+  forgotten: 'Export forgotten.',
+  busy: 'Index in use. Try again.',
+  app_data: "This folder is inside the app's data folder.",
 };
 
-/** Runs an open, a switch or a Locate, then reloads the exports. */
+/** Runs an open, a switch, a Locate or a Forget, then reloads the exports. */
 async function sourceAction(
   run: (generation: number) => Promise<SourceActionResult>,
 ): Promise<SourceActionResult> {
@@ -121,6 +124,8 @@ export const openExport = (sourceKey: string) =>
   sourceAction((g) => window.pev.openExport(sourceKey, g));
 export const switchRun = (runId: string) => sourceAction((g) => window.pev.switchRun(runId, g));
 export const locateExport = () => sourceAction((g) => window.pev.locateExport(g));
+export const forgetExport = (sourceKey: string) =>
+  sourceAction((g) => window.pev.forgetExport(sourceKey, g));
 
 export function showLink(url: string): void {
   update({ link: url });

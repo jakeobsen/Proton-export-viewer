@@ -1,25 +1,66 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// The welcome screen: choose an export folder, or open a recent export.
+// The welcome screen: choose an export folder, or open or forget a recent export.
 
+import { useState } from 'react';
 import type { ExportRow } from '../shared/sources';
 import { exportLabel } from './labels';
-import { chooseFolder, openExport } from './shell';
+import { chooseFolder, forgetExport, openExport } from './shell';
 
 function RecentRow({ row, busy }: { row: ExportRow; busy: boolean }) {
+  const [confirming, setConfirming] = useState(false);
   return (
     <li className="recent-row">
       <div className="recent-info">
         <div className="recent-account">{row.account ?? exportLabel(row.runName)}</div>
         {row.account !== null && <div className="recent-sub">{exportLabel(row.runName)}</div>}
       </div>
-      <button
-        type="button"
-        className="btn"
-        disabled={busy}
-        onClick={() => void openExport(row.sourceKey)}
-      >
-        Open
-      </button>
+      {confirming ? (
+        <div className="recent-confirm" role="group" aria-label="Forget">
+          <span>
+            Removes this export from the app and deletes its index. Export files stay intact.
+          </span>
+          <span className="recent-actions">
+            <button
+              type="button"
+              className="btn"
+              disabled={busy}
+              onClick={() => setConfirming(false)}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="btn danger"
+              disabled={busy}
+              onClick={() => {
+                setConfirming(false);
+                void forgetExport(row.sourceKey);
+              }}
+            >
+              Forget
+            </button>
+          </span>
+        </div>
+      ) : (
+        <span className="recent-actions">
+          <button
+            type="button"
+            className="btn"
+            disabled={busy}
+            onClick={() => void openExport(row.sourceKey)}
+          >
+            Open
+          </button>
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={busy}
+            onClick={() => setConfirming(true)}
+          >
+            Forget
+          </button>
+        </span>
+      )}
     </li>
   );
 }

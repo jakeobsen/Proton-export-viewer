@@ -181,10 +181,31 @@ export function probeIdentity(dbPath: string): { version: number; uuid: string |
   }
 }
 
+/**
+ * Why an index isn't the one expected: it can't be read as a database
+ * ('corrupt'), it has another schema version ('schema'), or another identity
+ * ('identity').
+ */
+export type Mismatch = 'corrupt' | 'schema' | 'identity';
+
+/** How a database's version and identity differ from the expected ones; null if they don't. */
+export function mismatchOf(
+  found: { version: number; uuid: string | null } | null,
+  expectedUuid: string | null,
+): Mismatch | null {
+  if (found === null) return 'corrupt';
+  if (found.version !== SCHEMA_VERSION) return 'schema';
+  return found.uuid === expectedUuid && expectedUuid !== null ? null : 'identity';
+}
+
+/** How the database file differs from this schema version and identity; null if it doesn't. */
+export function probeMismatch(dbPath: string, expectedUuid: string | null): Mismatch | null {
+  return mismatchOf(probeIdentity(dbPath), expectedUuid);
+}
+
 /** True if the file holds a database with this schema version and this identity. */
 export function probeSame(dbPath: string, expectedUuid: string): boolean {
-  const found = probeIdentity(dbPath);
-  return found !== null && found.version === SCHEMA_VERSION && found.uuid === expectedUuid;
+  return probeMismatch(dbPath, expectedUuid) === null;
 }
 
 function isFile(path: string): boolean {

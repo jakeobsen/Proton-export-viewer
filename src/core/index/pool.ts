@@ -6,7 +6,7 @@
 
 import type { Worker } from 'node:worker_threads';
 
-export type ThreadRole = 'writer' | 'query' | 'parse';
+export type ThreadRole = 'writer' | 'query' | 'parse' | 'verify';
 
 export interface ThreadRequest {
   id: number;
@@ -131,7 +131,11 @@ export class WorkerThread implements IndexThread {
 /** Runs jobs on a set of threads, first come first served. */
 export class Pool {
   private readonly idle: IndexThread[];
-  private readonly queue: Array<(thread: IndexThread) => void> = [];
+  private readonly queue: Array<{
+    resolve: (thread: IndexThread) => void;
+    reject: (err: Error) => void;
+  }> = [];
+  private stopped = false;
 
   constructor(readonly threads: IndexThread[]) {
     this.idle = [...threads];
@@ -142,17 +146,23 @@ export class Pool {
   }
 
   async run<T>(op: string, args: unknown, timeoutMs: number): Promise<T> {
-    const thread = this.idle.pop() ?? (await new Promise<IndexThread>((r) => this.queue.push(r)));
+    if (this.stopped) throw new ThreadError(THREAD_STOPPED);
+    const thread =
+      this.idle.pop() ??
+      (await new Promise<IndexThread>((resolve, reject) => this.queue.push({ resolve, reject })));
     try {
       return await thread.call<T>(op, args, timeoutMs);
     } finally {
       const next = this.queue.shift();
-      if (next) next(thread);
+      if (next) next.resolve(thread);
       else this.idle.push(thread);
     }
   }
 
+  /** Ends every thread; jobs waiting for one fail, and no new job starts. */
   async stop(): Promise<void> {
+    this.stopped = true;
+    for (const waiting of this.queue.splice(0)) waiting.reject(new ThreadError(THREAD_STOPPED));
     await Promise.all(this.threads.map((t) => t.stop()));
   }
 }

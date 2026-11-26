@@ -24,6 +24,11 @@ export interface CoreInit {
   indexDir: string;
   /** Null until a source is open: core then has no access to any export. */
   source: CoreSource | null;
+  /**
+   * The run folder of every export the app knows. No index file is opened,
+   * made or deleted while one of them overlaps the index folder.
+   */
+  exports: string[];
 }
 
 export interface StubAssetMessage {
@@ -146,6 +151,40 @@ export interface IndexRequest {
   stamp: Stamp;
   /** The identity the registry holds for this source's index; null if none. */
   dbUuid: string | null;
+  /** The index is made in place of a damaged one. */
+  rebuild?: boolean;
+}
+
+/**
+ * Forgets a source: tears down its index if it is the open one, then deletes
+ * its index files. Nothing of it is opened or created afterwards.
+ */
+export interface ForgetRequest {
+  type: 'forget';
+  reqId: number;
+  sourceKey: string;
+}
+
+/**
+ * Closes core to every open and rebuild, and tears down the open source's
+ * index, before the app's data is deleted.
+ */
+export interface ResetRequest {
+  type: 'reset';
+  reqId: number;
+}
+
+/**
+ * Core tells main about the open source's index without being asked: its
+ * state changed, or (with `damaged`) it was found damaged, torn down and its
+ * files deleted, so main can have it rebuilt.
+ */
+export interface CoreEvent {
+  type: 'event';
+  event: 'index';
+  stamp: Stamp;
+  progress: IndexProgress;
+  damaged: boolean;
 }
 
 /** A read from the open run's index. */
@@ -165,7 +204,9 @@ export type CoreRequest =
   | ScanRequest
   | ReadRequest
   | IndexRequest
-  | IndexQueryRequest;
+  | IndexQueryRequest
+  | ForgetRequest
+  | ResetRequest;
 
 export type CoreResult =
   | {
@@ -201,7 +242,10 @@ export type CoreResult =
         | 'not_found'
         | 'superseded'
         | 'reader_failed'
-        | 'no_index';
+        | 'no_index'
+        | 'damaged'
+        | 'closed'
+        | 'busy';
       /** Why the reader gave no body, for `reader_failed`. */
       reason?: ReaderFailure;
       /** Test builds only: why a test action failed. */

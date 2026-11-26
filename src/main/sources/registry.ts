@@ -172,6 +172,11 @@ export class Registry {
     this.data.active = sourceKey && this.source(sourceKey) ? sourceKey : null;
   }
 
+  /** Forgets every pick and source, in memory only. */
+  clear(): void {
+    this.data = empty();
+  }
+
   /** Drops picks that no source uses. */
   prunePicks(): void {
     const used = new Set(this.data.sources.map((s) => s.pickId));

@@ -3,14 +3,27 @@
 // stamps every piece of work with that source and its generation. Results go
 // through the writer, which drops them if the generation moved on while they
 // were in flight. The run's index opens once main asks for it, after a scan.
+//
+// Everything that opens, replaces or deletes the source's index goes through
+// one lock, one operation at a time: opening it, recovering it when it turns
+// out damaged, forgetting the source and resetting the app. Each starts with
+// the teardown of the index there is (its work stopped and drained, its check
+// joined, every connection closed), and nothing of a family is deleted while
+// core holds a connection or a file descriptor on it. Callbacks that arrive
+// later, such as the outcome of a check, are looked at again under the lock
+// and dropped if their index is no longer the current one.
 
 import { readdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import type {
+  CoreEvent,
   CoreResult,
   CoreSource,
+  ForgetRequest,
   IdentifyRequest,
   IndexQueryRequest,
   IndexRequest,
+  ResetRequest,
   ScanRequest,
 } from '../shared/core-protocol';
 import type { IndexOpened } from '../shared/index-types';
@@ -28,8 +41,12 @@ import {
 } from './containment';
 import { GenerationGate, Writer, sameStamp, type Stamp } from './generation';
 import { runIdentity } from './identity';
-import type { IndexThread, ThreadRole } from './index/pool';
-import { IndexService, type IndexOptions } from './index/service';
+import { FamilyInUse, deleteFamily } from './index/family';
+import type { CheckResult } from './index/ops';
+import { ThreadError, type IndexThread, type ThreadRole } from './index/pool';
+import { probeMismatch } from './index/schema';
+import { overlaps } from '../shared/overlap';
+import { ConnectionRegistry, IndexService, type IndexOptions } from './index/service';
 
 /** Entries scanned between yields, so core keeps answering during a long scan. */
 const SCAN_SLICE = 2000;
@@ -52,32 +69,55 @@ export function summarize(scan: RunScan): ScanSummary {
   };
 }
 
+/** Runs operations one at a time, in the order they were asked for. */
+export class LifecycleLock {
+  private tail: Promise<unknown> = Promise.resolve();
+
+  run<T>(op: () => Promise<T> | T): Promise<T> {
+    const next = this.tail.then(op, op);
+    this.tail = next.catch(() => undefined);
+    return next;
+  }
+}
+
 /** Where the source's index lives and how its threads start. */
 export interface IndexSetup {
   /** `<userData>/index`. */
   dir: string;
   thread: (role: ThreadRole) => IndexThread;
   options?: IndexOptions;
+  /** The run folders of the other exports the app knows. */
+  exports?: string[];
 }
 
 export class SourceSession {
   readonly gate = new GenerationGate();
   readonly records: SourceRecords = { scans: 0, rejected: [], summary: null };
+  /** Every database connection core holds. */
+  readonly connections = new ConnectionRegistry();
+  readonly lock = new LifecycleLock();
   private root: string | null = null;
   private readonly writer: Writer<RunScan>;
   /** The last scan the writer accepted. */
   private lastScan: RunScan | null = null;
   /** The open source's index, once main asked for it. */
   index: IndexService | null = null;
-  private indexOpening: Promise<IndexService> | null = null;
   private opened: IndexOpened | null = null;
+  /** Sources forgotten while core runs: nothing of theirs opens or is created again. */
+  private readonly retired = new Set<string>();
+  /** Closed for good by a reset: no open, rebuild or recovery starts. */
+  private admitting = true;
+  /** The run folders of the exports the app knows, this one included. */
+  private readonly exportRoots: string[];
 
   constructor(
     source: CoreSource | null,
     private readonly log: Logger,
     private readonly reply: (result: CoreResult) => void,
     private readonly indexSetup: IndexSetup | null = null,
+    private readonly emit: (event: CoreEvent) => void = () => {},
   ) {
+    this.exportRoots = [...(source?.root ? [source.root] : []), ...(indexSetup?.exports ?? [])];
     this.writer = new Writer(this.gate, (scan) => {
       this.records.scans += 1;
       this.records.rejected = scan.rejected;
@@ -136,39 +176,111 @@ export class SourceSession {
   }
 
   /**
+   * Whether an export the app knows overlaps the index folder now: lies
+   * inside it, or holds it, with links resolved at this moment. Then no index
+   * file is opened, made, replaced or deleted, so nothing of an export can be
+   * changed. Asked right before each of those, never remembered.
+   */
+  private overlapsIndex(): boolean {
+    const dir = this.indexSetup?.dir;
+    return dir !== undefined && this.exportRoots.some((root) => overlaps(root, dir));
+  }
+
+  private dbPathOf(sourceKey: string): string | null {
+    return this.indexSetup ? join(this.indexSetup.dir, `${sourceKey}.sqlite`) : null;
+  }
+
+  /**
+   * True while `service` is the source's index, its generation is current and
+   * no reset has closed core: a check result or a recovery waiting for the
+   * lock has no effect otherwise.
+   */
+  private isLive(service: IndexService, stamp: Stamp): boolean {
+    return (
+      this.admitting &&
+      this.index === service &&
+      !service.isClosed &&
+      this.gate.isCurrent(stamp) &&
+      !this.retired.has(stamp.sourceKey)
+    );
+  }
+
+  private newService(setup: IndexSetup, stamp: Stamp, root: string | null): IndexService {
+    const service: IndexService = new IndexService({
+      indexDir: setup.dir,
+      stamp,
+      root: root ?? '',
+      log: this.log,
+      thread: setup.thread,
+      connections: this.connections,
+      isCurrent: () => this.gate.isCurrent(stamp) && this.index === service,
+      ...(setup.options ? { options: setup.options } : {}),
+      onDamage: (reason) => void this.lock.run(() => this.recover(service, stamp, reason)),
+      onChecked: (result, ms) => void this.lock.run(() => this.checked(service, stamp, result, ms)),
+      onChange: () => {
+        if (this.index === service) this.sendEvent(stamp, service.progress, false);
+      },
+    });
+    return service;
+  }
+
+  /**
    * Opens the run's index (creating it if need be), answers with its identity
    * and starts phase 1 for the messages it doesn't have yet. While the run is
    * unavailable, only an existing index with the expected identity opens, for
-   * browsing; nothing is created, deleted or indexed.
+   * browsing; nothing is created or indexed. One there that isn't this index
+   * is damaged: it is deleted, and rebuilt once the run is back.
    */
-  private async openIndex(request: IndexRequest, root: string | null, stamp: Stamp): Promise<void> {
-    const setup = this.indexSetup;
-    if (!setup) {
-      this.send({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid', stamp });
-      return;
-    }
-    if (!this.indexOpening) {
-      const service = new IndexService({
-        indexDir: setup.dir,
-        stamp,
-        root: root ?? '',
-        log: this.log,
-        thread: setup.thread,
-        isCurrent: () => this.gate.isCurrent(stamp),
-        ...(setup.options ? { options: setup.options } : {}),
-      });
-      this.indexOpening = service.open(request.dbUuid, root !== null).then((opened) => {
-        this.index = service;
+  private openIndex(request: IndexRequest, root: string | null, stamp: Stamp): Promise<void> {
+    const fail = (code: 'invalid' | 'stale' | 'closed' | 'damaged' | 'unavailable') =>
+      this.send({ type: 'result', reqId: request.reqId, ok: false, code, stamp });
+    return this.lock.run(async () => {
+      const setup = this.indexSetup;
+      if (!setup) return fail('invalid');
+      if (!this.admitting || this.retired.has(stamp.sourceKey)) return fail('closed');
+      if (!this.gate.isCurrent(stamp)) return fail('stale');
+      let service = this.index;
+      if (!service) {
+        // Opening can make or replace the index's files.
+        if (this.overlapsIndex()) {
+          this.log.warn('index.open_refused', { reason: 'overlap' }, { src: stamp.sourceKey });
+          return fail('closed');
+        }
+        const fresh = this.newService(setup, stamp, root);
+        let opened: IndexOpened;
+        try {
+          opened = await fresh.open(request.dbUuid, root !== null, {
+            rebuild: request.rebuild === true,
+          });
+        } catch (err) {
+          await fresh.close();
+          if (err instanceof ThreadError && err.code === 'INDEX_DAMAGED') {
+            const dbPath = this.dbPathOf(stamp.sourceKey);
+            const reason = (dbPath && probeMismatch(dbPath, request.dbUuid)) || 'identity';
+            this.log.warn('index.damaged', { reason }, { src: stamp.sourceKey });
+            this.removeFamily(stamp.sourceKey, true);
+            this.sendEvent(stamp, { ...fresh.progress, condition: 'damaged' }, true);
+            return fail('damaged');
+          }
+          throw err;
+        }
+        this.index = fresh;
         this.opened = opened;
-        return service;
-      });
-      this.indexOpening.catch(() => {
-        this.indexOpening = null;
-        void service.close();
-      });
-    }
-    const service = await this.indexOpening;
-    if (root === null) {
+        service = fresh;
+      }
+      if (root === null) {
+        this.send({
+          type: 'result',
+          reqId: request.reqId,
+          ok: true,
+          stamp,
+          index: this.opened!,
+          progress: { ...service.progress },
+        });
+        return;
+      }
+      const scan = this.lastScan ?? (await this.scanNow(root, stamp));
+      if (!this.gate.isCurrent(stamp) || !scan) return fail('stale');
       this.send({
         type: 'result',
         reqId: request.reqId,
@@ -177,22 +289,131 @@ export class SourceSession {
         index: this.opened!,
         progress: { ...service.progress },
       });
-      return;
-    }
-    const scan = this.lastScan ?? (await this.scanNow(root, stamp));
-    if (!this.gate.isCurrent(stamp) || !scan) {
-      this.send({ type: 'result', reqId: request.reqId, ok: false, code: 'stale', stamp });
-      return;
-    }
-    this.send({
-      type: 'result',
-      reqId: request.reqId,
-      ok: true,
-      stamp,
-      index: this.opened!,
-      progress: { ...service.progress },
+      void service.startPhase1(scan);
     });
-    void service.startPhase1(scan);
+  }
+
+  /**
+   * The outcome of the check of an existing index, looked at under the lock:
+   * dropped if the index it checked is gone or its generation moved on.
+   */
+  private checked(
+    service: IndexService,
+    stamp: Stamp,
+    result: CheckResult | null,
+    ms: number,
+  ): void {
+    if (!this.isLive(service, stamp)) {
+      this.log.info('index.stale_dropped', { reason: 'generation' }, { src: stamp.sourceKey });
+      return;
+    }
+    if (result?.ok === false) {
+      // Recovery is queued behind this, on the same lock.
+      const reason = result.reason;
+      service.reportDamage(reason === 'identity' || reason === 'schema' ? reason : 'quick_check');
+      return;
+    }
+    if (result?.ok) this.log.info('index.verified', { ms }, { src: stamp.sourceKey });
+    else this.log.warn('index.unverified', { reason: 'worker_failed' }, { src: stamp.sourceKey });
+    if (service.progress.condition === 'verifying') service.setCondition('ok');
+  }
+
+  /**
+   * Recovers from a damaged index, under the lock: the code is logged, the
+   * index is torn down and its files deleted, and main is told, so it can
+   * rebuild under a new generation while the source is still known, or wait
+   * for the run to come back. Dropped if the index is no longer the current one.
+   */
+  private async recover(service: IndexService, stamp: Stamp, reason: string): Promise<void> {
+    if (!this.isLive(service, stamp)) {
+      this.log.info('index.stale_dropped', { reason: 'generation' }, { src: stamp.sourceKey });
+      return;
+    }
+    this.log.warn('index.damaged', { reason }, { src: stamp.sourceKey });
+    await this.teardownIndex();
+    // Whatever is left of it, if anything held on, goes when it is rebuilt.
+    this.removeFamily(stamp.sourceKey, true);
+    const condition = this.root === null ? 'damaged' : 'rebuilding';
+    this.sendEvent(stamp, { ...service.progress, condition }, true);
+  }
+
+  /**
+   * Tears the index down: it stops being current (its late results are
+   * dropped), its queued jobs are cancelled, the write in flight rolls back,
+   * the check is ended and joined, and every connection is closed.
+   */
+  private async teardownIndex(): Promise<void> {
+    const service = this.index;
+    this.index = null;
+    this.opened = null;
+    await service?.close();
+  }
+
+  /**
+   * Deletes a source's index files. For the open source, only once core holds
+   * no connection at all; for any source, only while no connection is listed
+   * and no file descriptor is open on its files. Returns whether it deleted.
+   */
+  private removeFamily(sourceKey: string, own: boolean): boolean {
+    const dbPath = this.dbPathOf(sourceKey);
+    if (dbPath === null) return false;
+    const refuse = (reason: 'in_use' | 'overlap' = 'in_use') => {
+      this.log.warn('index.delete_refused', { reason }, { src: sourceKey });
+      return false;
+    };
+    if (this.overlapsIndex()) return refuse('overlap');
+    if (this.connections.holds(dbPath) || (own && this.connections.size > 0)) return refuse();
+    try {
+      deleteFamily(dbPath);
+    } catch (err) {
+      if (err instanceof FamilyInUse) return refuse();
+      throw err;
+    }
+    this.log.info('index.deleted', {}, { src: sourceKey });
+    return true;
+  }
+
+  private sendEvent(stamp: Stamp, progress: IndexService['progress'], damaged: boolean): void {
+    this.emit({ type: 'event', event: 'index', stamp, progress: { ...progress }, damaged });
+  }
+
+  /**
+   * Forgets a source: from now on nothing of it opens, recovers or is
+   * created in this process. Under the lock, its index is torn down if it is
+   * the open one, then its files are deleted.
+   */
+  forget(request: ForgetRequest): Promise<void> {
+    const key = request.sourceKey;
+    this.retired.add(key);
+    return this.lock.run(async () => {
+      const own = this.gate.current?.sourceKey === key;
+      if (own) await this.teardownIndex();
+      const deleted = this.removeFamily(key, own);
+      this.send(
+        deleted
+          ? { type: 'result', reqId: request.reqId, ok: true }
+          : { type: 'result', reqId: request.reqId, ok: false, code: 'busy' },
+      );
+    });
+  }
+
+  /**
+   * Closes core to every open, rebuild and recovery for good, then tears the
+   * open source's index down under the lock, so the app's data can be deleted.
+   */
+  reset(request: ResetRequest): Promise<void> {
+    this.admitting = false;
+    return this.lock.run(async () => {
+      await this.teardownIndex();
+      const key = this.gate.current?.sourceKey;
+      if (key) this.retired.add(key);
+      const idle = this.connections.size === 0;
+      this.send(
+        idle
+          ? { type: 'result', reqId: request.reqId, ok: true }
+          : { type: 'result', reqId: request.reqId, ok: false, code: 'busy' },
+      );
+    });
   }
 
   private async query(request: IndexQueryRequest, stamp: Stamp): Promise<void> {
@@ -201,7 +422,18 @@ export class SourceSession {
       this.send({ type: 'result', reqId: request.reqId, ok: false, code: 'no_index', stamp });
       return;
     }
-    const answer = await service.ask(request.query);
+    // Rows from a damaged index may be wrong: none are given out.
+    const damaged = () =>
+      this.send({ type: 'result', reqId: request.reqId, ok: false, code: 'damaged', stamp });
+    if (service.isDamaged) return damaged();
+    let answer: Awaited<ReturnType<IndexService['ask']>>;
+    try {
+      answer = await service.ask(request.query);
+    } catch (err) {
+      if (service.isDamaged) return damaged();
+      throw err;
+    }
+    if (service.isDamaged) return damaged();
     this.send({
       type: 'result',
       reqId: request.reqId,
@@ -223,13 +455,9 @@ export class SourceSession {
     return this.writer.submit(stamp, scan) ? scan : null;
   }
 
-  /** Ends the index's threads; their connections close with them. */
-  async close(): Promise<void> {
-    const opening = this.indexOpening;
-    this.indexOpening = null;
-    const service = await opening?.catch(() => null);
-    await service?.close();
-    this.index = null;
+  /** Tears the index down, under the lock. */
+  close(): Promise<void> {
+    return this.lock.run(() => this.teardownIndex());
   }
 
   private async identify(request: IdentifyRequest, root: string, stamp: Stamp): Promise<void> {
