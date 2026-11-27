@@ -3,7 +3,7 @@
 // the stock Electron binary. Each launch gets its own userData under test-output/,
 // removed again when the test passes.
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   test as base,
@@ -12,7 +12,17 @@ import {
   type ElectronApplication,
   type Frame,
   type Page,
+  type TestInfo,
 } from '@playwright/test';
+import {
+  describePower,
+  readLidState,
+  readPowerEvents,
+  slept,
+  type LidState,
+  type PowerEvent,
+} from '../../scripts/power-state.mjs';
+import { stderrCodes } from '../app-exit';
 import { REPO_ROOT, removeTestDirs, takeTestDirs, testDir } from '../paths';
 
 export interface LogLine {
@@ -23,8 +33,32 @@ export interface LogLine {
   data: Record<string, unknown>;
 }
 
+/** How an app's process ended. */
+export interface AppExit {
+  code: number | null;
+  signal: string | null;
+}
+
+/** Why an app closed under a test, as far as the run can tell. */
+export interface ClosedReport {
+  /** How its process ended; null while it still runs. */
+  exit: AppExit | null;
+  /** Chromium's log codes from its stderr, and how many other lines there were. */
+  stderr: { codes: string[]; dropped: number };
+  lid: LidState | null;
+  /** The Mac's sleeps and wakes since the test started. */
+  power: PowerEvent[];
+  /** The Mac slept or entered DarkWake: the test's outcome says nothing about the code. */
+  slept: boolean;
+}
+
+/** stderr lines kept for a report. */
+const STDERR_TAIL = 400;
+
 export class PevApp {
   readonly consoleMessages: Array<{ type: string; text: string }> = [];
+  private ended: AppExit | null = null;
+  private readonly stderrTail: string[] = [];
 
   constructor(
     readonly app: ElectronApplication,
@@ -32,6 +66,31 @@ export class PevApp {
     readonly userData: string,
   ) {
     page.on('console', (m) => this.consoleMessages.push({ type: m.type(), text: m.text() }));
+    const proc = app.process();
+    proc.once('exit', (code, signal) => {
+      this.ended = { code, signal };
+    });
+    proc.stderr?.on('data', (chunk: Buffer | string) => {
+      this.stderrTail.push(...String(chunk).split('\n'));
+      this.stderrTail.splice(0, Math.max(0, this.stderrTail.length - STDERR_TAIL));
+    });
+  }
+
+  /** How the app's process ended, or null while it runs. */
+  exited(): AppExit | null {
+    return this.ended;
+  }
+
+  /** Why the app closed under a test: its exit, its stderr codes, the lid and the sleeps since `since`. */
+  closedReport(since: Date): ClosedReport {
+    const power = readPowerEvents(since, new Date());
+    return {
+      exit: this.ended,
+      stderr: stderrCodes(this.stderrTail),
+      lid: readLidState(),
+      power,
+      slept: slept(power),
+    };
   }
 
   /** Calls a main-process test hook. */
@@ -119,6 +178,31 @@ export class PevApp {
 
   async close(): Promise<void> {
     await this.app.close().catch(() => undefined);
+  }
+}
+
+/**
+ * Writes why the app closed under a failed test to the test's output folder
+ * and says so in the run's output. A test the Mac slept through is marked
+ * invalid: its failure says nothing about the code.
+ */
+function reportClosed(pev: PevApp, since: Date, testInfo: TestInfo): void {
+  const report = pev.closedReport(since);
+  mkdirSync(testInfo.outputDir, { recursive: true });
+  writeFileSync(testInfo.outputPath('app-closed.json'), `${JSON.stringify(report, null, 2)}\n`);
+  const exit = report.exit
+    ? `exit code ${String(report.exit.code)}, signal ${String(report.exit.signal)}`
+    : 'still running';
+  const power = describePower(report.lid, report.power) ?? 'no lid or sleep data';
+  console.log(
+    `app closed under "${testInfo.title}": ${exit}; ${report.stderr.codes.length} stderr codes, ` +
+      `${report.stderr.dropped} other lines; ${power}`,
+  );
+  if (report.slept) {
+    testInfo.annotations.push({ type: 'invalid', description: 'the Mac slept during this test' });
+    console.log(
+      `INVALID: the Mac slept during "${testInfo.title}"; its failure says nothing about the code.`,
+    );
   }
 }
 
@@ -217,13 +301,20 @@ export const test = base.extend<{ pev: PevApp; testDirs: void }>({
   ],
   // eslint-disable-next-line no-empty-pattern
   pev: async ({}, use, testInfo) => {
+    // pmset logs whole seconds.
+    const since = new Date(Date.now() - 1000);
     const pev = await launch(testInfo.title.replace(/[^a-z0-9]+/gi, '-').slice(0, 40));
     expect(await pev.main('dialogsStubbed')).toBe(true);
     expect(await pev.main('externalStubbed')).toBe(true);
     await use(pev);
+    const passed = testInfo.status === testInfo.expectedStatus;
+    const closed =
+      pev.exited() !== null ||
+      testInfo.errors.some((e) => (e.message ?? '').includes('has been closed'));
+    if (!passed && closed) reportClosed(pev, since, testInfo);
     // Test runs stay in the background: no window was ever shown or focused,
     // and no native dialog was opened.
-    if (testInfo.status === testInfo.expectedStatus) {
+    if (passed) {
       const windows = await pev.main<Array<{ visible: boolean; focused: boolean }>>('windowState');
       expect(windows.length).toBeGreaterThan(0);
       expect(windows.filter((w) => w.visible || w.focused)).toEqual([]);

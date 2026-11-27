@@ -5,8 +5,20 @@
 //                                code signing, the sandboxed build)
 //   node scripts/ci.mjs linux    the checks that run on Linux: everything up to
 //                                the license checks, without packaging
+//
+// Exit status: 0 when every step passed, 1 when one failed, 3 when a step
+// that launches the app couldn't count: the lid was closed with no external
+// display (the step doesn't start), or the Mac slept during it (invalid, not
+// failed). Run those again with the lid open.
 
 import { spawnSync } from 'node:child_process';
+import {
+  describePower,
+  mayLaunch,
+  readLidState,
+  readPowerEvents,
+  stepOutcome,
+} from './power-state.mjs';
 import { removeTestOutput } from './test-output.mjs';
 
 const ALL_STEPS = [
@@ -29,6 +41,9 @@ const ALL_STEPS = [
   ['sandbox checks (T11)', 'node', ['scripts/check-sandbox.mjs']],
 ];
 
+// Steps that launch the app, hidden: a sleep of the Mac can cut them short.
+const LAUNCHES_APP = new Set(['e2e tests', 'sandbox checks (T11)']);
+
 const linux = process.argv[2] === 'linux';
 if (process.argv.length > 3 || (process.argv[2] !== undefined && !linux)) {
   console.error('usage: node scripts/ci.mjs [linux]');
@@ -49,15 +64,34 @@ removeTestOutput();
 const results = [];
 for (const [name, command, args, env] of STEPS) {
   console.log(`\n=== ${name}`);
-  const started = Date.now();
+  const launches = LAUNCHES_APP.has(name);
+  if (launches && !mayLaunch(readLidState())) {
+    console.error(
+      'ci: the lid is closed and no external display is attached, so this Mac sleeps; ' +
+        'the step would not count. Open the lid and run again.',
+    );
+    results.push([name, 'not run', '0.0']);
+    break;
+  }
+  // pmset logs whole seconds.
+  const started = new Date(Date.now() - 1000);
   const run = spawnSync(command, args, { stdio: 'inherit', env: { ...process.env, ...env } });
-  const seconds = ((Date.now() - started) / 1000).toFixed(1);
-  results.push([name, run.status === 0, seconds]);
-  if (run.status !== 0) break;
+  const seconds = ((Date.now() - started.getTime() - 1000) / 1000).toFixed(1);
+  const events = launches ? readPowerEvents(started, new Date()) : [];
+  const outcome = stepOutcome(run.status, events);
+  if (outcome === 'INVALID') {
+    console.error(
+      `ci: the Mac slept during this step (${describePower(readLidState(), events)}); ` +
+        'it is invalid, not failed. Run it again with the lid open.',
+    );
+  }
+  results.push([name, outcome, seconds]);
+  if (outcome !== 'pass') break;
 }
 
 console.log('\n=== summary');
-for (const [name, ok, seconds] of results)
-  console.log(`${ok ? 'pass' : 'FAIL'}  ${name} (${seconds}s)`);
-const failed = results.some(([, ok]) => !ok) || results.length !== STEPS.length;
-process.exit(failed ? 1 : 0);
+for (const [name, outcome, seconds] of results) console.log(`${outcome}  ${name} (${seconds}s)`);
+const outcomes = new Set(results.map(([, outcome]) => outcome));
+if (outcomes.has('FAIL')) process.exit(1);
+if (outcomes.has('INVALID') || outcomes.has('not run')) process.exit(3);
+process.exit(results.length === STEPS.length ? 0 : 1);
