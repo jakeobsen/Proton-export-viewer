@@ -24,6 +24,7 @@
     "check:tree": "node scripts/check-tree.mjs",
     "check:licenses": "node scripts/check-licenses.mjs",
     "package:release": "npm run build && node scripts/package.mjs release",
+    "package:app": "npm run build && node scripts/package.mjs mas-local",
     "package:test": "npm run build:test && node scripts/package.mjs test",
     "bench": "node tools/bench/run-bench.mjs",
     "package:sandbox": "npm run build:test && node scripts/package.mjs mas-selftest && npm run build && node scripts/package.mjs mas-release",

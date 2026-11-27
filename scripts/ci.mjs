@@ -23,6 +23,7 @@ const ALL_STEPS = [
   ['license check (test build)', 'node', ['scripts/check-licenses.mjs', 'out-test']],
   ['package release', 'node', ['scripts/package.mjs', 'release']],
   ['package mas-release', 'node', ['scripts/package.mjs', 'mas-release']],
+  ['package mas-local', 'node', ['scripts/package.mjs', 'mas-local']],
   ['release checks (T10)', 'node', ['scripts/check-release.mjs']],
   ['package mas-selftest', 'node', ['scripts/package.mjs', 'mas-selftest']],
   ['sandbox checks (T11)', 'node', ['scripts/check-sandbox.mjs']],
