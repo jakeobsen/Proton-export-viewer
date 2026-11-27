@@ -10,7 +10,9 @@ import {
   coverageOf,
   ftsLiteral,
   searchPage,
+  searchSnippets,
 } from '../../src/core/index/search';
+import { rowDetails } from '../../src/core/index/queries';
 import { createSchema } from '../../src/core/index/schema';
 import { asNumber, configure, openDb, type Db } from '../../src/core/index/sql';
 import { IndexWriter } from '../../src/core/index/writer';
@@ -118,6 +120,15 @@ describe('grouped search', () => {
     ]);
     expect(page.next).toBeNull();
     expect(page.dropped).toBe(0);
+    expect(page.ranked).toBe(true);
+    expect(page.total).toBe(2);
+    // Each row's details, as the list shows them: the earliest subject and the senders.
+    expect(page.details.map((d) => [d.threadId, d.subject])).toEqual([
+      [threadOf(db, 'a2'), 'Budget plan'],
+      [threadOf(db, 'b1'), 'budgeting tips'],
+    ]);
+    // The same details the conversation list gives.
+    expect(page.details).toEqual(rowDetails(db, [threadOf(db, 'a2'), threadOf(db, 'b1')]));
   });
 
   it('pages by relevance with the best match of each conversation', () => {
@@ -199,6 +210,49 @@ describe('grouped search', () => {
     expect(rows.slice(0, SNIPPET_ROWS).every((r) => r.snippet !== null)).toBe(true);
     expect(rows.slice(SNIPPET_ROWS).every((r) => r.snippet === null)).toBe(true);
   });
+
+  it('gives the rows past those their snippets on request, at most 50 conversations at a time', () => {
+    const { db, writer } = fresh();
+    ingest(
+      writer,
+      [
+        ...Array.from({ length: SNIPPET_ROWS + 5 }, (_, i) =>
+          single(`s${i}`, { time: i, subject: `zeta ${i}` }),
+        ),
+        message('t1', ['kt'], { time: 1001, subject: 'zeta plain' }),
+        message('t2', ['kt2', 'kt'], { time: 1000, subject: 'zeta zeta best' }),
+      ],
+      100,
+    );
+    const page = search(db, 'zeta');
+    const later = page.rows.slice(SNIPPET_ROWS);
+    const asked = { op: 'snippets', queryId: 42, text: 'zeta' } as const;
+    const answer = searchSnippets(db, { ...asked, threadIds: later.map((r) => r.threadId) });
+    expect(answer.queryId).toBe(42);
+    expect(answer.snippets.map((s) => s.threadId)).toEqual(later.map((r) => r.threadId));
+    for (const s of answer.snippets) {
+      expect(s.snippet!.ranges.map(([a, b]) => s.snippet!.text.slice(a, b))).toEqual(['zeta']);
+    }
+    // The same snippet the page gives a first row: the conversation's best-ranked
+    // match, though its newest match is another message.
+    const thread = threadOf(db, 't1');
+    const fromPage = page.rows.find((r) => r.threadId === thread)!.snippet;
+    expect(searchSnippets(db, { ...asked, threadIds: [thread] }).snippets[0]!.snippet).toEqual(
+      fromPage,
+    );
+    expect(fromPage!.text).toContain('zeta zeta best');
+    // A conversation without a match gets none; repeats are answered once; 50 at most.
+    const unknown = searchSnippets(db, { ...asked, threadIds: [thread, thread, 999_999] });
+    expect(unknown.snippets).toEqual([
+      { threadId: thread, snippet: fromPage },
+      { threadId: 999_999, snippet: null },
+    ]);
+    const many = Array.from({ length: 60 }, (_, i) => i + 1);
+    expect(searchSnippets(db, { ...asked, threadIds: many }).snippets).toHaveLength(50);
+    // A query with no words to show gives none.
+    const filters = searchSnippets(db, { ...asked, text: 'is:unread -zeta', threadIds: [thread] });
+    expect(filters.snippets).toEqual([{ threadId: thread, snippet: null }]);
+  });
 });
 
 describe('page boundaries', () => {
@@ -244,6 +298,11 @@ describe('page boundaries', () => {
         }
       }
       expect(order.find((r) => r.matching === 30)).toBeDefined();
+      // Only the first page counts the matching conversations; every page has its rows' details.
+      expect(pages.map((p) => p.total)).toEqual([all, null, null]);
+      for (const p of pages) {
+        expect(p.details.map((d) => d.threadId)).toEqual(p.rows.map((r) => r.threadId));
+      }
       expect(pages[0]!.next).toEqual(
         sort === 'date'
           ? ({
@@ -264,8 +323,20 @@ describe('page boundaries', () => {
     expect(first.sort).toBe('relevance');
     const page = search(db, '-common', 'relevance', { rank: -1, threadId: 5 });
     expect(page.sort).toBe('date');
+    expect(page.ranked).toBe(false);
     expect(page.rows).toEqual([]);
+    expect(page.total).toBeNull();
     expect(page.next).toBeNull();
+  });
+
+  it('a first page with nothing to match counts none', () => {
+    const db = corpus();
+    for (const text of ['', 'nothingmatchesthis']) {
+      const page = search(db, text);
+      expect(page.rows).toEqual([]);
+      expect(page.details).toEqual([]);
+      expect(page.total).toBe(0);
+    }
   });
 });
 
@@ -582,13 +653,15 @@ describe('coverage', () => {
     const reader = openDb(path, true);
     configure(reader, 'reader');
     try {
-      expect(coverageOf(reader)).toEqual({ indexed: 0, total: 3 });
-      expect(search(reader, 'x').coverage).toEqual({ indexed: 0, total: 3 });
+      expect(coverageOf(reader)).toEqual({ indexed: 0, pending: 3, total: 3 });
+      expect(search(reader, 'x').coverage).toEqual({ indexed: 0, pending: 3, total: 3 });
       setBody(db, 'x', 'body');
       setBody(db, 'y', 'cut', BODY_STATE.truncated);
+      expect(coverageOf(reader)).toEqual({ indexed: 2, pending: 1, total: 3 });
+      // A body that couldn't be read is neither indexed nor waiting.
       setBody(db, 'z', '', BODY_STATE.failed);
-      expect(coverageOf(reader)).toEqual({ indexed: 2, total: 3 });
-      expect(search(reader, 'body').coverage).toEqual({ indexed: 2, total: 3 });
+      expect(coverageOf(reader)).toEqual({ indexed: 2, pending: 0, total: 3 });
+      expect(search(reader, 'body').coverage).toEqual({ indexed: 2, pending: 0, total: 3 });
     } finally {
       reader.close();
       db.close();

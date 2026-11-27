@@ -93,7 +93,11 @@ test('a search gives a page of the open export, by date and by relevance', async
   expect(byDate.page.sort).toBe('date');
   expect(byDate.page.queryId).toBe(byDate.queryId);
   expect(byDate.page.rows.map((r) => r.threadId)).toContain(newest.threadId);
-  expect(byDate.page.coverage).toEqual({ indexed: 0, total: 30 });
+  expect(byDate.page.coverage).toEqual({ indexed: 0, pending: 30, total: 30 });
+  expect(byDate.page.total).toBe(byDate.page.rows.length);
+  expect(byDate.page.details.map((d) => d.threadId)).toEqual(
+    byDate.page.rows.map((r) => r.threadId),
+  );
   expect(byDate.progress.phase).toBe('done');
   const row = byDate.page.rows.find((r) => r.threadId === newest.threadId)!;
   expect(row.matching).toBeGreaterThan(0);

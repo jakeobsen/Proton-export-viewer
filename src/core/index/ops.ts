@@ -24,7 +24,7 @@ import {
 import { MetadataError, parseMetadata, type MessageRow } from './metadata';
 import type { IndexAnswer, IndexQuery } from '../../shared/index-types';
 import { emlFile, listPage, listWindow, rowDetails, sidebar, threadOfMessage } from './queries';
-import { searchPage } from './search';
+import { searchPage, searchSnippets } from './search';
 import {
   META,
   createSchema,
@@ -417,6 +417,8 @@ export class QueryState {
         return emlFile(db, call.rowid);
       case 'search':
         return searchPage(db, call);
+      case 'snippets':
+        return searchSnippets(db, call);
     }
   }
 

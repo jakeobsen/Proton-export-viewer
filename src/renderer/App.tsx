@@ -2,8 +2,9 @@
 
 import { useEffect } from 'react';
 import type { IndexCondition } from '../shared/index-types';
-import { indexChanged, syncMailbox } from './mailbox-state';
+import { indexChanged, syncMailbox, useSearch } from './mailbox-state';
 import { ConversationList, Sidebar } from './Mailbox';
+import { SearchBox, SearchResults } from './SearchResults';
 import { LinkDialog } from './LinkDialog';
 import { generationChanged, useReaderState } from './reader';
 import { ReaderPane } from './ReaderPane';
@@ -19,6 +20,7 @@ const INDEX_BANNERS: Partial<Record<IndexCondition, string>> = {
 export function App() {
   const state = useShellState();
   const reader = useReaderState();
+  const results = useSearch().active;
 
   useEffect(() => window.pev.onLinkDialog(showLink), []);
   useEffect(() => window.pev.onSourcesChanged(() => void refreshSources()), []);
@@ -42,6 +44,7 @@ export function App() {
     <div className="shell">
       <header className="bar">
         <span className="bar-title">{__PEV_APP_NAME__}</span>
+        {!welcome && active && <SearchBox />}
       </header>
       {active?.status === 'offline' && (
         <div className="banner" role="alert">
@@ -79,7 +82,7 @@ export function App() {
       ) : (
         <main className="content">
           {active && <Sidebar active={active} busy={state.busy} />}
-          {active && <ConversationList />}
+          {active && (results ? <SearchResults /> : <ConversationList />)}
           <section className="reader" aria-label="Conversation">
             <ReaderPane />
           </section>

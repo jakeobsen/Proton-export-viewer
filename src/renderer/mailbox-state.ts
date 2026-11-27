@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// The open export's folders, the folder on screen and its list, and where
-// indexing stands. Everything is read for the shell's current generation and
-// read again when main reports that the index moved on.
+// The open export's folders, the folder on screen and its list, the search
+// and its results, and where indexing stands. Everything is read for the
+// shell's current generation; the folders and the list are read again when
+// main reports that the index moved on, and results are not.
 
 import { useSyncExternalStore } from 'react';
-import type { IndexResult, IndexUpdate } from '../shared/api';
-import type { IndexProgress, Sidebar } from '../shared/index-types';
+import type { IndexResult, IndexUpdate, SearchRequest, SnippetsRequest } from '../shared/api';
+import type { IndexProgress, SearchSort, Sidebar, ThreadSnippet } from '../shared/index-types';
 import { INBOX, sidebarModel, type SidebarModel } from './folders';
 import { ListModel, type Row } from './list';
 import { closeReader, getReaderState, openInReader } from './reader';
+import { SearchModel, type ResultRow } from './search';
 import { getShellState, refreshGeneration } from './shell';
 
 export interface MailboxState {
@@ -90,6 +92,76 @@ export function useList() {
   return useSyncExternalStore(subscribe, () => list.snapshot);
 }
 
+/** Snippets for rows of the shown search; null if the answer isn't for the current export. */
+async function askSnippets(request: SnippetsRequest): Promise<ThreadSnippet[] | null> {
+  try {
+    const generation = getShellState().generation;
+    if (generation === null) return null;
+    const result = await window.pev.searchSnippets(request, generation);
+    if (!result.ok || state.key === null || keyOf(result.generation) !== state.key) return null;
+    return result.snippets;
+  } catch {
+    return null;
+  }
+}
+
+export const search = new SearchModel(
+  (request: SearchRequest) =>
+    ask(async (generation) => {
+      const result = await window.pev.search(request, generation);
+      return result.ok
+        ? {
+            ok: true,
+            generation: result.generation,
+            answer: result.page,
+            progress: result.progress,
+          }
+        : result;
+    }),
+  askSnippets,
+  () => {
+    for (const listener of listeners) listener();
+  },
+);
+
+export function useSearch() {
+  return useSyncExternalStore(subscribe, () => search.snapshot);
+}
+
+/** Results go away: the message a result opened goes with them. */
+function leaveSearch(drop: () => void): void {
+  const selected = search.snapshot.selected;
+  drop();
+  if (selected !== null && getReaderState().rowid === selected.rowid) closeReader();
+}
+
+/** The search box's text changed. */
+export function setSearchText(text: string): void {
+  if (text.trim() === '') leaveSearch(() => search.setText(text));
+  else search.setText(text);
+}
+
+export function setSearchSort(sort: SearchSort): void {
+  search.setSort(sort);
+}
+
+/** Empties the search box; the folder's list shows again. */
+export function clearSearch(): void {
+  leaveSearch(() => search.clear());
+}
+
+/**
+ * Selects a result and opens its newest matching message in the reader. The
+ * list's selection goes: the reader no longer shows it.
+ */
+export function selectResult(row: ResultRow): void {
+  search.select(row);
+  list.clearSelection();
+  const reader = getReaderState();
+  if (reader.rowid === row.anchorRowid && reader.refused === null) return;
+  void openInReader(row.anchorRowid);
+}
+
 const keyOf = (generation: number | null): string | null => {
   const active = getShellState().sources?.active;
   return active && generation !== null ? `${active.sourceKey}:${generation}` : null;
@@ -132,6 +204,8 @@ export function syncMailbox(): void {
   }
   const sameExport = key !== null && state.key?.split(':')[0] === key.split(':')[0];
   const folder = sameExport ? state.folder : INBOX;
+  // Results belong to the generation that answered them.
+  search.clear();
   update({ key, sidebar: null, progress: null, folder });
   list.reset(key === null ? null : folder);
   if (key !== null) void readSidebar();
@@ -146,6 +220,8 @@ export function indexChanged(update_: IndexUpdate): void {
 }
 
 export function showFolder(id: string): void {
+  // A folder picked while results show takes their place.
+  if (search.snapshot.active || search.snapshot.text !== '') clearSearch();
   if (id === state.folder) return;
   update({ folder: id });
   list.reset(id);

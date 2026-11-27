@@ -79,6 +79,12 @@ const api: PevApi = {
       after: request.after,
       generation,
     }),
+  searchSnippets: (request, generation) =>
+    ipcRenderer.invoke(IPC.searchSnippets, {
+      queryId: request.queryId,
+      threadIds: request.threadIds,
+      generation,
+    }),
 };
 
 contextBridge.exposeInMainWorld('pev', api);

@@ -9,6 +9,7 @@ import type {
   SearchPage,
   SearchRankKey,
   Sidebar,
+  ThreadSnippet,
   WindowQuery,
 } from './index-types';
 import type { MessageHeaders, OpenMode } from './reader-protocol';
@@ -33,6 +34,7 @@ export const IPC = {
   index: 'pev:index',
   indexChanged: 'pev:index-changed',
   search: 'pev:search',
+  searchSnippets: 'pev:search-snippets',
 } as const;
 
 export type RejectCode =
@@ -124,6 +126,15 @@ export type SearchResult =
   | { ok: true; generation: number; queryId: number; page: SearchPage; progress: IndexProgress }
   | Rejected;
 
+/** Snippets for rows of one of this window's searches, named by its query ID. */
+export interface SnippetsRequest {
+  queryId: number;
+  threadIds: number[];
+}
+
+export type SnippetsResult =
+  { ok: true; generation: number; queryId: number; snippets: ThreadSnippet[] } | Rejected;
+
 export type ErrorKind = 'uncaught' | 'rejection' | 'error';
 
 export interface ErrorReport {
@@ -170,4 +181,9 @@ export interface PevApi {
    * 'superseded'.
    */
   search(request: SearchRequest, generation: number): Promise<SearchResult>;
+  /**
+   * Snippets for result rows that came without one, for a search this window
+   * made; one of an older search is answered as 'superseded'.
+   */
+  searchSnippets(request: SnippetsRequest, generation: number): Promise<SnippetsResult>;
 }

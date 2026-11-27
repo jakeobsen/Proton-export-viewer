@@ -8,6 +8,7 @@
 
 import type {
   MarkedSnippet,
+  RowDetails,
   SearchCoverage,
   SearchDateKey,
   SearchKey,
@@ -15,13 +16,17 @@ import type {
   SearchQuery,
   SearchRankKey,
   SearchRow,
+  SearchSnippets,
   SearchSort,
+  SnippetsQuery,
 } from '../../shared/index-types';
+import { MAX_SNIPPET_THREADS } from '../../shared/index-types';
 import { parseQuery, wordsOf, type ParsedQuery, type Term, type TextColumn } from '../search/query';
 import { markedToRanges, stripMarks } from '../search/ranges';
 import { SYSTEM_LABELS } from './labels';
+import { rowDetails } from './queries';
 import { BODY_STATE, META_STATE } from './schema';
-import { asNumber, scalar, type Db, type SqlValue } from './sql';
+import { asNumber, scalar, type Db, type Row, type SqlValue } from './sql';
 
 /** The most conversations one results page holds. */
 export const SEARCH_PAGE_SIZE = 200;
@@ -249,40 +254,55 @@ interface Grouped {
   matching: number;
 }
 
-function pageByDate(db: Db, built: BuiltQuery, after: SearchDateKey | null): Grouped[] {
+/** A page of grouped matches; on a first page, also how many conversations match in all. */
+interface GroupedPage {
+  groups: Grouped[];
+  total: number | null;
+}
+
+/**
+ * On a first page, each row also carries the number of matching
+ * conversations: the window counts the groups before the limit applies, so
+ * the matches are read once.
+ */
+const TOTAL_COLUMN = ', count(*) OVER () AS total';
+
+function groupedPage(rows: Row[], first: boolean): GroupedPage {
+  const groups = rows.map((r) => ({
+    threadId: asNumber(r.tid),
+    time: asNumber(r.max_time),
+    rank: r.best_rank === undefined ? null : Number(r.best_rank),
+    matching: asNumber(r.n),
+  }));
+  return { groups, total: first ? (rows.length > 0 ? asNumber(rows[0]!.total) : 0) : null };
+}
+
+function pageByDate(db: Db, built: BuiltQuery, after: SearchDateKey | null): GroupedPage {
   const h = hits(built, false, false);
-  return db
+  const rows = db
     .once(
       `WITH hit AS MATERIALIZED (${h.sql})
-       SELECT tid, max(time) AS max_time, count(*) AS n FROM hit GROUP BY tid
+       SELECT tid, max(time) AS max_time, count(*) AS n${after ? '' : TOTAL_COLUMN}
+       FROM hit GROUP BY tid
        ${after ? 'HAVING max(time) < ? OR (max(time) = ? AND tid < ?)' : ''}
        ORDER BY max_time DESC, tid DESC LIMIT ?`,
     )
-    .all(...h.params, ...(after ? [after.time, after.time, after.threadId] : []), SEARCH_PAGE_SIZE)
-    .map((r) => ({
-      threadId: asNumber(r.tid),
-      time: asNumber(r.max_time),
-      rank: null,
-      matching: asNumber(r.n),
-    }));
+    .all(...h.params, ...(after ? [after.time, after.time, after.threadId] : []), SEARCH_PAGE_SIZE);
+  return groupedPage(rows, after === null);
 }
 
-function pageByRelevance(db: Db, built: BuiltQuery, after: SearchRankKey | null): Grouped[] {
+function pageByRelevance(db: Db, built: BuiltQuery, after: SearchRankKey | null): GroupedPage {
   const h = hits(built, true, false);
-  return db
+  const rows = db
     .once(
       `WITH hit AS MATERIALIZED (${h.sql})
-       SELECT tid, min(rank) AS best_rank, max(time) AS max_time, count(*) AS n FROM hit GROUP BY tid
+       SELECT tid, min(rank) AS best_rank, max(time) AS max_time, count(*) AS n${after ? '' : TOTAL_COLUMN}
+       FROM hit GROUP BY tid
        ${after ? 'HAVING min(rank) > ? OR (min(rank) = ? AND tid < ?)' : ''}
        ORDER BY best_rank ASC, tid DESC LIMIT ?`,
     )
-    .all(...h.params, ...(after ? [after.rank, after.rank, after.threadId] : []), SEARCH_PAGE_SIZE)
-    .map((r) => ({
-      threadId: asNumber(r.tid),
-      time: asNumber(r.max_time),
-      rank: Number(r.best_rank),
-      matching: asNumber(r.n),
-    }));
+    .all(...h.params, ...(after ? [after.rank, after.rank, after.threadId] : []), SEARCH_PAGE_SIZE);
+  return groupedPage(rows, after === null);
 }
 
 /**
@@ -343,21 +363,24 @@ function snippets(
 const coverageCache = new WeakMap<Db, { version: number; coverage: SearchCoverage }>();
 
 /**
- * How many messages have their body in the index, out of all of them. Read
- * again only when another connection has committed since the last read.
+ * How many messages have their body in the index, and how many still wait for
+ * it, out of all of them. Read again only when another connection has
+ * committed since the last read.
  */
 export function coverageOf(db: Db): SearchCoverage {
   const version = scalar(db, 'PRAGMA data_version');
   const cached = coverageCache.get(db);
   if (cached && cached.version === version) return cached.coverage;
+  const bodies = db
+    .stmt(
+      `SELECT coalesce(sum(body_state IN (?, ?)), 0) AS indexed,
+              coalesce(sum(body_state = ?), 0) AS pending
+       FROM pairs WHERE meta_state = ?`,
+    )
+    .get(BODY_STATE.indexed, BODY_STATE.truncated, BODY_STATE.pending, META_STATE.indexed);
   const coverage = {
-    indexed: scalar(
-      db,
-      'SELECT count(*) FROM pairs WHERE meta_state = ? AND body_state IN (?, ?)',
-      META_STATE.indexed,
-      BODY_STATE.indexed,
-      BODY_STATE.truncated,
-    ),
+    indexed: asNumber(bodies?.indexed),
+    pending: asNumber(bodies?.pending),
     total: scalar(db, 'SELECT count(*) FROM messages'),
   };
   coverageCache.set(db, { version, coverage });
@@ -369,22 +392,32 @@ export function searchPage(db: Db, call: SearchQuery): SearchPage {
   const built = buildQuery(db, parseQuery(call.text));
   // With no words to rank by, results are by date only.
   const sort: SearchSort = call.sort === 'relevance' && built.hasText ? 'relevance' : 'date';
-  const page = (rows: SearchRow[], next: SearchKey | null, dropped = 0): SearchPage => ({
+  const page = (
+    rows: SearchRow[],
+    next: SearchKey | null,
+    total: number | null,
+    details: RowDetails[] = [],
+    dropped = 0,
+  ): SearchPage => ({
     queryId: call.queryId,
     sort,
+    ranked: built.hasText,
+    total,
     rows,
+    details,
     next,
     coverage: coverageOf(db),
     dropped,
   });
+  const first = call.after === null;
   // A relevance keyset for a query sorted by date continues nothing.
-  if (built.empty || (sort !== call.sort && call.after !== null)) return page([], null);
+  if (built.empty || (sort !== call.sort && !first)) return page([], null, first ? 0 : null);
 
-  const grouped =
+  const { groups: grouped, total } =
     sort === 'relevance'
       ? pageByRelevance(db, built, call.after as SearchRankKey | null)
       : pageByDate(db, built, call.after as SearchDateKey | null);
-  if (grouped.length === 0) return page([], null);
+  if (grouped.length === 0) return page([], null, total);
   const threadIds = grouped.map((g) => g.threadId);
   const { newest, best } = pickMessages(db, built, threadIds);
   const threads = new Map(
@@ -426,5 +459,29 @@ export function searchPage(db: Db, call: SearchQuery): SearchPage {
       : sort === 'relevance'
         ? { rank: last.rank ?? 0, threadId: last.threadId }
         : { time: last.time, threadId: last.threadId };
-  return page(rows, next, snipped.dropped);
+  return page(rows, next, total, rowDetails(db, threadIds, threadIds.length), snipped.dropped);
+}
+
+/**
+ * Snippets for conversations of a search's results: each one's best-ranked
+ * matching message, as the page gives its first rows. Null for a conversation
+ * with no match, or when the query has no words to match.
+ */
+export function searchSnippets(db: Db, call: SnippetsQuery): SearchSnippets {
+  const threadIds = [...new Set(call.threadIds)].slice(0, MAX_SNIPPET_THREADS);
+  const built = buildQuery(db, parseQuery(call.text));
+  const none = (dropped = 0, byThread = new Map<number, MarkedSnippet>()): SearchSnippets => ({
+    queryId: call.queryId,
+    snippets: threadIds.map((threadId) => ({ threadId, snippet: byThread.get(threadId) ?? null })),
+    dropped,
+  });
+  if (!built.hasText || built.match === null || threadIds.length === 0) return none();
+  const { best } = pickMessages(db, built, threadIds);
+  const { byRowid, dropped } = snippets(db, built.match, [...best.values()]);
+  const byThread = new Map<number, MarkedSnippet>();
+  for (const [threadId, rowid] of best) {
+    const snippet = byRowid.get(rowid);
+    if (snippet) byThread.set(threadId, snippet);
+  }
+  return none(dropped, byThread);
 }

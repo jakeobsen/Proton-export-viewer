@@ -2,7 +2,7 @@
 // Shell test hooks, reached by tests as window.__pevTest.
 
 import { reportError } from '../renderer/errors';
-import { list } from '../renderer/mailbox-state';
+import { list, search } from '../renderer/mailbox-state';
 import {
   chooseFolder,
   clearLink,
@@ -124,6 +124,11 @@ export function install(): void {
   const api = {
     state: () => getShellState(),
     listSelection: () => list.snapshot.selected,
+    /** The search's state, with the shown rows as conversation IDs. */
+    search: () => {
+      const { rows, ...rest } = search.snapshot;
+      return { ...rest, threadIds: rows.map((r) => r.threadId) };
+    },
     refreshGeneration,
     open: (id: string) => openStub(id),
     /** Opens a message in the reader pane. */

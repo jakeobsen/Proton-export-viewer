@@ -428,6 +428,24 @@ export async function install(ctx: AppContext): Promise<boolean> {
       if (!result.ok) throw new Error('release-writes');
     },
     /** Phase 1 writes waiting to be let through. */
+    /** Searches that reached core since it started. */
+    coreSearches: async () => {
+      const result = await core('searches');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
+    /** Core holds the searches and snippet requests that reach it until they are released. */
+    holdSearches: async () => {
+      if (!(await core('hold-searches')).ok) throw new Error('hold-searches');
+    },
+    /** Lets the held searches run; returns how many there were. */
+    releaseSearches: async () => {
+      const result = await core('release-searches');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
+    heldSearches: async () => {
+      const result = await core('held-searches');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
     heldWrites: async () => {
       const result = await core('held-writes');
       return result.ok ? (result.value ?? 0) : 0;
