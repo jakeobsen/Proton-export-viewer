@@ -17,7 +17,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { runIdentity } from '../../src/core/identity';
 import type { CoreRequest, CoreResult, CoreSource } from '../../src/shared/core-protocol';
 import type { Logger } from '../../src/shared/log/writer';
@@ -258,6 +258,20 @@ function tool(name: string) {
 
 const steps = (order: OrderStep[]) => order.map((s) => s.step);
 const settle = () => new Promise((r) => setTimeout(r, 20));
+/** How long a test waits for work the manager does in the background. */
+const WAIT = { timeout: 10_000, interval: 5 };
+
+/**
+ * Waits until the index of the source opened at `generation` is open: the
+ * last of the work an open leaves running (scan, then index).
+ */
+const indexOpened = (t: ReturnType<typeof setup>, generation: number) =>
+  vi.waitFor(() => {
+    const opened = t.lines
+      .map((l) => JSON.parse(l) as { code: string; data: { generation?: number } })
+      .some((e) => e.code === 'index.opened' && e.data.generation === generation);
+    expect(opened).toBe(true);
+  }, WAIT);
 
 describe('opening a source', () => {
   it('starts the scope, then core with the newest run, and records the run identity', async () => {
@@ -293,8 +307,7 @@ describe('opening a source', () => {
     });
     expect(t.manager.registry.active).toBe(source.sourceKey);
     expect([...t.live.values()]).toEqual(['bm1']);
-    await settle();
-    expect(t.manager.scanSummary()).toEqual(SUMMARY);
+    await vi.waitFor(() => expect(t.manager.scanSummary()).toEqual(SUMMARY), WAIT);
   });
 
   it('opens nothing for a cancelled dialog or a folder without runs', async () => {
@@ -411,8 +424,7 @@ describe('switching', () => {
     ]);
     expect(t.core.started.at(-1)).toEqual({ ...t.manager.stamp()!, root: two });
     expect(t.core.calls).toContain('identify');
-    await settle();
-    expect(t.manager.scanSummary()).toEqual(SUMMARY);
+    await vi.waitFor(() => expect(t.manager.scanSummary()).toEqual(SUMMARY), WAIT);
   });
 
   it('drops a scan result that arrives in main after a switch', async () => {
@@ -421,20 +433,21 @@ describe('switching', () => {
     t.core.holdScans = true;
     t.picks.push({ path: root, bookmark: 'bm1' });
     await t.manager.chooseFolder(null, t.generation());
-    await settle();
-    expect(t.core.heldScans.length).toBe(1);
+    await vi.waitFor(() => expect(t.core.heldScans.length).toBe(1), WAIT);
     const older = t.manager.view().active!.runs[1]!;
     await t.manager.switchRun(older.runId, t.generation());
-    await settle();
+    // The second run's scan is held too.
+    await vi.waitFor(() => expect(t.core.heldScans.length).toBe(2), WAIT);
     // The first run's scan, from the core that was stopped, comes back late.
     t.core.heldScans.shift()!();
-    await settle();
+    await vi.waitFor(
+      () => expect(t.lines.some((l) => l.includes('"source.stale_result"'))).toBe(true),
+      WAIT,
+    );
     expect(t.manager.scanSummary()).toBeNull();
-    expect(t.lines.some((l) => l.includes('"source.stale_result"'))).toBe(true);
     // The current run's own scan is accepted.
     t.core.heldScans.shift()!();
-    await settle();
-    expect(t.manager.scanSummary()).toEqual(SUMMARY);
+    await vi.waitFor(() => expect(t.manager.scanSummary()).toEqual(SUMMARY), WAIT);
   });
 });
 
@@ -700,7 +713,7 @@ describe('a damaged index', () => {
     const t = setup('mgr-rebuild');
     t.picks.push({ path: tool('mgr-rebuild-tool'), bookmark: 'bm1' });
     await t.manager.chooseFolder(null, t.generation());
-    await settle();
+    await indexOpened(t, t.manager.stamp()!.generation);
     const stamp = t.manager.stamp()!;
     const first = t.manager.registry.source(stamp.sourceKey)!.dbUuid;
     expect(first).toEqual(expect.any(String));
@@ -709,7 +722,7 @@ describe('a damaged index', () => {
     t.order.length = 0;
     t.manager.handleCoreEvent(damaged(stamp));
     expect(t.manager.view().active?.index).toBe('rebuilding');
-    await settle();
+    await indexOpened(t, stamp.generation + 1);
     // The generation moved; core was started again for the same run, and its
     // index is made afresh, as a rebuild.
     const now = t.manager.stamp()!;
@@ -727,8 +740,8 @@ describe('a damaged index', () => {
     const t = setup('mgr-rebuild-reads');
     t.picks.push({ path: tool('mgr-rebuild-reads-tool'), bookmark: 'bm1' });
     await t.manager.chooseFolder(null, t.generation());
-    await settle();
     const stamp = t.manager.stamp()!;
+    await indexOpened(t, stamp.generation);
     const first = t.manager.registry.source(stamp.sourceKey)!.dbUuid;
     const started = t.core.started.length;
 
@@ -743,7 +756,8 @@ describe('a damaged index', () => {
     try {
       t.manager.handleCoreEvent(damaged(stamp));
       read();
-      await settle();
+      // Until the rebuild has opened the new index.
+      await indexOpened(t, stamp.generation + 1);
     } finally {
       clearInterval(timer);
     }
@@ -766,11 +780,11 @@ describe('a damaged index', () => {
     const root = tool('mgr-rebuild-stale-tool');
     t.picks.push({ path: root, bookmark: 'bm1' });
     await t.manager.chooseFolder(null, t.generation());
-    await settle();
+    await indexOpened(t, t.manager.stamp()!.generation);
     const old = t.manager.stamp()!;
     const older = t.manager.view().active!.runs[1]!;
     await t.manager.switchRun(older.runId, t.generation());
-    await settle();
+    await indexOpened(t, t.manager.stamp()!.generation);
     const calls = t.core.indexCalls.length;
     const view = t.manager.view();
     t.manager.handleCoreEvent(damaged(old));
@@ -786,11 +800,14 @@ describe('a damaged index', () => {
     const root = tool('mgr-rebuild-offline-tool');
     t.picks.push({ path: root, bookmark: 'bm1' });
     await t.manager.chooseFolder(null, t.generation());
-    await settle();
+    await indexOpened(t, t.manager.stamp()!.generation);
     const key = t.manager.stamp()!.sourceKey;
     renameSync(join(root, 'secret.account@example.com'), join(root, 'away'));
+    const asks = () => t.core.calls.filter((c) => c === 'index').length;
+    const asked = asks();
     expect(await t.manager.openRecent(key, t.generation())).toBe('offline');
-    await settle();
+    // It is browsed from its index: core is asked to open it, and can't.
+    await vi.waitFor(() => expect(asks()).toBe(asked + 1), WAIT);
     const stamp = t.manager.stamp()!;
     const started = t.core.started.length;
     t.manager.handleCoreEvent(damaged(stamp, 'damaged'));
@@ -805,7 +822,7 @@ describe('a damaged index', () => {
     renameSync(join(root, 'away'), join(root, 'secret.account@example.com'));
     t.picks.push({ path: root, bookmark: 'bm2' });
     expect(await t.manager.locate(null, t.generation())).toBe('opened');
-    await settle();
+    await indexOpened(t, t.manager.stamp()!.generation);
     expect(t.core.indexCalls.at(-1)).toEqual({
       stamp: t.manager.stamp(),
       dbUuid: null,
@@ -818,7 +835,7 @@ describe('a damaged index', () => {
     const t = setup('mgr-rebuild-forget');
     t.picks.push({ path: tool('mgr-rebuild-forget-tool'), bookmark: 'bm1' });
     await t.manager.chooseFolder(null, t.generation());
-    await settle();
+    await indexOpened(t, t.manager.stamp()!.generation);
     const stamp = t.manager.stamp()!;
     const calls = t.core.indexCalls.length;
     const forgetting = t.manager.forget(stamp.sourceKey, t.generation());
@@ -839,7 +856,7 @@ describe('Forget', () => {
     await t.manager.chooseFolder(null, t.generation());
     const first = t.manager.stamp()!.sourceKey;
     await t.manager.switchRun(t.manager.view().active!.runs[1]!.runId, t.generation());
-    await settle();
+    await indexOpened(t, t.manager.stamp()!.generation);
     const open = t.manager.stamp()!;
     expect(t.manager.view().recent).toHaveLength(2);
 
@@ -857,7 +874,7 @@ describe('Forget', () => {
     const t = setup('mgr-forget-open');
     t.picks.push({ path: tool('mgr-forget-open-tool'), bookmark: 'bm1' });
     await t.manager.chooseFolder(null, t.generation());
-    await settle();
+    await indexOpened(t, t.manager.stamp()!.generation);
     const stamp = t.manager.stamp()!;
     t.order.length = 0;
     expect(await t.manager.forget(stamp.sourceKey, t.generation())).toBe('forgotten');
@@ -975,7 +992,7 @@ describe('Reset', () => {
     const root = tool('mgr-reset-tool');
     t.picks.push({ path: root, bookmark: 'bm1' });
     await t.manager.chooseFolder(null, t.generation());
-    await settle();
+    await indexOpened(t, t.manager.stamp()!.generation);
     const key = t.manager.stamp()!.sourceKey;
     mkdirSync(join(t.userData, 'index'), { recursive: true });
     writeFileSync(join(t.userData, 'index', `${key}.sqlite`), 'x');
@@ -988,14 +1005,15 @@ describe('Reset', () => {
     t.core.onStop = look('stop');
 
     // An open is under way (its dialog is up) and another is queued behind it.
-    let pick!: (p: Picked | null) => void;
+    let pick: ((p: Picked | null) => void) | undefined;
     t.manager.setAccess({ picker: () => new Promise((r) => (pick = r)) });
     const inProgress = t.manager.chooseFolder(null, t.generation());
-    await settle();
+    // Its dialog is up.
+    await vi.waitFor(() => expect(pick).toBeDefined(), WAIT);
     const queuedBefore = t.manager.openRecent(key, t.generation());
     const reset = t.manager.reset();
     const queuedAfter = t.manager.chooseFolder(null, t.generation());
-    pick({ path: root, bookmark: 'bm2' });
+    pick!({ path: root, bookmark: 'bm2' });
     expect(await inProgress).toBe('closed');
     expect(await queuedBefore).toBe('closed');
     await reset;
@@ -1020,10 +1038,10 @@ describe('Reset', () => {
     const root = tool('mgr-reset-recovery-tool');
     t.picks.push({ path: root, bookmark: 'bm1' });
     await t.manager.chooseFolder(null, t.generation());
-    await settle();
+    await indexOpened(t, t.manager.stamp()!.generation);
     const first = t.manager.stamp()!;
     await t.manager.switchRun(t.manager.view().active!.runs[1]!.runId, t.generation());
-    await settle();
+    await indexOpened(t, t.manager.stamp()!.generation);
     const stamp = t.manager.stamp()!;
     const calls = t.core.indexCalls.length;
     t.manager.handleCoreEvent(damaged(stamp));
