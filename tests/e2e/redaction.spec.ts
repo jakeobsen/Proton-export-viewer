@@ -15,7 +15,7 @@ import {
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { SCHEMA_VERSION } from '../../src/core/index/schema';
-import type { MessageOpenResult } from '../../src/shared/api';
+import type { MessageOpenResult, SourceActionResult } from '../../src/shared/api';
 import type { IndexProgress } from '../../src/shared/index-types';
 import type { Stamp } from '../../src/shared/sources';
 import { writeExport } from '../exports';
@@ -235,10 +235,13 @@ test('no marker reaches a log file through the index text and its schema checks,
     stampA = await first.main<Stamp>('sourceStamp');
     indexDir = await first.main<string>('indexDir');
 
-    // B: its phase 2 is under way, its first write held, when A is opened again.
+    // B: its phase 2 is under way, its first write held, when it is forgotten.
+    // Forgetting the open export closes its index inside the same core, so
+    // the write that was held ends as stale and that core logs it.
     await first.main('indexTestSettings', { holdWrites: true });
     await first.main('queuePick', rootB, 'bm2');
     await first.shell('chooseFolder', []);
+    const keyB = (await first.main<Stamp>('sourceStamp')).sourceKey;
     await expect.poll(() => first.main<number>('heldWrites')).toBeGreaterThan(0);
     await first.main('releaseWrites', 1);
     await expect
@@ -246,6 +249,15 @@ test('no marker reaches a log file through the index text and its schema checks,
       .toBe('indexing');
     await expect.poll(() => first.main<number>('heldWrites')).toBeGreaterThan(0);
     await first.main('indexTestSettings', null);
+    expect(await first.shell<SourceActionResult>('forgetExport', [keyB])).toMatchObject({
+      ok: true,
+      outcome: 'forgotten',
+    });
+    await expect
+      .poll(() => first.hasLog('index.phase2_failed', { proc: 'core', reason: 'stale_generation' }))
+      .toBe(true);
+
+    // A is open again at quit, for the schema checks below.
     await first.shell('openExport', [stampA.sourceKey]);
     await expect
       .poll(async () => (await first.main<Stamp>('sourceStamp')).sourceKey)
@@ -253,9 +265,6 @@ test('no marker reaches a log file through the index text and its schema checks,
     for (const code of ['index.phase2_done', 'index.body_failed', 'index.body_too_large']) {
       await expect.poll(() => first.hasLog(code, { proc: 'core' }), { message: code }).toBe(true);
     }
-    await expect
-      .poll(() => first.hasLog('index.phase2_failed', { proc: 'core', reason: 'stale_generation' }))
-      .toBe(true);
   } finally {
     await first.close();
   }
