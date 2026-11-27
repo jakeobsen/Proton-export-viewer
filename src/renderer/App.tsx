@@ -6,6 +6,8 @@ import type { IndexCondition } from '../shared/index-types';
 import { indexChanged, syncMailbox } from './mailbox-state';
 import { ConversationList, Sidebar } from './Mailbox';
 import { LinkDialog } from './LinkDialog';
+import { generationChanged, useReaderState } from './reader';
+import { ReaderPane } from './ReaderPane';
 import { locateExport, refreshSources, showLink, useShellState } from './shell';
 import { Welcome } from './Welcome';
 
@@ -17,6 +19,7 @@ const INDEX_BANNERS: Partial<Record<IndexCondition, string>> = {
 
 export function App() {
   const state = useShellState();
+  const reader = useReaderState();
 
   useEffect(() => window.pev.onLinkDialog(showLink), []);
   useEffect(() => window.pev.onSourcesChanged(() => void refreshSources()), []);
@@ -24,6 +27,7 @@ export function App() {
   useEffect(() => {
     void refreshSources();
   }, []);
+  useEffect(() => generationChanged(state.generation), [state.generation]);
 
   const active = state.sources?.active ?? null;
   // The list follows the open export and its generation.
@@ -32,7 +36,11 @@ export function App() {
   // The welcome screen shows while no export is open or being opened again,
   // unless a body is open.
   const welcome =
-    state.sources !== null && !state.sources.restoring && active === null && state.bodyUrl === null;
+    state.sources !== null &&
+    !state.sources.restoring &&
+    active === null &&
+    state.bodyUrl === null &&
+    reader.rowid === null;
   const banner = active?.index ? INDEX_BANNERS[active.index] : undefined;
 
   return (
@@ -65,7 +73,9 @@ export function App() {
           {active && <Sidebar active={active} busy={state.busy} />}
           {active && <ConversationList />}
           <section className="reader" aria-label="Conversation">
-            {state.bodyUrl && (
+            {reader.rowid !== null ? (
+              <ReaderPane />
+            ) : state.bodyUrl ? (
               <iframe
                 key={state.frameKey}
                 className="body-frame"
@@ -74,7 +84,7 @@ export function App() {
                 referrerPolicy="no-referrer"
                 src={state.bodyUrl}
               />
-            )}
+            ) : null}
           </section>
         </main>
       )}

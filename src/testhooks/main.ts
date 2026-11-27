@@ -6,7 +6,7 @@ import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { BrowserWindow, app, clipboard, dialog, shell } from 'electron';
-import { bumpGeneration, type AppContext } from '../main/context';
+import { bumpGeneration, notifySources, type AppContext } from '../main/context';
 import type { PolicyObserver } from '../main/harden';
 import { PROD_SWITCHES } from '../main/switches';
 import { ScopeError, type Picked } from '../main/sources/scope';
@@ -210,6 +210,8 @@ export async function install(ctx: AppContext): Promise<boolean> {
     windows: () => [...ctx.windows.values()].map((w) => w.id),
     generation: () => ctx.generation,
     bumpGeneration: () => bumpGeneration(ctx),
+    /** Tells every shell window that the sources changed, as main does after its own switch. */
+    notifySources: () => notifySources(ctx),
     setBodyCsp: (on: boolean) => {
       bodyCsp = on;
     },
