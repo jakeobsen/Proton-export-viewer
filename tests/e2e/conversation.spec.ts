@@ -161,6 +161,30 @@ async function pendingIn(pev: PevApp, rowid: number, held: number): Promise<void
   await expect(pev.page.locator('.rp-frame')).toHaveCount(0);
 }
 
+/** Scrolls the cards to the top. */
+async function scrollToTop(pev: PevApp): Promise<void> {
+  await pev.page.locator('.cv-scroll').evaluate((e) => {
+    e.scrollTop = 0;
+    e.dispatchEvent(new Event('scroll'));
+  });
+}
+
+/** Scrolls the cards to the end, until the card of `rowid` is above the screen or not drawn. */
+async function scrollPast(pev: PevApp, rowid: number): Promise<void> {
+  await pev.page.locator('.cv-scroll').evaluate((e) => {
+    e.scrollTop = e.scrollHeight;
+    e.dispatchEvent(new Event('scroll'));
+  });
+  await expect
+    .poll(() =>
+      pev.page.locator('.cv-scroll').evaluate((e, id) => {
+        const card = e.querySelector(`.card[data-rowid="${id}"]`);
+        return !card || card.getBoundingClientRect().bottom <= e.getBoundingClientRect().top;
+      }, rowid),
+    )
+    .toBe(true);
+}
+
 async function checkHidden(pev: PevApp): Promise<void> {
   const windows = await pev.main<Array<{ visible: boolean; focused: boolean }>>('windowState');
   expect(windows.filter((w) => w.visible || w.focused)).toEqual([]);
@@ -471,6 +495,85 @@ test('a pending card removed with no card left installs nothing and says the mes
   expect(count(pev, 'view.installed')).toBe(installed);
   expect(await oneView(pev)).toEqual({ frames: 0, live: 0 });
   expect((await reader(pev)).view).toBeNull();
+  await checkHidden(pev);
+});
+
+/**
+ * A conversation of 40 whose second message the index is about to remove
+ * (its message file stays, so it can still be read), shown with that card
+ * expanded and then scrolled out of view. With `pending`, core holds the
+ * card's open once its message file is open, before the parse.
+ */
+async function offScreenDoomed(pev: PevApp, name: string, pending: boolean) {
+  const written = await openThreads(pev, name, [{ messages: 40 }, { messages: 1 }]);
+  const doomed = written.threads[0]!.ids[1]!;
+  await reopenWithHeldRemovals(pev, written.run, [doomed], written.pairs, { keepEml: true });
+  const row = await rowOf(pev, 40);
+  const ids = await cardIds(pev, row.newestRowid);
+  await pressRow(pev, row);
+  await expanded(pev, ids[39]!);
+  await scrollToTop(pev);
+  if (pending) await core(pev, 'hold-opened');
+  await pressCard(pev, ids[1]!);
+  let url: string | null = null;
+  if (pending) {
+    await expect.poll(() => core(pev, 'held-opened')).toBe(1);
+    expect((await reader(pev)).pending).toBe(true);
+    expect(await oneView(pev)).toEqual({ frames: 0, live: 0 });
+  } else {
+    url = await expanded(pev, ids[1]!);
+  }
+  await scrollPast(pev, ids[1]!);
+  return { ids, url };
+}
+
+/** Lets the removal through, with the read for the removed card's place held in core. */
+async function removeWithPlaceHeld(pev: PevApp, removed: number): Promise<void> {
+  await pev.main('holdCards', removed);
+  await pev.main('releaseWrites', null);
+  await expect.poll(() => core(pev, 'held-cards'), { timeout: 20_000 }).toBe(1);
+}
+
+test('an expanded card removed off screen: its view is revoked before the read for its place is back', async ({
+  pev,
+}) => {
+  const { ids, url } = await offScreenDoomed(pev, 'conv-off-live', false);
+  const installed = count(pev, 'view.installed');
+  await removeWithPlaceHeld(pev, ids[1]!);
+  // The first read found it gone: its view is revoked and its frame gone already.
+  expect(await status(pev, url!)).toBe(404);
+  expect(await oneView(pev)).toEqual({ frames: 0, live: 0 });
+  await expect(pev.page.locator('.rp-frame')).toHaveCount(0);
+  expect((await reader(pev)).rowid).toBeNull();
+  // Then the nearest card, the next newer one, takes its place.
+  expect(await pev.main<number>('holdCards', null)).toBe(1);
+  await expect.poll(async () => (await cardsState(pev)).expanded, { timeout: 20_000 }).toBe(ids[2]);
+  await expanded(pev, ids[2]!);
+  expect(count(pev, 'view.installed')).toBe(installed + 1);
+  await checkHidden(pev);
+});
+
+test('an off-screen card removed while its open is pending: the open installs nothing, even before its place is read', async ({
+  pev,
+}) => {
+  const { ids } = await offScreenDoomed(pev, 'conv-off-pending', true);
+  const installed = count(pev, 'view.installed');
+  const stale = () =>
+    pev.logs('main').filter((l) => l.code === 'open.stale' && l.data.reason === 'open_id').length;
+  const before = stale();
+  await removeWithPlaceHeld(pev, ids[1]!);
+  // The open under way is revoked with the reader closed: no frame, no live view.
+  expect((await reader(pev)).rowid).toBeNull();
+  expect(await oneView(pev)).toEqual({ frames: 0, live: 0 });
+  // Its parse finishes while the read for its place is still held: main installs nothing.
+  expect(await core(pev, 'release-opened')).toBe(1);
+  await expect.poll(stale).toBe(before + 1);
+  expect(count(pev, 'view.installed')).toBe(installed);
+  expect(await oneView(pev)).toEqual({ frames: 0, live: 0 });
+  // Then the nearest card opens.
+  expect(await pev.main<number>('holdCards', null)).toBe(1);
+  await expanded(pev, ids[2]!);
+  expect(count(pev, 'view.installed')).toBe(installed + 1);
   await checkHidden(pev);
 });
 

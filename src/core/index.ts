@@ -71,6 +71,9 @@ const testState = {
   /** Holds reads once their message file is open, before the parse. */
   holdingOpened: false,
   heldOpened: [] as Array<() => void>,
+  /** Holds the shell's cards queries anchored at this message, until a test lets them go. */
+  holdCardsAt: null as number | null,
+  heldCards: [] as Array<() => void>,
 };
 /** Test builds can hold phase 1's writes. */
 let writeGate: import('../testhooks/core').WriteGate | null = null;
@@ -254,6 +257,17 @@ function handle(request: CoreRequest): void {
     case 'index-query':
       if (!session) {
         reply({ type: 'result', reqId: request.reqId, ok: false, code: 'no_source' });
+        return;
+      }
+      if (
+        __PEV_TEST_HOOKS__ &&
+        request.type === 'index-query' &&
+        request.query.op === 'cards' &&
+        testState.holdCardsAt !== null &&
+        request.query.anchor.rowid === testState.holdCardsAt
+      ) {
+        const held = session;
+        testState.heldCards.push(() => held.handle(request));
         return;
       }
       session.handle(request);

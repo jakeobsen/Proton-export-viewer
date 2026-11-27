@@ -276,9 +276,11 @@ export class CardsModel {
     const removed = expanded !== null && answer.followed !== expanded;
     if (removed && !atExpanded) {
       // This window may not hold the place of the card that went: read there.
+      // Its view and any open of it are revoked now, not once that read is back.
       this.seekExpanded = true;
       this.again = true;
       this.set({ threadId: answer.threadId });
+      this.actions.close();
       return true;
     }
     this.seekExpanded = false;

@@ -124,9 +124,10 @@ describe('the cards model', () => {
     await settle();
     expect(model.snapshot.expanded).toBe(ids[3]);
     expect(model.snapshot.total).toBe(5);
-    // The newest removed: the one before it, one place up. Its header
-    // scrolls to the top, with no shift on top of that.
+    // The newest removed, on screen: the one before it, one place up. Its
+    // header scrolls to the top, with no shift on top of that.
     model.expand(model.cardAt(4)!);
+    model.setViewport(0, 4);
     const { scrollId, shiftId } = model.snapshot;
     db.exec(`DELETE FROM messages WHERE rowid = ${ids[5]!}`);
     model.refresh();
@@ -178,6 +179,29 @@ describe('the cards model', () => {
       key: { time: 101, rowid: ids[1] },
     });
     expect(actions.at(-1)).toEqual(['open', ids[2]]);
+    db.close();
+  });
+
+  it('revokes the removed card’s view at the first answer, while its place is still being read', async () => {
+    const { db, ids, model, actions, queries, settle, holdReads, releaseReads } = setup(65);
+    model.show(ids[1]!, null);
+    await settle();
+    model.setViewport(55, 64);
+    await settle();
+    await settle();
+    const reads = queries.length;
+    db.exec(`DELETE FROM messages WHERE rowid = ${ids[1]!}`);
+    // The first read answers at once; the one for the removed card's place is held.
+    model.refresh();
+    holdReads();
+    await settle();
+    await settle();
+    expect(queries.length).toBe(reads + 2);
+    expect(queries.at(-1)!.anchor).toMatchObject({ rowid: ids[1] });
+    expect(actions).toEqual([['open', ids[1]], ['close']]);
+    await releaseReads();
+    expect(model.snapshot.expanded).toBe(ids[2]);
+    expect(actions).toEqual([['open', ids[1]], ['close'], ['open', ids[2]]]);
     db.close();
   });
 
