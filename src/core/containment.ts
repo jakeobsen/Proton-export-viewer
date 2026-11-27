@@ -137,6 +137,8 @@ export class ContainmentError extends Error {
   constructor(
     readonly kind: RejectKind | 'root_unavailable',
     readonly errno: string | null = null,
+    /** Bytes read before the file was refused. */
+    readonly read = 0,
   ) {
     super(kind);
   }
@@ -185,6 +187,18 @@ function isPlainName(name: string): boolean {
   );
 }
 
+/**
+ * Whether a size an lstat gave is over the file kind's limit. Where a file is
+ * looked at with lstat anyway, a file over its limit is refused without being
+ * read; every read also stops one byte past the limit, whatever the size.
+ */
+export function overLimit(kind: FileKind, size: number): boolean {
+  return (
+    (kind === 'metadata' && size > MAX_METADATA_BYTES) ||
+    (kind === 'labels' && size > MAX_LABELS_BYTES)
+  );
+}
+
 /** A FileRef from an lstat or fstat result. */
 export function refOf(rel: string, kind: FileKind, st: BigIntStats): FileRef {
   return { rel, kind, dev: st.dev, ino: st.ino, size: Number(st.size), mtimeNs: st.mtimeNs };
@@ -193,8 +207,8 @@ export function refOf(rel: string, kind: FileKind, st: BigIntStats): FileRef {
 /**
  * Looks at one entry of the run folder with lstat: a FileRef for a regular
  * export file, a rejection for anything else that isn't an ordinary ignored
- * file, or null for a regular file of another kind. Sizes are not judged
- * here: the size limits apply to the bytes a read gets.
+ * file, or null for a regular file of another kind. A file over its kind's
+ * size limit is refused.
  */
 export function examine(
   root: string,
@@ -207,6 +221,7 @@ export function examine(
   if (type !== 'file') return { rejected: { rel: name, kind: type } };
   const kind = fileKindOf(name);
   if (!kind) return null;
+  if (overLimit(kind.kind, Number(st.size))) return { rejected: { rel: name, kind: 'too_large' } };
   return { ref: refOf(name, kind.kind, st), id: kind.id };
 }
 
@@ -415,7 +430,7 @@ export function readCapped(fd: number, maxBytes: number): Buffer {
     chunks.push(Buffer.from(scratch.subarray(0, n)));
     total += n;
   }
-  if (total > maxBytes) throw new ContainmentError('too_large');
+  if (total > maxBytes) throw new ContainmentError('too_large', null, total);
   return chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, total);
 }
 
@@ -453,13 +468,13 @@ export function limitFor(kind: FileKind): number {
  * looked at, or one that went away, is examined again and, if it is still
  * an acceptable regular file, read once more with its new identity. Returns
  * the bytes and the identity of the file they were read from (its fstat), or
- * the rejection.
+ * the rejection, with the bytes read before it when there were any.
  */
 export function readWithRescan(
   root: string,
   file: ListedFile | FileRef,
   fs: ScanFs = realFs,
-): { ok: true; bytes: Buffer; ref: FileRef } | { ok: false; rejection: Rejection } {
+): { ok: true; bytes: Buffer; ref: FileRef } | { ok: false; rejection: Rejection; read?: number } {
   let current: ListedFile | FileRef = file;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
@@ -469,7 +484,8 @@ export function readWithRescan(
       if (!(err instanceof ContainmentError)) throw err;
       if (err.kind !== 'changed' || attempt > 0) {
         const kind: RejectKind = err.kind === 'root_unavailable' ? 'unreadable' : err.kind;
-        return { ok: false, rejection: { rel: current.rel, kind } };
+        const rejection = { rel: current.rel, kind };
+        return err.read > 0 ? { ok: false, rejection, read: err.read } : { ok: false, rejection };
       }
       let again;
       try {
@@ -487,8 +503,8 @@ export function readWithRescan(
 
 /**
  * Looks at a listed file with lstat (never following a link): its identity
- * if it is a regular file, the rejection if it is now of another type, or
- * null if it is gone or can't be looked at.
+ * if it is a regular file, the rejection if it is now of another type or
+ * over its size limit, or null if it is gone or can't be looked at.
  */
 export function statListed(
   root: string,
@@ -503,6 +519,9 @@ export function statListed(
   }
   const type = entryType(st);
   if (type !== 'file') return { rejected: { rel: file.rel, kind: type } };
+  if (overLimit(file.kind, Number(st.size))) {
+    return { rejected: { rel: file.rel, kind: 'too_large' } };
+  }
   return { ref: refOf(file.rel, file.kind, st) };
 }
 

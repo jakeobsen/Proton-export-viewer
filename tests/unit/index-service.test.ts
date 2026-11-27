@@ -7,6 +7,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -34,10 +35,11 @@ import {
 } from '../../src/core/containment';
 import { parseMetadata, type MessageRow } from '../../src/core/index/metadata';
 import { QueryState, WriterState, type ApplyResult } from '../../src/core/index/ops';
+import { TXN_INPUT_BYTES } from '../../src/core/index/limits';
 import { IndexService, type IndexOptions } from '../../src/core/index/service';
 import type { Phase1Item } from '../../src/core/index/writer';
 import { openDb } from '../../src/core/index/sql';
-import { ThreadError, type IndexThread, type ThreadRole } from '../../src/core/index/pool';
+import { ThreadError, TIMEOUT, type IndexThread, type ThreadRole } from '../../src/core/index/pool';
 import type { IndexTotals, ListPage, Sidebar } from '../../src/shared/index-types';
 import type { Logger } from '../../src/shared/log/writer';
 import { sanitizeEvent } from '../../src/shared/log/schema';
@@ -167,6 +169,8 @@ function recording(
     meta: [] as string[][],
     revs: [] as Array<[string, number]>,
     written: [] as Array<{ id: string; rev: number }>,
+    /** The IDs of each write transaction. */
+    writes: [] as string[][],
   };
   const wrap = (role: ThreadRole, inner: IndexThread): IndexThread => ({
     get respawns() {
@@ -190,9 +194,9 @@ function recording(
         );
       }
       if (role === 'writer' && op === 'phase1') {
-        for (const i of (args as { items: Phase1Item[] }).items) {
-          seen.written.push({ id: i.pair.protonId, rev: i.expectedRev });
-        }
+        const items = (args as { items: Phase1Item[] }).items;
+        for (const i of items) seen.written.push({ id: i.pair.protonId, rev: i.expectedRev });
+        seen.writes.push(items.map((i) => i.pair.protonId));
       }
       const result = await inner.call<T>(op, args, timeoutMs);
       if (role === 'writer' && op === 'apply') seen.revs.push(...(result as ApplyResult).revs);
@@ -677,6 +681,99 @@ describe('phase 1', () => {
     await h.service.close();
   });
 
+  it('charges refused reads to both shares: files over the limit in a row are read a few per batch', async () => {
+    for (const [poolSize, metaJob] of [
+      [1, 50],
+      [2, 1],
+    ] as const) {
+      const { run, indexDir } = exportAt(`over-limit-${poolSize}`, 6);
+      const ids = readdirSync(run)
+        .filter((n) => n.endsWith('.metadata.json'))
+        .map((n) => n.slice(0, -'.metadata.json'.length))
+        .sort();
+      // Sparse: each read gets the limit and one byte more, of zeros.
+      for (const id of ids.slice(0, 3)) {
+        truncateSync(join(run, `${id}.metadata.json`), MAX_METADATA_BYTES + 1);
+      }
+      const rejected: Rejection[] = [];
+      const h = harness(
+        run,
+        indexDir,
+        { poolSize, metaJob, readByName: true },
+        undefined,
+        undefined,
+        {
+          onRejected: (found) => rejected.push(...found),
+        },
+      );
+      await h.service.open(null);
+      await h.service.startPhase1(scanRun(run));
+      const label = `pool ${poolSize}`;
+      expect(
+        rejected.map((r) => r.kind),
+        label,
+      ).toEqual(['too_large', 'too_large', 'too_large']);
+      expect(h.service.progress, label).toMatchObject({ phase: 'done', total: 3, loaded: 3 });
+      // A refused read uses up the share like any other, so they don't all go in one batch.
+      expect(h.service.reads.batches, label).toBeGreaterThanOrEqual(2);
+      const jobShare = Math.ceil(TXN_INPUT_BYTES / poolSize);
+      const bound = TXN_INPUT_BYTES + poolSize * (jobShare + MAX_METADATA_BYTES + 1);
+      expect(h.service.reads.peakBytes, label).toBeGreaterThan(MAX_METADATA_BYTES);
+      expect(h.service.reads.peakBytes, label).toBeLessThanOrEqual(bound);
+      await h.service.close();
+    }
+  });
+
+  it('reads the files of a job that failed one per job under the same share, and leaves the rest for the next batch, read alone', async () => {
+    const { run, indexDir } = exportAt('retry-share', 8);
+    const ids = readdirSync(run)
+      .filter((n) => n.endsWith('.metadata.json'))
+      .map((n) => n.slice(0, -'.metadata.json'.length))
+      .sort();
+    // About 100 kB each, so three of them pass the share.
+    for (const id of ids) {
+      const path = join(run, `${id}.metadata.json`);
+      const doc = JSON.parse(readFileSync(path, 'utf8')) as { Payload: Record<string, unknown> };
+      doc.Payload.Subject = 'x'.repeat(100_000);
+      writeFileSync(path, JSON.stringify(doc));
+    }
+    const largest = Math.max(...ids.map((id) => statSync(join(run, `${id}.metadata.json`)).size));
+    const share = 250_000;
+    const first = ids.slice(0, 4);
+    const { seen, wrap } = recording();
+    // The job with the first four files runs past its limit; each alone doesn't.
+    const h = harness(
+      run,
+      indexDir,
+      { poolSize: 1, metaJob: 4, jobMs: 300, readBytes: share, readByName: true },
+      (role, op, args) => {
+        const items = (args as { items?: Array<{ protonId: string }> }).items ?? [];
+        return (
+          role === 'parse' && op === 'meta' && items.length > 1 && items[0]!.protonId === ids[0]
+        );
+      },
+      wrap,
+    );
+    await h.service.open(null);
+    await h.service.startPhase1(scanRun(run));
+    expect(h.service.progress).toMatchObject({ phase: 'done', loaded: 8, failed: 0, timeouts: 1 });
+    // After the failed job, its files are only ever read alone.
+    const after = seen.meta.slice(1);
+    expect(seen.meta[0]).toEqual(first);
+    expect(
+      after.filter((job) => job.some((id) => first.includes(id))).every((j) => j.length === 1),
+    ).toBe(true);
+    // The retries stop at the share: the first batch writes three, the fourth comes next.
+    expect(seen.writes[0]).toEqual(first.slice(0, 3));
+    // At most the share, plus for the one thread a job's share and the file past it.
+    expect(h.service.reads.peakBytes).toBeLessThanOrEqual(share + (share + largest));
+    // Every registered rev is written once, the carried ones included.
+    const written = seen.written.map((w) => `${w.id}:${w.rev}`);
+    expect(new Set(written).size).toBe(written.length);
+    expect(written.sort()).toEqual(seen.revs.map(([id, rev]) => `${id}:${rev}`).sort());
+    await h.service.close();
+  });
+
   it('stops reading once closed: pairs left for the next batch wait, and the next open reads them', async () => {
     const { run, indexDir } = exportAt('budget-close', 30);
     const largest = Math.max(
@@ -937,15 +1034,30 @@ describe('files that change after the listing', () => {
       `SELECT rowid FROM messages WHERE proton_id = '${id}'`,
     );
     expect(before).toBeDefined();
+    // Its text, and an attachment as reading its message file lists one.
+    const db = openDb(first.service.dbPath);
+    db.stmt(
+      "INSERT INTO attachments(message_rowid, idx, filename, mime, size, content_id, source) VALUES (?, 0, 'a.pdf', 'application/pdf', 1, NULL, 'eml')",
+    ).run(Number(before!.rowid));
+    db.close();
+    expect(
+      dbRows(
+        first.service.dbPath,
+        `SELECT 1 FROM message_text WHERE rowid = ${Number(before!.rowid)}`,
+      ),
+    ).toHaveLength(1);
     truncateSync(join(run, `${id}.metadata.json`), MAX_METADATA_BYTES + 1);
 
     const rejected: Rejection[] = [];
-    const h = harness(run, indexDir, {}, undefined, undefined, {
+    const { seen, wrap } = recording();
+    const h = harness(run, indexDir, {}, undefined, wrap, {
       onRejected: (found) => rejected.push(...found),
     });
     await h.service.open(opened.dbUuid);
     await h.service.startPhase1(scanRun(run));
     expect(rejected).toEqual([{ rel: `${id}.metadata.json`, kind: 'too_large' }]);
+    // Its look gave its size: it is refused without being read.
+    expect(seen.meta.flat()).not.toContain(id);
     expect(h.service.progress).toMatchObject({ phase: 'done', total: 5, loaded: 5, failed: 0 });
     const rowid = Number(before!.rowid);
     expect(dbRows(h.service.dbPath, `SELECT 1 FROM messages WHERE proton_id = '${id}'`)).toEqual(
@@ -963,6 +1075,199 @@ describe('files that change after the listing', () => {
     );
     expect(pair).toEqual({ meta_state: 4, error_code: 'PAIR_META_MISSING', meta_rel: null });
     await h.service.close();
+  });
+
+  it('refuses a stored file that grows past its limit between its look and its read', async () => {
+    const { run, indexDir } = exportAt('grown-late', 5);
+    const first = harness(run, indexDir);
+    const opened = await first.service.open(null);
+    await first.service.startPhase1(scanRun(run));
+    await first.service.close();
+    const id = readdirSync(run)
+      .filter((n) => n.endsWith('.metadata.json'))
+      .map((n) => n.slice(0, -'.metadata.json'.length))
+      .sort()[0]!;
+    const path = join(run, `${id}.metadata.json`);
+    // Changed, so it is read again; it grows past the limit after its look.
+    writeFileSync(path, readFileSync(path, 'utf8').replace('"Subject"', '"Subject" '));
+    const { wrap } = recording((role, op) => {
+      if (role === 'parse' && op === 'meta') truncateSync(path, MAX_METADATA_BYTES + 1);
+    });
+    const rejected: Rejection[] = [];
+    const h = harness(run, indexDir, {}, undefined, wrap, {
+      onRejected: (found) => rejected.push(...found),
+    });
+    await h.service.open(opened.dbUuid);
+    await h.service.startPhase1(scanRun(run));
+    expect(rejected).toEqual([{ rel: `${id}.metadata.json`, kind: 'too_large' }]);
+    expect(h.service.progress).toMatchObject({ phase: 'done', total: 4, loaded: 4, failed: 0 });
+    const [pair] = dbRows(
+      h.service.dbPath,
+      `SELECT meta_state, error_code FROM pairs WHERE proton_id = '${id}'`,
+    );
+    expect(pair).toEqual({ meta_state: 4, error_code: 'PAIR_META_MISSING' });
+    expect(dbRows(h.service.dbPath, `SELECT 1 FROM messages WHERE proton_id = '${id}'`)).toEqual(
+      [],
+    );
+    await h.service.close();
+  });
+
+  it('looks at stored files without a time limit: a slow look does not fail phase 1', async () => {
+    const { run, indexDir } = exportAt('slow-look', 6);
+    const first = harness(run, indexDir);
+    const opened = await first.service.open(null);
+    await first.service.startPhase1(scanRun(run));
+    await first.service.close();
+    // Each look takes 150 ms; any limit below that would end it.
+    const { seen, wrap } = recording(async (role, op) => {
+      if (role !== 'parse' || op !== 'stat') return;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+    const limits: number[] = [];
+    const timed = (role: ThreadRole, inner: IndexThread): IndexThread => {
+      const outer = wrap(role, inner);
+      return {
+        get respawns() {
+          return outer.respawns;
+        },
+        get onRespawn() {
+          return outer.onRespawn;
+        },
+        set onRespawn(f) {
+          outer.onRespawn = f;
+        },
+        stop: () => outer.stop(),
+        call: <T>(op: string, args?: unknown, timeoutMs?: number): Promise<T> => {
+          if (role === 'parse' && op === 'stat') {
+            limits.push(timeoutMs ?? 0);
+            if (timeoutMs) return Promise.reject(new ThreadError(TIMEOUT));
+          }
+          return outer.call<T>(op, args, timeoutMs);
+        },
+      };
+    };
+    const h = harness(run, indexDir, { jobMs: 100 }, undefined, timed);
+    await h.service.open(opened.dbUuid);
+    await h.service.startPhase1(scanRun(run));
+    expect(h.service.progress).toMatchObject({ phase: 'done', loaded: 6, total: 6 });
+    expect(seen.stat.length).toBeGreaterThan(0);
+    expect(limits.every((ms) => ms === 0)).toBe(true);
+    await h.service.close();
+  });
+
+  it('gives a new file whose read failed its identity, so an unchanged one is not read again', async () => {
+    const { run, indexDir } = exportAt('failed-identity', 6);
+    const ids = readdirSync(run)
+      .filter((n) => n.endsWith('.metadata.json'))
+      .map((n) => n.slice(0, -'.metadata.json'.length))
+      .sort();
+    const [locked, slow] = ids as [string, string];
+    const lockedPath = join(run, `${locked}.metadata.json`);
+    // One can't be opened; the other's read always runs past its limit.
+    chmodSync(lockedPath, 0o000);
+    try {
+      const first = harness(run, indexDir, { jobMs: 200, metaJob: 1 }, (role, op, args) => {
+        const items = (args as { items?: Array<{ protonId: string }> }).items ?? [];
+        return role === 'parse' && op === 'meta' && items.some((i) => i.protonId === slow);
+      });
+      const opened = await first.service.open(null);
+      await first.service.startPhase1(scanRun(run));
+      expect(first.service.progress).toMatchObject({ phase: 'done', loaded: 6, failed: 2 });
+      const stored = Object.fromEntries(
+        dbRows(
+          first.service.dbPath,
+          'SELECT proton_id, error_code, CAST(meta_ino AS TEXT) AS ino FROM pairs',
+        ).map((r) => [String(r.proton_id), [r.error_code, r.ino]]),
+      );
+      expect(stored[locked]).toEqual([
+        'FILE_UNREADABLE',
+        String(lstatSync(lockedPath, { bigint: true }).ino),
+      ]);
+      expect(stored[slow]).toEqual([
+        'META_TIMEOUT',
+        String(lstatSync(join(run, `${slow}.metadata.json`), { bigint: true }).ino),
+      ]);
+      await first.service.close();
+
+      // Unchanged since: neither is read again.
+      const { seen, wrap } = recording();
+      const again = harness(run, indexDir, {}, undefined, wrap);
+      await again.service.open(opened.dbUuid);
+      await again.service.startPhase1(scanRun(run));
+      expect(seen.meta).toEqual([]);
+      expect(again.service.progress).toMatchObject({ phase: 'done', loaded: 6 });
+      await again.service.close();
+    } finally {
+      chmodSync(lockedPath, 0o644);
+    }
+  });
+
+  it('refuses a labels.json over its limit when it is listed, and clears the stored labels', async () => {
+    const { run, indexDir } = exportAt('labels-over', 6);
+    const first = harness(run, indexDir);
+    const opened = await first.service.open(null);
+    await first.service.startPhase1(scanRun(run));
+    await first.service.close();
+    expect(dbRows(first.service.dbPath, 'SELECT 1 FROM labels').length).toBeGreaterThan(0);
+    truncateSync(join(run, 'labels.json'), MAX_LABELS_BYTES + 1);
+    const scan = scanRun(run);
+    expect(scan.labels).toBeNull();
+    expect(scan.rejected).toEqual([{ rel: 'labels.json', kind: 'too_large' }]);
+    const { wrap } = recording();
+    const h = harness(run, indexDir, {}, undefined, wrap);
+    await h.service.open(opened.dbUuid);
+    await h.service.startPhase1(scan);
+    expect(h.service.progress.phase).toBe('done');
+    expect(dbRows(h.service.dbPath, 'SELECT 1 FROM labels')).toEqual([]);
+    expect(h.threads.filter((t) => t.role === 'parse').flatMap((t) => t.calls)).not.toContain(
+      'labels',
+    );
+    await h.service.close();
+  });
+
+  it('leaves no failed registration unhandled while it waits for writes', async () => {
+    const { run, indexDir } = exportAt('register-fails', 12);
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    let applies = 0;
+    let release = (): void => undefined;
+    const writesHeld = new Promise<void>((resolve) => (release = resolve));
+    const wrap = (role: ThreadRole, inner: IndexThread): IndexThread => ({
+      get respawns() {
+        return inner.respawns;
+      },
+      get onRespawn() {
+        return inner.onRespawn;
+      },
+      set onRespawn(f) {
+        inner.onRespawn = f;
+      },
+      stop: () => inner.stop(),
+      call: async <T>(op: string, args?: unknown, timeoutMs?: number): Promise<T> => {
+        if (role === 'writer' && op === 'phase1') await writesHeld;
+        if (role === 'writer' && op === 'apply') {
+          applies += 1;
+          // The registration made while the batches before wait for their writes.
+          if (applies === 4) throw new ThreadError('WRITER_DOWN');
+        }
+        return inner.call<T>(op, args, timeoutMs);
+      },
+    });
+    try {
+      const h = harness(run, indexDir, { batchPairs: 2 }, undefined, wrap);
+      await h.service.open(null);
+      const phase1 = h.service.startPhase1(scanRun(run));
+      await expect.poll(() => applies).toBe(4);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      release();
+      await phase1;
+      expect(h.service.progress.phase).toBe('failed');
+      expect(unhandled).toEqual([]);
+      await h.service.close();
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
   });
 
   it("gives a stored pair whose file became a FIFO after its look the pair's code, as before", async () => {

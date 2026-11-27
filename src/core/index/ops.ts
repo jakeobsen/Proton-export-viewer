@@ -495,7 +495,7 @@ export interface MetaJobResult {
   error: string | null;
   /** The file as it was read, with the identity of its open; as asked for if it wasn't read. */
   ref: ListedFile | FileRef;
-  /** The bytes read. */
+  /** The bytes read, those of a read that refused the file included. */
   bytes: number;
   /** For an item with `eml`: the message file's identity, or null if it is gone or not a regular file. */
   eml?: FileRef | null;
@@ -557,15 +557,19 @@ function parseOne(root: string, { protonId, ref, eml }: MetaJobItem): MetaJobRes
   const read = readWithRescan(root, ref);
   if (!read.ok) {
     const { kind } = read.rejection;
+    const bytes = read.read ?? 0;
     const first = !hasIdentity(ref);
     if (kind === 'too_large' || (first && SCAN_KIND.has(kind))) {
       rejected.push(read.rejection);
-      return { protonId, row: null, error: null, ref, bytes: 0, absent: true, ...extra };
+      return { protonId, row: null, error: null, ref, bytes, absent: true, ...extra };
     }
     if (first && kind === 'changed') {
-      return { protonId, row: null, error: null, ref, bytes: 0, absent: true, ...extra };
+      return { protonId, row: null, error: null, ref, bytes, absent: true, ...extra };
     }
-    return { protonId, row: null, error: rejectCode(kind), ref, bytes: 0, ...extra };
+    // Not opened: its identity from lstat, so an unchanged file isn't read again.
+    const seen = first ? statListed(root, ref) : null;
+    const known = seen && 'ref' in seen ? seen.ref : ref;
+    return { protonId, row: null, error: rejectCode(kind), ref: known, bytes, ...extra };
   }
   const bytes = read.bytes.length;
   try {

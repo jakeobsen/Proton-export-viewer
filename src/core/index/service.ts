@@ -192,6 +192,8 @@ export interface OpenOptions {
 interface Registered {
   files: PairRefs;
   rev: number;
+  /** Its file was in a job that failed: it is read in a job of its own. */
+  alone?: boolean;
 }
 
 const fileStat = (ref: FileRef): FileStat => ({
@@ -715,10 +717,11 @@ export class IndexService {
         const job = jobs[next]!;
         next += 1;
         if (!this.current()) throw new ThreadError('STALE');
+        // No time limit, as for the listing: a slow volume only takes longer.
         const results = await pool.run<StatJobResult[]>(
           'stat',
           { root: this.deps.root, files: job.map((l) => l.file) },
-          this.jobMs,
+          0,
         );
         job.forEach(({ id, file }, i) => {
           const seen = results[i] ?? null;
@@ -780,7 +783,10 @@ export class IndexService {
         .map((u) => ({ files: u.files, rev: revs.get(u.files.protonId)! }));
     };
     let carried: Registered[] = [];
+    // Its failure is handled where it is awaited; this only keeps it from
+    // counting as unhandled meanwhile.
     let registering = register(this.batchPairs);
+    registering.catch(() => undefined);
     try {
       for (;;) {
         const batch = [...carried, ...(await registering)];
@@ -793,6 +799,7 @@ export class IndexService {
         carried = unread;
         // The next batch is registered before this one's writes are queued.
         registering = register(this.batchPairs - carried.length);
+        registering.catch(() => undefined);
         // The budget again, on the bytes actually read.
         const parts = splitBatches(read, this.batchPairs, TXN_INPUT_BYTES, (s) => s.bytes);
         writes = writes.then(async () => {
@@ -867,12 +874,15 @@ export class IndexService {
   /**
    * Reads and parses part of a batch's metadata files on the pool, in jobs of
    * META_JOB files, as many at once as the pool has threads. No new job starts
-   * once the batch has read its share of bytes; a job reads at most its own
-   * share, plus the file that took it past it. So a batch reads at most its
-   * share plus, for each thread, a job's share and one file at its limit.
-   * Each result carries the rev its pair was given for this read and the bytes
-   * actually read. Returns what was read, in batch order, and the pairs left
-   * for the next batch.
+   * once the batch has read its share of bytes, refused reads included; a job
+   * reads at most its own share, plus the file that took it past it. So a
+   * batch reads at most its share plus, for each thread, a job's share and one
+   * file at its limit. When a job of several files runs past its time limit
+   * (or its thread dies), its files are read again one per job, under the
+   * same share, so only the file that breaches gets the timeout code. Each
+   * result carries the rev its pair was given for this read and the bytes
+   * read. Returns what was read, in batch order, and the pairs left for the
+   * next batch.
    */
   private async parseBatch(
     pool: Pool,
@@ -880,10 +890,13 @@ export class IndexService {
     refs: Map<string, ListedFile | FileRef>,
     emls: Map<string, ListedFile>,
   ): Promise<{ read: Array<{ item: Phase1Item; bytes: number }>; unread: Registered[] }> {
-    const items: MetaJobItem[] = batch.map(({ files: { protonId } }) => {
+    const itemOf = (protonId: string): MetaJobItem => {
       const eml = emls.get(protonId);
       return { protonId, ref: refs.get(protonId)!, ...(eml ? { eml } : {}) };
-    });
+    };
+    const items = batch.filter((p) => !p.alone).map((p) => itemOf(p.files.protonId));
+    // Files of a job that failed, read one per job.
+    const singles = batch.filter((p) => p.alone).map((p) => itemOf(p.files.protonId));
     const share = this.readBytes;
     const jobShare = Math.max(1, Math.ceil(share / this.poolSize));
     const results = new Map<string, MetaJobResult>();
@@ -891,10 +904,18 @@ export class IndexService {
     let total = 0;
     let next = 0;
     const lane = async (): Promise<void> => {
-      while (next < items.length && total < share) {
-        const job = items.slice(next, next + this.metaJob);
-        next += job.length;
+      while (total < share) {
+        let job: MetaJobItem[];
+        if (singles.length > 0) job = [singles.shift()!];
+        else if (next < items.length) {
+          job = items.slice(next, next + this.metaJob);
+          next += job.length;
+        } else return;
         const out = await this.parseJob(pool, job, jobShare);
+        if (!out) {
+          singles.push(...job);
+          continue;
+        }
         for (const r of out.results) {
           results.set(r.protonId, r);
           total += r.bytes;
@@ -903,14 +924,19 @@ export class IndexService {
         left.push(...out.unread);
       }
     };
-    await Promise.all(Array.from({ length: Math.min(this.poolSize, items.length) }, lane));
+    await Promise.all(Array.from({ length: Math.min(this.poolSize, batch.length) }, lane));
     this.reads.batches += 1;
     this.reads.peakBytes = Math.max(this.reads.peakBytes, total);
     const unreadIds = new Set([...left, ...items.slice(next)].map((i) => i.protonId));
+    const aloneIds = new Set(singles.map((i) => i.protonId));
     const read: Array<{ item: Phase1Item; bytes: number }> = [];
     const unread: Registered[] = [];
     for (const pair of batch) {
       const id = pair.files.protonId;
+      if (aloneIds.has(id)) {
+        unread.push({ ...pair, alone: true });
+        continue;
+      }
       if (unreadIds.has(id)) {
         unread.push(pair);
         continue;
@@ -933,11 +959,15 @@ export class IndexService {
   }
 
   /**
-   * Runs one job. If it runs past its limit (or its thread dies), each of its
-   * files is tried again on its own, so only the file that breaches gets the
-   * timeout code.
+   * Runs one job. A job of one file that runs past its limit (or whose thread
+   * dies) gives that file the timeout (or failure) code. For a job of several
+   * files it returns null: they are read again one per job.
    */
-  private async parseJob(pool: Pool, items: MetaJobItem[], budget: number): Promise<MetaJobOutput> {
+  private async parseJob(
+    pool: Pool,
+    items: MetaJobItem[],
+    budget: number,
+  ): Promise<MetaJobOutput | null> {
     try {
       return await pool.run<MetaJobOutput>(
         'meta',
@@ -947,24 +977,40 @@ export class IndexService {
     } catch (err) {
       const code = err instanceof ThreadError ? err.code : 'FAILED';
       if (code === THREAD_STOPPED) throw err;
-      if (items.length === 1) {
-        if (code === TIMEOUT) this.progress.timeouts += 1;
-        return {
-          results: [
-            {
-              protonId: items[0]!.protonId,
-              row: null,
-              error: code === TIMEOUT ? 'META_TIMEOUT' : 'META_FAILED',
-              ref: items[0]!.ref,
-              bytes: 0,
-            },
-          ],
-          unread: [],
-        };
-      }
       if (code === TIMEOUT) this.progress.timeouts += 1;
-      const singles = await Promise.all(items.map((item) => this.parseJob(pool, [item], budget)));
-      return { results: singles.flatMap((s) => s.results), unread: [] };
+      if (items.length > 1) return null;
+      const item = items[0]!;
+      return {
+        results: [
+          {
+            protonId: item.protonId,
+            row: null,
+            error: code === TIMEOUT ? 'META_TIMEOUT' : 'META_FAILED',
+            ref: hasIdentity(item.ref) ? item.ref : await this.identityOf(pool, item.ref),
+            bytes: 0,
+          },
+        ],
+        unread: [],
+      };
+    }
+  }
+
+  /**
+   * A file's identity from lstat on the pool, for a new file whose read
+   * failed, so an unchanged one isn't read again; the file as given if the
+   * look fails.
+   */
+  private async identityOf(pool: Pool, file: ListedFile): Promise<ListedFile | FileRef> {
+    try {
+      const [seen] = await pool.run<StatJobResult[]>(
+        'stat',
+        { root: this.deps.root, files: [file] },
+        0,
+      );
+      return seen && 'ref' in seen ? seen.ref : file;
+    } catch (err) {
+      if (err instanceof ThreadError && err.code === THREAD_STOPPED) throw err;
+      return file;
     }
   }
 

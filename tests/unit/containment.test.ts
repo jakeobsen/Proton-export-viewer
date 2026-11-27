@@ -207,6 +207,7 @@ describe('the scan', () => {
     expect(readWithRescan(root, scan.metadata.get('a')!)).toEqual({
       ok: false,
       rejection: { rel: 'a.metadata.json', kind: 'too_large' },
+      read: MAX_METADATA_BYTES + 1,
     });
     const b = readWithRescan(root, scan.metadata.get('b')!);
     expect(b.ok && b.bytes.length).toBe(MAX_METADATA_BYTES);
