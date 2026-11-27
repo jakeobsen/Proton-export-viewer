@@ -254,6 +254,7 @@ export type CoreResult =
         | 'no_source'
         | 'unavailable'
         | 'not_found'
+        | 'eml_missing'
         | 'superseded'
         | 'reader_failed'
         | 'no_index'

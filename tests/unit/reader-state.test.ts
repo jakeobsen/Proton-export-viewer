@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Reader state in the shell: a failed open call settles the pane, and closing
-// the pane or a new generation closes the link dialog.
+// Reader state in the shell: a failed open call settles the pane, the newest
+// of racing opens owns it, and closing the pane or a new generation closes the
+// link dialog.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { LinkPrompt } from '../../src/shared/api';
@@ -55,6 +56,31 @@ describe('openInReader', () => {
     expect(await reader.openInReader(7)).toEqual({ ok: false, code: 'stale_generation' });
     expect(reader.getReaderState()).toMatchObject({ pending: false, refused: 'stale_generation' });
     expect(pev.open).not.toHaveBeenCalled();
+  });
+
+  it('lets the newer of two racing opens own the pane, whichever answers first', async () => {
+    const view = (openId: number, id: string) => ({
+      ok: true,
+      openId,
+      outcome: 'view',
+      url: `mail-body://v/${id.repeat(32)}`,
+      format: 'html',
+    });
+    let answerOld: (value: unknown) => void = () => {};
+    pev.open
+      .mockReturnValueOnce(new Promise((resolve) => (answerOld = resolve)))
+      .mockResolvedValueOnce(view(2, 'b'));
+    const older = reader.openInReader(4);
+    const newer = reader.openInReader(5);
+    await newer;
+    // The older open's answer comes last and changes nothing.
+    answerOld(view(1, 'a'));
+    await older;
+    expect(reader.getReaderState()).toMatchObject({
+      rowid: 5,
+      pending: false,
+      view: { openId: 2, url: `mail-body://v/${'b'.repeat(32)}` },
+    });
   });
 });
 

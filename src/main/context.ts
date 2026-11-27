@@ -41,6 +41,8 @@ export interface AppContext {
   shellCsp: string;
   /** Set only in builds with test hooks: observes one window's session policy. */
   observerFor?: ((windowId: number) => PolicyObserver) | undefined;
+  /** Set only in builds with test hooks: the least time between a window's opens. */
+  openGapMs?: number | undefined;
 }
 
 /** Tells every shell window that the sources changed. */

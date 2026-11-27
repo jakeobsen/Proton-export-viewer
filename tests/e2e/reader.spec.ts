@@ -564,6 +564,8 @@ test('an older open whose lookup finishes last never drops the newer one', async
   ]);
   await startOpen(pev, 1, '__busy');
   await startOpen(pev, 2, '__older');
+  // Main spaces a window's opens out: the older one is in core before the newer one starts.
+  await expect.poll(() => gateWaiting(pev, 'older')).toBe(1);
   await startOpen(pev, 3, '__newer');
   await expect.poll(async () => (await laneInfo(pev)).queued).toBe(1);
   expect(await gateWaiting(pev, 'older')).toBe(1);

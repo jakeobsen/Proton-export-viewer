@@ -34,7 +34,7 @@ import { SCHEMA_VERSION } from '../../src/core/index/schema';
 import type { IndexOptions } from '../../src/core/index/service';
 import { SourceSession } from '../../src/core/source';
 import type { CoreEvent, CoreRequest, CoreResult } from '../../src/shared/core-protocol';
-import type { IndexTotals } from '../../src/shared/index-types';
+import type { EmlFile, IndexTotals } from '../../src/shared/index-types';
 import type { Logger } from '../../src/shared/log/writer';
 import { sanitizeEvent } from '../../src/shared/log/schema';
 import type { Stamp } from '../../src/shared/sources';
@@ -808,5 +808,99 @@ describe('the writer', () => {
       created: false,
     });
     again.close();
+  });
+});
+
+describe("the reader's open of a message file", () => {
+  const eml = async (c: ReturnType<typeof core>, rowid: number) =>
+    (await c.session.index!.ask({ op: 'eml', rowid })) as EmlFile | null;
+
+  it('opens the file of an indexed message, only for the current generation and the newest open', async () => {
+    const e = exportAt('lc-reader', 6, 21);
+    const c = core({ root: e.run, indexDir: e.indexDir });
+    expect(await c.openIndex(null)).toMatchObject({ ok: true });
+    await c.session.index!.settled();
+    const generation = c.stamp.generation;
+
+    const opened = await c.session.openForReader(1, generation, () => false);
+    expect(opened.ok).toBe(true);
+    if (opened.ok) {
+      const input = opened.opened.input;
+      expect(input.kind).toBe('fd');
+      if (input.kind === 'fd') {
+        const file = (await eml(c, 1))!;
+        expect(readFileSync(input.fd)).toEqual(readFileSync(join(e.run, file.rel!)));
+      }
+      await opened.opened.close();
+    }
+    expect(await c.session.openForReader(1, generation + 1, () => false)).toEqual({
+      ok: false,
+      code: 'superseded',
+    });
+    // A newer open came in while the message was looked up: nothing is opened.
+    expect(await c.session.openForReader(1, generation, () => true)).toEqual({
+      ok: false,
+      code: 'superseded',
+    });
+    expect(await c.session.openForReader(9999, generation, () => false)).toEqual({
+      ok: false,
+      code: 'not_found',
+    });
+    expect(c.logs.filter((l) => l.code === 'open.file_refused')).toEqual([]);
+    await c.session.close();
+  });
+
+  it('opens no file that is missing, went away, or that a link took the place of', async () => {
+    const e = exportAt('lc-reader-files', 6, 22);
+    // One message file is missing from the start.
+    const first = readdirSync(e.run)
+      .filter((n) => n.endsWith('.eml'))
+      .sort()[0]!;
+    rmSync(join(e.run, first));
+    const c = core({ root: e.run, indexDir: e.indexDir });
+    expect(await c.openIndex(null)).toMatchObject({ ok: true });
+    await c.session.index!.settled();
+    const generation = c.stamp.generation;
+    const files = new Map<number, EmlFile>();
+    for (let rowid = 1; rowid <= 6; rowid += 1) files.set(rowid, (await eml(c, rowid))!);
+    const [listedOnly] = [...files].find(([, f]) => f.rel === null)!;
+    const [gone, linked, target] = [...files].filter(([, f]) => f.rel !== null).map(([r]) => r);
+
+    expect(await c.session.openForReader(listedOnly, generation, () => false)).toEqual({
+      ok: false,
+      code: 'eml_missing',
+    });
+    rmSync(join(e.run, files.get(gone!)!.rel!));
+    expect(await c.session.openForReader(gone!, generation, () => false)).toEqual({
+      ok: false,
+      code: 'eml_missing',
+    });
+    const linkPath = join(e.run, files.get(linked!)!.rel!);
+    rmSync(linkPath);
+    symlinkSync(join(e.run, files.get(target!)!.rel!), linkPath);
+    expect(await c.session.openForReader(linked!, generation, () => false)).toEqual({
+      ok: false,
+      code: 'refused',
+    });
+    // Only the files that went or changed after the scan are logged, with fixed codes.
+    expect(c.logs.filter((l) => l.code === 'open.file_refused').map((l) => l.data)).toEqual([
+      { reason: 'eml_missing' },
+      { reason: 'symlink' },
+    ]);
+    await c.session.close();
+  });
+
+  it('opens nothing while the run is unavailable, or without a source', async () => {
+    const e = exportAt('lc-reader-none', 3, 23);
+    const c = core({ root: null, indexDir: e.indexDir });
+    expect(await c.session.openForReader(1, c.stamp.generation, () => false)).toEqual({
+      ok: false,
+      code: 'unavailable',
+    });
+    await c.session.close();
+    const quiet: Logger = { log() {}, error() {}, warn() {}, info() {} };
+    const none = new SourceSession(null, quiet, () => {});
+    expect(await none.openForReader(1, 1, () => false)).toEqual({ ok: false, code: 'no_source' });
+    await none.close();
   });
 });

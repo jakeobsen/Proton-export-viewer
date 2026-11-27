@@ -5,8 +5,10 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  closeSync,
   lstatSync,
   mkdirSync,
+  readFileSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -26,6 +28,7 @@ import {
   openContained,
   pairCounts,
   readContained,
+  openWithRescan,
   readWithRescan,
   realFs,
   resolveRoot,
@@ -232,6 +235,51 @@ describe('the open procedure', () => {
     expect(() => readContained(root, scan.metadata.get('b')!, MAX_METADATA_BYTES)).toThrow(
       expect.objectContaining({ kind: 'too_large' }) as Error,
     );
+  });
+
+  it('opens a message file for the reader; one replaced by a regular file opens after a rescan', () => {
+    const root = run('open-reader');
+    const scan = scanRun(root);
+    const opened = openWithRescan(root, scan.eml.get('a')!);
+    expect(opened.ok).toBe(true);
+    if (opened.ok) closeSync(opened.fd);
+
+    writeFileSync(join(root, 'new.tmp'), 'Subject: b again\r\n\r\n');
+    renameSync(join(root, 'new.tmp'), join(root, 'b.eml'));
+    const again = openWithRescan(root, scan.eml.get('b')!);
+    expect(again.ok).toBe(true);
+    if (!again.ok) return;
+    try {
+      expect(readFileSync(again.fd, 'utf8')).toBe('Subject: b again\r\n\r\n');
+      expect(again.ref.ino).toBe(lstatSync(join(root, 'b.eml'), { bigint: true }).ino);
+    } finally {
+      closeSync(again.fd);
+    }
+  });
+
+  it('opens no message file that went away, or that a link or a FIFO took the place of', () => {
+    const root = run('open-reader-refused', ['a', 'b', 'c']);
+    const scan = scanRun(root);
+    rmSync(join(root, 'a.eml'));
+    expect(openWithRescan(root, scan.eml.get('a')!)).toEqual({
+      ok: false,
+      rejection: { rel: 'a.eml', kind: 'changed' },
+      gone: true,
+    });
+    rmSync(join(root, 'b.eml'));
+    symlinkSync(join(root, 'c.eml'), join(root, 'b.eml'));
+    expect(openWithRescan(root, scan.eml.get('b')!)).toEqual({
+      ok: false,
+      rejection: { rel: 'b.eml', kind: 'symlink' },
+      gone: false,
+    });
+    rmSync(join(root, 'c.eml'));
+    mkfifo(join(root, 'c.eml'));
+    expect(openWithRescan(root, scan.eml.get('c')!)).toEqual({
+      ok: false,
+      rejection: { rel: 'c.eml', kind: 'fifo' },
+      gone: false,
+    });
   });
 
   it('examines one name at a time, never a path with a separator', () => {

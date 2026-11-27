@@ -44,6 +44,8 @@ export interface ListRow {
   attachments: boolean;
   /** The conversation's newest message in this folder or label: a selection holds this. */
   anchorRowid: number;
+  /** The conversation's newest message in any folder or label: selecting it opens this. */
+  newestRowid: number;
 }
 
 export interface ListPage {
@@ -120,10 +122,25 @@ export type IndexQuery =
   | { op: 'details'; threadIds: number[] }
   | { op: 'resolve'; rowid: number }
   | { op: 'totals' }
+  | { op: 'eml'; rowid: number }
   | WindowQuery;
 
 export type IndexAnswer =
-  Sidebar | ListPage | RowDetails[] | number | null | IndexTotals | ListWindow;
+  Sidebar | ListPage | RowDetails[] | number | null | IndexTotals | ListWindow | EmlFile;
+
+/**
+ * Where a message's file is, as the scan last saw it: its name relative to the
+ * export's folder and its identity. Core only; it never leaves core.
+ */
+export interface EmlFile {
+  /** Null once the pair has no message file. */
+  rel: string | null;
+  size: number;
+  mtimeNs: string;
+  dev: string;
+  ino: string;
+  bodyState: number;
+}
 
 /**
  * The index's own state: 'verifying' while an index that was already there

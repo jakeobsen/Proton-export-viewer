@@ -23,6 +23,7 @@ class Folder {
       unreadHere: 0,
       attachments: false,
       anchorRowid: rowid,
+      newestRowid: rowid,
     });
     this.messages.set(rowid, threadId);
     this.rows.sort((a, b) => b.time - a.time || b.threadId - a.threadId);

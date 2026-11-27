@@ -160,6 +160,8 @@ export async function install(ctx: AppContext): Promise<boolean> {
   });
 
   const requests = new Map<number, WindowRequests>();
+  /** When each window's body requests came, in ms on main's clock. */
+  const bodyTimes = new Map<number, number[]>();
   let bodyCsp = true;
 
   const recordsFor = (windowId: number): WindowRequests => {
@@ -199,7 +201,12 @@ export async function install(ctx: AppContext): Promise<boolean> {
     const rec = recordsFor(windowId);
     return {
       onAppRequest: (url) => rec.app.push(url),
-      onBodyRequest: (url) => rec.body.push(url),
+      onBodyRequest: (url) => {
+        rec.body.push(url);
+        const times = bodyTimes.get(windowId) ?? [];
+        times.push(performance.now());
+        bodyTimes.set(windowId, times);
+      },
       onAssetRequest: (url) => rec.asset.push(url),
       onBlocked: (url) => rec.blocked.push(url),
       bodyCspEnabled: () => bodyCsp,
@@ -251,7 +258,13 @@ export async function install(ctx: AppContext): Promise<boolean> {
       bodyCsp = on;
     },
     requests: (windowId: number) => recordsFor(windowId),
+    bodyRequestTimes: (windowId: number) => [...(bodyTimes.get(windowId) ?? [])],
+    /** Sets the least time between a window's opens; null restores the usual one. */
+    openGap: (ms: number | null) => {
+      ctx.openGapMs = ms ?? undefined;
+    },
     clearRequests: () => {
+      bodyTimes.clear();
       // Each session's observer keeps its record object, so empty it in place.
       for (const rec of requests.values()) {
         rec.app.length = 0;

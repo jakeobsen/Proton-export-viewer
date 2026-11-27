@@ -43,6 +43,7 @@ const FORBIDDEN_CONTENT = [
   'pev-no-resolver-rule',
   'sessionPreconnects',
   'readByName',
+  'openGapMs',
   'better-sqlite3',
   'ws://localhost',
   "style-src 'self' 'unsafe-inline'",
