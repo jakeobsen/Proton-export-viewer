@@ -5,12 +5,14 @@
 // workspace down is a real folder (not a link), and the real path matches.
 
 import {
+  existsSync,
   lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -30,6 +32,25 @@ function lstatOrNull(path) {
 /** True if `path` is a real, normalized absolute path with no link on the way. */
 function isPhysical(path) {
   return isAbsolute(path) && resolve(path) === path && realpathSync(path) === path;
+}
+
+/**
+ * Throws if `path` is the folder `folder` or inside it. `path` need not exist:
+ * the check takes the real path of its nearest existing folder and compares
+ * that folder, and every folder above it, with `folder` by device and inode,
+ * so no link, `..` or change of letter case hides that it is inside.
+ */
+export function checkOutside(folder, path) {
+  if (!isAbsolute(path)) throw new Error(`${path} is not an absolute path`);
+  const target = statSync(folder);
+  let existing = resolve(path);
+  while (!existsSync(existing)) existing = dirname(existing);
+  for (let current = realpathSync(existing); ; current = dirname(current)) {
+    const stat = statSync(current);
+    if (stat.dev === target.dev && stat.ino === target.ino)
+      throw new Error(`${path} is inside ${folder}`);
+    if (dirname(current) === current) return path;
+  }
 }
 
 /**

@@ -434,6 +434,11 @@ export async function install(ctx: AppContext): Promise<boolean> {
     void bench.runBench(ctx, process.argv);
     return true;
   }
+  const openBench = await import('./open-bench');
+  if (openBench.openBenchRequested(process.argv)) {
+    void openBench.runOpenBench(ctx, process.argv, windowEvents);
+    return true;
+  }
 
   const selfTest = process.argv.includes('--pev-selftest');
   if (selfTest) {
