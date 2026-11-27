@@ -72,6 +72,13 @@ const api: PevApi = {
       ipcRenderer.off(IPC.indexChanged, handler);
     };
   },
+  search: (request, generation) =>
+    ipcRenderer.invoke(IPC.search, {
+      text: request.text,
+      sort: request.sort,
+      after: request.after,
+      generation,
+    }),
 };
 
 contextBridge.exposeInMainWorld('pev', api);

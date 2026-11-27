@@ -33,6 +33,7 @@ import type {
   IndexOpened,
   IndexProgress,
   IndexQuery,
+  SearchPage,
 } from '../../shared/index-types';
 import type { Logger } from '../../shared/log/writer';
 import type { Stamp } from '../../shared/sources';
@@ -473,7 +474,13 @@ export class IndexService {
     this.touch();
     try {
       await this.openQuery();
-      return await this.query!.call<IndexAnswer>('query', { call });
+      const answer = await this.query!.call<IndexAnswer>('query', { call });
+      if (call.op === 'search') {
+        // A snippet whose match ranges failed the check is given as plain text.
+        const dropped = (answer as SearchPage | null)?.dropped ?? 0;
+        if (dropped > 0) this.deps.log.warn('search.ranges_dropped', { count: dropped }, this.src);
+      }
+      return answer;
     } catch (err) {
       this.watch(err);
       throw err;

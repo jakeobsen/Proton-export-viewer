@@ -83,6 +83,7 @@ export const LOG_CODES = [
   'index.open_refused',
   'app.reset',
   'app.reset_refused',
+  'search.ranges_dropped',
 ] as const;
 
 /** Codes that only exist in builds with test hooks. */

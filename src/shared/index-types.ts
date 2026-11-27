@@ -116,6 +116,83 @@ export interface ListWindow {
   selected: number | null;
 }
 
+export type SearchSort = 'date' | 'relevance';
+
+/** The most UTF-16 units of search text a request may carry. */
+export const MAX_QUERY_LENGTH = 1000;
+
+/** Where a date-sorted results page continues: after this conversation, newest first. */
+export interface SearchDateKey {
+  time: number;
+  threadId: number;
+}
+
+/** Where a relevance-sorted results page continues: after this conversation, best first. */
+export interface SearchRankKey {
+  rank: number;
+  threadId: number;
+}
+
+export type SearchKey = SearchDateKey | SearchRankKey;
+
+/** A search of the whole export: one page of matching conversations. */
+export type SearchQuery = {
+  op: 'search';
+  /** Main's ID for this request; the answer carries it back. */
+  queryId: number;
+  text: string;
+} & (
+  { sort: 'date'; after: SearchDateKey | null } | { sort: 'relevance'; after: SearchRankKey | null }
+);
+
+/** Text with its matches as ranges of UTF-16 code units: ascending, non-overlapping. */
+export interface MarkedSnippet {
+  text: string;
+  ranges: Array<[number, number]>;
+}
+
+export interface SearchRow {
+  threadId: number;
+  /** The date of the conversation's newest matching message. */
+  time: number;
+  /** The best relevance of its matching messages (lower is better); null when sorted by date. */
+  rank: number | null;
+  /** Messages in the whole conversation. */
+  count: number;
+  /** Unread messages in the whole conversation. */
+  unread: number;
+  /** Whether any of its messages says it has attachments. */
+  attachments: boolean;
+  /** Its messages that match. */
+  matching: number;
+  /** The newest matching message (ties to the higher rowid): a selection holds this. */
+  anchorRowid: number;
+  /**
+   * The best-ranked matching message's snippet, for the first rows of a page
+   * when the query has words to match; null otherwise.
+   */
+  snippet: MarkedSnippet | null;
+}
+
+/** How much of the export's text the index holds. */
+export interface SearchCoverage {
+  /** Messages whose body is in the index (whole or its first part). */
+  indexed: number;
+  /** Messages in the index. */
+  total: number;
+}
+
+export interface SearchPage {
+  queryId: number;
+  /** The sort used: a query with no words to match is sorted by date. */
+  sort: SearchSort;
+  rows: SearchRow[];
+  next: SearchKey | null;
+  coverage: SearchCoverage;
+  /** Snippets whose match ranges failed the check and were given without them. */
+  dropped: number;
+}
+
 export type IndexQuery =
   | { op: 'sidebar' }
   | { op: 'page'; labelId: string; after: PageKey | null; limit?: number }
@@ -123,10 +200,19 @@ export type IndexQuery =
   | { op: 'resolve'; rowid: number }
   | { op: 'totals' }
   | { op: 'eml'; rowid: number }
-  | WindowQuery;
+  | WindowQuery
+  | SearchQuery;
 
 export type IndexAnswer =
-  Sidebar | ListPage | RowDetails[] | number | null | IndexTotals | ListWindow | EmlFile;
+  | Sidebar
+  | ListPage
+  | RowDetails[]
+  | number
+  | null
+  | IndexTotals
+  | ListWindow
+  | EmlFile
+  | SearchPage;
 
 /**
  * Where a message's file is, as the scan last saw it: its name relative to the

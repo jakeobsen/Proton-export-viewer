@@ -72,6 +72,9 @@ class FakeCore implements CoreControl {
   readonly calls: string[] = [];
   holdScans = false;
   readonly heldScans: Array<() => void> = [];
+  /** Index reads held until the test answers them. */
+  holdQueries = false;
+  readonly heldQueries: Array<() => void> = [];
   /** Index opens, with what main asked for. */
   readonly indexCalls: Array<{ stamp: Stamp; dbUuid: string | null; rebuild: boolean }> = [];
   readonly forgets: string[] = [];
@@ -190,6 +193,18 @@ class FakeCore implements CoreControl {
       const result: CoreResult = { type: 'result', reqId: 0, ok: true, stamp, scan: SUMMARY };
       if (!this.holdScans) return result;
       return new Promise((resolve) => this.heldScans.push(() => resolve(result)));
+    }
+    if (call.type === 'index-query') {
+      const result: CoreResult = {
+        type: 'result',
+        reqId: 0,
+        ok: true,
+        stamp,
+        answer: call.query.op === 'search' ? ({ queryId: call.query.queryId } as never) : null,
+        progress: PROGRESS,
+      };
+      if (!this.holdQueries) return result;
+      return new Promise((resolve) => this.heldQueries.push(() => resolve(result)));
     }
     return fail('invalid');
   }
@@ -468,6 +483,35 @@ describe('switching', () => {
     // The current run's own scan is accepted.
     t.core.heldScans.shift()!();
     await vi.waitFor(() => expect(t.manager.scanSummary()).toEqual(SUMMARY), WAIT);
+  });
+});
+
+describe('index reads', () => {
+  const search = { op: 'search', queryId: 7, text: 'x', sort: 'date', after: null } as const;
+
+  it('gives a search the answer core made for the open run', async () => {
+    const t = setup('mgr-search');
+    t.picks.push({ path: tool('mgr-search-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    expect((await t.manager.queryIndex(search))?.answer).toEqual({ queryId: 7 });
+  });
+
+  it('drops a search answered after a switch', async () => {
+    const t = setup('mgr-search-late');
+    t.picks.push({ path: tool('mgr-search-late-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await settle();
+    t.core.holdQueries = true;
+    const late = t.manager.queryIndex(search);
+    await settle();
+    expect(t.core.heldQueries.length).toBe(1);
+    const older = t.manager.view().active!.runs[1]!;
+    await t.manager.switchRun(older.runId, t.generation());
+    // The first run's answer, from the core that was stopped, comes back late.
+    t.core.heldQueries.shift()!();
+    expect(await late).toBeNull();
+    t.core.holdQueries = false;
+    expect((await t.manager.queryIndex(search))?.answer).toEqual({ queryId: 7 });
   });
 });
 

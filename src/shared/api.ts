@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The typed surface between the shell renderer and the main process.
 
-import type { IndexProgress, ListWindow, Sidebar, WindowQuery } from './index-types';
 import type { LinkAction } from './constants';
+import type {
+  IndexProgress,
+  ListWindow,
+  SearchDateKey,
+  SearchPage,
+  SearchRankKey,
+  Sidebar,
+  WindowQuery,
+} from './index-types';
 import type { MessageHeaders, OpenMode } from './reader-protocol';
 import type { SourceOutcome, SourcesView } from './sources';
 
@@ -24,6 +32,7 @@ export const IPC = {
   sourcesChanged: 'pev:sources-changed',
   index: 'pev:index',
   indexChanged: 'pev:index-changed',
+  search: 'pev:search',
 } as const;
 
 export type RejectCode =
@@ -105,6 +114,16 @@ export interface LinkPrompt {
 
 export type LinkActionResult = { ok: true } | Rejected;
 
+/** A search of the open export: the text, the sort, and where the page continues. */
+export type SearchRequest =
+  | { text: string; sort: 'date'; after: SearchDateKey | null }
+  | { text: string; sort: 'relevance'; after: SearchRankKey | null };
+
+/** One page of results; `queryId` names the request it answers. */
+export type SearchResult =
+  | { ok: true; generation: number; queryId: number; page: SearchPage; progress: IndexProgress }
+  | Rejected;
+
 export type ErrorKind = 'uncaught' | 'rejection' | 'error';
 
 export interface ErrorReport {
@@ -145,4 +164,10 @@ export interface PevApi {
   listWindow(query: WindowQuery, generation: number): Promise<IndexResult<ListWindow>>;
   /** Called as indexing moves on or the index's state changes. */
   onIndexChanged(listener: (update: IndexUpdate) => void): () => void;
+  /**
+   * Searches the open export. A request made while this window's previous
+   * search is still running waits for it, and a newer one answers it as
+   * 'superseded'.
+   */
+  search(request: SearchRequest, generation: number): Promise<SearchResult>;
 }
