@@ -190,10 +190,9 @@ export function refusedText(code: RejectCode): string | null {
 /**
  * The open message below its header: the body switch, the recipients, the
  * state lines and the body frame, or the line that says why it can't open.
- * `frameHeight` gives the body a fixed height (a card's pane-high frame);
- * without it, the body fills the pane.
+ * It fills the pane; in a card, the stylesheet makes it as high as the pane.
  */
-export function MessageBody({ frameHeight }: { frameHeight?: number }) {
+export function MessageBody() {
   const reader = useReaderState();
   const { rowid, view, pending } = reader;
   if (rowid === null) return null;
@@ -252,10 +251,7 @@ export function MessageBody({ frameHeight }: { frameHeight?: number }) {
           </button>
         </div>
       )}
-      <div
-        className="rp-body"
-        style={frameHeight === undefined ? undefined : { height: frameHeight, flex: 'none' }}
-      >
+      <div className="rp-body">
         {view && (
           <iframe
             key={view.url}

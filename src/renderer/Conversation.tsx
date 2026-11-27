@@ -5,7 +5,11 @@
 // a Spam or Trash badge. The cards are a virtual list, so a conversation of
 // any length draws only what is on screen.
 
-import { defaultRangeExtractor, useVirtualizer } from '@tanstack/react-virtual';
+import {
+  defaultRangeExtractor,
+  observeElementOffset,
+  useVirtualizer,
+} from '@tanstack/react-virtual';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CardRow } from '../shared/index-types';
 import { CARD_HEIGHT } from './cards';
@@ -24,15 +28,7 @@ function cardDate(time: number): string {
   return Number.isNaN(date.getTime()) ? '' : shortDate(date.toISOString());
 }
 
-function Card({
-  card,
-  expanded,
-  frameHeight,
-}: {
-  card: CardRow;
-  expanded: boolean;
-  frameHeight: number;
-}) {
+function Card({ card, expanded }: { card: CardRow; expanded: boolean }) {
   const reader = useReaderState();
   const name = card.senderName || card.senderAddress;
   return (
@@ -65,7 +61,7 @@ function Card({
       </button>
       {expanded && reader.rowid === card.rowid && (
         <div className="card-body">
-          <MessageBody frameHeight={frameHeight} />
+          <MessageBody />
         </div>
       )}
     </article>
@@ -77,6 +73,9 @@ export function Conversation() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [paneHeight, setPaneHeight] = useState(0);
   const expandedIndex = cards.expandedIndex();
+  // Where the cards are scrolled, as the virtualizer knows it: set at once
+  // after a scroll of ours, since its scroll event may come late or not at all.
+  const offsetSink = useRef<((offset: number, isScrolling: boolean) => void) | null>(null);
   // The virtualizer's methods aren't memoized; nothing below memoizes them.
   // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
@@ -95,13 +94,34 @@ export function Conversation() {
       if (expandedIndex === null || indexes.includes(expandedIndex)) return indexes;
       return [...indexes, expandedIndex].sort((a, b) => a - b);
     },
+    observeElementOffset: (instance, cb) => {
+      offsetSink.current = cb;
+      return observeElementOffset(instance, cb);
+    },
   });
 
-  // The cards on screen; the expanded card drawn out of view doesn't count.
+  // The cards on screen, where the pane is scrolled now; the expanded card
+  // drawn out of view doesn't count.
   const reportViewport = useCallback(() => {
-    const range = virtualizer.calculateRange();
-    if (range) cards.setViewport(range.startIndex, range.endIndex);
+    const el = scrollRef.current;
+    if (!el) return;
+    const first = virtualizer.getVirtualItemForOffset(el.scrollTop);
+    const last = virtualizer.getVirtualItemForOffset(
+      el.scrollTop + Math.max(el.clientHeight, 1) - 1,
+    );
+    if (first && last) cards.setViewport(first.index, last.index);
   }, [virtualizer]);
+
+  const scrollTo = useCallback(
+    (top: number) => {
+      const el = scrollRef.current;
+      if (!el) return;
+      el.scrollTop = top;
+      offsetSink.current?.(el.scrollTop, false);
+      reportViewport();
+    },
+    [reportViewport],
+  );
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -126,8 +146,9 @@ export function Conversation() {
   useLayoutEffect(() => {
     if (expandedIndex === null || snap.scrollId === scrollSeen.current) return;
     scrollSeen.current = snap.scrollId;
-    virtualizer.scrollToIndex(expandedIndex, { align: 'start' });
-  }, [snap.scrollId, expandedIndex, virtualizer]);
+    const target = virtualizer.getOffsetForIndex(expandedIndex, 'start');
+    if (target) scrollTo(target[0]);
+  }, [snap.scrollId, expandedIndex, virtualizer, scrollTo]);
 
   // Cards that arrived above the anchor: scroll by as many, before the paint.
   const shiftSeen = useRef(snap.shiftId);
@@ -135,8 +156,8 @@ export function Conversation() {
     if (snap.shiftId === shiftSeen.current) return;
     shiftSeen.current = snap.shiftId;
     const el = scrollRef.current;
-    if (el) el.scrollTop += snap.shift * CARD_HEIGHT;
-  }, [snap.shiftId, snap.shift]);
+    if (el) scrollTo(el.scrollTop + snap.shift * CARD_HEIGHT);
+  }, [snap.shiftId, snap.shift, scrollTo]);
 
   if (snap.gone) {
     return (
@@ -147,7 +168,6 @@ export function Conversation() {
       </div>
     );
   }
-  const frameHeight = Math.max(160, paneHeight);
   return (
     <div className="rp cv">
       <div className="cv-head">
@@ -173,11 +193,7 @@ export function Conversation() {
                 style={{ transform: `translateY(${item.start}px)` }}
               >
                 {card ? (
-                  <Card
-                    card={card}
-                    expanded={card.rowid === snap.expanded}
-                    frameHeight={frameHeight}
-                  />
+                  <Card card={card} expanded={card.rowid === snap.expanded} />
                 ) : (
                   <div className="card placeholder" aria-hidden="true" />
                 )}

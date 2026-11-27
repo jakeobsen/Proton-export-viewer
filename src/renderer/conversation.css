@@ -29,6 +29,8 @@
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
+  /* The expanded card's frame is as high as this pane: 100cqh. */
+  container-type: size;
 }
 
 .cv-inner {
@@ -134,6 +136,8 @@
 }
 
 .card-body .rp-body {
+  flex: none;
+  height: max(160px, 100cqh);
   border-top: 1px solid var(--line);
 }
 
