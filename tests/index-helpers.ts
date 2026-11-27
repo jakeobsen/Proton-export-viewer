@@ -204,6 +204,20 @@ export function checkAgainstScratch(db: Db, rows: MessageRow[]): void {
     const t = db.stmt('SELECT thread_id FROM messages WHERE proton_id = ?').get(owner!.protonId);
     if (asNumber(t?.thread_id) !== asNumber(r.thread_id)) throw new Error('key points elsewhere');
   }
+  // Every key of every member is stored, for its member's conversation, and no other.
+  const wantKeys = new Map<string, number>();
+  for (const [threadId, list] of members) {
+    for (const m of list) for (const key of keysOf(m)) wantKeys.set(key, threadId);
+  }
+  const haveKeys = new Map(
+    db
+      .stmt('SELECT key, thread_id FROM thread_keys')
+      .all()
+      .map((r) => [String(r.key), asNumber(r.thread_id)] as const),
+  );
+  if (JSON.stringify([...haveKeys].sort()) !== JSON.stringify([...wantKeys].sort())) {
+    throw new Error('conversation keys differ');
+  }
 }
 
 export function shuffled<T>(list: T[], seed: number): T[] {
