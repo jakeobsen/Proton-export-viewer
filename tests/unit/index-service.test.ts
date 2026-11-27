@@ -14,6 +14,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
@@ -22,9 +23,12 @@ import { scanRun, type RunScan } from '../../src/core/containment';
 import { parseMetadata, type MessageRow } from '../../src/core/index/metadata';
 import { QueryState, WriterState } from '../../src/core/index/ops';
 import { IndexService, type IndexOptions } from '../../src/core/index/service';
+import { MAX_ATTACHMENTS } from '../../src/core/index/body';
+import { BODY_STATE, CAPPED, SCHEMA_VERSION } from '../../src/core/index/schema';
+import { validRanges } from '../../src/core/search/ranges';
 import { openDb } from '../../src/core/index/sql';
 import type { IndexThread, ThreadRole } from '../../src/core/index/pool';
-import type { IndexTotals, ListPage, Sidebar } from '../../src/shared/index-types';
+import type { IndexTotals, ListPage, SearchPage, Sidebar } from '../../src/shared/index-types';
 import type { Logger } from '../../src/shared/log/writer';
 import { sanitizeEvent } from '../../src/shared/log/schema';
 import { digest } from '../../tools/gen-export/tree.mjs';
@@ -141,7 +145,7 @@ describe('phase 1', () => {
         .map((c) => c.role)
         .sort(),
     ).toEqual(['query', 'writer']);
-    await h.service.startPhase1(scan);
+    await h.service.startIndexing(scan);
     expect(h.service.progress).toMatchObject({
       phase: 'done',
       loaded: scan.metadata.size,
@@ -169,7 +173,11 @@ describe('phase 1', () => {
       expect(mode(join(indexDir, name)), name).toBe(0o600);
     }
     expect(readdirSync(indexDir)).toContain(`${STAMP.sourceKey}.sqlite-wal`);
-    expect(h.logs.map((l) => l.code)).toEqual(['index.created', 'index.phase1_done']);
+    expect(h.logs.map((l) => l.code)).toEqual([
+      'index.created',
+      'index.phase1_done',
+      'index.phase2_done',
+    ]);
     await h.service.close();
     expect(h.service.connections.size).toBe(0);
   });
@@ -184,7 +192,7 @@ describe('phase 1', () => {
     };
     const first = harness(run, indexDir);
     const opened = await first.service.open(null);
-    await first.service.startPhase1(partial);
+    await first.service.startIndexing(partial);
     expect(first.service.progress).toMatchObject({ loaded: 20, total: 20 });
     await first.service.close();
 
@@ -194,7 +202,7 @@ describe('phase 1', () => {
       created: false,
       replaced: false,
     });
-    await second.service.startPhase1(scan);
+    await second.service.startIndexing(scan);
     expect(second.service.progress).toMatchObject({ phase: 'done', loaded: 60, total: 60 });
     const revs = dbRows(second.service.dbPath, 'SELECT rev FROM pairs').map((r) => Number(r.rev));
     expect(revs).toHaveLength(60);
@@ -230,7 +238,7 @@ describe('phase 1', () => {
       );
     });
     await h.service.open(null);
-    await h.service.startPhase1(scan);
+    await h.service.startIndexing(scan);
     expect(h.service.progress).toMatchObject({
       phase: 'done',
       loaded: 40,
@@ -271,7 +279,7 @@ describe('phase 1', () => {
     const scan = scanRun(run);
     const h = harness(run, indexDir);
     await h.service.open(null);
-    await h.service.startPhase1(scan);
+    await h.service.startIndexing(scan);
     expect(h.service.progress).toMatchObject({ phase: 'done', capped: 1 });
     const [row] = dbRows(
       h.service.dbPath,
@@ -311,7 +319,7 @@ describe('phase 1', () => {
     expect(made.status).toBe(0);
     const h = harness(run, indexDir, { jobMs: 2000 });
     await h.service.open(null);
-    await h.service.startPhase1(scan);
+    await h.service.startIndexing(scan);
     expect(h.service.progress).toMatchObject({ phase: 'done', total: 5, loaded: 5, failed: 1 });
     const pairs = Object.fromEntries(
       dbRows(
@@ -351,7 +359,7 @@ describe('phase 1', () => {
     }
     const h = harness(realpathSync(run), join(dir, 'index'));
     await h.service.open(null);
-    await h.service.startPhase1(scanRun(realpathSync(run)));
+    await h.service.startIndexing(scanRun(realpathSync(run)));
     expect(dbPartition(h.service.dbPath)).toEqual([['aaaa'], ['bbbb']]);
     await h.service.close();
   });
@@ -375,7 +383,7 @@ describe('phase 1', () => {
     }
     const h = harness(run, indexDir);
     await h.service.open(null);
-    await h.service.startPhase1(scan);
+    await h.service.startIndexing(scan);
     expect(h.service.progress).toMatchObject({ phase: 'done', loaded: 6, failed: 0 });
     const writer = h.threads.find((t) => t.role === 'writer')!;
     // Each 3 MiB file needs a transaction of its own; the scan saw them all small.
@@ -393,7 +401,7 @@ describe('phase 1', () => {
     const h = harness(run, indexDir);
     await h.service.open(null);
     h.setCurrent(false);
-    await h.service.startPhase1(scanRun(run));
+    await h.service.startIndexing(scanRun(run));
     expect(h.service.progress.phase).toBe('failed');
     const n = dbRows(h.service.dbPath, 'SELECT count(*) AS n FROM pairs')[0]?.n;
     expect(Number(n)).toBe(0);
@@ -444,7 +452,7 @@ describe('phase 1', () => {
       const scan = scanRun(run);
       const h = harness(run, indexDir, { batchPairs: 10, readByName }, undefined, wrap);
       await h.service.open(null);
-      await h.service.startPhase1(scan);
+      await h.service.startIndexing(scan);
       expect(h.service.progress).toMatchObject({ phase: 'done', loaded: 30, total: 30, failed: 0 });
       expect(dbPartition(h.service.dbPath)).toEqual(partitionOfFiles(run));
       await h.service.close();
@@ -471,7 +479,7 @@ describe('reconcile on reopen', () => {
     const { dir, run, indexDir } = exportAt('reconcile', 30);
     const first = harness(run, indexDir);
     const opened = await first.service.open(null);
-    await first.service.startPhase1(scanRun(run));
+    await first.service.startIndexing(scanRun(run));
     await first.service.close();
     const revSeq = (path: string) =>
       Number(dbRows(path, "SELECT value FROM source_meta WHERE key = 'rev_seq'")[0]?.value);
@@ -526,7 +534,7 @@ describe('reconcile on reopen', () => {
 
     const second = harness(run, indexDir, { metaJob: 1 });
     await second.service.open(opened.dbUuid);
-    await second.service.startPhase1(scanRun(run));
+    await second.service.startIndexing(scanRun(run));
     const files = ids.length - 2 + 1;
     expect(second.service.progress).toMatchObject({
       phase: 'done',
@@ -553,7 +561,9 @@ describe('reconcile on reopen', () => {
     expect(pairs.has(bothGone)).toBe(false);
     expect(pairs.get(metaGone)).toMatchObject({ meta_state: 4, error_code: 'PAIR_META_MISSING' });
     expect(pairs.get(emlGone)).toMatchObject({ meta_state: 1, body_state: 4 });
-    expect(pairs.get(emlChanged)).toMatchObject({ meta_state: 1, body_state: 0 });
+    // Phase 2 read the changed message file again.
+    expect(pairs.get(emlChanged)).toMatchObject({ meta_state: 1, body_state: 1 });
+    expect(pairs.get(added)).toMatchObject({ meta_state: 1, body_state: 1 });
     for (const id of [metaGone, changed, emlChanged, emlGone, added]) {
       expect(Number(pairs.get(id)?.rev), id).toBeGreaterThan(highest);
     }
@@ -574,10 +584,22 @@ describe('reconcile on reopen', () => {
     // Nothing changed since: nothing is written or read but the plan.
     const third = harness(run, indexDir);
     await third.service.open(opened.dbUuid);
-    await third.service.startPhase1(scanRun(run));
-    expect(third.service.progress).toMatchObject({ phase: 'done', loaded: files, total: files });
+    await third.service.startIndexing(scanRun(run));
+    expect(third.service.progress).toMatchObject({
+      phase: 'done',
+      loaded: files,
+      total: files,
+      bodyPhase: 'done',
+      bodiesTotal: 0,
+    });
     const writer = third.threads.find((t) => t.role === 'writer')!;
-    expect(writer.calls.filter((op) => op !== 'shrink')).toEqual(['open', 'plan', 'finish']);
+    // Phase 2 only finds that no message waits for its text.
+    expect(writer.calls.filter((op) => op !== 'shrink')).toEqual([
+      'open',
+      'plan',
+      'finish',
+      'bodyOrder',
+    ]);
     expect(third.threads.filter((t) => t.role === 'parse').flatMap((t) => t.calls)).toEqual([]);
     expect(third.logs.map((l) => l.code)).not.toContain('index.reconciled');
     await third.service.close();
@@ -589,7 +611,7 @@ describe('an unavailable export', () => {
     const { run, indexDir } = exportAt('offline', 10);
     const first = harness(run, indexDir);
     const opened = await first.service.open(null);
-    await first.service.startPhase1(scanRun(run));
+    await first.service.startIndexing(scanRun(run));
     await first.service.close();
     const dbPath = join(indexDir, `${STAMP.sourceKey}.sqlite`);
     const family = () =>
@@ -651,7 +673,7 @@ describe('an unavailable export', () => {
     const { run, indexDir } = exportAt('offline-wal', 8);
     const h = harness(run, indexDir);
     const opened = await h.service.open(null);
-    await h.service.startPhase1(scanRun(run));
+    await h.service.startIndexing(scanRun(run));
     // The writer is still open, so the last batches may be in the WAL only.
     const query = new QueryState();
     query.open(h.service.dbPath, opened.dbUuid);
@@ -727,11 +749,11 @@ describe('the writer', () => {
 });
 
 describe('when idle', () => {
-  it('ends the pool after phase 1 and releases both caches after the idle time', async () => {
+  it('ends the pool once indexing is done and releases both caches after the idle time', async () => {
     const { run, indexDir } = exportAt('idle', 10);
     const h = harness(run, indexDir, { idleMs: 60_000 });
     await h.service.open(null);
-    await h.service.startPhase1(scanRun(run));
+    await h.service.startIndexing(scanRun(run));
     const writer = h.threads.find((t) => t.calls[0] === 'open' && t.calls.includes('phase1'))!;
     const query = h.threads.find((t) => t.calls[0] === 'open' && !t.calls.includes('phase1'))!;
     expect(await h.service.releaseIfIdle(Date.now())).toBe(false);
@@ -744,5 +766,370 @@ describe('when idle', () => {
     await h.service.ask({ op: 'totals' });
     expect(await h.service.releaseIfIdle(Date.now() + 120_000)).toBe(true);
     await h.service.close();
+  });
+});
+
+// --- Phase 2 ---------------------------------------------------------------------
+
+/** The message IDs of a run folder, sorted. */
+const idsOf = (run: string) =>
+  readdirSync(run)
+    .filter((n) => n.endsWith('.metadata.json'))
+    .map((n) => n.slice(0, -'.metadata.json'.length))
+    .sort();
+
+/** A message file with this text and these attachment parts. */
+function eml(body: string, attachments: string[] = []): string {
+  return [
+    'From: <sender@example.com>',
+    'Subject: replaced',
+    'Content-Type: multipart/mixed; boundary="m"',
+    '',
+    '--m',
+    'Content-Type: text/plain; charset=utf-8',
+    '',
+    body,
+    ...attachments.flatMap((name) => [
+      '--m',
+      `Content-Type: application/pdf; name="${name}"`,
+      'Content-Disposition: attachment',
+      '',
+      'x',
+    ]),
+    '--m--',
+    '',
+  ].join('\r\n');
+}
+
+let searches = 0;
+async function search(service: IndexService, text: string): Promise<SearchPage> {
+  searches += 1;
+  return (await service.ask({
+    op: 'search',
+    queryId: searches,
+    text,
+    sort: 'date',
+    after: null,
+  })) as SearchPage;
+}
+
+/** The message IDs a search finds, by the newest match of each conversation. */
+async function found(service: IndexService, text: string): Promise<string[]> {
+  const page = await search(service, text);
+  const ids = page.rows.map((r) =>
+    String(
+      dbRows(service.dbPath, `SELECT proton_id FROM messages WHERE rowid = ${r.anchorRowid}`)[0]
+        ?.proton_id,
+    ),
+  );
+  return ids.sort();
+}
+
+const states = (dbPath: string) =>
+  Object.fromEntries(
+    dbRows(dbPath, 'SELECT proton_id, body_state, error_code FROM pairs').map((r) => [
+      String(r.proton_id),
+      [Number(r.body_state), r.error_code === null ? null : String(r.error_code)],
+    ]),
+  );
+
+describe('phase 2', () => {
+  it('reads every message file, newest first, and search finds its text and attachment names', async () => {
+    const { run, indexDir } = exportAt('p2-all', 30);
+    const [first, second] = idsOf(run) as [string, string];
+    writeFileSync(
+      join(run, `${first}.eml`),
+      eml('periwinkle zeppelin harbour', ['budget plan.pdf']),
+    );
+    const read: string[] = [];
+    const h = harness(run, indexDir, {}, (role, op, args) => {
+      if (op === 'body') read.push((args as { item: { protonId: string } }).item.protonId);
+      return false;
+    });
+    const scan = scanRun(run);
+    await h.service.open(null);
+    await h.service.startIndexing(scan);
+    const files = scan.eml.size;
+    expect(h.service.progress).toMatchObject({
+      phase: 'done',
+      bodyPhase: 'done',
+      bodiesDone: files,
+      bodiesTotal: files,
+      bodiesFailed: 0,
+      timeouts: 0,
+    });
+    const newestFirst = dbRows(
+      h.service.dbPath,
+      'SELECT proton_id FROM messages ORDER BY time DESC, rowid DESC',
+    ).map((r) => String(r.proton_id));
+    expect(read).toEqual(newestFirst);
+    expect(Object.values(states(h.service.dbPath)).every(([s]) => s === BODY_STATE.indexed)).toBe(
+      true,
+    );
+    expect(await found(h.service, 'zeppelin')).toEqual([first]);
+    expect(await found(h.service, 'filename:"budget plan.pdf"')).toEqual([first]);
+    expect((await search(h.service, 'zeppelin')).coverage).toEqual({
+      indexed: files,
+      total: files,
+    });
+    // A word of a generated message's body.
+    const body = String(
+      dbRows(
+        h.service.dbPath,
+        `SELECT t.body FROM message_text t JOIN messages m ON m.rowid = t.rowid
+         WHERE m.proton_id = '${second}'`,
+      )[0]?.body,
+    );
+    const word = body.match(/[A-Za-z]{6,}/)![0];
+    expect(await found(h.service, word)).toContain(second);
+    expect(h.logs.find((l) => l.code === 'index.phase2_done')?.data).toMatchObject({
+      count: files,
+    });
+    // Every body went through the pool, in transactions of at most 500.
+    const writer = h.threads.find((t) => t.role === 'writer')!;
+    expect(writer.calls.filter((c) => c === 'phase2').length).toBeGreaterThanOrEqual(1);
+    await h.service.close();
+  });
+
+  it('fails a file past its time limit alone, and reads the others', async () => {
+    const { run, indexDir } = exportAt('p2-timeout', 12);
+    const slow = idsOf(run)[3]!;
+    const h = harness(
+      run,
+      indexDir,
+      { jobMs: 300 },
+      (_role, op, args) =>
+        op === 'body' && (args as { item: { protonId: string } }).item.protonId === slow,
+    );
+    await h.service.open(null);
+    await h.service.startIndexing(scanRun(run));
+    expect(h.service.progress).toMatchObject({
+      bodyPhase: 'done',
+      bodiesDone: 12,
+      bodiesFailed: 1,
+      timeouts: 1,
+    });
+    const all = states(h.service.dbPath);
+    expect(all[slow]).toEqual([BODY_STATE.failed, 'BODY_TIMEOUT']);
+    for (const [id, state] of Object.entries(all)) {
+      if (id !== slow) expect(state, id).toEqual([BODY_STATE.indexed, null]);
+    }
+    const fileId = String(
+      dbRows(h.service.dbPath, `SELECT file_id FROM pairs WHERE proton_id = '${slow}'`)[0]?.file_id,
+    );
+    expect(h.logs.filter((l) => l.code === 'index.timeout').map((l) => l.data)).toEqual([
+      { fileId, reason: 'timeout' },
+    ]);
+    // The thread that ran it was replaced.
+    expect(h.threads.filter((t) => t.role === 'parse').reduce((n, t) => n + t.respawns, 0)).toBe(1);
+    await h.service.close();
+  });
+
+  it('leaves a file that changed or went since the scan for the next reconcile', async () => {
+    const { run, indexDir } = exportAt('p2-changed', 10);
+    const [changed, gone, linked] = idsOf(run) as [string, string, string];
+    const scan = scanRun(run);
+    // After the scan, before phase 2 reads them.
+    writeFileSync(join(run, `${changed}.eml`), eml('rewritten afterwards'));
+    rmSync(join(run, `${gone}.eml`));
+    // A link the open refuses, in place of a file.
+    const target = join(run, `${linked}.eml`);
+    renameSync(target, `${target}.moved`);
+    symlinkSync(`${target}.moved`, target);
+    const first = harness(run, indexDir);
+    const opened = await first.service.open(null);
+    await first.service.startIndexing(scan);
+    expect(first.service.progress).toMatchObject({
+      bodyPhase: 'done',
+      bodiesDone: 10,
+      bodiesFailed: 1,
+    });
+    const after = states(first.service.dbPath);
+    expect(after[changed]).toEqual([BODY_STATE.pending, null]);
+    expect(after[gone]).toEqual([BODY_STATE.pending, null]);
+    expect(after[linked]).toEqual([BODY_STATE.failed, 'FILE_SYMLINK']);
+    expect(
+      first.logs.filter((l) => l.code === 'index.body_failed').map((l) => l.data.reason),
+    ).toEqual(['symlink']);
+    await first.service.close();
+
+    // The next open reconciles them: the changed file is read, the gone one is marked.
+    const second = harness(run, indexDir);
+    await second.service.open(opened.dbUuid);
+    await second.service.startIndexing(scanRun(run));
+    const again = states(second.service.dbPath);
+    expect(again[changed]).toEqual([BODY_STATE.indexed, null]);
+    expect(again[gone]).toEqual([BODY_STATE.emlMissing, null]);
+    expect(await found(second.service, 'rewritten')).toEqual([changed]);
+    await second.service.close();
+  });
+
+  it('writes nothing once the generation has moved on', async () => {
+    const { run, indexDir } = exportAt('p2-stale', 10);
+    let bodies = 0;
+    const h = harness(run, indexDir, {}, (_role, op) => {
+      // The source switches while the first file is read.
+      if (op === 'body' && (bodies += 1) === 1) h.setCurrent(false);
+      return false;
+    });
+    await h.service.open(null);
+    await h.service.startIndexing(scanRun(run));
+    expect(h.service.progress).toMatchObject({ phase: 'done', bodyPhase: 'failed' });
+    expect(Object.values(states(h.service.dbPath)).every(([s]) => s === BODY_STATE.pending)).toBe(
+      true,
+    );
+    const writer = h.threads.find((t) => t.role === 'writer')!;
+    expect(writer.calls).not.toContain('phase2');
+    expect(h.logs.map((l) => l.code)).toContain('writer.stale_dropped');
+    expect(h.logs.find((l) => l.code === 'index.phase2_failed')?.data).toEqual({
+      reason: 'stale_generation',
+    });
+    await h.service.close();
+  });
+
+  it('stops at a close, keeps what was written, and the next open reads the rest', async () => {
+    const { run, indexDir } = exportAt('p2-close', 40);
+    let writes = 0;
+    let closing: Promise<void> | null = null;
+    // Transactions smaller than the bodies of 40 messages; the close comes with the second.
+    const first = harness(run, indexDir, { txnBytes: 24_000 }, (role, op) => {
+      if (role === 'writer' && op === 'phase2' && (writes += 1) === 2) {
+        closing = first.service.close();
+      }
+      return false;
+    });
+    const opened = await first.service.open(null);
+    await first.service.startIndexing(scanRun(run));
+    await closing;
+    const after = Object.values(states(first.service.dbPath));
+    const written = after.filter(([s]) => s === BODY_STATE.indexed).length;
+    expect(written).toBeGreaterThan(0);
+    expect(written).toBeLessThan(40);
+    expect(after.filter(([s]) => s === BODY_STATE.pending)).toHaveLength(40 - written);
+    expect(first.logs.find((l) => l.code === 'index.phase2_done')).toBeUndefined();
+
+    const second = harness(run, indexDir);
+    await second.service.open(opened.dbUuid);
+    await second.service.startIndexing(scanRun(run));
+    expect(second.service.progress).toMatchObject({
+      bodyPhase: 'done',
+      bodiesTotal: 40 - written,
+      bodiesDone: 40 - written,
+    });
+    expect(
+      Object.values(states(second.service.dbPath)).every(([s]) => s === BODY_STATE.indexed),
+    ).toBe(true);
+    await second.service.close();
+  });
+
+  it('keeps the first 1,000 attachments, flags and logs the cut, and finds a kept name only', async () => {
+    const { run, indexDir } = exportAt('p2-attachments', 4);
+    const [many] = idsOf(run) as [string];
+    const names = Array.from({ length: MAX_ATTACHMENTS + 1 }, (_, i) => `part-${i}.pdf`);
+    writeFileSync(join(run, `${many}.eml`), eml('many parts', names));
+    const h = harness(run, indexDir);
+    await h.service.open(null);
+    await h.service.startIndexing(scanRun(run));
+    const [row] = dbRows(
+      h.service.dbPath,
+      `SELECT m.rowid, m.capped, p.file_id FROM messages m JOIN pairs p ON p.proton_id = m.proton_id
+       WHERE m.proton_id = '${many}'`,
+    );
+    expect(Number(row!.capped)).toBe(CAPPED.attachments);
+    const rows = dbRows(
+      h.service.dbPath,
+      `SELECT count(*) AS n FROM attachments WHERE message_rowid = ${Number(row!.rowid)} AND source = 'eml'`,
+    );
+    expect(Number(rows[0]?.n)).toBe(MAX_ATTACHMENTS);
+    expect(h.service.progress.capped).toBe(1);
+    expect(h.logs.filter((l) => l.code === 'index.capped').map((l) => l.data)).toEqual([
+      { fileId: row!.file_id, list: 'attachments' },
+    ]);
+    expect(await found(h.service, 'filename:part-999.pdf')).toEqual([many]);
+    expect(await found(h.service, 'filename:part-1000.pdf')).toEqual([]);
+    await h.service.close();
+  });
+
+  it('splits writes by the text budget, and fails with its own code a message alone over it', async () => {
+    const { run, indexDir } = exportAt('p2-budget', 6);
+    const [big, ...rest] = idsOf(run) as [string, ...string[]];
+    writeFileSync(join(run, `${big}.eml`), eml('x'.repeat(5000)));
+    for (const id of rest) writeFileSync(join(run, `${id}.eml`), eml(`${id} ${'y'.repeat(600)}`));
+    const h = harness(run, indexDir, { txnBytes: 4000 });
+    await h.service.open(null);
+    await h.service.startIndexing(scanRun(run));
+    const all = states(h.service.dbPath);
+    expect(all[big]).toEqual([BODY_STATE.failed, 'BODY_TOO_LARGE']);
+    for (const id of rest) expect(all[id], id).toEqual([BODY_STATE.indexed, null]);
+    const writer = h.threads.find((t) => t.role === 'writer')!;
+    // Five bodies of about 700 bytes take at least two transactions of 4,000.
+    expect(writer.calls.filter((c) => c === 'phase2').length).toBeGreaterThanOrEqual(2);
+    const fileId = String(
+      dbRows(h.service.dbPath, `SELECT file_id FROM pairs WHERE proton_id = '${big}'`)[0]?.file_id,
+    );
+    expect(
+      h.logs.filter((l) => l.code === 'index.body_too_large').map((l) => [l.level, l.data]),
+    ).toEqual([['warn', { fileId }]]);
+    expect(h.service.progress).toMatchObject({ bodiesFailed: 1, bodiesDone: 6 });
+    await h.service.close();
+  });
+
+  it('rebuilds an index of the older schema with marker characters, with the schema code, and leaves none', async () => {
+    const { run, indexDir } = exportAt('p2-older', 8);
+    const [marked] = idsOf(run) as [string];
+    const metaFile = join(run, `${marked}.metadata.json`);
+    const doc = JSON.parse(readFileSync(metaFile, 'utf8')) as { Payload: Record<string, unknown> };
+    const M = '\uE000';
+    const E = '\uE001';
+    doc.Payload.Subject = `Quarterly ${M}tangerine${E} figures`;
+    doc.Payload.Sender = { Name: `Ann ${E}Lee`, Address: 'ann@example.com' };
+    doc.Payload.ToList = [{ Name: `Bo ${M}Ek`, Address: 'bo@example.com' }];
+    writeFileSync(metaFile, JSON.stringify(doc));
+    const first = harness(run, indexDir);
+    const opened = await first.service.open(null);
+    await first.service.startIndexing(scanRun(run));
+    await first.service.close();
+
+    // As an older build stored it: the marker characters kept, also in the full-text index.
+    const db = openDb(first.service.dbPath);
+    db.stmt(
+      `UPDATE message_text SET subject = ?, sender = ?, recipients = ?
+       WHERE rowid = (SELECT rowid FROM messages WHERE proton_id = ?)`,
+    ).run(
+      String(doc.Payload.Subject),
+      `Ann ${E}Lee ann@example.com`,
+      `Bo ${M}Ek bo@example.com`,
+      marked,
+    );
+    // The marker characters are part of the word there: the older index can't find it.
+    expect(db.stmt("SELECT count(*) AS n FROM fts WHERE fts MATCH 'tangerine'").get()?.n).toBe(0);
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION - 1}`);
+    db.close();
+
+    const second = harness(run, indexDir);
+    const reopened = await second.service.open(opened.dbUuid);
+    expect(reopened).toMatchObject({ created: true, replaced: true });
+    expect(second.service.progress.condition).toBe('ok');
+    expect(
+      second.logs.filter((l) => ['index.schema_rebuild', 'index.damaged'].includes(l.code)),
+    ).toEqual([{ level: 'info', code: 'index.schema_rebuild', data: { reason: 'schema' } }]);
+    await second.service.startIndexing(scanRun(run));
+    const withMarks = dbRows(
+      second.service.dbPath,
+      `SELECT count(*) AS n FROM message_text WHERE
+         instr(subject, char(57344)) OR instr(subject, char(57345)) OR
+         instr(sender, char(57344)) OR instr(sender, char(57345)) OR
+         instr(recipients, char(57344)) OR instr(recipients, char(57345)) OR
+         instr(body, char(57344)) OR instr(body, char(57345)) OR
+         instr(attachments, char(57344)) OR instr(attachments, char(57345))`,
+    );
+    expect(Number(withMarks[0]?.n)).toBe(0);
+    const page = await search(second.service, 'tangerine');
+    expect(page.rows).toHaveLength(1);
+    const snippet = page.rows[0]!.snippet!;
+    expect(snippet.text).toContain('Quarterly tangerine figures');
+    expect(validRanges(snippet.text, snippet.ranges)).toBe(true);
+    expect(snippet.ranges.map(([a, b]) => snippet.text.slice(a, b))).toEqual(['tangerine']);
+    await second.service.close();
   });
 });

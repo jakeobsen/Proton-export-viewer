@@ -262,17 +262,28 @@ describe('an index found damaged on open', () => {
       const opened = await c.openIndex(uuid);
       expect(opened).toMatchObject({ ok: true, index: { created: true, replaced: true } });
       expect(opened.ok && opened.index!.dbUuid).not.toBe(uuid);
-      expect(opened.ok && opened.progress?.condition).toBe('rebuilding');
-      expect(c.logs.find((l) => l.code === 'index.damaged')?.data).toEqual({
-        reason: reasons[name.split(' ')[0]!],
-      });
+      const reason = reasons[name.split(' ')[0]!];
+      // An index of an older schema version is no damage: it is rebuilt with the usual state.
+      const upgrade = reason === 'schema';
+      expect(opened.ok && opened.progress?.condition).toBe(upgrade ? 'ok' : 'rebuilding');
+      expect(c.logs.find((l) => l.code === 'index.damaged')?.data).toEqual(
+        upgrade ? undefined : { reason },
+      );
+      expect(c.logs.find((l) => l.code === 'index.schema_rebuild')?.data).toEqual(
+        upgrade ? { reason } : undefined,
+      );
       await c.session.index!.settled();
       expect(await c.totals()).toMatchObject({ messages: pairs, pairs });
       expect(c.session.index!.progress.condition).toBe('ok');
-      // Progress while it rebuilds, then ok once; main is never told of damage.
+      // Rebuilding until it is ok, and ok from then on (phase 2 reports after
+      // phase 1); an older schema shows the usual state throughout. Main is
+      // never told of damage.
       const conditions = c.events.map((e) => e.progress.condition);
-      expect(conditions.filter((condition) => condition !== 'rebuilding')).toEqual(['ok']);
-      expect(conditions.at(-1)).toBe('ok');
+      const ok = conditions.indexOf('ok');
+      if (upgrade) expect(ok).toBe(0);
+      else expect(ok).toBeGreaterThan(0);
+      expect(conditions.slice(0, ok).every((condition) => condition === 'rebuilding')).toBe(true);
+      expect(conditions.slice(ok).every((condition) => condition === 'ok')).toBe(true);
       expect(c.events.some((e) => e.damaged)).toBe(false);
       await c.session.close();
       expect(digest(root)).toBe(before);
@@ -421,6 +432,50 @@ describe('an index found damaged by the check', () => {
     expect(c.events.map((e) => [e.progress.condition, e.damaged])).toEqual([['damaged', true]]);
     expect(family(indexDir)).toEqual([]);
   });
+
+  for (const [kind, delta] of [
+    ['older', -1],
+    ['newer', 1],
+  ] as const) {
+    it(`of an ${kind} schema version is kept untouched while the export is unavailable, then rebuilt as usual`, async () => {
+      const { run, root, indexDir, pairs } = exportAt(`lc-schema-${kind}`);
+      const exportBefore = digest(root);
+      const uuid = await built(run, indexDir);
+      const db = new DatabaseSync(join(indexDir, `${KEY}.sqlite`));
+      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION + delta}`);
+      db.close();
+      // Every file of the index folder, with its time and content.
+      const before = digest(indexDir);
+
+      const c = core({ root: null, indexDir, generation: 2 });
+      expect(await c.openIndex(uuid)).toMatchObject({ ok: false, code: 'unavailable' });
+      expect(c.events).toEqual([]);
+      const codes = c.logs.map((l) => l.code);
+      expect(codes).toContain('index.schema_pending');
+      expect(codes).not.toContain('index.damaged');
+      expect(codes).not.toContain('index.schema_rebuild');
+      await c.session.close();
+      expect(digest(indexDir)).toBe(before);
+
+      // The export is back: the index is rebuilt with the usual indexing state.
+      const back = core({ root: run, indexDir, generation: 3 });
+      const opened = await back.openIndex(uuid);
+      expect(opened).toMatchObject({
+        ok: true,
+        index: { created: true, replaced: true },
+        progress: { condition: 'ok' },
+      });
+      expect(back.logs.find((l) => l.code === 'index.schema_rebuild')?.data).toEqual({
+        reason: 'schema',
+      });
+      expect(back.logs.map((l) => l.code)).not.toContain('index.damaged');
+      await back.session.index!.settled();
+      expect(await back.totals()).toMatchObject({ messages: pairs, pairs });
+      expect(back.events.filter((e) => e.damaged || e.progress.condition !== 'ok')).toEqual([]);
+      await back.session.close();
+      expect(digest(root)).toBe(exportBefore);
+    });
+  }
 
   it('with a WAL from another index: no crash, the export unchanged, rebuilt if found', async () => {
     const { run, root, indexDir } = exportAt('lc-foreign-wal');

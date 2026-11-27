@@ -24,10 +24,17 @@
 
 import { randomUUID } from 'node:crypto';
 import { sameStamp, type Stamp } from '../../shared/sources';
-import { LABEL_CHUNK, REPOINT_CHUNK } from './limits';
+import type { AttachmentRow } from './body';
+import { LABEL_CHUNK, REPOINT_CHUNK, TXN_INPUT_BYTES } from './limits';
 import type { LabelEntry } from './labels';
-import { MAX_LABELS, addressText, conversationKeys, type MessageRow } from './metadata';
-import { BODY_STATE, META, META_STATE } from './schema';
+import {
+  MAX_LABELS,
+  addressText,
+  conversationKeys,
+  foldAddress,
+  type MessageRow,
+} from './metadata';
+import { BODY_STATE, CAPPED, META, META_STATE } from './schema';
 import { asNumber, type Db, type Row, type SqlValue } from './sql';
 import { stripMarks } from '../search/ranges';
 
@@ -131,6 +138,53 @@ export interface ApplyStats extends GroupStats {
   /** Items left alone because the index no longer matched what the plan saw. */
   skipped: number;
 }
+
+/** A message whose file phase 2 is to read, with the file as reconcile last saw it. */
+export interface BodyTodo {
+  protonId: string;
+  /** The rev the pair had when it was listed; the result must carry it. */
+  rev: number;
+  rel: string;
+  size: number;
+  mtimeNs: string;
+  dev: string;
+  ino: string;
+}
+
+/** What phase 2 read from one message file, for the writer. */
+export interface Phase2Item {
+  protonId: string;
+  rev: number;
+  /** BODY_STATE.indexed, truncated or failed. */
+  state: number;
+  body: string;
+  attachments: AttachmentRow[];
+  attachmentText: string;
+  attachmentsCapped: boolean;
+  /** Why the file couldn't be read, at state failed. */
+  error: string | null;
+}
+
+export interface Phase2Stats {
+  stale: boolean;
+  /** Items written, failed ones included. */
+  written: number;
+  /** Items dropped because their pair's rev had moved on, or it no longer waits for a body. */
+  dropped: number;
+  /** Items left for another transaction, from the end of the batch: the text budget was reached. */
+  rest: number;
+  /** UTF-8 bytes of text the transaction wrote. */
+  bytes: number;
+  truncated: number;
+  /** File IDs of the messages whose attachment list was cut to its limit. */
+  capped: string[];
+  /** Of those, the messages that had no other list cut. */
+  cappedNew: number;
+  failed: Array<{ fileId: string; code: string }>;
+}
+
+/** A message whose text alone is over the transaction budget. */
+export const BODY_TOO_LARGE = 'BODY_TOO_LARGE';
 
 export const PAIR_META_MISSING = 'PAIR_META_MISSING';
 
@@ -598,8 +652,8 @@ export class IndexWriter {
 
   /**
    * Clears what was read from a pair's message file: its body text and
-   * attachment names (and their full-text entries), and the attachments
-   * listed from it.
+   * attachment names (and their full-text entries), the attachments listed
+   * from it, and its attachments cap flag. The message's other cap flags stay.
    */
   private clearBody(protonId: string): void {
     const m = this.db.stmt('SELECT rowid FROM messages WHERE proton_id = ?').get(protonId);
@@ -611,6 +665,9 @@ export class IndexWriter {
       )
       .run(rowid);
     this.db.stmt("DELETE FROM attachments WHERE message_rowid = ? AND source = 'eml'").run(rowid);
+    this.db
+      .stmt('UPDATE messages SET capped = capped & ? WHERE rowid = ? AND capped & ?')
+      .run(~CAPPED.attachments, rowid, CAPPED.attachments);
   }
 
   /**
@@ -628,7 +685,9 @@ export class IndexWriter {
     }
     this.transaction(() => {
       const pairOf = this.db.stmt('SELECT rev, file_id, meta_state FROM pairs WHERE proton_id = ?');
-      const messageOf = this.db.stmt('SELECT rowid, thread_id FROM messages WHERE proton_id = ?');
+      const messageOf = this.db.stmt(
+        'SELECT rowid, thread_id, capped FROM messages WHERE proton_id = ?',
+      );
       const setMeta = this.db.stmt(
         `UPDATE pairs SET meta_rel = ?, meta_size = ?, meta_mtime_ns = ?, meta_dev = ?, meta_ino = ?,
            meta_state = ?, error_code = ? WHERE proton_id = ?`,
@@ -655,7 +714,9 @@ export class IndexWriter {
             this.detach(asNumber(old.rowid), asNumber(old.thread_id), stats);
             stats.replaced += 1;
           }
-          this.insertMessage(item.row, stats, oldRowid);
+          // The attachments flag comes from the message file, which stays.
+          const kept = old ? asNumber(old.capped) & CAPPED.attachments : 0;
+          this.insertMessage(item.row, stats, oldRowid, kept);
           stats.messages += 1;
           if (item.row.capped !== 0) stats.capped.push({ fileId, capped: item.row.capped });
           setMeta.run(...fileValues(item.pair.meta), META_STATE.indexed, null, id);
@@ -666,6 +727,149 @@ export class IndexWriter {
           stats.errors.push({ fileId, code });
           setMeta.run(...fileValues(item.pair.meta), META_STATE.failed, code, id);
         }
+      }
+    });
+    return stats;
+  }
+
+  /**
+   * The messages whose body phase 2 still has to read, newest first (ties to
+   * the higher rowid), as rowids. A message without a message file, or whose
+   * metadata isn't indexed, has none to read.
+   */
+  bodyOrder(): number[] {
+    return this.db
+      .stmt(
+        `SELECT m.rowid AS rowid FROM messages m JOIN pairs p ON p.proton_id = m.proton_id
+         WHERE p.body_state = ? AND p.eml_rel IS NOT NULL
+         ORDER BY m.time DESC, m.rowid DESC`,
+      )
+      .all(BODY_STATE.pending)
+      .map((r) => asNumber(r.rowid));
+  }
+
+  /** Of these messages, in this order, the ones that still wait for their body, with their files. */
+  bodyTodo(rowids: number[]): BodyTodo[] {
+    const one = this.db.stmt(
+      `SELECT p.proton_id, p.rev, p.eml_rel, p.eml_size, CAST(p.eml_mtime_ns AS TEXT) AS mtime,
+         CAST(p.eml_dev AS TEXT) AS dev, CAST(p.eml_ino AS TEXT) AS ino
+       FROM messages m JOIN pairs p ON p.proton_id = m.proton_id
+       WHERE m.rowid = ? AND p.body_state = ? AND p.eml_rel IS NOT NULL`,
+    );
+    const out: BodyTodo[] = [];
+    for (const rowid of rowids) {
+      const r = one.get(rowid, BODY_STATE.pending);
+      if (!r) continue;
+      out.push({
+        protonId: String(r.proton_id),
+        rev: asNumber(r.rev),
+        rel: String(r.eml_rel),
+        size: asNumber(r.eml_size),
+        mtimeNs: text(r.mtime) ?? '0',
+        dev: text(r.dev) ?? '0',
+        ino: text(r.ino) ?? '0',
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Writes one batch of phase 2 results in one transaction, each checked
+   * against its pair's current rev inside the transaction and dropped unless
+   * it matches and the pair still waits for its body. A result sets the
+   * body, the attachment names (the full-text entry is rewritten with them),
+   * the attachment rows read from the file, the attachments cap flag and the
+   * body state. The transaction writes at most `budget` bytes of text,
+   * counting the message's other columns, which its full-text entry rewrites
+   * too: the items past that are left for another transaction. One message
+   * that alone is over the budget gets the failed state and BODY_TOO_LARGE.
+   */
+  phase2Batch(stamp: Stamp, items: Phase2Item[], budget = TXN_INPUT_BYTES): Phase2Stats {
+    const stats: Phase2Stats = {
+      stale: false,
+      written: 0,
+      dropped: 0,
+      rest: 0,
+      bytes: 0,
+      truncated: 0,
+      capped: [],
+      cappedNew: 0,
+      failed: [],
+    };
+    if (!sameStamp(stamp, this.stamp)) {
+      stats.stale = true;
+      return stats;
+    }
+    this.transaction(() => {
+      const target = this.db.stmt(
+        `SELECT m.rowid AS rowid, m.capped AS capped, p.rev AS rev, p.file_id AS file_id,
+           p.body_state AS body_state, coalesce(length(CAST(t.subject AS BLOB)), 0) + coalesce(length(CAST(t.sender AS BLOB)), 0)
+             + coalesce(length(CAST(t.recipients AS BLOB)), 0) AS other
+         FROM pairs p JOIN messages m ON m.proton_id = p.proton_id
+           LEFT JOIN message_text t ON t.rowid = m.rowid
+         WHERE p.proton_id = ?`,
+      );
+      const setText = this.db.stmt(
+        'UPDATE message_text SET body = ?, attachments = ? WHERE rowid = ?',
+      );
+      const dropRows = this.db.stmt(
+        "DELETE FROM attachments WHERE message_rowid = ? AND source = 'eml'",
+      );
+      const putRow = this.db.stmt(
+        `INSERT OR REPLACE INTO attachments(message_rowid, idx, filename, mime, size, content_id, source)
+         VALUES (?, ?, ?, ?, ?, ?, 'eml')`,
+      );
+      const setCapped = this.db.stmt('UPDATE messages SET capped = capped | ? WHERE rowid = ?');
+      const setState = this.db.stmt(
+        'UPDATE pairs SET body_state = ?, error_code = ? WHERE proton_id = ?',
+      );
+      for (const [i, item] of items.entries()) {
+        this.step();
+        const row = target.get(item.protonId);
+        if (
+          !row ||
+          asNumber(row.rev) !== item.rev ||
+          asNumber(row.body_state) !== BODY_STATE.pending
+        ) {
+          stats.dropped += 1;
+          continue;
+        }
+        const rowid = asNumber(row.rowid);
+        const fileId = String(row.file_id);
+        if (item.state === BODY_STATE.failed) {
+          setState.run(BODY_STATE.failed, item.error ?? 'BODY_FAILED', item.protonId);
+          stats.failed.push({ fileId, code: item.error ?? 'BODY_FAILED' });
+          stats.written += 1;
+          continue;
+        }
+        const bytes = textBytes(item) + asNumber(row.other);
+        if (bytes > budget) {
+          setState.run(BODY_STATE.failed, BODY_TOO_LARGE, item.protonId);
+          stats.failed.push({ fileId, code: BODY_TOO_LARGE });
+          stats.written += 1;
+          continue;
+        }
+        if (stats.bytes + bytes > budget) {
+          stats.rest = items.length - i;
+          break;
+        }
+        stats.bytes += bytes;
+        if (item.body !== '' || item.attachmentText !== '') {
+          setText.run(item.body, item.attachmentText, rowid);
+        }
+        dropRows.run(rowid);
+        for (const [idx, a] of item.attachments.entries()) {
+          if (idx > 0 && idx % REPOINT_CHUNK === 0) this.step();
+          putRow.run(rowid, idx, a.name, a.mime, a.size, a.contentId);
+        }
+        if (item.attachmentsCapped) {
+          setCapped.run(CAPPED.attachments, rowid);
+          stats.capped.push(fileId);
+          if (asNumber(row.capped) === 0) stats.cappedNew += 1;
+        }
+        if (item.state === BODY_STATE.truncated) stats.truncated += 1;
+        setState.run(item.state, null, item.protonId);
+        stats.written += 1;
       }
     });
     return stats;
@@ -903,9 +1107,15 @@ export class IndexWriter {
   /**
    * Places a message: joins the conversation of its keys, merges the ones it
    * links, or starts a new one. `rowid` keeps the row of a message placed
-   * again, whose text (and body) stays where it is.
+   * again, whose text (and body) stays where it is; `keptCapped` holds the
+   * cap flags it keeps from before.
    */
-  private insertMessage(row: MessageRow, stats: Phase1Stats, rowid: number | null = null): void {
+  private insertMessage(
+    row: MessageRow,
+    stats: Phase1Stats,
+    rowid: number | null = null,
+    keptCapped = 0,
+  ): void {
     const keys = conversationKeys(row);
     const found = new Set<number>();
     for (const key of keys) {
@@ -941,9 +1151,10 @@ export class IndexWriter {
       this.db
         .stmt(
           `INSERT INTO messages(rowid, proton_id, time, subject, sender_name, sender_addr, to_json, cc_json,
-             bcc_json, reply_to_json, flags, unread, replied, replied_all, forwarded, size,
-             num_attachments, mime_type, message_id, in_reply_to_json, references_json, dmarc, capped, thread_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             bcc_json, reply_to_json, sender_fold, to_fold, cc_fold, flags, unread, replied, replied_all,
+             forwarded, size, num_attachments, mime_type, message_id, in_reply_to_json, references_json,
+             dmarc, capped, thread_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           rowid,
@@ -956,6 +1167,9 @@ export class IndexWriter {
           JSON.stringify(row.cc),
           JSON.stringify(row.bcc),
           JSON.stringify(row.replyTo),
+          foldAddress(row.sender.address),
+          JSON.stringify(row.to.map((a) => foldAddress(a.address))),
+          JSON.stringify(row.cc.map((a) => foldAddress(a.address))),
           row.flags,
           row.unread,
           row.replied,
@@ -968,7 +1182,7 @@ export class IndexWriter {
           JSON.stringify(row.inReplyTo),
           JSON.stringify(row.references),
           row.dmarc,
-          row.capped,
+          row.capped | keptCapped,
           threadId,
         ).lastInsertRowid,
     );
@@ -1012,6 +1226,15 @@ export class IndexWriter {
         .run(messageRowid, subject, sender, recipients, '', '');
     }
   }
+}
+
+/** The UTF-8 bytes of text a phase 2 result writes: body, attachment names and rows. */
+export function textBytes(item: Phase2Item): number {
+  let n = Buffer.byteLength(item.body) + Buffer.byteLength(item.attachmentText);
+  for (const a of item.attachments) {
+    n += Buffer.byteLength(a.name) + Buffer.byteLength(a.mime) + Buffer.byteLength(a.contentId);
+  }
+  return n;
 }
 
 function metaRow(db: Db, key: string): unknown {

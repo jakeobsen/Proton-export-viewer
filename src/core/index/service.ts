@@ -11,6 +11,13 @@
 // after a while without queries or writes, both connections release their
 // caches.
 //
+// Phase 2 then reads the text of every message file still waiting for it,
+// newest message first: one file per pool job, with the same time limit, so a
+// file past it fails alone. The text is written in transactions of at most
+// 500 bodies and 4 MiB of text, counted after reading. A message whose file
+// changed since the scan waits for the next reconcile; one interrupted by a
+// close waits for the next open.
+//
 // On reopen, phase 1 reconciles: the folder's files are compared with the
 // stored pairs, what needs nothing read (a file gone, a message file changed)
 // is applied first, and only new and changed metadata files are read.
@@ -39,14 +46,17 @@ import type { Logger } from '../../shared/log/writer';
 import type { Stamp } from '../../shared/sources';
 import type { FileRef, RunScan } from '../containment';
 import { TXN_INPUT_BYTES, WRITE_BATCH_PAIRS } from './limits';
-import type {
-  ApplyResult,
-  BatchResult,
-  CheckResult,
-  LabelsJobResult,
-  MetaJobItem,
-  MetaJobResult,
-  WriterOpened,
+import {
+  BODY_CHANGED,
+  type ApplyResult,
+  type BatchResult,
+  type BodyJobItem,
+  type BodyJobResult,
+  type CheckResult,
+  type LabelsJobResult,
+  type MetaJobItem,
+  type MetaJobResult,
+  type WriterOpened,
 } from './ops';
 import {
   Pool,
@@ -56,13 +66,18 @@ import {
   type IndexThread,
   type ThreadRole,
 } from './pool';
-import { CAPPED, CAPPED_LISTS } from './schema';
+import { BODY_STATE, CAPPED, CAPPED_LISTS } from './schema';
 import {
+  BODY_TOO_LARGE,
   labelsStatOf,
+  textBytes,
   type ApplyItem,
+  type BodyTodo,
   type FileStat,
   type PairFiles,
   type Phase1Item,
+  type Phase2Item,
+  type Phase2Stats,
   type ReconcilePlan,
 } from './writer';
 
@@ -78,6 +93,10 @@ export const BATCHES_AHEAD = 2;
 export const IDLE_MS = 20_000;
 /** Progress is reported at most this often, and once more after the last change. */
 export const PROGRESS_MS = 250;
+/** Bodies per phase 2 transaction, at most. */
+export const BODY_BATCH = 500;
+/** Phase 2 jobs waiting per pool thread, so a thread never waits for the next file. */
+const BODY_LANES = 2;
 
 /** One registered connection: which thread holds it, on which database. */
 export interface Connection {
@@ -134,6 +153,8 @@ export interface IndexOptions {
    * write their batches in that order.
    */
   readByName?: boolean;
+  /** Bytes of text one phase 2 transaction writes, at most; TXN_INPUT_BYTES by default. */
+  txnBytes?: number;
 }
 
 export interface IndexServiceDeps {
@@ -217,7 +238,10 @@ export function reasonOf(code: string): string {
     case 'META_ID':
       return 'meta_id';
     case 'META_TIMEOUT':
+    case 'BODY_TIMEOUT':
       return 'timeout';
+    case BODY_TOO_LARGE:
+      return 'too_large';
     default:
       return 'worker_failed';
   }
@@ -251,6 +275,10 @@ export class IndexService {
     timeouts: 0,
     capped: 0,
     condition: 'ok',
+    bodyPhase: 'waiting',
+    bodiesDone: 0,
+    bodiesTotal: 0,
+    bodiesFailed: 0,
   };
   private readonly poolSize: number;
   private readonly jobMs: number;
@@ -266,6 +294,7 @@ export class IndexService {
   private readonly closing = new Promise<void>((resolve) => {
     this.endClosing = resolve;
   });
+  private readonly txnBytes: number;
 
   constructor(private readonly deps: IndexServiceDeps) {
     this.dbPath = join(deps.indexDir, `${deps.stamp.sourceKey}.sqlite`);
@@ -277,6 +306,7 @@ export class IndexService {
     this.idleMs = o.idleMs ?? IDLE_MS;
     this.capBytes = o.capBytes ?? null;
     this.batchPairs = Math.max(1, Math.min(WRITE_BATCH_PAIRS, o.batchPairs ?? WRITE_BATCH_PAIRS));
+    this.txnBytes = Math.max(1, Math.min(TXN_INPUT_BYTES, o.txnBytes ?? TXN_INPUT_BYTES));
   }
 
   private get src() {
@@ -372,12 +402,17 @@ export class IndexService {
     });
     this.writerEntry = this.connections.add({ role: 'writer', dbPath: this.dbPath });
     this.opened = opened;
-    if (opened.replaced) {
+    // An index of an older schema version is rebuilt like a new one: that's
+    // no damage, so it shows the usual indexing state.
+    const upgrade = opened.replaced && opened.mismatch === 'schema';
+    if (upgrade) {
+      this.deps.log.info('index.schema_rebuild', { reason: 'schema' }, this.src);
+    } else if (opened.replaced) {
       this.deps.log.warn('index.damaged', { reason: opened.mismatch ?? 'identity' }, this.src);
     }
     if (opened.created) this.deps.log.info('index.created', {}, this.src);
     this.progress.condition = opened.created
-      ? options.rebuild || opened.replaced
+      ? options.rebuild || (opened.replaced && !upgrade)
         ? 'rebuilding'
         : 'ok'
       : 'verifying';
@@ -487,15 +522,28 @@ export class IndexService {
     }
   }
 
-  /** Starts phase 1 for the pairs the index doesn't have yet. */
-  startPhase1(scan: RunScan): Promise<void> {
-    this.running ??= this.runPhase1(scan).finally(() => {
+  /**
+   * Starts indexing the scanned folder: phase 1 brings the metadata in line
+   * with it, then phase 2 reads the text of the message files that wait for
+   * it. Resolves when both have ended.
+   */
+  startIndexing(scan: RunScan): Promise<void> {
+    this.running ??= this.index(scan).finally(() => {
       this.running = null;
     });
     return this.running;
   }
 
-  /** Resolves when phase 1, if running, has ended. */
+  private async index(scan: RunScan): Promise<void> {
+    try {
+      if (await this.runPhase1(scan)) await this.runPhase2(scan);
+    } finally {
+      await this.stopPool();
+      this.touch();
+    }
+  }
+
+  /** Resolves when indexing, if running, has ended. */
   async settled(): Promise<void> {
     await this.running;
   }
@@ -538,7 +586,8 @@ export class IndexService {
     await pool?.stop();
   }
 
-  private async runPhase1(scan: RunScan): Promise<void> {
+  /** Phase 1; resolves true if it ended with every pair handled. */
+  private async runPhase1(scan: RunScan): Promise<boolean> {
     const started = performance.now();
     const stamp = this.deps.stamp;
     this.touch();
@@ -607,15 +656,238 @@ export class IndexService {
         { count: this.progress.loaded, ms: Math.round(performance.now() - started) },
         this.src,
       );
+      return true;
     } catch (err) {
       this.progress.phase = 'failed';
       this.report(true);
       this.watch(err);
       const code = err instanceof ThreadError ? err.code : 'FAILED';
       this.deps.log.warn('index.phase1_failed', { reason: failureReason(code) }, this.src);
-    } finally {
-      await this.stopPool();
-      this.touch();
+      return false;
+    }
+  }
+
+  /**
+   * Phase 2: reads the text of every message file that waits for it, newest
+   * message first, and writes it. Progress counts the files handled in this
+   * run.
+   */
+  private async runPhase2(scan: RunScan): Promise<void> {
+    const started = performance.now();
+    try {
+      const writer = this.writer;
+      if (!writer) throw new ThreadError('NOT_OPEN');
+      const pool = this.startPool();
+      if (!this.current()) throw new ThreadError('STALE');
+      const order = await writer.call<number[]>('bodyOrder');
+      this.progress.bodyPhase = 'indexing';
+      this.progress.bodiesTotal = order.length;
+      this.report(true);
+      await this.readBodies(pool, writer, order, scan.eml);
+      if (!this.current()) throw new ThreadError('STALE');
+      this.progress.bodyPhase = 'done';
+      this.report(true);
+      this.deps.log.info(
+        'index.phase2_done',
+        { count: this.progress.bodiesDone, ms: Math.round(performance.now() - started) },
+        this.src,
+      );
+    } catch (err) {
+      this.progress.bodyPhase = 'failed';
+      this.report(true);
+      this.watch(err);
+      const code = err instanceof ThreadError ? err.code : 'FAILED';
+      this.deps.log.warn('index.phase2_failed', { reason: failureReason(code) }, this.src);
+    }
+  }
+
+  /**
+   * Reads the files of these messages, in this order, and writes their text.
+   * The messages are looked up a page at a time, just before their files are
+   * read, each with its current rev. Results are written in batches of at
+   * most BODY_BATCH bodies and 4 MiB of text; a few batches wait for the
+   * writer at most, and no file is read while they do.
+   */
+  private async readBodies(
+    pool: Pool,
+    writer: IndexThread,
+    order: number[],
+    refs: Map<string, FileRef>,
+  ): Promise<void> {
+    const stamp = this.deps.stamp;
+    let failure: unknown = null;
+    let page: BodyTodo[] = [];
+    let next = 0;
+    let listed = 0;
+    let fetching: Promise<void> | null = null;
+    // The next message to read, or null once there are none.
+    const take = async (): Promise<BodyTodo | null> => {
+      while (next >= page.length) {
+        if (listed >= order.length || failure) return null;
+        fetching ??= (async () => {
+          const rowids = order.slice(listed, listed + BODY_BATCH);
+          listed += rowids.length;
+          const todo = await writer.call<BodyTodo[]>('bodyTodo', { rowids });
+          // The rest no longer wait for their text.
+          this.progress.bodiesDone += rowids.length - todo.length;
+          page = todo;
+          next = 0;
+        })().finally(() => {
+          fetching = null;
+        });
+        await fetching;
+      }
+      return page[next++]!;
+    };
+
+    let buffer: Phase2Item[] = [];
+    let bufferBytes = 0;
+    let writes: Promise<void> = Promise.resolve();
+    const pending: Array<Promise<void>> = [];
+    const write = async (items: Phase2Item[]): Promise<void> => {
+      let rest = items;
+      while (rest.length > 0 && !failure) {
+        if (!this.current()) {
+          this.deps.log.info(
+            'writer.stale_dropped',
+            { generation: stamp.generation, count: rest.length },
+            this.src,
+          );
+          throw new ThreadError('STALE');
+        }
+        const stats = await writer.call<Phase2Stats>('phase2', {
+          stamp,
+          items: rest,
+          budget: this.txnBytes,
+        });
+        if (stats.stale) throw new ThreadError('STALE');
+        const handled = rest.length - stats.rest;
+        // The writer always writes the first item: alone, it fits or fails.
+        if (handled <= 0) throw new ThreadError('FAILED');
+        this.afterBodies(stats, handled);
+        rest = rest.slice(handled);
+      }
+    };
+    const flush = (): void => {
+      if (buffer.length === 0 || failure) return;
+      const items = buffer;
+      buffer = [];
+      bufferBytes = 0;
+      writes = writes.then(() => write(items));
+      const done: Promise<void> = writes
+        .catch((err: unknown) => {
+          failure ??= err;
+        })
+        .finally(() => pending.splice(pending.indexOf(done), 1));
+      pending.push(done);
+    };
+    const lane = async (): Promise<void> => {
+      for (;;) {
+        while (pending.length >= BATCHES_AHEAD && !failure) await pending[0];
+        if (failure || !this.current()) return;
+        const todo = await take();
+        if (!todo) return;
+        const item = await this.bodyItem(pool, todo, refs);
+        if (item === null) {
+          // Left waiting for the next reconcile.
+          this.progress.bodiesDone += 1;
+          continue;
+        }
+        const bytes = textBytes(item);
+        if (buffer.length > 0 && bufferBytes + bytes > this.txnBytes) flush();
+        buffer.push(item);
+        bufferBytes += bytes;
+        if (buffer.length >= BODY_BATCH || bufferBytes >= this.txnBytes) flush();
+      }
+    };
+    await Promise.all(
+      Array.from({ length: pool.threads.length * BODY_LANES }, () =>
+        lane().catch((err: unknown) => {
+          failure ??= err;
+        }),
+      ),
+    );
+    flush();
+    while (pending.length > 0) await pending[0];
+    if (failure) throw failure;
+  }
+
+  /**
+   * Reads one message file on the pool. Null leaves the message waiting: its
+   * file isn't the one the scan found, or changed since.
+   */
+  private async bodyItem(
+    pool: Pool,
+    todo: BodyTodo,
+    refs: Map<string, FileRef>,
+  ): Promise<Phase2Item | null> {
+    const ref = refs.get(todo.protonId);
+    if (
+      !ref ||
+      ref.rel !== todo.rel ||
+      ref.size !== todo.size ||
+      String(ref.mtimeNs) !== todo.mtimeNs ||
+      String(ref.dev) !== todo.dev ||
+      String(ref.ino) !== todo.ino
+    ) {
+      return null;
+    }
+    const failed = (error: string): Phase2Item => ({
+      protonId: todo.protonId,
+      rev: todo.rev,
+      state: BODY_STATE.failed,
+      body: '',
+      attachments: [],
+      attachmentText: '',
+      attachmentsCapped: false,
+      error,
+    });
+    let result: BodyJobResult;
+    try {
+      const item: BodyJobItem = { protonId: todo.protonId, rev: todo.rev, ref };
+      result = await pool.run<BodyJobResult>('body', { root: this.deps.root, item }, this.jobMs);
+    } catch (err) {
+      const code = err instanceof ThreadError ? err.code : 'FAILED';
+      // The pool ended: indexing stops here.
+      if (code === THREAD_STOPPED) throw err;
+      if (code === TIMEOUT) {
+        this.progress.timeouts += 1;
+        return failed('BODY_TIMEOUT');
+      }
+      return failed('BODY_FAILED');
+    }
+    if (!result.ok) return result.error === BODY_CHANGED ? null : failed(result.error);
+    return {
+      protonId: todo.protonId,
+      rev: todo.rev,
+      state: result.truncated ? BODY_STATE.truncated : BODY_STATE.indexed,
+      body: result.body,
+      attachments: result.attachments,
+      attachmentText: result.attachmentText,
+      attachmentsCapped: result.attachmentsCapped,
+      error: null,
+    };
+  }
+
+  private afterBodies(stats: Phase2Stats, handled: number): void {
+    this.touch();
+    this.progress.bodiesDone += handled;
+    this.progress.bodiesFailed += stats.failed.length;
+    this.progress.capped += stats.cappedNew;
+    this.report();
+    for (const fileId of stats.capped) {
+      this.deps.log.info('index.capped', { fileId, list: 'attachments' }, this.src);
+    }
+    for (const { fileId, code } of stats.failed) {
+      if (code === BODY_TOO_LARGE) {
+        this.deps.log.warn('index.body_too_large', { fileId }, this.src);
+      } else {
+        this.deps.log.info(
+          code === 'BODY_TIMEOUT' ? 'index.timeout' : 'index.body_failed',
+          { fileId, reason: reasonOf(code) },
+          this.src,
+        );
+      }
     }
   }
 
