@@ -37,6 +37,7 @@ const FORBIDDEN_CONTENT = [
   'pev-selftest',
   'pev-script-marker',
   'pev-bench',
+  'pev-open-bench',
   'pev-reader-test-source',
   'pev-reader-unsanitized',
   'pev-no-resolver-rule',
