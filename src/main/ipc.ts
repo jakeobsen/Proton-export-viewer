@@ -31,7 +31,7 @@ import { CoreUnavailableError } from './core-host';
 import type { AppContext, AppWindow } from './context';
 import { DIALOG_ID_RE } from './link-dialog';
 import { sameFrame } from './navigation';
-import { OpenPacer } from './open-pacer';
+import { OPEN_GAP_MS, OpenPacer } from './open-pacer';
 import { PLACEHOLDER } from './placeholder';
 import { bodyUrl } from './views';
 
@@ -212,7 +212,9 @@ export function registerIpc(ctx: AppContext): void {
     return { ok: true, openId, url: bodyUrl(token) };
   });
 
-  const openPacer = new OpenPacer<AppWindow>();
+  const openPacer = new OpenPacer<AppWindow>(() =>
+    __PEV_TEST_HOOKS__ ? (ctx.openGapMs ?? OPEN_GAP_MS) : OPEN_GAP_MS,
+  );
   guarded<MessageOpenResult>(IPC.open, async (appWin, raw) => {
     const args = MessageOpenArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
@@ -235,6 +237,18 @@ export function registerIpc(ctx: AppContext): void {
       return reject('superseded', appWin);
     }
     if (appWin.win.isDestroyed()) return reject('superseded', appWin);
+    // While it waited, the source may have changed, a newer open come in, or
+    // the export gone: then nothing goes to core.
+    if (generation !== ctx.generation || openId !== appWin.views.latest) {
+      const reason = generation !== ctx.generation ? 'generation' : 'open_id';
+      appWin.views.abandon(openId);
+      ctx.log.info('open.stale', { reason, openId, windowId: appWin.id });
+      return reject(reason === 'generation' ? 'stale_generation' : 'superseded', appWin);
+    }
+    if (ctx.sources.isOffline()) {
+      appWin.views.abandon(openId);
+      return reject('offline', appWin);
+    }
     let result;
     try {
       result = await ctx.core.requestRunning(

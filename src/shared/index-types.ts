@@ -44,6 +44,8 @@ export interface ListRow {
   attachments: boolean;
   /** The conversation's newest message in this folder or label: a selection holds this. */
   anchorRowid: number;
+  /** The conversation's newest message in any folder or label: selecting it opens this. */
+  newestRowid: number;
 }
 
 export interface ListPage {

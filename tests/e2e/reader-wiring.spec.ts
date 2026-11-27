@@ -6,7 +6,15 @@
 // nothing to core; and a message file that is missing, deleted or swapped
 // shows a state and holds nothing up.
 
-import { realpathSync, renameSync, rmSync, symlinkSync } from 'node:fs';
+import {
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import type { Page } from '@playwright/test';
@@ -100,7 +108,7 @@ async function showAll(pev: PevApp, page: Page = pev.page): Promise<void> {
 
 /** The message file of a row's newest message, as the scan saw it. */
 async function emlOf(pev: PevApp, written: WrittenExport, row: ListRow): Promise<string> {
-  const file = (await ask<EmlFile>(pev, { op: 'eml', rowid: row.anchorRowid }))!.answer;
+  const file = (await ask<EmlFile>(pev, { op: 'eml', rowid: row.newestRowid }))!.answer;
   if (file.rel === null) throw new Error('no message file');
   return join(written.run, file.rel);
 }
@@ -134,7 +142,7 @@ test("a click or a key opens the conversation's newest message from the export",
   expect(rows.length).toBeGreaterThan(2);
 
   await pressRow(pev.page, rows[1]!);
-  const first = await shown(pev, rows[1]!.anchorRowid);
+  const first = await shown(pev, rows[1]!.newestRowid);
   expect(await status(pev, 1, first)).toBe(200);
   // The pane has the message's own header.
   await expect(pev.page.locator('.rp-subject')).not.toHaveText('');
@@ -145,7 +153,7 @@ test("a click or a key opens the conversation's newest message from the export",
     'aria-selected',
     'true',
   );
-  const second = await shown(pev, rows[2]!.anchorRowid);
+  const second = await shown(pev, rows[2]!.newestRowid);
   expect(second).not.toBe(first);
   expect(await status(pev, 1, first)).toBe(404);
 
@@ -165,6 +173,106 @@ test("a click or a key opens the conversation's newest message from the export",
   await checkHidden(pev);
 });
 
+/** Rewrites a pair under a new ID, with its own headers, time, subject and labels. */
+function rewrite(
+  run: string,
+  from: string,
+  to: string,
+  fields: { headers: string; time: number; subject: string; labelIds: string[] },
+): void {
+  const doc = JSON.parse(readFileSync(join(run, `${from}.metadata.json`), 'utf8')) as {
+    Payload: Record<string, unknown>;
+  };
+  doc.Payload.ID = to;
+  doc.Payload.Headers = fields.headers;
+  doc.Payload.Time = fields.time;
+  doc.Payload.Subject = fields.subject;
+  doc.Payload.LabelIDs = fields.labelIds;
+  doc.Payload.Unread = 0;
+  rmSync(join(run, `${from}.metadata.json`));
+  writeFileSync(join(run, `${to}.metadata.json`), JSON.stringify(doc));
+  renameSync(join(run, `${from}.eml`), join(run, `${to}.eml`));
+}
+
+test('a conversation whose newest message is in another folder opens that message, by click and by key', async ({
+  pev,
+}) => {
+  const root = realpathSync(testDir('wire-split'));
+  const written = writeExport(root, { seed: 64, messages: 4 });
+  const ids = readdirSync(written.run)
+    .filter((n) => n.endsWith('.metadata.json'))
+    .map((n) => n.slice(0, -'.metadata.json'.length))
+    .sort();
+  const t0 = 1_750_000_000;
+  const inboxOnly = ['0', ALL];
+  // S: its first message is in the inbox, its newer reply only in Sent.
+  rewrite(written.run, ids[0]!, 'S1', {
+    headers: 'Message-ID: <s1@example.com>\r\n',
+    time: t0,
+    subject: 'Plan',
+    labelIds: inboxOnly,
+  });
+  rewrite(written.run, ids[1]!, 'S2', {
+    headers: 'Message-ID: <s2@example.com>\r\nIn-Reply-To: <s1@example.com>\r\n',
+    time: t0 + 3600,
+    subject: 'Re: Plan',
+    labelIds: ['7', ALL],
+  });
+  // Two newer inbox conversations above it.
+  rewrite(written.run, ids[2]!, 'O1', {
+    headers: 'Message-ID: <o1@example.com>\r\n',
+    time: t0 + 60,
+    subject: 'Other',
+    labelIds: inboxOnly,
+  });
+  rewrite(written.run, ids[3]!, 'P1', {
+    headers: 'Message-ID: <p1@example.com>\r\n',
+    time: t0 + 30,
+    subject: 'Third',
+    labelIds: inboxOnly,
+  });
+  await pev.main('queuePick', root, 'bm1');
+  await pev.shell('chooseFolder', []);
+  await phase1Done(pev, 4);
+  await press(pev.page, '[data-folder="0"]');
+  await expect(pev.page.locator('[data-folder="0"]')).toHaveAttribute('aria-current', 'true');
+  const rows = (await ask<ListWindow>(pev, {
+    op: 'window',
+    labelId: '0',
+    anchor: { index: 0 },
+    before: 0,
+    after: 10,
+    selected: null,
+  }))!.answer.rows;
+  expect(rows.map((r) => r.count)).toEqual([1, 1, 2]);
+  const split = rows[2]!;
+  // In the inbox its anchor is S1; its newest message of all is S2, in Sent.
+  expect(split.newestRowid).not.toBe(split.anchorRowid);
+  const fileOf = async (rowid: number) =>
+    (await ask<EmlFile>(pev, { op: 'eml', rowid }))!.answer.rel;
+  expect(await fileOf(split.anchorRowid)).toMatch(/(^|\/)S1\.eml$/);
+  expect(await fileOf(split.newestRowid)).toMatch(/(^|\/)S2\.eml$/);
+
+  // By click: the reader opens S2.
+  await pressRow(pev.page, split);
+  const clicked = await shown(pev, split.newestRowid);
+  expect(await status(pev, 1, clicked)).toBe(200);
+
+  // By key, from the top row down to it: S2 again, in a new view.
+  await pressRow(pev.page, rows[0]!);
+  await shown(pev, rows[0]!.newestRowid);
+  await arrowDown(pev.page);
+  await shown(pev, rows[1]!.newestRowid);
+  await arrowDown(pev.page);
+  await expect(pev.page.locator(`.conv[data-thread="${split.threadId}"]`)).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  const keyed = await shown(pev, split.newestRowid);
+  expect(keyed).not.toBe(clicked);
+  await checkHidden(pev);
+});
+
 test('fast selection renders only the newest open, and opens no file for the others', async ({
   pev,
 }) => {
@@ -172,7 +280,7 @@ test('fast selection renders only the newest open, and opens no file for the oth
   const rows = await inbox(pev);
   expect(rows.length).toBeGreaterThan(5);
   await pressRow(pev.page, rows[0]!);
-  const first = await shown(pev, rows[0]!.anchorRowid);
+  const first = await shown(pev, rows[0]!.newestRowid);
 
   // Five key presses while core holds every open. The first goes to core at
   // once; of the four that wait their turn, only the newest follows it.
@@ -188,7 +296,7 @@ test('fast selection renders only the newest open, and opens no file for the oth
   const opens = await fileOpens(pev);
   await pev.main('core', 'release');
 
-  const last = await shown(pev, rows[5]!.anchorRowid);
+  const last = await shown(pev, rows[5]!.newestRowid);
   expect(count(pev, 'view.installed')).toBe(installed + 1);
   await expect
     .poll(() => count(pev, 'ipc.rejected', { reason: 'superseded' }))
@@ -228,7 +336,7 @@ test('selection faster than the frame may navigate: the frame keeps up, the last
   const rows = await inbox(pev);
   expect(rows.length).toBeGreaterThan(2);
   await pressRow(pev.page, rows[0]!);
-  await shown(pev, rows[0]!.anchorRowid);
+  await shown(pev, rows[0]!.newestRowid);
   await pev.main('clearRequests');
 
   // 300 selections a few milliseconds apart, between the first two rows: far
@@ -247,7 +355,7 @@ test('selection faster than the frame may navigate: the frame keeps up, the last
     'true',
   );
   // The last selection loads, in the one body frame there is.
-  const burst = await readerText(pev, last.anchorRowid);
+  const burst = await readerText(pev, last.newestRowid);
   await expect(pev.page.locator('.reader .rp-frame')).toHaveCount(1);
   expect(await pev.main('liveViews', 1)).toBe(1);
   const times = await pev.main<number[]>('bodyRequestTimes', 1);
@@ -257,9 +365,70 @@ test('selection faster than the frame may navigate: the frame keeps up, the last
 
   // Header and body are the message's own: the same as a calm open of it.
   await pressRow(pev.page, rows[1]!);
-  await shown(pev, rows[1]!.anchorRowid);
+  await shown(pev, rows[1]!.newestRowid);
   await pressRow(pev.page, last);
-  expect(await readerText(pev, last.anchorRowid)).toEqual(burst);
+  expect(await readerText(pev, last.newestRowid)).toEqual(burst);
+  await checkHidden(pev);
+});
+
+test('an open waiting its turn sends nothing to core once a newer open, a switch or going offline came first', async ({
+  pev,
+}) => {
+  const written = await openExport(pev, 'wire-recheck', 67);
+  const key = (await pev.main<Stamp>('sourceStamp')).sourceKey;
+  // Long enough to change things while an open waits its turn.
+  const gap = 4000;
+  await pev.main('openGap', gap);
+  const stale = (reason: string) =>
+    pev.logs('main').filter((l) => l.code === 'open.stale' && l.data.reason === reason).length;
+
+  /** Opens `first`, then selects `next`, whose open main accepts and holds until its turn. */
+  const waitingOpen = async (first: ListRow, next: ListRow) => {
+    await pev.page.waitForTimeout(gap + 100);
+    await pressRow(pev.page, first);
+    await shown(pev, first.newestRowid);
+    const replaced = count(pev, 'view.revoked', { reason: 'replaced' });
+    await pressRow(pev.page, next);
+    // Main accepted it: the view shown was revoked for it.
+    await expect.poll(() => count(pev, 'view.revoked', { reason: 'replaced' })).toBe(replaced + 1);
+    expect(await held(pev)).toBe(0);
+  };
+  /** Holds core's opens until the waiting open's turn has come, and checks none reached core. */
+  const nothingSent = async (reason: string, before: number, installed: number) => {
+    await pev.main('core', 'hold');
+    await expect.poll(() => stale(reason), { timeout: gap + 5000 }).toBe(before + 1);
+    expect(await held(pev)).toBe(0);
+    await pev.main('core', 'release');
+    expect(count(pev, 'view.installed')).toBe(installed);
+  };
+
+  // A newer open that doesn't wait its turn: the stub open of the test hooks.
+  let rows = await inbox(pev);
+  await waitingOpen(rows[0]!, rows[1]!);
+  const byOpen = stale('open_id');
+  expect(await pev.open('sample')).toMatchObject({ ok: true });
+  await nothingSent('open_id', byOpen, count(pev, 'view.installed'));
+
+  // The same export opened again: a new generation, where its row is still there.
+  rows = await inbox(pev);
+  await waitingOpen(rows[2]!, rows[3]!);
+  const bySwitch = stale('generation');
+  const installed = count(pev, 'view.installed');
+  expect(await pev.shell('openExport', [key])).toMatchObject({ outcome: 'opened' });
+  await nothingSent('generation', bySwitch, installed);
+  expect(await fileOpens(pev)).toBe(0);
+
+  // The export goes away while an open waits: it is opened again, offline.
+  await showAll(pev);
+  await expect.poll(async () => (await inbox(pev)).length).toBeGreaterThan(3);
+  rows = await inbox(pev);
+  await waitingOpen(rows[0]!, rows[1]!);
+  const byOffline = stale('generation');
+  const away = realpathSync(testDir('wire-recheck-away'));
+  renameSync(join(written.root, written.account), join(away, written.account));
+  expect(await pev.shell('openExport', [key])).toMatchObject({ outcome: 'offline' });
+  await nothingSent('generation', byOffline, count(pev, 'view.installed'));
+  await pev.main('openGap', null);
   await checkHidden(pev);
 });
 
@@ -271,7 +440,7 @@ test('a switch, Forget, a window close or a new generation leaves nothing of the
   // A switch to another export.
   const rows = await inbox(pev);
   await pressRow(pev.page, rows[0]!);
-  const beforeSwitch = await shown(pev, rows[0]!.anchorRowid);
+  const beforeSwitch = await shown(pev, rows[0]!.newestRowid);
   await openExport(pev, 'wire-gen-other', 64, 'bm2');
   expect(await status(pev, 1, beforeSwitch)).toBe(404);
   await expect.poll(async () => (await reader(pev)).rowid).toBeNull();
@@ -279,7 +448,7 @@ test('a switch, Forget, a window close or a new generation leaves nothing of the
   // Forget of the open export.
   const otherRows = await inbox(pev);
   await pressRow(pev.page, otherRows[0]!);
-  const beforeForget = await shown(pev, otherRows[0]!.anchorRowid);
+  const beforeForget = await shown(pev, otherRows[0]!.newestRowid);
   const key = (await pev.main<Stamp>('sourceStamp')).sourceKey;
   await pev.shell('forgetExport', [key]);
   expect(await status(pev, 1, beforeForget)).toBe(404);
@@ -292,7 +461,7 @@ test('a switch, Forget, a window close or a new generation leaves nothing of the
   const windowRows = await inbox(pev);
   await expect(b.page.locator(`.conv[data-thread="${windowRows[0]!.threadId}"]`)).toHaveCount(1);
   await pressRow(b.page, windowRows[0]!);
-  const inB = await shown(pev, windowRows[0]!.anchorRowid, b.page);
+  const inB = await shown(pev, windowRows[0]!.newestRowid, b.page);
   expect(await status(pev, b.windowId, inB)).toBe(200);
   await b.page.close();
   await expect
@@ -301,7 +470,7 @@ test('a switch, Forget, a window close or a new generation leaves nothing of the
 
   // A result that comes back after the generation moved installs nothing.
   await pressRow(pev.page, windowRows[0]!);
-  const first = await shown(pev, windowRows[0]!.anchorRowid);
+  const first = await shown(pev, windowRows[0]!.newestRowid);
   await pev.main('core', 'hold');
   await pressRow(pev.page, windowRows[1]!);
   await expect.poll(() => held(pev)).toBe(1);
@@ -361,7 +530,7 @@ test('a message file that is missing, deleted or swapped shows a state and holds
   const key = (await pev.main<Stamp>('sourceStamp')).sourceKey;
   await pev.shell('openExport', [key]);
   await expect
-    .poll(async () => (await ask<EmlFile>(pev, { op: 'eml', rowid: missing.anchorRowid }))?.answer)
+    .poll(async () => (await ask<EmlFile>(pev, { op: 'eml', rowid: missing.newestRowid }))?.answer)
     .toMatchObject({ bodyState: 4 });
 
   // The others change after the scan.
@@ -380,14 +549,14 @@ test('a message file that is missing, deleted or swapped shows a state and holds
   await pressRow(pev.page, deleted);
   await expect
     .poll(async () => (await reader(pev)) as Reader)
-    .toMatchObject({ rowid: deleted.anchorRowid, refused: 'eml_missing' });
+    .toMatchObject({ rowid: deleted.newestRowid, refused: 'eml_missing' });
   await expect(pev.page.locator('.rp-state')).toHaveText('Message file missing');
 
   for (const row of [linked, piped]) {
     await pressRow(pev.page, row);
     await expect
       .poll(async () => (await reader(pev)) as Reader)
-      .toMatchObject({ rowid: row.anchorRowid, pending: false, fallback: true, view: null });
+      .toMatchObject({ rowid: row.newestRowid, pending: false, fallback: true, view: null });
     await expect(pev.page.locator('.rp-fallback b')).toHaveText("Couldn't render this message");
   }
   expect(count(pev, 'open.fallback', { reason: 'file' })).toBe(2);
@@ -400,7 +569,7 @@ test('a message file that is missing, deleted or swapped shows a state and holds
 
   // Nothing was held up: the next message opens.
   await pressRow(pev.page, fine);
-  await shown(pev, fine.anchorRowid);
+  await shown(pev, fine.newestRowid);
   await checkHidden(pev);
 });
 
@@ -410,7 +579,7 @@ test("the test hooks' stub frame has the attributes of the reader's body frame",
   await openExport(pev, 'wire-frames', 68);
   const rows = await inbox(pev);
   await pressRow(pev.page, rows[0]!);
-  await shown(pev, rows[0]!.anchorRowid);
+  await shown(pev, rows[0]!.newestRowid);
   await pev.open('sample');
   const attributes = (selector: string) =>
     pev.page.locator(selector).evaluate((el) => {

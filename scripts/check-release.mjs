@@ -39,6 +39,7 @@ const FORBIDDEN_CONTENT = [
   'pev-bench',
   'pev-reader-test-source',
   'readByName',
+  'openGapMs',
   'better-sqlite3',
   'ws://localhost',
   "style-src 'self' 'unsafe-inline'",

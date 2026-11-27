@@ -154,13 +154,13 @@ export function showFolder(id: string): void {
 }
 
 /**
- * Selects a conversation, by a click or a key, and opens its newest message
- * in this folder in the reader. The message already open there stays as it
- * is, unless its open was refused.
+ * Selects a conversation, by a click or a key, and opens its newest message,
+ * in whatever folder or label it is, in the reader. The message already open
+ * there stays as it is, unless its open was refused.
  */
 export function selectRow(row: Row): void {
   list.select(row);
   const reader = getReaderState();
-  if (reader.rowid === row.anchorRowid && reader.refused === null) return;
-  void openInReader(row.anchorRowid);
+  if (reader.rowid === row.newestRowid && reader.refused === null) return;
+  void openInReader(row.newestRowid);
 }

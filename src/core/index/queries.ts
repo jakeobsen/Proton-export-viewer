@@ -85,12 +85,18 @@ const ROW_SELECT = `SELECT tl.thread_id AS thread_id, tl.last_time AS last_time,
     t.attach_count AS attach_count
   FROM thread_labels tl JOIN threads t ON t.thread_id = tl.thread_id`;
 
-/** List rows from query rows, each with its newest message in the folder or label. */
+/**
+ * List rows from query rows, each with its newest message in the folder or
+ * label, and its newest message of all.
+ */
 function toListRows(db: Db, labelId: string, rows: Record<string, unknown>[]): ListRow[] {
   const anchor = db.stmt(
     `SELECT m.rowid AS rowid FROM messages m JOIN message_labels ml
        ON ml.message_rowid = m.rowid AND ml.label_id = ?
      WHERE m.thread_id = ? ORDER BY m.time DESC, m.rowid DESC LIMIT 1`,
+  );
+  const newest = db.stmt(
+    `SELECT rowid FROM messages WHERE thread_id = ? ORDER BY time DESC, rowid DESC LIMIT 1`,
   );
   return rows.map((r) => {
     const threadId = asNumber(r.thread_id);
@@ -102,6 +108,7 @@ function toListRows(db: Db, labelId: string, rows: Record<string, unknown>[]): L
       unreadHere: asNumber(r.unread_here),
       attachments: asNumber(r.attach_count) > 0,
       anchorRowid: asNumber(anchor.get(labelId, threadId)?.rowid),
+      newestRowid: asNumber(newest.get(threadId)?.rowid),
     };
   });
 }

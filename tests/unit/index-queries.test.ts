@@ -56,8 +56,15 @@ describe('conversation list pages', () => {
       db.stmt("SELECT rowid FROM messages WHERE proton_id = 'in'").get()?.rowid,
     );
     expect(inbox[1]!.anchorRowid).toBe(inRowid);
+    // Its newest message of all is the sent reply, outside the inbox.
+    const sentRowid = asNumber(
+      db.stmt("SELECT rowid FROM messages WHERE proton_id = 'sent'").get()?.rowid,
+    );
+    expect(inbox[1]!.newestRowid).toBe(sentRowid);
+    expect(inbox[0]!.newestRowid).toBe(inbox[0]!.anchorRowid);
     const sent = listPage(db, '7', null).rows;
     expect(sent.map((r) => r.time)).toEqual([50]);
+    expect(sent[0]!.newestRowid).toBe(sentRowid);
     db.close();
   });
 

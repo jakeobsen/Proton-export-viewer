@@ -224,6 +224,10 @@ export async function install(ctx: AppContext): Promise<boolean> {
     },
     requests: (windowId: number) => recordsFor(windowId),
     bodyRequestTimes: (windowId: number) => [...(bodyTimes.get(windowId) ?? [])],
+    /** Sets the least time between a window's opens; null restores the usual one. */
+    openGap: (ms: number | null) => {
+      ctx.openGapMs = ms ?? undefined;
+    },
     clearRequests: () => {
       bodyTimes.clear();
       // Each session's observer keeps its record object, so empty it in place.

@@ -22,7 +22,7 @@ export class OpenPacer<W extends object> {
   private readonly lanes = new WeakMap<W, Lane>();
 
   constructor(
-    private readonly gapMs: number = OPEN_GAP_MS,
+    private readonly gap: () => number = () => OPEN_GAP_MS,
     private readonly now: () => number = () => performance.now(),
   ) {}
 
@@ -42,18 +42,25 @@ export class OpenPacer<W extends object> {
       current.waiting.resolve(false);
       current.waiting = null;
     }
-    const wait = current.last + this.gapMs - this.now();
+    const wait = current.last + this.gap() - this.now();
     if (wait <= 0) {
       current.last = this.now();
       return Promise.resolve(true);
     }
     return new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => {
+      const go = () => {
+        // A timer runs in whole milliseconds, on another clock: wait out what's left.
+        const left = current.last + this.gap() - this.now();
+        if (left > 0) {
+          waiting.timer = setTimeout(go, Math.ceil(left));
+          return;
+        }
         current.waiting = null;
         current.last = this.now();
         resolve(true);
-      }, wait);
-      current.waiting = { timer, resolve };
+      };
+      const waiting: Waiting = { timer: setTimeout(go, Math.ceil(wait)), resolve };
+      current.waiting = waiting;
     });
   }
 }

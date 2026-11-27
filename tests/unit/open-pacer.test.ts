@@ -10,7 +10,11 @@ describe('the open pacer', () => {
     vi.useRealTimers();
   });
 
-  const pacer = () => new OpenPacer<object>(OPEN_GAP_MS, () => Date.now());
+  const pacer = () =>
+    new OpenPacer<object>(
+      () => OPEN_GAP_MS,
+      () => Date.now(),
+    );
 
   it('starts an open at once when the gap since the last one has passed', async () => {
     const p = pacer();
@@ -62,6 +66,28 @@ describe('the open pacer', () => {
     expect(starts.length).toBeGreaterThan(150);
     // The last selection always opens.
     expect(starts.at(-1)).toBeGreaterThanOrEqual(2000 * 5 - 5);
+  });
+
+  it('holds the gap on a clock with fractions of a millisecond', async () => {
+    let now = 0.4;
+    const p = new OpenPacer<object>(
+      () => OPEN_GAP_MS,
+      () => now,
+    );
+    const win = {};
+    expect(await p.turn(win)).toBe(true);
+    now = 10;
+    let started: number | null = null;
+    void p.turn(win).then((go) => {
+      if (go) started = now;
+    });
+    // The timer fires while the clock is still short of the gap: it waits on.
+    now = OPEN_GAP_MS + 0.2;
+    await vi.advanceTimersByTimeAsync(Math.ceil(OPEN_GAP_MS + 0.4 - 10));
+    expect(started).toBeNull();
+    now = OPEN_GAP_MS + 0.4;
+    await vi.advanceTimersByTimeAsync(1);
+    expect(started).toBe(OPEN_GAP_MS + 0.4);
   });
 
   it('keeps windows apart', async () => {
