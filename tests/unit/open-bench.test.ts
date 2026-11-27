@@ -32,6 +32,7 @@ import {
 } from '../../tools/bench/run-open-bench.mjs';
 import { checkOutside, createWorkspace } from '../../tools/bench/workspace.mjs';
 import { readConfig } from '../../src/testhooks/open-bench-config';
+import { OPEN_PACE_MS, paced } from '../../src/testhooks/open-pace';
 import type { TimedOpen } from '../../src/testhooks/open-bench-types';
 import { REPO_ROOT, testDir } from '../paths';
 
@@ -211,6 +212,49 @@ describe('the output folder', () => {
     // A workspace beside the corpus is accepted.
     const outside = createWorkspace(join(parent, 'ws'), nonce, []);
     expect(readConfig(config(outside)).workspace).toBe(outside);
+  });
+});
+
+describe('the pace', () => {
+  /** A clock whose timers fire `early` ms before they are due. */
+  function clock(early: number) {
+    let t = 1000.3;
+    const sleeps: number[] = [];
+    return {
+      sleeps,
+      now: () => t,
+      advance: (ms: number) => {
+        t += ms;
+      },
+      sleep: (ms: number) => {
+        sleeps.push(ms);
+        if (sleeps.length > 1000) throw new Error('the pace never ends');
+        t += ms - early;
+        return Promise.resolve();
+      },
+    };
+  }
+
+  it('starts each open at least 60 ms after the one before, though timers fire early', async () => {
+    const c = clock(0.7);
+    const starts: number[] = [];
+    const took = [12.25, 70, 12.25, 3];
+    const out = await paced(
+      [1, 2, 3, 4],
+      (n) => {
+        starts.push(c.now());
+        c.advance(took[n - 1]!);
+        return Promise.resolve([n * 10]);
+      },
+      c,
+    );
+    expect(out).toEqual([10, 20, 30, 40]);
+    const gaps = starts.slice(1).map((s, i) => s - starts[i]!);
+    for (const gap of gaps) expect(gap).toBeGreaterThanOrEqual(OPEN_PACE_MS);
+    // An open that took longer than the pace is followed at once.
+    expect(gaps[1]).toBe(70);
+    // Timers are set in whole milliseconds.
+    expect(c.sleeps.every((ms) => Number.isInteger(ms) && ms >= 1)).toBe(true);
   });
 });
 

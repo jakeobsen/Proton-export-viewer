@@ -15,6 +15,7 @@ import type { AppContext } from '../main/context';
 import { createAppWindow } from '../main/windows';
 import { checkNewFile } from '../../tools/bench/workspace.mjs';
 import { readConfig } from './open-bench-config';
+import { OPEN_PACE_MS, paced } from './open-pace';
 import type { TimedOpen } from './open-bench-types';
 import { READER_SOURCE_ACTION } from './reader-source';
 import type { WindowEventRecorder } from './window-events';
@@ -22,13 +23,6 @@ import type { WindowEventRecorder } from './window-events';
 const FLAG = '--pev-open-bench=';
 /** How long the shell, the restore at launch and each step may take. */
 const STEP_TIMEOUT_MS = 60_000;
-/**
- * Opens start at least this far apart. Chromium drops a frame's navigations
- * past 200 in 10 s, so a faster loop would time navigations that never
- * happen. Main keeps the pace: a hidden window's timers are throttled.
- */
-export const OPEN_PACE_MS = 60;
-
 export const openBenchRequested = (argv: string[]): boolean => argv.some((a) => a.startsWith(FLAG));
 
 async function until(check: () => boolean | Promise<boolean>, what: string): Promise<number> {
@@ -41,16 +35,8 @@ async function until(check: () => boolean | Promise<boolean>, what: string): Pro
 }
 
 /** Times each open in the shell, one at a time, starting them OPEN_PACE_MS apart. */
-async function paced(js: <T>(code: string) => Promise<T>, rowids: number[]): Promise<TimedOpen[]> {
-  const out: TimedOpen[] = [];
-  let last = -Infinity;
-  for (const rowid of rowids) {
-    const wait = last + OPEN_PACE_MS - performance.now();
-    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
-    last = performance.now();
-    out.push(...(await js<TimedOpen[]>(`window.__pevTest.openTimes([${rowid}])`)));
-  }
-  return out;
+function timedOpens(js: <T>(code: string) => Promise<T>, rowids: number[]): Promise<TimedOpen[]> {
+  return paced(rowids, (rowid) => js<TimedOpen[]>(`window.__pevTest.openTimes([${rowid}])`));
 }
 
 export async function runOpenBench(
@@ -113,9 +99,9 @@ export async function runOpenBench(
     await js('window.__pevTest.readyFrame()');
 
     const rowids = config.files.map((_, i) => i + 1);
-    const warm = await paced(js, rowids.slice(0, config.warmup));
+    const warm = await timedOpens(js, rowids.slice(0, config.warmup));
     const timedStart = performance.now();
-    const opens = await paced(js, rowids);
+    const opens = await timedOpens(js, rowids);
     result.timedWallMs = Math.round(performance.now() - timedStart);
     result.warmup = { count: warm.length, views: warm.filter((o) => o.outcome === 'view').length };
     result.opens = opens;
