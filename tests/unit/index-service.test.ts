@@ -835,7 +835,7 @@ const states = (dbPath: string) =>
 
 describe('phase 2', () => {
   it('reads every message file, newest first, and search finds its text and attachment names', async () => {
-    const { run, indexDir } = exportAt('p2-all', 30);
+    const { run, indexDir } = exportAt('phase2-all', 30);
     const [first, second] = idsOf(run) as [string, string];
     writeFileSync(
       join(run, `${first}.eml`),
@@ -892,7 +892,7 @@ describe('phase 2', () => {
   });
 
   it('fails a file past its time limit alone, and reads the others', async () => {
-    const { run, indexDir } = exportAt('p2-timeout', 12);
+    const { run, indexDir } = exportAt('phase2-timeout', 12);
     const slow = idsOf(run)[3]!;
     const h = harness(
       run,
@@ -926,7 +926,7 @@ describe('phase 2', () => {
   });
 
   it('leaves a file that changed or went since the scan for the next reconcile', async () => {
-    const { run, indexDir } = exportAt('p2-changed', 10);
+    const { run, indexDir } = exportAt('phase2-changed', 10);
     const [changed, gone, linked] = idsOf(run) as [string, string, string];
     const scan = scanRun(run);
     // After the scan, before phase 2 reads them.
@@ -965,7 +965,7 @@ describe('phase 2', () => {
   });
 
   it('writes nothing once the generation has moved on', async () => {
-    const { run, indexDir } = exportAt('p2-stale', 10);
+    const { run, indexDir } = exportAt('phase2-stale', 10);
     let bodies = 0;
     const h = harness(run, indexDir, {}, (_role, op) => {
       // The source switches while the first file is read.
@@ -988,7 +988,7 @@ describe('phase 2', () => {
   });
 
   it('stops at a close, keeps what was written, and the next open reads the rest', async () => {
-    const { run, indexDir } = exportAt('p2-close', 40);
+    const { run, indexDir } = exportAt('phase2-close', 40);
     let writes = 0;
     let closing: Promise<void> | null = null;
     // Transactions smaller than the bodies of 40 messages; the close comes with the second.
@@ -1023,7 +1023,7 @@ describe('phase 2', () => {
   });
 
   it('keeps the first 1,000 attachments, flags and logs the cut, and finds a kept name only', async () => {
-    const { run, indexDir } = exportAt('p2-attachments', 4);
+    const { run, indexDir } = exportAt('phase2-attachments', 4);
     const [many] = idsOf(run) as [string];
     const names = Array.from({ length: MAX_ATTACHMENTS + 1 }, (_, i) => `part-${i}.pdf`);
     writeFileSync(join(run, `${many}.eml`), eml('many parts', names));
@@ -1051,7 +1051,7 @@ describe('phase 2', () => {
   });
 
   it('splits writes by the text budget, and fails with its own code a message alone over it', async () => {
-    const { run, indexDir } = exportAt('p2-budget', 6);
+    const { run, indexDir } = exportAt('phase2-budget', 6);
     const [big, ...rest] = idsOf(run) as [string, ...string[]];
     writeFileSync(join(run, `${big}.eml`), eml('x'.repeat(5000)));
     for (const id of rest) writeFileSync(join(run, `${id}.eml`), eml(`${id} ${'y'.repeat(600)}`));
@@ -1075,7 +1075,7 @@ describe('phase 2', () => {
   });
 
   it('rebuilds an index of the older schema with marker characters, with the schema code, and leaves none', async () => {
-    const { run, indexDir } = exportAt('p2-older', 8);
+    const { run, indexDir } = exportAt('phase2-older', 8);
     const [marked] = idsOf(run) as [string];
     const metaFile = join(run, `${marked}.metadata.json`);
     const doc = JSON.parse(readFileSync(metaFile, 'utf8')) as { Payload: Record<string, unknown> };

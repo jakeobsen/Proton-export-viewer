@@ -153,7 +153,10 @@ export interface IndexOptions {
    * write their batches in that order.
    */
   readByName?: boolean;
-  /** Bytes of text one phase 2 transaction writes, at most; TXN_INPUT_BYTES by default. */
+  /**
+   * Builds with test hooks only: bytes of text one phase 2 transaction
+   * writes, at most; TXN_INPUT_BYTES otherwise.
+   */
   txnBytes?: number;
 }
 
@@ -294,7 +297,8 @@ export class IndexService {
   private readonly closing = new Promise<void>((resolve) => {
     this.endClosing = resolve;
   });
-  private readonly txnBytes: number;
+  /** Bytes of text one phase 2 transaction writes, at most. */
+  private readonly textBudget: number;
 
   constructor(private readonly deps: IndexServiceDeps) {
     this.dbPath = join(deps.indexDir, `${deps.stamp.sourceKey}.sqlite`);
@@ -306,7 +310,11 @@ export class IndexService {
     this.idleMs = o.idleMs ?? IDLE_MS;
     this.capBytes = o.capBytes ?? null;
     this.batchPairs = Math.max(1, Math.min(WRITE_BATCH_PAIRS, o.batchPairs ?? WRITE_BATCH_PAIRS));
-    this.txnBytes = Math.max(1, Math.min(TXN_INPUT_BYTES, o.txnBytes ?? TXN_INPUT_BYTES));
+    let textBudget = TXN_INPUT_BYTES;
+    if (__PEV_TEST_HOOKS__ && o.txnBytes !== undefined) {
+      textBudget = Math.max(1, Math.min(TXN_INPUT_BYTES, o.txnBytes));
+    }
+    this.textBudget = textBudget;
   }
 
   private get src() {
@@ -747,6 +755,10 @@ export class IndexService {
     const write = async (items: Phase2Item[]): Promise<void> => {
       let rest = items;
       while (rest.length > 0 && !failure) {
+        // Builds with test hooks can hold phase 2's writes too.
+        if (__PEV_TEST_HOOKS__ && this.deps.options?.beforeWrite) {
+          await Promise.race([this.deps.options.beforeWrite(), this.closing]);
+        }
         if (!this.current()) {
           this.deps.log.info(
             'writer.stale_dropped',
@@ -758,7 +770,7 @@ export class IndexService {
         const stats = await writer.call<Phase2Stats>('phase2', {
           stamp,
           items: rest,
-          budget: this.txnBytes,
+          budget: this.textBudget,
         });
         if (stats.stale) throw new ThreadError('STALE');
         const handled = rest.length - stats.rest;
@@ -794,10 +806,10 @@ export class IndexService {
           continue;
         }
         const bytes = textBytes(item);
-        if (buffer.length > 0 && bufferBytes + bytes > this.txnBytes) flush();
+        if (buffer.length > 0 && bufferBytes + bytes > this.textBudget) flush();
         buffer.push(item);
         bufferBytes += bytes;
-        if (buffer.length >= BODY_BATCH || bufferBytes >= this.txnBytes) flush();
+        if (buffer.length >= BODY_BATCH || bufferBytes >= this.textBudget) flush();
       }
     };
     await Promise.all(

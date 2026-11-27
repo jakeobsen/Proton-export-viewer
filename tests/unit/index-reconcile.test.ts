@@ -975,6 +975,33 @@ describe('phase 2 results', () => {
     expect(found(f.db, 'filename:new.pdf')).toEqual([]);
   });
 
+  it('read the text again once metadata that went, or stopped parsing, is back', () => {
+    const f = folder()
+      .add(message('a', ['a']))
+      .add(message('b', ['b']));
+    f.reconcile();
+    const rev = (id: string) => asNumber(pairRow(f.db, id)?.rev);
+    f.writer.phase2Batch(STAMP, [bodyItem('a', rev('a')), bodyItem('b', rev('b'))]);
+    expect(found(f.db, 'words')).toEqual(['a', 'b']);
+
+    // a's metadata goes; b's no longer parses. Their text goes with them.
+    f.set('a', { meta: null });
+    f.set('b', { row: null, meta: 2 });
+    f.reconcile();
+    expect(found(f.db, 'words')).toEqual([]);
+    for (const id of ['a', 'b']) {
+      expect(pairRow(f.db, id)).toMatchObject({ body_state: BODY_STATE.pending });
+    }
+
+    // Both are back: their message files are read again, and the text is found.
+    f.set('a', { meta: 3 });
+    f.change(message('b', ['b']));
+    f.reconcile();
+    expect(f.writer.bodyOrder().sort()).toEqual([rowidOf(f.db, 'a'), rowidOf(f.db, 'b')].sort());
+    f.writer.phase2Batch(STAMP, [bodyItem('a', rev('a')), bodyItem('b', rev('b'))]);
+    expect(found(f.db, 'words')).toEqual(['a', 'b']);
+  });
+
   it('set the attachments cap flag, and clear only that one when the message file changes or goes', () => {
     const other = CAPPED.labels | CAPPED.to;
     const f = folder()

@@ -19,6 +19,7 @@ import {
   LIMITS,
   MAX_ATTACHMENTS,
   NAME_UNITS,
+  QuotedPrintableDecoder,
   STORED_TEXT_BYTES,
   cutUnits,
   extractBody,
@@ -100,6 +101,36 @@ describe('the body text', () => {
     const r = await atEverySize(qp);
     expect(r.body).toBe('Grüße aus Köln, a soft break and = sign\n');
     expect(r).toMatchObject({ truncated: false, attachments: [], attachmentsCapped: false });
+  });
+
+  it('carries an escape, or a soft line break with its padding, from one chunk to the next', () => {
+    const encoded = Buffer.from('Hello =\r\nworld, padding=  \t\r\nends =3D here', 'latin1');
+    const decoded = (chunks: Buffer[]) => {
+      const d = new QuotedPrintableDecoder();
+      return Buffer.concat([...chunks.map((c) => d.write(c)), d.end()]).toString('latin1');
+    };
+    for (let i = 1; i < encoded.length; i += 1) {
+      for (let j = i; j < encoded.length; j += 1) {
+        const parts = [encoded.subarray(0, i), encoded.subarray(i, j), encoded.subarray(j)];
+        expect(decoded(parts), `split at ${i}, ${j}`).toBe('Hello world, paddingends = here');
+      }
+    }
+  });
+
+  it('keeps the spaces before a quoted-printable soft break and drops the padding after it, split anywhere', async () => {
+    const qp = crlf([
+      'Content-Type: text/plain; charset=utf-8',
+      'Content-Transfer-Encoding: quoted-printable',
+      '',
+      'Hello =',
+      'world, two spaces  =',
+      'here; padding=  \t',
+      'gone=',
+      '',
+      '',
+    ]);
+    const r = await atEverySize(qp, [1, 2, 3, 4, 5, 7, 64, 4096]);
+    expect(r.body).toBe('Hello world, two spaces  here; paddinggone\n');
   });
 
   it('decodes odd charsets, and reads an unknown one as UTF-8', async () => {
@@ -477,6 +508,21 @@ describe('the body job', () => {
     expect(await bodyJob(gone.dir, { protonId: 'a', rev: 1, ref: gone.ref })).toMatchObject({
       ok: false,
       error: BODY_CHANGED,
+    });
+  });
+
+  it('reads a file past the parser limits up to there, truncated and capped, and checks it again', async () => {
+    const dir = testDir('body-job-limit');
+    writeFileSync(join(dir, 'a.metadata.json'), '{}');
+    const parts = Array.from({ length: MAX_MIME_PARTS + 10 }, (_, i) => named(`p${i}`));
+    writeFileSync(join(dir, 'a.eml'), mixed(parts));
+    const ref = scanRun(dir).eml.get('a')!;
+    expect(await bodyJob(dir, { protonId: 'a', rev: 1, ref })).toMatchObject({
+      protonId: 'a',
+      rev: 1,
+      ok: true,
+      truncated: true,
+      attachmentsCapped: true,
     });
   });
 

@@ -46,7 +46,7 @@ import { runIdentity } from './identity';
 import { FamilyInUse, deleteFamily } from './index/family';
 import type { CheckResult } from './index/ops';
 import { ThreadError, type IndexThread, type ThreadRole } from './index/pool';
-import { BODY_STATE, probeMismatch } from './index/schema';
+import { BODY_STATE, mismatchOf, probeIdentity } from './index/schema';
 import type { OpenedMessage } from './reader/source';
 import { overlaps } from '../shared/overlap';
 import { ConnectionRegistry, IndexService, type IndexOptions } from './index/service';
@@ -278,12 +278,17 @@ export class SourceSession {
           }
           if (err instanceof ThreadError && err.code === 'INDEX_DAMAGED') {
             const dbPath = this.dbPathOf(stamp.sourceKey);
-            const reason = (dbPath && probeMismatch(dbPath, request.dbUuid)) || 'identity';
+            const found = dbPath ? probeIdentity(dbPath) : null;
+            const reason = (dbPath && mismatchOf(found, request.dbUuid)) || 'identity';
             if (reason === 'schema' && root === null) {
               // An index of another schema version is no damage: it stays as
               // it is while the export can't be read, and the next open with
               // the export there rebuilds it.
-              this.log.info('index.schema_pending', {}, { src: stamp.sourceKey });
+              this.log.info(
+                'index.schema_pending',
+                { schemaVersion: found?.version ?? 0 },
+                { src: stamp.sourceKey },
+              );
               return fail('unavailable');
             }
             this.log.warn('index.damaged', { reason }, { src: stamp.sourceKey });

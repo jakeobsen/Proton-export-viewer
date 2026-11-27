@@ -97,12 +97,15 @@ export class Base64Decoder {
   }
 }
 
-/** A streaming quoted-printable decoder: keeps at most an unfinished escape between chunks. */
+/**
+ * A streaming quoted-printable decoder: keeps at most an unfinished escape or
+ * soft line break between chunks.
+ */
 export class QuotedPrintableDecoder {
   private carry = '';
   write(chunk: Buffer): Buffer {
     let s = this.carry + chunk.toString('latin1');
-    const tail = /=(?:[0-9A-Fa-f]?|\r)$/.exec(s);
+    const tail = /=(?:[0-9A-Fa-f]?|[ \t]*\r?)$/.exec(s);
     this.carry = tail ? tail[0] : '';
     if (tail) s = s.slice(0, tail.index);
     return QuotedPrintableDecoder.decode(s);
@@ -113,8 +116,10 @@ export class QuotedPrintableDecoder {
     return rest;
   }
   static decode(s: string): Buffer {
+    // A soft line break is "=" at the end of a line; spaces before it are
+    // text, and only padding after it goes with it.
     const out = s
-      .replace(/[ \t]*=\r?\n/g, '')
+      .replace(/=[ \t]*\r?\n/g, '')
       .replace(/=([0-9A-Fa-f]{2})/g, (_m, hex: string) => String.fromCharCode(parseInt(hex, 16)));
     return Buffer.from(out, 'latin1');
   }

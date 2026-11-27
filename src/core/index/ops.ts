@@ -4,11 +4,12 @@
 // one, and the index pool's threads read and parse export files. These run in
 // worker threads (see thread.ts); tests call them directly.
 
-import { chmodSync, closeSync, createReadStream, fstatSync, openSync, statSync } from 'node:fs';
+import { chmodSync, closeSync, fstatSync, openSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { overlaps } from '../../shared/overlap';
 import type { Stamp } from '../../shared/sources';
 import { ContainmentError, openContained, readWithRescan, type FileRef } from '../containment';
+import { borrowedFdStream } from '../fd-stream';
 import { extractBody, type AttachmentRow } from './body';
 import { FamilyInUse, deleteFamily, familyBytes } from './family';
 import { LabelsError, SYSTEM_LABELS, parseLabels, type LabelEntry } from './labels';
@@ -584,8 +585,10 @@ export async function bodyJob(root: string, item: BodyJobItem): Promise<BodyJobR
     const kind = err.kind === 'root_unavailable' ? 'unreadable' : err.kind;
     return { protonId, rev, ok: false, error: rejectCode(kind) };
   }
-  // The stream leaves the file open at its end, so it can be checked again.
-  const input = createReadStream('', { fd, highWaterMark: 64 * 1024, autoClose: false });
+  // The stream never closes the file, not even when a read error destroys
+  // it, so the file can be checked again once read; it is closed below. It
+  // reads no more than the scan saw: a file that grew is left as changed.
+  const input = borrowedFdStream(fd, { start: 0, end: Math.max(item.ref.size, 1) - 1 });
   try {
     const text = await extractBody(input);
     if (!asScanned(fd, item.ref)) return { protonId, rev, ok: false, error: BODY_CHANGED };
@@ -598,13 +601,14 @@ export async function bodyJob(root: string, item: BodyJobItem): Promise<BodyJobR
       error: codeOf(err) === 'FAILED' ? 'BODY_FAILED' : codeOf(err),
     };
   } finally {
-    // Destroying the stream closes the file, once no read is running on it.
+    // The file is closed once no read is running on it.
     if (!input.closed) {
       await new Promise<void>((resolve) => {
         input.once('close', () => resolve());
         input.destroy();
       });
     }
+    closeSync(fd);
   }
 }
 

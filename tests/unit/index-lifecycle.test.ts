@@ -451,7 +451,9 @@ describe('an index found damaged by the check', () => {
       expect(await c.openIndex(uuid)).toMatchObject({ ok: false, code: 'unavailable' });
       expect(c.events).toEqual([]);
       const codes = c.logs.map((l) => l.code);
-      expect(codes).toContain('index.schema_pending');
+      expect(c.logs.find((l) => l.code === 'index.schema_pending')?.data).toEqual({
+        schemaVersion: SCHEMA_VERSION + delta,
+      });
       expect(codes).not.toContain('index.damaged');
       expect(codes).not.toContain('index.schema_rebuild');
       await c.session.close();

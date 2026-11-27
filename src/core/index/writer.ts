@@ -599,7 +599,12 @@ export class IndexWriter {
           metaState = META_STATE.missing;
           error = PAIR_META_MISSING;
         }
-        let bodyState = asNumber(row.body_state);
+        // Taking the message out may have set its body back to waiting.
+        let bodyState = asNumber(
+          change.meta === 'remove'
+            ? this.db.stmt('SELECT body_state FROM pairs WHERE proton_id = ?').get(id)?.body_state
+            : row.body_state,
+        );
         if (change.eml !== 'keep') {
           if (change.eml !== 'back') this.clearBody(id);
           bodyState = change.eml === 'missing' ? BODY_STATE.emlMissing : BODY_STATE.pending;
@@ -967,7 +972,8 @@ export class IndexWriter {
   /**
    * Takes a message out of the index: its row, labels, text (with its
    * full-text entry) and attachments, and its place in its conversation.
-   * Returns whether there was one.
+   * Its message file, if still there, waits to be read again, so the text
+   * is back once the message is. Returns whether there was one.
    */
   private removeMessage(protonId: string, stats: GroupStats): boolean {
     const m = this.db
@@ -978,6 +984,11 @@ export class IndexWriter {
     this.detach(rowid, asNumber(m.thread_id), stats);
     this.db.stmt('DELETE FROM message_text WHERE rowid = ?').run(rowid);
     this.db.stmt('DELETE FROM attachments WHERE message_rowid = ?').run(rowid);
+    this.db
+      .stmt(
+        'UPDATE pairs SET body_state = ? WHERE proton_id = ? AND eml_rel IS NOT NULL AND body_state <> ?',
+      )
+      .run(BODY_STATE.pending, protonId, BODY_STATE.emlMissing);
     return true;
   }
 
