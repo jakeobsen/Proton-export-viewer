@@ -130,6 +130,15 @@ describe('the query parser', () => {
     ]);
   });
 
+  it('drops a word made only of combining marks: it leaves the tokenizer nothing to match', () => {
+    const acute = '\u0301';
+    expect(terms(`hello ${acute}`)).toEqual([text('hello')]);
+    expect(terms(`${acute}${acute} -${acute} subject:${acute} "${acute}"`)).toEqual([]);
+    // A mark on a letter stays part of its word.
+    expect(terms(`cafe${acute}`)).toEqual([text(`cafe${acute}`)]);
+    expect(terms(`"hello ${acute}"`)).toEqual([text(`hello ${acute}`, { exact: true })]);
+  });
+
   it('runs an unclosed quote to the end', () => {
     expect(terms('subject:"half open')).toEqual([
       text('half open', { column: 'subject', exact: true }),

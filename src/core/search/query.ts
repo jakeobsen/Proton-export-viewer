@@ -115,9 +115,12 @@ export function cleanQuery(raw: string): string {
   );
 }
 
-/** The words the tokenizer would find in `text`. */
+/**
+ * The words the tokenizer would find in `text`. A run of combining marks
+ * alone is no word: the tokenizer removes the marks and leaves nothing to match.
+ */
 export function wordsOf(text: string): string[] {
-  return text.match(WORD_CHARS) ?? [];
+  return (text.match(WORD_CHARS) ?? []).filter((word) => word.replace(MARK, '') !== '');
 }
 
 /**

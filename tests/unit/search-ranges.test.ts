@@ -29,6 +29,11 @@ describe('match ranges', () => {
     }
   });
 
+  it('refuse a mark between the two halves of a surrogate pair', () => {
+    expect(markedToRanges(`\ud83d${S}\ude00x${E}`)).toBeNull();
+    expect(markedToRanges(`${S}\ud83d${E}\ude00`)).toBeNull();
+  });
+
   it('check order, overlap, bounds and surrogate pairs', () => {
     const text = 'ab😀cd';
     expect(validRanges(text, [])).toBe(true);

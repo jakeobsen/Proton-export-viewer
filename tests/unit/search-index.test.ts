@@ -343,6 +343,9 @@ describe('operators', () => {
     expect(ids(db, 'subject:alice')).toEqual(['alice']);
     expect(ids(db, 'subject:quarterly')).toEqual([]);
     expect(ids(db, 'quarterly')).toEqual(['alice']);
+    // A stray combining mark typed as its own word changes nothing.
+    expect(ids(db, 'quarterly \u0301')).toEqual(['alice']);
+    expect(ids(db, 'from:alice.smith@example.com \u0301\u0301')).toEqual(['alice']);
     expect(ids(db, 'filename:report')).toEqual(['bob']);
     expect(ids(db, 'filename:"q3 report"')).toEqual(['bob']);
     expect(ids(db, 'filename:notes.txt')).toEqual(['bob']);
