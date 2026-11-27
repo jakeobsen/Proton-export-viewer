@@ -16,7 +16,7 @@ import type { MessageHeaders, OpenMode, RenderedMessage } from '../../shared/rea
 import { htmlTextParser } from '../text/html-to-text';
 import { KEEP_BYTES, extractMessage, type Body } from './extract';
 import { plainBody } from './plain';
-import { sanitizeHtml } from './sanitize';
+import { sanitizeHtml, type SanitizedBody } from './sanitize';
 
 /** HTML bodies larger than this, in encoded bytes, open as plain text unless asked for anyway. */
 export const HTML_VIEW_BYTES = 5 * 1024 * 1024;
@@ -34,6 +34,8 @@ export interface RenderOptions {
   mode: OpenMode;
   /** `mail-asset://v/<token>` of the view being opened. */
   assetBase: string;
+  /** What makes the HTML body safe: the sanitizer, unless a test build replaces it. */
+  sanitize?: (html: string, assetBase: string) => SanitizedBody;
 }
 
 function cut(text: string, max: number): string {
@@ -147,7 +149,7 @@ export async function renderMessage(
   const hasHtml = html.content.length > 0 || html.cut;
   const htmlLimit = options.mode === 'html-anyway' ? HTML_ANYWAY_BYTES : HTML_VIEW_BYTES;
   if (options.mode !== 'plain' && hasHtml && html.bytes <= htmlLimit) {
-    const body = sanitizeHtml(html.content, options.assetBase);
+    const body = (options.sanitize ?? sanitizeHtml)(html.content, options.assetBase);
     return {
       headers,
       html: body.html,

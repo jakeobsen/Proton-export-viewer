@@ -18,6 +18,7 @@ import { errorData } from '../shared/log/schema';
 import { TESTHOOKS_MARKER, markLoaded } from './marker';
 import { TEST_PAGE, testRoute } from './pages';
 import { READER_SOURCE_ACTION, type SourceEntry } from './reader-source';
+import { READER_UNSANITIZED_ACTION } from './unsanitized';
 import { runControl, runFolderProof, type OpenDialog } from './proof/main';
 import { killRenderer } from './renderer-kill';
 import { runSelfTest } from './selftest';
@@ -30,6 +31,11 @@ interface WindowRequests {
   body: string[];
   asset: string[];
   blocked: string[];
+  /**
+   * Console messages of the window's frames, as main gets them. Some
+   * reports, such as a CSP refusal of a nested frame, reach only main.
+   */
+  console: Array<{ frame: string; text: string }>;
 }
 
 const DIALOG_METHODS = [
@@ -154,11 +160,26 @@ export async function install(ctx: AppContext): Promise<boolean> {
   const recordsFor = (windowId: number): WindowRequests => {
     let rec = requests.get(windowId);
     if (!rec) {
-      rec = { app: [], body: [], asset: [], blocked: [] };
+      rec = { app: [], body: [], asset: [], blocked: [], console: [] };
       requests.set(windowId, rec);
     }
     return rec;
   };
+
+  // Every frame's console messages, per window. Windows are created after this.
+  app.on('web-contents-created', (_event, contents) => {
+    contents.on('console-message', (details) => {
+      const appWin = ctx.windows.get(contents.id);
+      if (!appWin) return;
+      let frame = '';
+      try {
+        frame = details.frame?.url ?? '';
+      } catch {
+        // The frame is already gone.
+      }
+      recordsFor(appWin.id).console.push({ frame, text: details.message });
+    });
+  });
 
   ctx.observerFor = (windowId: number): PolicyObserver => {
     const rec = recordsFor(windowId);
@@ -221,6 +242,7 @@ export async function install(ctx: AppContext): Promise<boolean> {
         rec.body.length = 0;
         rec.asset.length = 0;
         rec.blocked.length = 0;
+        rec.console.length = 0;
       }
     },
     linkDialogs: () => [...ctx.linkDialog.shown],
@@ -302,6 +324,9 @@ export async function install(ctx: AppContext): Promise<boolean> {
       }),
     readerLimits: (limits: { heapMb?: number; timeoutMs?: number }) =>
       ctx.core.request({ type: 'test', action: 'reader-limits', payload: limits }),
+    /** Serves later HTML bodies without the sanitizer and the CSS filter, or with them again. */
+    readerUnsanitized: (on: boolean) =>
+      ctx.core.request({ type: 'test', action: READER_UNSANITIZED_ACTION, payload: on }),
     /** Opens a gate of the reader's test source; lookups waiting there go on. */
     readerGate: (name: string) =>
       ctx.core.request({ type: 'test', action: 'reader-gate', payload: name }),

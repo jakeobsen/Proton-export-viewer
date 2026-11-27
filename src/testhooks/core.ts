@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Core-process test hooks: hold opens to keep them pending, push markers
 // through every logging path, set the reader's source and limits, open the
-// source's gates, and report the reader's memory.
+// source's gates, report the reader's memory, and turn the unsanitized path
+// on or off.
 
 import type { ReaderLane } from '../core/reader/lane';
 import type { ReaderSource } from '../core/reader/source';
@@ -17,6 +18,7 @@ import type { LogWriter } from '../shared/log/writer';
 import type { SourceSession } from '../core/source';
 import type { ReadRequest } from '../shared/reader-protocol';
 import { markLoaded } from './marker';
+import { READER_UNSANITIZED_ACTION } from './unsanitized';
 import {
   READER_SOURCE_ACTION,
   TestReaderSource,
@@ -30,7 +32,7 @@ markLoaded();
 export interface CoreTestDeps {
   log: LogWriter;
   roots: Array<[string, string]>;
-  state: { holding: boolean; held: Array<OpenRequest | ReadRequest> };
+  state: { holding: boolean; held: Array<OpenRequest | ReadRequest>; unsanitized: boolean };
   open: (request: OpenRequest | ReadRequest) => void;
   toWorker: (message: WorkerRequest) => void;
   reply: (result: CoreResult) => void;
@@ -157,6 +159,15 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
       void deps.lane.setLimits(next).then(() => ok());
       return;
     }
+    case READER_UNSANITIZED_ACTION:
+      // Later opens serve HTML bodies without the sanitizer and the CSS filter.
+      if (typeof request.payload !== 'boolean') {
+        deps.reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
+        return;
+      }
+      deps.state.unsanitized = request.payload;
+      ok();
+      return;
     case 'reader-lane':
       deps.reply({ type: 'result', reqId: request.reqId, ok: true, data: deps.lane.describe() });
       return;

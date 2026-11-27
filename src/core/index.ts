@@ -60,7 +60,11 @@ const lane = new ReaderLane<WorkerRequest, WorkerMessage>({
 let session: SourceSession | null = null;
 
 /** Test builds can hold opens in core to keep them pending. */
-const testState = { holding: false, held: [] as Array<OpenRequest | ReadRequest> };
+const testState = {
+  holding: false,
+  held: [] as Array<OpenRequest | ReadRequest>,
+  unsanitized: false,
+};
 
 process.on('uncaughtException', (err) => log?.error('core.uncaught', errorData(err, roots)));
 process.on('unhandledRejection', (reason) =>
@@ -122,6 +126,7 @@ async function read(request: ReadRequest): Promise<void> {
         input: opened.input,
         mode: request.mode,
         assetBase: `${ASSET_SCHEME}://${VIEW_HOST}/${request.token}`,
+        ...(__PEV_TEST_HOOKS__ && testState.unsanitized ? { unsanitized: true as const } : {}),
       },
       { key: request.lane, order: request.openId },
     );
