@@ -90,6 +90,8 @@ class FakeCore implements CoreControl {
   failStarts = 0;
   /** Told when core exits on its own, with the source it had, as core-host does. */
   onExit: ((source: CoreSource | null) => void) | null = null;
+  /** The next identify, scan or index open is answered with this failure code. */
+  readonly failNext: { identify?: string; scan?: string; index?: string } = {};
 
   setSource(source: CoreSource | null) {
     this.next = source && { ...source };
@@ -172,6 +174,18 @@ class FakeCore implements CoreControl {
     }
     if (!src?.root) return fail('unavailable');
     const stamp = { sourceKey: src.sourceKey, generation: src.generation };
+    if (
+      (call.type === 'identify' || call.type === 'scan' || call.type === 'index') &&
+      this.failNext[call.type]
+    ) {
+      const code = this.failNext[call.type]!;
+      delete this.failNext[call.type];
+      if (call.type === 'index')
+        this.indexCalls.push({ stamp: call.stamp, dbUuid: call.dbUuid, rebuild: false });
+      const failure = { type: 'result', reqId: 0, ok: false, code, stamp } as CoreResult;
+      if (call.type !== 'scan' || !this.holdScans) return failure;
+      return new Promise((resolve) => this.heldScans.push(() => resolve(failure)));
+    }
     if (call.type === 'index') {
       const rebuild = call.rebuild === true;
       this.indexCalls.push({ stamp: call.stamp, dbUuid: call.dbUuid, rebuild });
@@ -221,6 +235,7 @@ function setup(name: string, at?: string) {
   let generation = 1;
   let notified = 0;
   const lines: string[] = [];
+  const indexUpdates: IndexProgress[] = [];
   const push = (code: string, data?: unknown, meta?: unknown) =>
     lines.push(JSON.stringify({ code, data, meta }));
   const log: Logger = { log: (_l, c, d, m) => push(c, d, m), error: push, warn: push, info: push };
@@ -245,6 +260,7 @@ function setup(name: string, at?: string) {
       generation: () => generation,
       bumpGeneration: () => (generation += 1),
       notify: () => (notified += 1),
+      indexChanged: (progress) => indexUpdates.push(progress),
       picker: () => Promise.resolve(picks.shift() ?? null),
       scopes,
       record: (step) => order.push(step),
@@ -264,6 +280,7 @@ function setup(name: string, at?: string) {
     failing,
     live,
     lines,
+    indexUpdates,
     make,
     relaunch,
     manager: make(),
@@ -1054,6 +1071,214 @@ function damaged(stamp: Stamp, condition: IndexCondition = 'rebuilding') {
     damaged: true,
   };
 }
+
+/** The data of each line logged with `code`. */
+const logged = (t: ReturnType<typeof setup>, code: string) =>
+  t.lines
+    .map((l) => JSON.parse(l) as { code: string; data: unknown })
+    .filter((e) => e.code === code)
+    .map((e) => e.data);
+
+/** Core's event that phase 1 stopped short. */
+function phaseFailed(stamp: Stamp, isDamaged = false) {
+  return {
+    type: 'event' as const,
+    event: 'index' as const,
+    stamp,
+    progress: { ...PROGRESS, phase: 'failed' as const },
+    damaged: isDamaged,
+  };
+}
+
+describe('a step of the open that fails', () => {
+  it('closes the export when core can not scan it, logs core’s answer, and Reopen opens it again', async () => {
+    const t = setup('mgr-scan-failed');
+    t.picks.push({ path: tool('mgr-scan-failed-tool'), bookmark: 'bm1' });
+    t.core.failNext.scan = 'unavailable';
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('opened');
+    const generation = t.generation();
+    const notified = t.notified();
+    await vi.waitFor(() => expect(t.manager.view().active?.closed).toBe(true), WAIT);
+    // The open views go with a new generation; core is stopped. The index came first.
+    expect(t.generation()).toBe(generation + 1);
+    expect(t.core.running).toBe(false);
+    expect(t.core.indexCalls).toEqual([
+      {
+        stamp: { sourceKey: expect.any(String) as string, generation },
+        dbUuid: null,
+        rebuild: false,
+      },
+    ]);
+    expect(t.notified()).toBeGreaterThan(notified);
+    expect(logged(t, 'source.scan_failed')).toEqual([{ generation, reason: 'unavailable' }]);
+
+    const key = t.manager.stamp()!.sourceKey;
+    expect(await t.manager.openRecent(key, t.generation())).toBe('opened');
+    expect(t.manager.view().active?.closed).toBe(false);
+    await indexOpened(t, t.manager.stamp()!.generation);
+    expect(t.manager.view().active?.closed).toBe(false);
+  });
+
+  it('logs core’s answer when it can not identify the run, which then shows as unavailable', async () => {
+    const t = setup('mgr-identify-failed');
+    t.picks.push({ path: tool('mgr-identify-failed-tool'), bookmark: 'bm1' });
+    t.core.failNext.identify = 'unavailable';
+    const generation = t.generation() + 1;
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('unavailable');
+    expect(t.manager.view().active).toBeNull();
+    expect(logged(t, 'source.identify_failed')).toEqual([{ generation, reason: 'unavailable' }]);
+    expect(t.core.calls).not.toContain('scan');
+  });
+
+  it('leaves the export open when a failed scan is answered after the generation moved on', async () => {
+    const t = setup('mgr-scan-failed-late');
+    t.picks.push({ path: tool('mgr-scan-failed-late-tool'), bookmark: 'bm1' });
+    t.core.holdScans = true;
+    t.core.failNext.scan = 'unavailable';
+    await t.manager.chooseFolder(null, t.generation());
+    await vi.waitFor(() => expect(t.core.heldScans).toHaveLength(1), WAIT);
+    // A switch to the other run, whose own scan is held too.
+    const older = t.manager.view().active!.runs[1]!;
+    await t.manager.switchRun(older.runId, t.generation());
+    await vi.waitFor(() => expect(t.core.heldScans).toHaveLength(2), WAIT);
+    const generation = t.generation();
+    // The first run's failed scan comes back now: it belongs to the old generation.
+    t.core.heldScans.shift()!();
+    await settle();
+    expect(t.manager.view().active).toMatchObject({ status: 'online', closed: false });
+    expect(t.generation()).toBe(generation);
+    expect(logged(t, 'source.scan_failed')).toEqual([]);
+    t.core.heldScans.shift()!();
+    await vi.waitFor(() => expect(t.manager.scanSummary()).toEqual(SUMMARY), WAIT);
+  });
+
+  it('closes it when core can not open the index, with an unknown answer logged as unknown', async () => {
+    for (const [answer, reason] of [
+      ['unavailable', 'unavailable'],
+      ['invalid', 'invalid'],
+      ['closed', 'closed'],
+      ['busy', 'unknown'],
+    ] as const) {
+      const t = setup(`mgr-index-failed-${answer}`);
+      t.picks.push({ path: tool(`mgr-index-failed-${answer}-tool`), bookmark: 'bm1' });
+      t.core.failNext.index = answer;
+      await t.manager.chooseFolder(null, t.generation());
+      const generation = t.generation();
+      await vi.waitFor(() => expect(t.manager.view().active?.closed).toBe(true), WAIT);
+      expect(t.generation()).toBe(generation + 1);
+      expect(t.core.running).toBe(false);
+      expect(logged(t, 'index.open_failed')).toEqual([{ generation, reason }]);
+      expect(logged(t, 'index.opened')).toEqual([]);
+    }
+  });
+
+  it('leaves it open when the index open is answered damaged or stale', async () => {
+    for (const answer of ['damaged', 'stale']) {
+      const t = setup(`mgr-index-${answer}`);
+      t.picks.push({ path: tool(`mgr-index-${answer}-tool`), bookmark: 'bm1' });
+      t.core.failNext.index = answer;
+      await t.manager.chooseFolder(null, t.generation());
+      const generation = t.generation();
+      await vi.waitFor(() => expect(t.core.indexCalls).toHaveLength(1), WAIT);
+      await settle();
+      expect(t.manager.view().active?.closed).toBe(false);
+      expect(t.generation()).toBe(generation);
+      expect(t.core.running).toBe(true);
+      expect(logged(t, 'index.open_failed')).toEqual([]);
+    }
+  });
+
+  it('closes it when phase 1 stops short, but not for an older generation or a damaged index', async () => {
+    const t = setup('mgr-phase-failed');
+    t.picks.push({ path: tool('mgr-phase-failed-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    const stamp = t.manager.stamp()!;
+    await indexOpened(t, stamp.generation);
+
+    t.manager.handleCoreEvent(phaseFailed({ ...stamp, generation: stamp.generation - 1 }));
+    await settle();
+    expect(t.manager.view().active?.closed).toBe(false);
+    expect(t.generation()).toBe(stamp.generation);
+
+    t.manager.handleCoreEvent(phaseFailed(stamp));
+    await vi.waitFor(() => expect(t.manager.view().active?.closed).toBe(true), WAIT);
+    expect(t.generation()).toBe(stamp.generation + 1);
+    expect(t.core.running).toBe(false);
+
+    // A damaged index is rebuilt instead.
+    const u = setup('mgr-phase-damaged');
+    u.picks.push({ path: tool('mgr-phase-damaged-tool'), bookmark: 'bm1' });
+    await u.manager.chooseFolder(null, u.generation());
+    const at = u.manager.stamp()!;
+    await indexOpened(u, at.generation);
+    u.manager.handleCoreEvent(phaseFailed(at, true));
+    await indexOpened(u, at.generation + 1);
+    expect(u.manager.view().active?.closed).toBe(false);
+  });
+
+  it('passes a scan’s progress on, and leaves the index state as it is', async () => {
+    const t = setup('mgr-scan-progress');
+    t.picks.push({ path: tool('mgr-scan-progress-tool'), bookmark: 'bm1' });
+    t.core.holdScans = true;
+    await t.manager.chooseFolder(null, t.generation());
+    const stamp = t.manager.stamp()!;
+    // The index answered first; the scan is still under way.
+    await vi.waitFor(() => expect(t.core.heldScans).toHaveLength(1), WAIT);
+    const index = t.manager.view().active?.index;
+    expect(index).toBe('ok');
+    const notified = t.notified();
+    t.manager.handleCoreEvent({
+      type: 'event',
+      event: 'index',
+      stamp,
+      progress: { ...PROGRESS, phase: 'scanning', loaded: 2, total: 5, condition: 'ok' },
+      damaged: false,
+    });
+    await settle();
+    expect(t.manager.view().active).toMatchObject({ index, closed: false });
+    expect(t.notified()).toBe(notified);
+    expect(t.indexUpdates).toEqual([
+      { ...PROGRESS, phase: 'scanning', loaded: 2, total: 5, condition: 'ok' },
+    ]);
+  });
+
+  it('asks for the index before the scan, so a stored list shows while the run is scanned', async () => {
+    const t = setup('mgr-index-first');
+    t.picks.push({ path: tool('mgr-index-first-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    const key = t.manager.stamp()!.sourceKey;
+    // A reopen: the stored index is opened while the scan is held.
+    t.core.holdScans = true;
+    t.core.calls.length = 0;
+    expect(await t.manager.openRecent(key, t.generation())).toBe('opened');
+    await indexOpened(t, t.manager.stamp()!.generation);
+    await vi.waitFor(() => expect(t.core.heldScans).toHaveLength(1), WAIT);
+    expect(t.core.calls).toEqual(['index', 'scan']);
+    expect(t.manager.scanSummary()).toBeNull();
+    t.core.heldScans.shift()!();
+    await vi.waitFor(() => expect(t.manager.scanSummary()).toEqual(SUMMARY), WAIT);
+  });
+
+  it('leaves an unavailable source, browsed from its index, as it is', async () => {
+    const t = setup('mgr-offline-index-failed');
+    const root = tool('mgr-offline-index-failed-tool');
+    t.picks.push({ path: root, bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    const key = t.manager.stamp()!.sourceKey;
+    renameSync(join(root, 'secret.account@example.com'), join(root, 'away'));
+    // Core, without the run, answers the index open with 'unavailable'.
+    t.core.calls.length = 0;
+    expect(await t.manager.openRecent(key, t.generation())).toBe('offline');
+    const generation = t.generation();
+    await vi.waitFor(() => expect(t.core.calls).toContain('index'), WAIT);
+    await settle();
+    expect(t.manager.view().active).toMatchObject({ status: 'offline', closed: false });
+    expect(t.generation()).toBe(generation);
+    expect(logged(t, 'index.open_failed')).toEqual([]);
+  });
+});
 
 describe('a damaged index', () => {
   it('is rebuilt under a new generation while its source is still known', async () => {

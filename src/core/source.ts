@@ -28,6 +28,7 @@ import type {
   ScanRequest,
 } from '../shared/core-protocol';
 import type { EmlFile, IndexOpened } from '../shared/index-types';
+import { errorClassOf } from '../shared/log/schema';
 import type { Logger } from '../shared/log/writer';
 import type { ScanSummary } from '../shared/sources';
 import {
@@ -49,10 +50,17 @@ import { ThreadError, type IndexThread, type ThreadRole } from './index/pool';
 import { BODY_STATE, probeMismatch } from './index/schema';
 import type { OpenedMessage } from './reader/source';
 import { overlaps } from '../shared/overlap';
-import { ConnectionRegistry, IndexService, type IndexOptions } from './index/service';
+import {
+  ConnectionRegistry,
+  IndexService,
+  failureReason,
+  type IndexOptions,
+} from './index/service';
 
 /** Entries scanned between yields, so core keeps answering during a long scan. */
 const SCAN_SLICE = 2000;
+/** The shortest time between two reports of a scan's progress, in milliseconds. */
+const SCAN_REPORT_MS = 250;
 
 const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -115,6 +123,12 @@ export class SourceSession {
   private readonly writer: Writer<RunScan>;
   /** The last scan the writer accepted. */
   private lastScan: RunScan | null = null;
+  /** The run's scan, made once for this core's source and shared by whoever asks for it. */
+  private scanning: Promise<RunScan | null> | null = null;
+  /** Indexes whose phase 1 was started. */
+  private readonly phase1Started = new WeakSet<IndexService>();
+  /** The work the last index open left running: the scan, then phase 1's start. */
+  private indexing: Promise<void> | null = null;
   /** The open source's index, once main asked for it. */
   index: IndexService | null = null;
   private opened: IndexOpened | null = null;
@@ -185,7 +199,16 @@ export class SourceSession {
           : request.type === 'index'
             ? this.openIndex(request, root, stamp)
             : this.query(request, stamp);
-    work.catch(() => {
+    work.catch((err: unknown) => {
+      // Only the class and, for a thread's error, its reason: never a message.
+      this.log.warn(
+        'source.request_failed',
+        {
+          errorClass: errorClassOf(err),
+          ...(err instanceof ThreadError ? { reason: failureReason(err.code) } : {}),
+        },
+        { src: stamp.sourceKey },
+      );
       this.send({ type: 'result', reqId: request.reqId, ok: false, code: 'unavailable', stamp });
     });
   }
@@ -242,25 +265,30 @@ export class SourceSession {
 
   /**
    * Opens the run's index (creating it if need be), answers with its identity
-   * and starts phase 1 for the messages it doesn't have yet. While the run is
+   * and starts phase 1 for the messages it doesn't have yet once the run is
+   * scanned. It answers before the scan, so a stored list shows at once; the
+   * scan runs outside the lock, so reads and a teardown don't wait for it.
+   * While the run is
    * unavailable, only an existing index with the expected identity opens, for
    * browsing; nothing is created or indexed. One there that isn't this index
    * is damaged: it is deleted, and rebuilt once the run is back.
    */
-  private openIndex(request: IndexRequest, root: string | null, stamp: Stamp): Promise<void> {
-    const fail = (code: 'invalid' | 'stale' | 'closed' | 'damaged' | 'unavailable') =>
+  private async openIndex(request: IndexRequest, root: string | null, stamp: Stamp): Promise<void> {
+    const failed = (code: 'invalid' | 'stale' | 'closed' | 'damaged' | 'unavailable') => {
       this.send({ type: 'result', reqId: request.reqId, ok: false, code, stamp });
-    return this.lock.run(async () => {
+      return false;
+    };
+    const answered = await this.lock.run(async (): Promise<boolean> => {
       const setup = this.indexSetup;
-      if (!setup) return fail('invalid');
-      if (!this.admitting || this.retired.has(stamp.sourceKey)) return fail('closed');
-      if (!this.gate.isCurrent(stamp)) return fail('stale');
+      if (!setup) return failed('invalid');
+      if (!this.admitting || this.retired.has(stamp.sourceKey)) return failed('closed');
+      if (!this.gate.isCurrent(stamp)) return failed('stale');
       let service = this.index;
       if (!service) {
         // Opening can make or replace the index's files.
         if (this.overlapsIndex()) {
           this.log.warn('index.open_refused', { reason: 'overlap' }, { src: stamp.sourceKey });
-          return fail('closed');
+          return failed('closed');
         }
         const fresh = this.newService(setup, stamp, root);
         let opened: IndexOpened;
@@ -273,7 +301,7 @@ export class SourceSession {
           if (err instanceof ThreadError && err.code === 'INDEX_OVERLAP') {
             // The writer found the overlap after the check above.
             this.log.warn('index.open_refused', { reason: 'overlap' }, { src: stamp.sourceKey });
-            return fail('closed');
+            return failed('closed');
           }
           if (err instanceof ThreadError && err.code === 'INDEX_DAMAGED') {
             const dbPath = this.dbPathOf(stamp.sourceKey);
@@ -281,7 +309,7 @@ export class SourceSession {
             this.log.warn('index.damaged', { reason }, { src: stamp.sourceKey });
             this.removeFamily(stamp.sourceKey, true);
             this.sendEvent(stamp, { ...fresh.progress, condition: 'damaged' }, true);
-            return fail('damaged');
+            return failed('damaged');
           }
           throw err;
         }
@@ -289,19 +317,6 @@ export class SourceSession {
         this.opened = opened;
         service = fresh;
       }
-      if (root === null) {
-        this.send({
-          type: 'result',
-          reqId: request.reqId,
-          ok: true,
-          stamp,
-          index: this.opened!,
-          progress: { ...service.progress },
-        });
-        return;
-      }
-      const scan = this.lastScan ?? (await this.scanNow(root, stamp));
-      if (!this.gate.isCurrent(stamp) || !scan) return fail('stale');
       this.send({
         type: 'result',
         reqId: request.reqId,
@@ -310,6 +325,29 @@ export class SourceSession {
         index: this.opened!,
         progress: { ...service.progress },
       });
+      return true;
+    });
+    if (!answered || root === null) return;
+    this.indexing = (async () => {
+      // A failed scan is answered to main's scan request, which reports it.
+      const scan = await this.scanOnce(root, stamp).catch(() => null);
+      if (scan) await this.startPhase1(stamp, scan);
+    })();
+    await this.indexing;
+  }
+
+  /** Resolves once what the last index open left running has ended: its scan, then phase 1. */
+  async settled(): Promise<void> {
+    await this.indexing;
+    await this.index?.settled();
+  }
+
+  /** Starts phase 1 once both the index and the scan are there, and only once for an index. */
+  private startPhase1(stamp: Stamp, scan: RunScan): Promise<void> {
+    return this.lock.run(() => {
+      const service = this.index;
+      if (!service || !this.isLive(service, stamp) || this.phase1Started.has(service)) return;
+      this.phase1Started.add(service);
       void service.startPhase1(scan);
     });
   }
@@ -520,15 +558,75 @@ export class SourceSession {
     };
   }
 
-  /** Scans the run for the index when no scan was accepted yet. */
-  private async scanNow(root: string, stamp: Stamp): Promise<RunScan | null> {
+  /**
+   * Looks at every entry of the run folder, and reports how far it got: once
+   * the folder is listed, then at most every SCAN_REPORT_MS, and at the end.
+   */
+  private async scanEntries(root: string, stamp: Stamp): Promise<RunScan> {
+    if (__PEV_TEST_HOOKS__) await this.indexSetup?.options?.beforeScan?.();
     const names = await readdir(root);
     const scan = emptyScan(root);
+    let reported = 0;
+    const report = (done: number) => {
+      reported = performance.now();
+      this.sendEvent(
+        stamp,
+        {
+          phase: 'scanning',
+          loaded: done,
+          total: names.length,
+          failed: 0,
+          timeouts: 0,
+          capped: 0,
+          // An index opened first keeps its own condition, e.g. while it is rebuilt.
+          condition: this.index?.progress.condition ?? 'ok',
+        },
+        false,
+      );
+    };
+    report(0);
     for (let i = 0; i < names.length; i += 1) {
       addEntry(scan, names[i]!);
-      if (i % SCAN_SLICE === SCAN_SLICE - 1) await yieldToLoop();
+      if (i % SCAN_SLICE === SCAN_SLICE - 1) {
+        if (performance.now() - reported >= SCAN_REPORT_MS) report(i + 1);
+        await yieldToLoop();
+      }
     }
-    return this.writer.submit(stamp, scan) ? scan : null;
+    report(names.length);
+    // Test builds can hold the scan here too, with everything listed.
+    if (__PEV_TEST_HOOKS__) await this.indexSetup?.options?.beforeScan?.();
+    return scan;
+  }
+
+  /**
+   * The run's scan: made once, by whichever of the index open and main's scan
+   * request comes first, and logged once. Null when the generation moved on.
+   */
+  private scanOnce(root: string, stamp: Stamp): Promise<RunScan | null> {
+    this.scanning ??= (async () => {
+      const started = performance.now();
+      const scan = await this.scanEntries(root, stamp);
+      if (!this.writer.submit(stamp, scan)) {
+        this.log.info(
+          'writer.stale_dropped',
+          { generation: stamp.generation, count: 1 },
+          { src: stamp.sourceKey },
+        );
+        return null;
+      }
+      const summary = summarize(scan);
+      this.log.info(
+        'scan.done',
+        { count: summary.pairs, ms: Math.round(performance.now() - started) },
+        { src: stamp.sourceKey },
+      );
+      for (const [kind, count] of Object.entries(summary.rejected)) {
+        if (count > 0)
+          this.log.info('scan.rejected', { reason: kind, count }, { src: stamp.sourceKey });
+      }
+      return scan;
+    })();
+    return this.scanning;
   }
 
   /** Tears the index down, under the lock. */
@@ -542,33 +640,14 @@ export class SourceSession {
   }
 
   private async scan(request: ScanRequest, root: string, stamp: Stamp): Promise<void> {
-    const started = performance.now();
-    const names = await readdir(root);
-    const scan = emptyScan(root);
-    for (let i = 0; i < names.length; i += 1) {
-      addEntry(scan, names[i]!);
-      if (i % SCAN_SLICE === SCAN_SLICE - 1) await yieldToLoop();
-    }
-    if (!this.writer.submit(stamp, scan)) {
-      this.log.info(
-        'writer.stale_dropped',
-        { generation: stamp.generation, count: 1 },
-        { src: stamp.sourceKey },
-      );
+    const scan = await this.scanOnce(root, stamp);
+    if (!scan) {
       this.send({ type: 'result', reqId: request.reqId, ok: false, code: 'stale', stamp });
       return;
     }
-    const summary = summarize(scan);
-    this.log.info(
-      'scan.done',
-      { count: summary.pairs, ms: Math.round(performance.now() - started) },
-      { src: stamp.sourceKey },
-    );
-    for (const [kind, count] of Object.entries(summary.rejected)) {
-      if (count > 0)
-        this.log.info('scan.rejected', { reason: kind, count }, { src: stamp.sourceKey });
-    }
-    this.send({ type: 'result', reqId: request.reqId, ok: true, stamp, scan: summary });
+    this.send({ type: 'result', reqId: request.reqId, ok: true, stamp, scan: summarize(scan) });
+    // Phase 1 starts here if the index opened first.
+    await this.startPhase1(stamp, scan);
   }
 
   private send(result: CoreResult): void {

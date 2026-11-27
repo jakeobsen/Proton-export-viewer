@@ -432,6 +432,23 @@ export async function install(ctx: AppContext): Promise<boolean> {
       const result = await core('held-writes');
       return result.ok ? (result.value ?? 0) : 0;
     },
+    /**
+     * Lets `count` held scan steps through; null stops holding them. A scan
+     * waits before it lists the run, and again once it has listed it.
+     */
+    releaseScans: async (count: number | null) => {
+      const result = await ctx.core.request({
+        type: 'test',
+        action: 'release-scans',
+        payload: { count },
+      });
+      if (!result.ok) throw new Error('release-scans');
+    },
+    /** Scan steps waiting to be let through. */
+    heldScans: async () => {
+      const result = await core('held-scans');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
     indexDir: () => join(app.getPath('userData'), 'index'),
     /** Resets the app's data, as Settings will. */
     resetApp: () => ctx.sources.reset(),

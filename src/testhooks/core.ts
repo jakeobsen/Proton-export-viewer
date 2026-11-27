@@ -49,9 +49,11 @@ export interface CoreTestDeps {
   setReaderSource: (source: ReaderSource) => void;
   readerSource: () => ReaderSource | null;
   writeGate: WriteGate | null;
+  /** Holds scans before they list the run's folder, the same way. */
+  scanGate: WriteGate | null;
 }
 
-/** Holds phase 1's writes, while holding, until a test lets them through. */
+/** Holds work (phase 1's writes, or scans), while holding, until a test lets it through. */
 export class WriteGate {
   private allowed = 0;
   private readonly waiting: Array<() => void> = [];
@@ -148,6 +150,21 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
     }
     case 'held-writes':
       ok(deps.writeGate?.held ?? 0);
+      return;
+    case 'release-scans': {
+      const count = (request.payload as { count?: unknown } | undefined)?.count;
+      const valid =
+        count === null || (typeof count === 'number' && Number.isSafeInteger(count) && count > 0);
+      if (!deps.scanGate || !valid) {
+        deps.reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
+        return;
+      }
+      deps.scanGate.release(count as number | null);
+      ok();
+      return;
+    }
+    case 'held-scans':
+      ok(deps.scanGate?.held ?? 0);
       return;
     case 'log':
       deps.log.info('test.log', {

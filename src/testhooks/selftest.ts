@@ -5,13 +5,19 @@
 // Arguments: --pev-selftest --pev-selftest-write=<file> --pev-selftest-port=<port>
 //            --pev-selftest-nonce=<hex value echoed into the result>
 //            --pev-selftest-smoke=<export folder inside the app's container>
+//            --pev-selftest-timing=<export folder inside the app's container>
+//            --pev-selftest-timing-ms=<how long the timing waits for phase 1>
+//            --pev-selftest-timing-keep (the export stays known, for a reopen)
+//            --pev-selftest-timing-reopen (times the reopen at launch; no pick)
 // The result goes to selftest-result-<nonce>.json, so concurrent runs that share
 // a sandbox container never overwrite each other's result.
 //
 // With an export folder, the self-test also runs the smoke: it opens the
 // export as a user would, through the shell and the production source, opens
 // messages, switches to plain text, clicks a link, opens a message whose file
-// is missing, and forgets the export again (smoke, in the result).
+// is missing, and forgets the export again (smoke, in the result). With a
+// timing folder, it opens that export and times what the shell shows, from
+// the pick to the end of phase 1, then forgets it (timing, in the result).
 //
 // Besides the end state (shownWindows), the result carries the record of every
 // show and focus event during the run (windowEvents, which must be empty), and
@@ -281,6 +287,113 @@ async function runSmoke(
   return smoke;
 }
 
+/** Milliseconds from the pick to each step a user sees; null for a step not reached. */
+export interface Timing {
+  chosen: string | null;
+  /** The export is open: the shell leaves the welcome screen. */
+  opened: number | null;
+  /** The sidebar's loading bar, with or without numbers. */
+  firstBar: number | null;
+  /** The first line with numbers: the files read, or the messages loaded. */
+  firstCount: number | null;
+  /** Main accepted the scan. */
+  scanDone: number | null;
+  /** The list shows its first conversation. */
+  firstRows: number | null;
+  phase1Done: number | null;
+  pairs: number | null;
+  /** The most memory core's processes held at a sample, in MB. */
+  peakCoreMb: number;
+  forgotten: string | null;
+  error: string | null;
+}
+
+/** How often the timing looks, in milliseconds. */
+const TIMING_SAMPLE_MS = 100;
+
+/**
+ * Opens the export at `root` as a user would and times, from the pick, what
+ * the shell shows, until phase 1 ends or `limitMs` passed. With `reopen`
+ * there is no pick: it times the export the app reopened at launch, from
+ * now. Then forgets the export, which deletes its index, unless `keep`.
+ */
+async function runTiming(
+  ctx: AppContext,
+  appWin: AppWindow,
+  root: string,
+  queuePick: (path: string, bookmark: string) => void,
+  limitMs: number,
+  mode: { keep: boolean; reopen: boolean },
+): Promise<Timing> {
+  const timing: Timing = {
+    chosen: null,
+    opened: null,
+    firstBar: null,
+    firstCount: null,
+    scanDone: null,
+    firstRows: null,
+    phase1Done: null,
+    pairs: null,
+    peakCoreMb: 0,
+    forgotten: null,
+    error: null,
+  };
+  const shell = <T>(code: string) => appWin.win.webContents.executeJavaScript(code) as Promise<T>;
+  const start = performance.now();
+  const since = () => Math.round(performance.now() - start);
+  try {
+    if (mode.reopen) {
+      // The self-test skips the launch's own reopen, so it starts it here.
+      void ctx.sources.restore();
+    } else {
+      queuePick(root, 'timing');
+      void shell<SourceActionResult>('window.__pevTest.chooseFolder()').then(
+        (r) => {
+          timing.chosen = r.ok ? r.outcome : r.code;
+        },
+        () => {
+          timing.chosen = 'threw';
+        },
+      );
+    }
+    while (timing.phase1Done === null && performance.now() - start < limitMs) {
+      const seen = await shell<{ bar: boolean; count: boolean; rows: number }>(
+        `({ bar: !!document.querySelector('.side-foot .bar-track'),` +
+          ` count: !!document.querySelector('.side-foot .loading-text'),` +
+          ` rows: document.querySelectorAll('.list-scroll .conv:not(.placeholder)').length })`,
+      );
+      const at = since();
+      if (timing.opened === null && ctx.sources.view().active) timing.opened = at;
+      if (timing.firstBar === null && seen.bar) timing.firstBar = at;
+      if (timing.firstCount === null && seen.count) timing.firstCount = at;
+      if (timing.scanDone === null && ctx.sources.scanSummary()) timing.scanDone = at;
+      if (timing.firstRows === null && seen.rows > 0) timing.firstRows = at;
+      if (timing.scanDone !== null) {
+        const totals = await ctx.sources.queryIndex({ op: 'totals' });
+        if (totals?.progress.phase === 'done') {
+          timing.phase1Done = since();
+          timing.pairs = (totals.answer as IndexTotals).pairs;
+        }
+      }
+      const coreKb = app
+        .getAppMetrics()
+        .filter((m) => m.type === 'Utility')
+        .reduce((sum, m) => sum + m.memory.workingSetSize, 0);
+      timing.peakCoreMb = Math.max(timing.peakCoreMb, Math.round(coreKb / 1024));
+      await delay(TIMING_SAMPLE_MS);
+    }
+    const key = ctx.sources.stamp()?.sourceKey;
+    const forgotten =
+      key && !mode.keep
+        ? await shell<SourceActionResult>(`window.__pevTest.forgetExport(${JSON.stringify(key)})`)
+        : null;
+    timing.forgotten = forgotten ? (forgotten.ok ? forgotten.outcome : forgotten.code) : null;
+  } catch (err) {
+    timing.error = err instanceof Error ? err.message : String(err);
+  }
+  return timing;
+}
+
 /** The result file for a run; a nonce that isn't plain hex is not used in the name. */
 export function resultFileName(nonce: string | null): string {
   return nonce !== null && /^[0-9a-f]{8,64}$/.test(nonce)
@@ -308,6 +421,7 @@ export async function runSelfTest(
     windowEvents: [] as WindowEvent[],
     recorderProbe: [] as WindowEvent[],
     smoke: null as Smoke | null,
+    timing: null as Timing | null,
   };
   try {
     const appWin = createAppWindow(ctx, { show: false });
@@ -336,6 +450,15 @@ export async function runSelfTest(
     result.connect = Number.isInteger(port) && port > 0 ? await tryConnect(port) : result.connect;
     const smokeRoot = argValue(argv, 'pev-selftest-smoke');
     if (smokeRoot) result.smoke = await runSmoke(ctx, appWin, smokeRoot, queuePick);
+    const timingRoot = argValue(argv, 'pev-selftest-timing');
+    if (timingRoot) {
+      const limit = Number(argValue(argv, 'pev-selftest-timing-ms') ?? '600000');
+      const limitMs = Number.isSafeInteger(limit) && limit > 0 ? limit : 600_000;
+      result.timing = await runTiming(ctx, appWin, timingRoot, queuePick, limitMs, {
+        keep: argv.includes('--pev-selftest-timing-keep'),
+        reopen: argv.includes('--pev-selftest-timing-reopen'),
+      });
+    }
   } catch (err) {
     result.error = err instanceof Error ? err.constructor.name : 'NonError';
   }

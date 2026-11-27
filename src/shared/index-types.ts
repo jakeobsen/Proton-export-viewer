@@ -238,10 +238,12 @@ export type IndexCondition = 'ok' | 'verifying' | 'rebuilding' | 'damaged';
 
 /**
  * Where phase 1 stands. During it, list pages hold the rows loaded so far.
+ * 'scanning': the run's folder is being read, before its index is open;
+ * `loaded` counts the entries looked at and `total` the entries listed.
  * 'unavailable': the export can't be read, and the index shows what it holds.
  */
 export interface IndexProgress {
-  phase: 'opening' | 'loading' | 'done' | 'failed' | 'unavailable';
+  phase: 'scanning' | 'opening' | 'loading' | 'done' | 'failed' | 'unavailable';
   /** Metadata files handled so far (indexed or failed). */
   loaded: number;
   /** Metadata files the scan found. */

@@ -49,6 +49,9 @@ export const LOG_CODES = [
   'source.no_runs',
   'source.not_same',
   'source.stale_result',
+  'source.identify_failed',
+  'source.scan_failed',
+  'source.request_failed',
   'scope.failed',
   'scope.released',
   'scan.done',
@@ -62,6 +65,7 @@ export const LOG_CODES = [
   'reader.worker_retired',
   'index.created',
   'index.opened',
+  'index.open_failed',
   'index.phase1_done',
   'index.phase1_failed',
   'index.labels_failed',
@@ -186,6 +190,8 @@ export const REASONS = [
   'eml_missing',
   'offline',
   'file',
+  'unavailable',
+  'closed',
 ] as const;
 
 /** The lists of a message whose entries can be cut to a limit when indexed. */

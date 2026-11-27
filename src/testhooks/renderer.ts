@@ -160,6 +160,11 @@ export function install(): void {
       });
     },
     error: (markers: string) => reportError('error', new Error(markers)),
+    /** Makes the shell throw on each render while on; the sources are read again to render. */
+    renderFault: async (on: boolean) => {
+      (window as unknown as { __pevTestRenderFault?: boolean }).__pevTestRenderFault = on;
+      await refreshSources();
+    },
     throwUncaught: (markers: string) => {
       setTimeout(() => {
         throw new Error(markers);

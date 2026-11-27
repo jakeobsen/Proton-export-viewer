@@ -141,6 +141,8 @@ export function syncMailbox(): void {
 export function indexChanged(update_: IndexUpdate): void {
   if (keyOf(update_.generation) !== state.key || state.key === null) return;
   setProgress(update_.progress);
+  // While the run is read there is no index to read yet.
+  if (update_.progress.phase === 'scanning') return;
   void readSidebar();
   list.refresh();
 }

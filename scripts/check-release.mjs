@@ -50,6 +50,8 @@ const FORBIDDEN_CONTENT = [
   'sessionPreconnects',
   'readByName',
   'openGapMs',
+  // Core's test hold for scans.
+  'beforeScan',
   // The self-test's smoke drives the body frame through the DevTools protocol.
   ...SELFTEST_ONLY,
   'better-sqlite3',

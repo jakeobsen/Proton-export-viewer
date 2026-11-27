@@ -3,12 +3,12 @@
 // started with, requests for another stamp are refused, and the scan's results
 // go through the writer.
 
-import { realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { readdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { SourceSession } from '../../src/core/source';
 import { runIdentity } from '../../src/core/identity';
-import type { CoreResult } from '../../src/shared/core-protocol';
+import type { CoreEvent, CoreResult } from '../../src/shared/core-protocol';
 import type { Logger } from '../../src/shared/log/writer';
 import { writeExport } from '../exports';
 import { testDir } from '../paths';
@@ -17,16 +17,23 @@ const KEY = '01234567-89ab-cdef-0123-456789abcdef';
 
 function session(root: string | null, generation = 3) {
   const replies: CoreResult[] = [];
+  const events: CoreEvent[] = [];
   const lines: Array<{ code: string; data: unknown }> = [];
   const push = (code: string, data?: unknown) => lines.push({ code, data });
   const log: Logger = { log: (_l, c, d) => push(c, d), error: push, warn: push, info: push };
-  const s = new SourceSession({ sourceKey: KEY, generation, root }, log, (r) => replies.push(r));
+  const s = new SourceSession(
+    { sourceKey: KEY, generation, root },
+    log,
+    (r) => replies.push(r),
+    null,
+    (e) => events.push(e),
+  );
   const next = async () => {
     for (let i = 0; i < 100 && replies.length === 0; i += 1)
       await new Promise((r) => setTimeout(r, 5));
     return replies.shift();
   };
-  return { s, replies, lines, next };
+  return { s, replies, events, lines, next };
 }
 
 describe('SourceSession', () => {
@@ -52,6 +59,30 @@ describe('SourceSession', () => {
     expect(t.s.records).toMatchObject({ scans: 1, rejected: [{ rel: 'x.eml', kind: 'symlink' }] });
     expect(t.lines.map((l) => l.code)).toEqual(['scan.done', 'scan.rejected']);
     expect(t.lines[1]?.data).toEqual({ reason: 'symlink', count: 1 });
+  });
+
+  it('reports a scan’s progress: once the run is listed, and at the end', async () => {
+    const written = writeExport(realpathSync(testDir('core-src-progress')), {
+      seed: 1,
+      messages: 6,
+    });
+    const t = session(written.run);
+    const stamp = { sourceKey: KEY, generation: 3 };
+    t.s.handle({ type: 'scan', reqId: 1, stamp });
+    expect(await t.next()).toMatchObject({ reqId: 1, ok: true });
+    const entries = readdirSync(written.run).length;
+    expect(
+      t.events.map((e) => [
+        e.stamp,
+        e.progress.phase,
+        e.progress.loaded,
+        e.progress.total,
+        e.damaged,
+      ]),
+    ).toEqual([
+      [stamp, 'scanning', 0, entries, false],
+      [stamp, 'scanning', entries, entries, false],
+    ]);
   });
 
   it('refuses a request for another source or generation', async () => {
@@ -102,12 +133,19 @@ describe('SourceSession', () => {
     expect(session(written.run).s.hasRoot).toBe(true);
   });
 
-  it('reports a run that went away during the work as unavailable', async () => {
+  it('reports a run that went away during the work as unavailable, and logs the error class', async () => {
     const written = writeExport(realpathSync(testDir('core-src-vanish')), { seed: 1, messages: 2 });
     const t = session(written.run);
     rmSync(written.run, { recursive: true });
     t.s.handle({ type: 'scan', reqId: 1, stamp: { sourceKey: KEY, generation: 3 } });
     expect(await t.next()).toMatchObject({ reqId: 1, ok: false, code: 'unavailable' });
+    t.s.handle({ type: 'identify', reqId: 2, stamp: { sourceKey: KEY, generation: 3 } });
+    expect(await t.next()).toMatchObject({ reqId: 2, ok: false, code: 'unavailable' });
+    // Each failure is logged with its class only: no message, no path.
+    expect(t.lines).toEqual([
+      { code: 'source.request_failed', data: { errorClass: 'Error' } },
+      { code: 'source.request_failed', data: { errorClass: 'Error' } },
+    ]);
   });
 });
 

@@ -38,6 +38,14 @@ export function App() {
     state.sources !== null && !state.sources.restoring && active === null && reader.rowid === null;
   const banner = active?.index ? INDEX_BANNERS[active.index] : undefined;
 
+  // Test builds: a test can make the shell throw while it renders.
+  if (
+    __PEV_TEST_HOOKS__ &&
+    (window as unknown as { __pevTestRenderFault?: boolean }).__pevTestRenderFault
+  ) {
+    throw new Error('render fault');
+  }
+
   return (
     <div className="shell">
       <header className="bar">

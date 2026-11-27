@@ -209,7 +209,7 @@ async function built(run: string, indexDir: string, sourceKey = KEY): Promise<st
   const c = core({ root: run, indexDir, sourceKey });
   const opened = await c.openIndex(null);
   expect(opened).toMatchObject({ ok: true });
-  await c.session.index!.settled();
+  await c.session.settled();
   const uuid = opened.ok ? opened.index!.dbUuid : '';
   await c.session.close();
   return uuid;
@@ -266,7 +266,7 @@ describe('an index found damaged on open', () => {
       expect(c.logs.find((l) => l.code === 'index.damaged')?.data).toEqual({
         reason: reasons[name.split(' ')[0]!],
       });
-      await c.session.index!.settled();
+      await c.session.settled();
       expect(await c.totals()).toMatchObject({ messages: pairs, pairs });
       expect(c.session.index!.progress.condition).toBe('ok');
       // Progress while it rebuilds, then ok once; main is never told of damage.
@@ -326,7 +326,7 @@ describe('an index found damaged by the check', () => {
       index: { created: true, replaced: false },
       progress: { condition: 'rebuilding' },
     });
-    await again.session.index!.settled();
+    await again.session.settled();
     expect(await again.totals()).toMatchObject({ messages: pairs });
     expect(again.session.index!.progress.condition).toBe('ok');
     await again.session.close();
@@ -338,7 +338,7 @@ describe('an index found damaged by the check', () => {
     const query = new CorruptingQuery();
     const c = core({ root: run, indexDir, query });
     await c.openIndex(null);
-    await c.session.index!.settled();
+    await c.session.settled();
     expect(await c.totals()).toMatchObject({ messages: 30 });
     query.corrupt = true;
     expect(await c.totals()).toBe('damaged');
@@ -386,7 +386,7 @@ describe('an index found damaged by the check', () => {
       ok: true,
       index: { created: true, replaced: false },
     });
-    await again.session.index!.settled();
+    await again.session.settled();
     expect(await again.totals()).toMatchObject({ messages: pairs });
     await again.session.close();
     expect(digest(root)).toBe(before);
@@ -430,7 +430,7 @@ describe('an index found damaged by the check', () => {
     const other = exportAt('lc-foreign-wal-other', 12, 13);
     const o = core({ root: other.run, indexDir, sourceKey: OTHER });
     await o.openIndex(null);
-    await o.session.index!.settled();
+    await o.session.settled();
     copyFileSync(join(indexDir, `${OTHER}.sqlite-wal`), join(indexDir, `${KEY}.sqlite-wal`));
     await o.session.close();
 
@@ -483,7 +483,7 @@ describe('the lifecycle lock', () => {
     const query = new CorruptingQuery();
     const c = core({ root: run, indexDir, query });
     await c.openIndex(null);
-    await c.session.index!.settled();
+    await c.session.settled();
     // Hold the lock, so the recovery queues behind it.
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
@@ -516,7 +516,7 @@ describe('the lifecycle lock', () => {
     const b = exportAt('lc-switch-b', 10, 15);
     const coreB = core({ root: b.run, indexDir, generation: 3, sourceKey: OTHER });
     await coreB.openIndex(null);
-    await coreB.session.index!.settled();
+    await coreB.session.settled();
     expect(await coreB.totals()).toMatchObject({ messages: 10 });
     expect(coreA.events.filter((e) => e.damaged)).toEqual([]);
     expect(family(indexDir, KEY)).toContain(`${KEY}.sqlite`);
@@ -528,7 +528,7 @@ describe('the lifecycle lock', () => {
     const { run, indexDir } = exportAt('lc-reset');
     const c = core({ root: run, indexDir });
     await c.openIndex(null);
-    await c.session.index!.settled();
+    await c.session.settled();
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
     void c.session.lock.run(() => held);
@@ -549,7 +549,7 @@ describe('the lifecycle lock', () => {
     const query = new CorruptingQuery();
     const c = core({ root: run, indexDir, query });
     await c.openIndex(null);
-    await c.session.index!.settled();
+    await c.session.settled();
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
     void c.session.lock.run(() => held);
@@ -628,7 +628,7 @@ describe('an export that comes to overlap the index folder later', () => {
     expect(family(indexDir)).toEqual([]);
     away();
     expect(await c.openIndex(null)).toMatchObject({ ok: true });
-    await c.session.index!.settled();
+    await c.session.settled();
     expect(c.logs.filter((l) => l.code === 'index.open_refused')).toHaveLength(1);
   });
 
@@ -636,7 +636,7 @@ describe('an export that comes to overlap the index folder later', () => {
     const { run, indexDir, link, point, away } = linked('lc-overlap-delete');
     const c = core({ root: run, indexDir, exports: [link] });
     expect(await c.openIndex(null)).toMatchObject({ ok: true });
-    await c.session.index!.settled();
+    await c.session.settled();
     writeFileSync(join(indexDir, `${OTHER}.sqlite`), 'x');
     point(indexDir);
     expect(await c.forget(OTHER)).toMatchObject({ ok: false, code: 'busy' });
@@ -681,7 +681,7 @@ describe('an export that comes to overlap the index folder later', () => {
     expect(c.session.connections.size).toBe(0);
     away();
     expect(await c.openIndex(uuid)).toMatchObject({ ok: true, index: { dbUuid: uuid } });
-    await c.session.index!.settled();
+    await c.session.settled();
   });
 
   it('is looked at again by the writer before it replaces an index', async () => {
@@ -703,7 +703,7 @@ describe('an export that comes to overlap the index folder later', () => {
     expect(readFileSync(join(indexDir, `${KEY}.sqlite`), 'utf8')).toBe('not a database');
     away();
     expect(await c.openIndex(null)).toMatchObject({ ok: true, index: { created: true } });
-    await c.session.index!.settled();
+    await c.session.settled();
     expect(
       readFileSync(join(indexDir, `${KEY}.sqlite`))
         .subarray(0, 15)
@@ -735,7 +735,7 @@ describe('Forget', () => {
     await built(a.run, a.indexDir, OTHER);
     const c = core({ root: a.run, indexDir: a.indexDir });
     await c.openIndex(null);
-    await c.session.index!.settled();
+    await c.session.settled();
     const otherDb = join(a.indexDir, `${OTHER}.sqlite`);
     const fd = openSync(otherDb, 'r');
     try {
@@ -819,7 +819,7 @@ describe("the reader's open of a message file", () => {
     const e = exportAt('lc-reader', 6, 21);
     const c = core({ root: e.run, indexDir: e.indexDir });
     expect(await c.openIndex(null)).toMatchObject({ ok: true });
-    await c.session.index!.settled();
+    await c.session.settled();
     const generation = c.stamp.generation;
 
     const opened = await c.session.openForReader(1, generation, () => false);
@@ -859,7 +859,7 @@ describe("the reader's open of a message file", () => {
     rmSync(join(e.run, first));
     const c = core({ root: e.run, indexDir: e.indexDir });
     expect(await c.openIndex(null)).toMatchObject({ ok: true });
-    await c.session.index!.settled();
+    await c.session.settled();
     const generation = c.stamp.generation;
     const files = new Map<number, EmlFile>();
     for (let rowid = 1; rowid <= 6; rowid += 1) files.set(rowid, (await eml(c, rowid))!);

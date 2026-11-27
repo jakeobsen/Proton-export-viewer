@@ -40,6 +40,8 @@ export interface CoreTestInit {
   batchPairs?: number;
   /** Phase 1 writes wait until a test lets them through. */
   holdWrites?: boolean;
+  /** Scans wait before they list the run's folder, and once they have, until a test lets them on. */
+  holdScans?: boolean;
   /** New metadata files are read in name order, and their batches written in that order. */
   readByName?: boolean;
 }
