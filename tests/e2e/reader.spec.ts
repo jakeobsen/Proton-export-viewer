@@ -273,7 +273,8 @@ test('an HTML message opens sanitized, with placeholders, and requests nothing r
     )
     .toBe(true);
 
-  // The placeholder serves; a cid and a link id serve nothing for now.
+  // The placeholder serves, and so does the cid part, as the PNG it is; a
+  // link id serves nothing.
   const asset = (id: string) =>
     pev.main<{ status: number; headers: Record<string, string>; length: number }>(
       'fetchIn',
@@ -282,7 +283,8 @@ test('an HTML message opens sanitized, with placeholders, and requests nothing r
     );
   expect(await asset('r1')).toMatchObject({ status: 200, length: 68 });
   expect((await asset('r1')).headers['content-type']).toBe('image/png');
-  expect((await asset('c1')).status).toBe(404);
+  expect(await asset('c1')).toMatchObject({ status: 200, length: 68 });
+  expect((await asset('c1')).headers['content-type']).toBe('image/png');
   expect((await asset('l1')).status).toBe(404);
 
   // Nothing but this view's own URLs was requested, nothing was cancelled,
