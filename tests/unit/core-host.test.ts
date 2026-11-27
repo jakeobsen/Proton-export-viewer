@@ -170,6 +170,33 @@ describe('stopping core', () => {
     expect(await asked).toMatchObject({ ok: true });
   });
 
+  it('kills a core given up on before it spawned when it spawns late, and sends it nothing', async () => {
+    const { host, codes } = make(30);
+    host.setSource(A1);
+    const first = host.start();
+    const switched = host.startWith(B2);
+    await expect(first).rejects.toBeInstanceOf(CoreUnavailableError);
+    expect(codes).toContain('core.stop_timeout');
+    await vi.waitFor(() => expect(children()).toHaveLength(2));
+    ready(1);
+    expect(await switched).toBe(true);
+
+    // The old core spawns after all: it is killed and gets no init with the old source.
+    const old = children()[0]!;
+    old.exitsOnKill = false;
+    old.spawn();
+    expect(old.kills).toBe(2);
+    expect(old.inits).toEqual([]);
+    expect(codes.filter((c) => c === 'core.spawn')).toHaveLength(1);
+    expect(children()[1]!.inits.map((i) => i.source)).toEqual([B2]);
+    // The new core still answers.
+    const asked = host.requestRunning({ type: 'ping' }, stampOf(B2));
+    await tick();
+    answer(1);
+    expect(await asked).toMatchObject({ ok: true });
+    expect(host.running).toBe(true);
+  });
+
   it('fails the requests a core given up on still had', async () => {
     const { host } = make(30);
     host.setSource(A1);

@@ -131,6 +131,11 @@ export class CoreHost {
       });
       port1.start();
       child.once('spawn', () => {
+        // A core given up on before it spawned gets nothing, and is ended.
+        if (this.child !== child) {
+          child.kill();
+          return;
+        }
         this.options.log.info('core.spawn');
         const init: CoreInit = {
           type: 'init',
