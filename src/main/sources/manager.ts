@@ -766,11 +766,9 @@ export class SourceManager {
     answer: string | null,
   ): void {
     void this.serial(async () => {
-      const active = this.active;
-      if (!this.admitting || !active?.online || active.closed) return;
+      // An answer for an older generation is no longer about the open source.
       if (!sameStamp(stamp, this.stamp())) return;
-      const generation = this.deps.bumpGeneration();
-      active.closed = true;
+      // Logged even when the source stays as it is: unavailable, or already closed.
       if (code !== null) {
         this.deps.log.warn(
           code,
@@ -778,6 +776,10 @@ export class SourceManager {
           { src: stamp.sourceKey },
         );
       }
+      const active = this.active;
+      if (!this.admitting || !active?.online || active.closed) return;
+      const generation = this.deps.bumpGeneration();
+      active.closed = true;
       await this.stopCore(generation);
       this.deps.notify();
     });
@@ -1009,18 +1011,18 @@ function runOf(source: SourceRecord): FoundRun {
   return { rel: source.rel, runName: source.runName, accountName: source.accountName };
 }
 
-/**
- * True if `path` is a directory reached without any link: its canonical path
- * is the path itself. The picked folder's path is stored canonical, so a link
- * put anywhere on the way to a saved run (an account folder replaced by a
- * link, say) makes the run unavailable instead of redirecting it.
- */
 /** Core's answer code as a log reason: one the log knows, else 'unknown'. */
 function reasonOf(answer: string): string {
   if (answer === 'stale') return 'stale_generation';
   return (REASONS as readonly string[]).includes(answer) ? answer : 'unknown';
 }
 
+/**
+ * True if `path` is a directory reached without any link: its canonical path
+ * is the path itself. The picked folder's path is stored canonical, so a link
+ * put anywhere on the way to a saved run (an account folder replaced by a
+ * link, say) makes the run unavailable instead of redirecting it.
+ */
 async function isRunFolder(path: string): Promise<boolean> {
   try {
     return (await realpath(path)) === path && (await lstat(path)).isDirectory();

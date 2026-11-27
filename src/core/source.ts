@@ -121,8 +121,6 @@ export class SourceSession {
   readonly lock = new LifecycleLock();
   private root: string | null = null;
   private readonly writer: Writer<RunScan>;
-  /** The last scan the writer accepted. */
-  private lastScan: RunScan | null = null;
   /** The run's scan, made once for this core's source and shared by whoever asks for it. */
   private scanning: Promise<RunScan | null> | null = null;
   /** Indexes whose phase 1 was started. */
@@ -131,6 +129,8 @@ export class SourceSession {
   private indexing: Promise<void> | null = null;
   /** The open source's index, once main asked for it. */
   index: IndexService | null = null;
+  /** Main was told that this generation's index is damaged. */
+  private damageReported = false;
   private opened: IndexOpened | null = null;
   /** Sources forgotten while core runs: nothing of theirs opens or is created again. */
   private readonly retired = new Set<string>();
@@ -151,7 +151,6 @@ export class SourceSession {
       this.records.scans += 1;
       this.records.rejected = scan.rejected;
       this.records.summary = summarize(scan);
-      this.lastScan = scan;
     });
     if (!source) return;
     this.gate.set({ sourceKey: source.sourceKey, generation: source.generation });
@@ -432,7 +431,15 @@ export class SourceSession {
     return true;
   }
 
+  /**
+   * Main hears of a damaged index once, and that is the last it hears of this
+   * generation's index: main rebuilds it under a new generation. A scan still
+   * running here then reports nothing, so the damage isn't followed by
+   * progress that shows the index as fine.
+   */
   private sendEvent(stamp: Stamp, progress: IndexService['progress'], damaged: boolean): void {
+    if (this.damageReported) return;
+    if (damaged) this.damageReported = true;
     this.emit({ type: 'event', event: 'index', stamp, progress: { ...progress }, damaged });
   }
 

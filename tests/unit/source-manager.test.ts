@@ -1260,7 +1260,7 @@ describe('a step of the open that fails', () => {
     await vi.waitFor(() => expect(t.manager.scanSummary()).toEqual(SUMMARY), WAIT);
   });
 
-  it('leaves an unavailable source, browsed from its index, as it is', async () => {
+  it('leaves an unavailable source, browsed from its index, as it is, and logs core’s answer', async () => {
     const t = setup('mgr-offline-index-failed');
     const root = tool('mgr-offline-index-failed-tool');
     t.picks.push({ path: root, bookmark: 'bm1' });
@@ -1276,7 +1276,7 @@ describe('a step of the open that fails', () => {
     await settle();
     expect(t.manager.view().active).toMatchObject({ status: 'offline', closed: false });
     expect(t.generation()).toBe(generation);
-    expect(logged(t, 'index.open_failed')).toEqual([]);
+    expect(logged(t, 'index.open_failed')).toEqual([{ generation, reason: 'unavailable' }]);
   });
 });
 

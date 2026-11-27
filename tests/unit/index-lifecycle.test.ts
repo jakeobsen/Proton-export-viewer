@@ -356,7 +356,17 @@ describe('an index found damaged by the check', () => {
     const uuid = await built(run, indexDir);
     const check = new HeldCheck();
     const query = new CorruptingQuery();
-    const c = core({ root: run, indexDir, generation: 2, check, query });
+    // The run's scan is held until the damage has been reported.
+    let releaseScan!: () => void;
+    const scanHeld = new Promise<void>((r) => (releaseScan = r));
+    const c = core({
+      root: run,
+      indexDir,
+      generation: 2,
+      check,
+      query,
+      options: { beforeScan: () => scanHeld },
+    });
     expect(await c.openIndex(uuid)).toMatchObject({
       ok: true,
       progress: { condition: 'verifying' },
@@ -368,6 +378,11 @@ describe('an index found damaged by the check', () => {
 
     await until(() => c.events.some((e) => e.damaged));
     expect(check.stopped).toBe(true);
+    // The scan then runs to its end, and reports nothing after the damage.
+    releaseScan();
+    await c.session.settled();
+    expect(c.logs.some((l) => l.code === 'scan.done')).toBe(true);
+    expect(c.events.filter((e) => e.damaged)).toHaveLength(1);
     expect(c.events.at(-1)).toMatchObject({
       stamp: c.stamp,
       damaged: true,
@@ -381,13 +396,19 @@ describe('an index found damaged by the check', () => {
     expect(family(indexDir)).toEqual([]);
     expect(c.session.connections.size).toBe(0);
 
+    // Main rebuilds it under a new generation: rebuilding while it fills, then ok once.
     const again = core({ root: run, indexDir, generation: 3 });
     expect(await again.openIndex(null, true)).toMatchObject({
       ok: true,
       index: { created: true, replaced: false },
+      progress: { condition: 'rebuilding' },
     });
     await again.session.settled();
     expect(await again.totals()).toMatchObject({ messages: pairs });
+    const conditions = again.events.map((e) => e.progress.condition);
+    expect(conditions.filter((condition) => condition !== 'rebuilding')).toEqual(['ok']);
+    expect(conditions.at(-1)).toBe('ok');
+    expect(again.events.some((e) => e.damaged)).toBe(false);
     await again.session.close();
     expect(digest(root)).toBe(before);
   });
