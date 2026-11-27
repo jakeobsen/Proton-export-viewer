@@ -7,7 +7,7 @@ import { ConversationList, Sidebar } from './Mailbox';
 import { LinkDialog } from './LinkDialog';
 import { generationChanged, useReaderState } from './reader';
 import { ReaderPane } from './ReaderPane';
-import { locateExport, refreshSources, showLink, useShellState } from './shell';
+import { locateExport, openExport, refreshSources, showLink, useShellState } from './shell';
 import { Welcome } from './Welcome';
 
 /** Index states shown as a banner; "Verifying index…" shows in the sidebar. */
@@ -53,6 +53,19 @@ export function App() {
             onClick={() => void locateExport()}
           >
             Locate export…
+          </button>
+        </div>
+      )}
+      {active?.closed && (
+        <div className="banner" role="alert">
+          <span>Export closed after an error.</span>
+          <button
+            type="button"
+            className="btn"
+            disabled={state.busy}
+            onClick={() => void openExport(active.sourceKey)}
+          >
+            Reopen
           </button>
         </div>
       )}

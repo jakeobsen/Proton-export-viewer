@@ -118,6 +118,8 @@ interface Active {
   scan: ScanSummary | null;
   /** The state of its index, once core reported it. */
   index: IndexCondition | null;
+  /** Core kept exiting, so it is no longer restarted until the export is opened again. */
+  closed: boolean;
 }
 
 interface Target {
@@ -134,7 +136,13 @@ interface Target {
   onMismatch: 'open' | 'offline';
   /** The pick's runs, when discovery just listed them. */
   runs?: FoundRun[];
+  /** Opened again by main itself (a restart or a rebuild): the restart count carries over. */
+  again?: true;
 }
+
+/** Restarts of core allowed within RESTART_WINDOW_MS before it is left down. */
+export const RESTART_LIMIT = 3;
+export const RESTART_WINDOW_MS = 60_000;
 
 /** The answer to an operation made for a generation that has moved on before it ran. */
 export const STALE = 'stale_generation';
@@ -161,6 +169,8 @@ export function sameRun(source: SourceRecord, run: FoundRun, identity: RunIdenti
 export class SourceManager {
   readonly registry: Registry;
   private active: Active | null = null;
+  /** When core was restarted for the open source, within the last window. */
+  private restarts: number[] = [];
   private scope: { pickId: string; handle: ScopeHandle } | null = null;
   private queue: Promise<unknown> = Promise.resolve();
   private restoring = false;
@@ -220,6 +230,7 @@ export class SourceManager {
         ...row(current.source),
         status: current.online ? 'online' : 'offline',
         index: current.index,
+        closed: current.closed,
         runs: current.runs.map((r) => ({
           runId: r.runId,
           account: r.accountName,
@@ -393,8 +404,9 @@ export class SourceManager {
     }, expected);
   }
 
-  /** At quit: releases the folder scope. */
+  /** At quit: nothing opens or restarts any more, and the folder scope is released. */
   close(): void {
+    this.admitting = false;
     this.releaseScope(this.deps.generation(), 'quit');
   }
 
@@ -448,6 +460,7 @@ export class SourceManager {
       this.deps.log.warn('source.refused', { reason: 'app_data' });
       return 'app_data';
     }
+    if (!target.again) this.restarts = [];
     const generation = this.deps.bumpGeneration();
     await this.stopCore(generation);
     const pickId = target.pick.pickId;
@@ -584,7 +597,15 @@ export class SourceManager {
     const runs = (target.runs ?? []).map((r) => ({ ...r, runId: randomBytes(8).toString('hex') }));
     // An index found damaged while the run was unavailable is rebuilt once it is back.
     const index = !online && this.rebuilds.has(source.sourceKey) ? 'damaged' : null;
-    this.active = { source: fresh, pick: target.pick, online, runs, scan: null, index };
+    this.active = {
+      source: fresh,
+      pick: target.pick,
+      online,
+      runs,
+      scan: null,
+      index,
+      closed: false,
+    };
     this.deps.log.info(
       online ? 'source.opened' : 'source.offline',
       { generation: stamp.generation },
@@ -626,7 +647,7 @@ export class SourceManager {
   private async identify(stamp: Stamp): Promise<RunIdentity | null> {
     let result: CoreResult;
     try {
-      result = await this.deps.core.request({ type: 'identify', stamp });
+      result = await this.deps.core.requestRunning({ type: 'identify', stamp }, stamp);
     } catch {
       return null;
     }
@@ -637,7 +658,7 @@ export class SourceManager {
   private async scan(stamp: Stamp): Promise<void> {
     let result: CoreResult;
     try {
-      result = await this.deps.core.request({ type: 'scan', stamp });
+      result = await this.deps.core.requestRunning({ type: 'scan', stamp }, stamp);
     } catch {
       this.deps.log.info(
         'source.stale_result',
@@ -678,12 +699,15 @@ export class SourceManager {
     const rebuild = this.rebuilds.has(source.sourceKey);
     let result: CoreResult;
     try {
-      result = await this.deps.core.request({
-        type: 'index',
+      result = await this.deps.core.requestRunning(
+        {
+          type: 'index',
+          stamp,
+          dbUuid: source.dbUuid ?? null,
+          ...(rebuild ? { rebuild: true } : {}),
+        },
         stamp,
-        dbUuid: source.dbUuid ?? null,
-        ...(rebuild ? { rebuild: true } : {}),
-      });
+      );
     } catch {
       return;
     }
@@ -748,6 +772,55 @@ export class SourceManager {
       verify: false,
       onMismatch: 'offline',
       runs: active.runs,
+      again: true,
+    });
+  }
+
+  /**
+   * Core exited without being stopped. If it was the core of the open source
+   * under the current generation, main opens the source again: a new
+   * generation, core, the index with its checks, and reconcile. At most
+   * RESTART_LIMIT times within RESTART_WINDOW_MS; after that the export stays
+   * closed until it is opened again.
+   */
+  coreExited(source: Stamp | null): void {
+    if (!this.admitting || !this.active || !source || !sameStamp(source, this.stamp())) return;
+    void this.serial(async () => {
+      // Only if nothing moved on meanwhile: no switch, Forget, Reset or quit.
+      // The open source is compared by its stamp: an open that settled since
+      // made a new entry for the same one.
+      const active = this.active;
+      if (!this.admitting || !active || !sameStamp(source, this.stamp())) return;
+      const record = this.registry.source(source.sourceKey);
+      if (!record) return;
+      const at = { generation: source.generation };
+      const now = performance.now();
+      this.restarts = this.restarts.filter((t) => now - t < RESTART_WINDOW_MS);
+      if (this.restarts.length >= RESTART_LIMIT) {
+        // The open views go with the core that served them.
+        this.deps.bumpGeneration();
+        active.closed = true;
+        this.deps.log.warn('core.restart_gave_up', at, { src: source.sourceKey });
+        this.deps.notify();
+        return;
+      }
+      this.restarts.push(now);
+      this.deps.log.warn('core.restart', at, { src: source.sourceKey });
+      try {
+        await this.activate({
+          pick: active.pick,
+          run: runOf(record),
+          known: record,
+          verify: false,
+          onMismatch: 'offline',
+          runs: active.runs,
+          again: true,
+        });
+      } catch {
+        // The new core ended before it was ready. Its exit was reported too,
+        // and is next in the queue: another restart, or the end of them.
+        this.deps.log.warn('core.restart_failed', at, { src: source.sourceKey });
+      }
     });
   }
 

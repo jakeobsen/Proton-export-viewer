@@ -56,6 +56,7 @@ const familyOf = (indexDir: string, key: string) =>
 /** Opens an export in a first launch, indexes it, and quits. */
 async function indexedOnce(name: string, root: string, pairs: number) {
   const first = await launch(name);
+  let once;
   try {
     await first.main('queuePick', root, 'bm1');
     await first.shell('chooseFolder', []);
@@ -65,10 +66,13 @@ async function indexedOnce(name: string, root: string, pairs: number) {
     const registry = await first.main<string>('registryFile');
     const uuid = registryUuid(registry, stamp.sourceKey)!;
     await checkHidden(first);
-    return { userData: first.userData, stamp, indexDir, registry, uuid };
+    once = { userData: first.userData, stamp, indexDir, registry, uuid };
   } finally {
     await first.close();
   }
+  // Quitting restarted nothing.
+  expect(first.logs('main').filter((l) => l.code === 'core.restart')).toEqual([]);
+  return once;
 }
 
 test('a damaged index is found by its check after a reopen and rebuilt', async () => {
@@ -247,4 +251,87 @@ test('Reset deletes the app data once the open export is torn down, and nothing 
   expect(existsSync(logsDir)).toBe(false);
   expect(digest(root)).toBe(before);
   expect(digest(nestedRoot)).toBe(nestedBefore);
+});
+
+test('core that exits on its own is restarted for the open export, and a switch restarts nothing', async ({
+  pev,
+}) => {
+  const root = realpathSync(testDir('life-restart'));
+  const written = writeExport(root, { seed: 25, messages: 12 });
+  const other = realpathSync(testDir('life-restart-other'));
+  writeExport(other, { seed: 26, messages: 4 });
+  await pev.main('queuePick', root, 'bm1');
+  await pev.shell('chooseFolder', []);
+  await phase1Done(pev, written.pairs);
+  const before = await pev.main<Stamp>('sourceStamp');
+  // The reader shows a message when core goes.
+  type Reader = { rowid: number | null; view: { url: string } | null };
+  const reader = () => pev.shell<Reader>('reader');
+  await pev.page.locator('[data-folder="5"]').dispatchEvent('click');
+  await pev.page.locator('.conv[role="option"]').first().dispatchEvent('click');
+  await expect.poll(async () => (await reader()).view?.url ?? null).not.toBeNull();
+  const shown = (await reader()).view!.url;
+  expect((await pev.main<{ status: number }>('fetchIn', 1, shown)).status).toBe(200);
+
+  await pev.main('core', 'exit');
+  await expect.poll(() => pev.hasLog('core.restart')).toBe(true);
+  await expect
+    .poll(async () => (await pev.main<Stamp>('sourceStamp')).generation)
+    .toBe(before.generation + 1);
+  expect((await pev.main<Stamp>('sourceStamp')).sourceKey).toBe(before.sourceKey);
+  // Its view went with the old generation, and the pane closed.
+  expect(pev.hasLog('view.revoked', { reason: 'generation' })).toBe(true);
+  expect((await pev.main<{ status: number }>('fetchIn', 1, shown)).status).toBe(404);
+  await expect.poll(async () => (await reader()).rowid).toBeNull();
+  await expect(pev.page.locator('.reader .rp')).toHaveCount(0);
+  // The same index is opened again, and the list reads from it.
+  await phase1Done(pev, written.pairs);
+  expect((await view(pev)).active).toMatchObject({ status: 'online', closed: false });
+  await expect(pev.page.locator('.conv[role="option"]').first()).toBeVisible();
+
+  // A switch stops core on purpose: no restart.
+  await pev.main('queuePick', other, 'bm2');
+  await pev.shell('chooseFolder', []);
+  await expect.poll(async () => (await view(pev)).active?.sourceKey).not.toBe(before.sourceKey);
+  await pev.page.waitForTimeout(500);
+  expect(pev.logs('main').filter((l) => l.code === 'core.restart')).toHaveLength(1);
+  await checkHidden(pev);
+});
+
+test('after 3 restarts within a minute the export is closed, and Reopen opens it again', async ({
+  pev,
+}) => {
+  const root = realpathSync(testDir('life-restart-limit'));
+  const written = writeExport(root, { seed: 27, messages: 6 });
+  await pev.main('queuePick', root, 'bm1');
+  await pev.shell('chooseFolder', []);
+  await phase1Done(pev, written.pairs);
+  for (let i = 0; i < 3; i += 1) {
+    const { generation } = await pev.main<Stamp>('sourceStamp');
+    await pev.main('core', 'exit');
+    await expect
+      .poll(async () => (await pev.main<Stamp>('sourceStamp')).generation)
+      .toBe(generation + 1);
+    await phase1Done(pev, written.pairs);
+  }
+  const { generation } = await pev.main<Stamp>('sourceStamp');
+  // A body view is open when core goes for the fourth time.
+  const opened = await pev.open('sample');
+  expect(opened).toMatchObject({ ok: true });
+  expect((await pev.main<{ status: number }>('fetchIn', 1, opened.url!)).status).toBe(200);
+  await pev.main('core', 'exit');
+  await expect.poll(() => pev.hasLog('core.restart_gave_up')).toBe(true);
+  const banner = pev.page.locator('.banner[role="alert"]');
+  await expect(banner.locator('span')).toHaveText('Export closed after an error.');
+  // The open view went with it: a new generation, and its token is gone.
+  expect((await pev.main<Stamp>('sourceStamp')).generation).toBe(generation + 1);
+  expect(pev.hasLog('view.revoked', { reason: 'generation' })).toBe(true);
+  expect((await pev.main<{ status: number }>('fetchIn', 1, opened.url!)).status).toBe(404);
+  expect(pev.logs('main').filter((l) => l.code === 'core.restart')).toHaveLength(3);
+
+  await banner.locator('button:text("Reopen")').dispatchEvent('click');
+  await expect(banner).toHaveCount(0);
+  await phase1Done(pev, written.pairs);
+  expect((await view(pev)).active).toMatchObject({ status: 'online', closed: false });
+  await checkHidden(pev);
 });
