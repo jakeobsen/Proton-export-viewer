@@ -28,6 +28,23 @@ test('stale generations are rejected by the real main handler', async ({ pev }) 
     .toBe(2);
 });
 
+test('a message open from the shell never starts core', async ({ pev }) => {
+  // With nothing to open, core runs without a source from launch.
+  expect(await pev.page.evaluate(() => window.pev.openStub('sample', 1))).toMatchObject({
+    ok: true,
+  });
+  await pev.main('core', 'exit');
+  await expect.poll(() => pev.hasLog('core.exit', { exitCode: 3 })).toBe(true);
+  const spawns = () => pev.logs('main').filter((l) => l.code === 'core.spawn').length;
+  const before = spawns();
+
+  const unavailable = { ok: false, code: 'core_unavailable' };
+  expect(await pev.page.evaluate(() => window.pev.openStub('sample', 1))).toEqual(unavailable);
+  expect(await pev.page.evaluate(() => window.pev.open(1, 'plain', 1))).toEqual(unavailable);
+  await pev.page.waitForTimeout(500);
+  expect(spawns()).toBe(before);
+});
+
 test('renderer logs and error reports for a stale generation are dropped', async ({ pev }) => {
   const rejectedStale = () =>
     pev

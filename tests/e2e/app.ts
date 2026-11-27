@@ -3,7 +3,7 @@
 // the stock Electron binary. Each launch gets its own userData under test-output/,
 // removed again when the test passes.
 
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   test as base,
@@ -155,6 +155,45 @@ export async function launch(name: string, options: LaunchOptions = {}): Promise
   return new PevApp(app, page, userData);
 }
 
+/**
+ * The log lines of every app launch under `dirs`, oldest first, as
+ * "proc code data". Logs hold fixed codes and redacted data only.
+ */
+function logLinesUnder(dirs: string[]): string[] {
+  const lines: LogLine[] = [];
+  const visit = (dir: string, depth: number) => {
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      const path = join(dir, name);
+      let isDir: boolean;
+      try {
+        isDir = statSync(path).isDirectory();
+      } catch {
+        continue;
+      }
+      if (!isDir) continue;
+      if (name === 'logs') {
+        for (const file of readdirSync(path).filter((f) => f.endsWith('.jsonl'))) {
+          for (const line of readFileSync(join(path, file), 'utf8').split('\n')) {
+            if (line) lines.push(JSON.parse(line) as LogLine);
+          }
+        }
+      } else if (depth < 3) {
+        visit(path, depth + 1);
+      }
+    }
+  };
+  for (const dir of dirs) visit(dir, 0);
+  return lines
+    .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0))
+    .map((l) => `${l.proc} ${l.code} ${JSON.stringify(l.data)}`);
+}
+
 export const test = base.extend<{ pev: PevApp; testDirs: void }>({
   // Removes the folders the test made under test-output/ once it passed,
   // after every other fixture (the app included) has been torn down. A
@@ -168,6 +207,10 @@ export const test = base.extend<{ pev: PevApp; testDirs: void }>({
       const dirs = takeTestDirs();
       if (testInfo.status === testInfo.expectedStatus && testInfo.errors.length === 0) {
         removeTestDirs(dirs);
+      } else {
+        // The apps' logs, for a failure seen only where the test output isn't kept.
+        const lines = logLinesUnder(dirs).slice(-300);
+        console.log(`app logs of "${testInfo.title}":\n${lines.join('\n')}`);
       }
     },
     { auto: true },

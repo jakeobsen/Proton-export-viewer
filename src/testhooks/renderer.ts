@@ -2,6 +2,7 @@
 // Shell test hooks, reached by tests as window.__pevTest.
 
 import { reportError } from '../renderer/errors';
+import { list } from '../renderer/mailbox-state';
 import {
   chooseFolder,
   forgetExport,
@@ -26,6 +27,7 @@ function frame(): HTMLIFrameElement | null {
 export function install(): void {
   const api = {
     state: () => getShellState(),
+    listSelection: () => list.snapshot.selected,
     refreshGeneration,
     open: (id: string) => openMessage(id),
     /** Opens a message in the reader pane. */

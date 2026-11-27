@@ -64,13 +64,21 @@ export interface CoreControl {
   readonly running: boolean;
   setSource(source: (Stamp & { root: string | null }) | null): void;
   /**
-   * Makes sure core runs with exactly this source: a core started with
-   * another one in the meantime (by a request) is stopped first. Resolves
-   * true if it had to stop one.
+   * Makes sure core runs with exactly this source, or with none: a core
+   * started with another one in the meantime (by a request) is stopped
+   * first. Resolves true if it had to stop one.
    */
-  startWith(source: Stamp & { root: string | null }): Promise<boolean>;
+  startWith(source: (Stamp & { root: string | null }) | null): Promise<boolean>;
   stop(): Promise<void>;
   request(call: DistributiveOmit<CoreRequest, 'reqId'>): Promise<CoreResult>;
+  /**
+   * A request only for a core already started for this stamp (null: no
+   * source open). It never starts one.
+   */
+  requestRunning(
+    call: DistributiveOmit<CoreRequest, 'reqId'>,
+    stamp: Stamp | null,
+  ): Promise<CoreResult>;
 }
 
 export interface SourceManagerDeps {
@@ -85,6 +93,8 @@ export interface SourceManagerDeps {
   notify(): void;
   /** Stops main's own log files, so a reset leaves no log folder behind. */
   stopLogs?(): void;
+  /** Tells the shell where the open source's index stands. */
+  indexChanged?(progress: IndexProgress): void;
   picker: Picker;
   scopes: Scopes;
   discover?: typeof discoverRuns;
@@ -238,7 +248,14 @@ export class SourceManager {
     const key = this.registry.active;
     const source = key ? this.registry.source(key) : undefined;
     const pick = source && this.registry.pick(source.pickId);
-    if (!source || !pick) return Promise.resolve(null);
+    if (!source || !pick) {
+      // Nothing to open: core starts without a source, so the calls the
+      // shell makes, which never start core, find one up.
+      return this.serial(async () => {
+        if (this.admitting) await this.deps.core.startWith(null).catch(() => false);
+        return null;
+      });
+    }
     // The shell waits for it instead of showing the welcome screen first.
     this.restoring = true;
     return this.serial(async () => {
@@ -695,7 +712,9 @@ export class SourceManager {
       );
       return;
     }
+    const changed = active.index !== event.progress.condition;
     active.index = event.progress.condition;
+    this.deps.indexChanged?.(event.progress);
     if (event.damaged) {
       const key = active.source.sourceKey;
       this.rebuilds.add(key);
@@ -706,7 +725,7 @@ export class SourceManager {
         void this.serial(() => this.rebuild(event.stamp), event.stamp.generation);
       }
     }
-    this.deps.notify();
+    if (changed || event.damaged) this.deps.notify();
   }
 
   /** Reopens the open source to rebuild its index, if it is still the open, known source. */
@@ -836,7 +855,9 @@ export class SourceManager {
     if (!stamp) return null;
     let result: CoreResult;
     try {
-      result = await this.deps.core.request({ type: 'index-query', stamp, query });
+      // A read never starts core: during a switch it would start one with
+      // the old source, which the switch then has to stop again.
+      result = await this.deps.core.requestRunning({ type: 'index-query', stamp, query }, stamp);
     } catch {
       return null;
     }

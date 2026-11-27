@@ -23,7 +23,7 @@ import {
 } from './limits';
 import { MetadataError, parseMetadata, type MessageRow } from './metadata';
 import type { IndexAnswer, IndexQuery } from '../../shared/index-types';
-import { listPage, rowDetails, sidebar, threadOfMessage } from './queries';
+import { listPage, listWindow, rowDetails, sidebar, threadOfMessage } from './queries';
 import {
   META,
   createSchema,
@@ -410,6 +410,8 @@ export class QueryState {
           conversations: scalar(db, 'SELECT count(*) FROM threads'),
           pairs: scalar(db, 'SELECT count(*) FROM pairs'),
         };
+      case 'window':
+        return listWindow(db, call);
     }
   }
 

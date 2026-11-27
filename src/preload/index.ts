@@ -2,7 +2,13 @@
 // Preload for the shell's main frame. It exposes a small typed API and nothing else.
 
 import { contextBridge, ipcRenderer } from 'electron';
-import { IPC, type ErrorReport, type LinkPrompt, type PevApi } from '../shared/api';
+import {
+  IPC,
+  type ErrorReport,
+  type IndexUpdate,
+  type LinkPrompt,
+  type PevApi,
+} from '../shared/api';
 
 /** True for a link prompt as main sends it. */
 function isPrompt(value: unknown): value is LinkPrompt {
@@ -55,6 +61,15 @@ const api: PevApi = {
     ipcRenderer.on(IPC.sourcesChanged, handler);
     return () => {
       ipcRenderer.off(IPC.sourcesChanged, handler);
+    };
+  },
+  sidebar: (generation) => ipcRenderer.invoke(IPC.index, { query: { op: 'sidebar' }, generation }),
+  listWindow: (query, generation) => ipcRenderer.invoke(IPC.index, { query, generation }),
+  onIndexChanged: (listener) => {
+    const handler = (_event: unknown, update: IndexUpdate) => listener(update);
+    ipcRenderer.on(IPC.indexChanged, handler);
+    return () => {
+      ipcRenderer.off(IPC.indexChanged, handler);
     };
   },
 };

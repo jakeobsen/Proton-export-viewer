@@ -18,6 +18,7 @@ import { errorData } from '../shared/log/schema';
 import { LogWriter, type Logger } from '../shared/log/writer';
 import type { ReadRequest, ReaderFailure } from '../shared/reader-protocol';
 import { WorkerThread, type ThreadRole } from './index/pool';
+import type { IndexOptions } from './index/service';
 import { READER_RETIRE_MB, ReaderLane } from './reader/lane';
 import type { ReaderSource } from './reader/source';
 import { SourceSession } from './source';
@@ -61,6 +62,8 @@ let session: SourceSession | null = null;
 
 /** Test builds can hold opens in core to keep them pending. */
 const testState = { holding: false, held: [] as Array<OpenRequest | ReadRequest> };
+/** Test builds can hold phase 1's writes. */
+let writeGate: import('../testhooks/core').WriteGate | null = null;
 
 process.on('uncaughtException', (err) => log?.error('core.uncaught', errorData(err, roots)));
 process.on('unhandledRejection', (reason) =>
@@ -174,6 +177,7 @@ function handle(request: CoreRequest): void {
             },
             readerSource: () => readerSource,
             session,
+            writeGate,
           }),
         );
         return;
@@ -213,16 +217,33 @@ function handle(request: CoreRequest): void {
   }
 }
 
-process.parentPort.once('message', (event) => {
+process.parentPort.once('message', (event) => void init(event));
+
+async function init(event: Electron.MessageEvent): Promise<void> {
   const init = event.data as CoreInit;
   roots = [[init.appRoot + sep, '']];
   log = new LogWriter(init.logsDir, 'core', 'core');
   workerLog = log.forProc('worker');
+  let options: IndexOptions | undefined;
+  if (__PEV_TEST_HOOKS__ && init.test) {
+    const hooks = await import('../testhooks/core');
+    writeGate = new hooks.WriteGate(init.test.holdWrites === true);
+    options = {
+      ...(init.test.batchPairs ? { batchPairs: init.test.batchPairs } : {}),
+      readByName: init.test.readByName === true,
+      beforeWrite: writeGate.beforeWrite,
+    };
+  }
   session = new SourceSession(
     init.source,
     log,
     reply,
-    { dir: init.indexDir, thread: indexThread, exports: init.exports },
+    {
+      dir: init.indexDir,
+      thread: indexThread,
+      exports: init.exports,
+      ...(options ? { options } : {}),
+    },
     (event) => port?.postMessage(event),
   );
   const p = event.ports[0];
@@ -232,4 +253,4 @@ process.parentPort.once('message', (event) => {
   port.start();
   lane.start();
   port.postMessage({ type: 'ready' });
-});
+}
