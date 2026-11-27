@@ -21,7 +21,7 @@ import { WorkerThread, type ThreadRole } from './index/pool';
 import type { IndexOptions } from './index/service';
 import { READER_RETIRE_MB, ReaderLane } from './reader/lane';
 import type { ReaderSource } from './reader/source';
-import { SourceSession } from './source';
+import { SourceSession, type ReaderFile } from './source';
 
 process.umask(0o077);
 
@@ -61,7 +61,12 @@ const lane = new ReaderLane<WorkerRequest, WorkerMessage>({
 let session: SourceSession | null = null;
 
 /** Test builds can hold opens in core to keep them pending. */
-const testState = { holding: false, held: [] as Array<OpenRequest | ReadRequest> };
+const testState = {
+  holding: false,
+  held: [] as Array<OpenRequest | ReadRequest>,
+  /** Message files opened for the reader. */
+  fileOpens: 0,
+};
 /** Test builds can hold phase 1's writes. */
 let writeGate: import('../testhooks/core').WriteGate | null = null;
 
@@ -107,16 +112,41 @@ function build(request: OpenRequest): void {
   });
 }
 
-/** Opens one message from the reader source and renders it in the reader lane. */
+/** The newest open each window's lane has asked for. */
+const newestOpen = new Map<number, number>();
+
+/** The message to read: from the test source if a test set one, else from the open export. */
+async function openForRead(
+  request: ReadRequest,
+): Promise<ReaderFile | { ok: false; code: 'no_source' }> {
+  if (__PEV_TEST_HOOKS__ && readerSource) {
+    const opened = await readerSource.open(request.rowid).catch(() => null);
+    return opened ? { ok: true, opened } : { ok: false, code: 'not_found' };
+  }
+  if (!session) return { ok: false, code: 'no_source' };
+  const stale = () => (newestOpen.get(request.lane) ?? 0) > request.openId;
+  return session
+    .openForReader(request.rowid, request.generation, stale)
+    .catch((): ReaderFile => ({ ok: false, code: 'not_found' }));
+}
+
+/**
+ * Opens one message and renders it in the reader lane. Of a window's opens,
+ * one is rendered and the newest waits; an older one ends as superseded, and
+ * nothing is opened for it once a newer one has come in.
+ */
 async function read(request: ReadRequest): Promise<void> {
   const { reqId } = request;
   const fail = (
-    code: 'no_source' | 'not_found' | 'superseded' | 'reader_failed',
+    code:
+      'no_source' | 'not_found' | 'superseded' | 'unavailable' | 'eml_missing' | 'reader_failed',
     reason?: ReaderFailure,
   ) => reply({ type: 'result', reqId, ok: false, code, ...(reason ? { reason } : {}) });
-  if (!readerSource) return fail('no_source');
-  const opened = await readerSource.open(request.rowid).catch(() => null);
-  if (!opened) return fail('not_found');
+  newestOpen.set(request.lane, Math.max(newestOpen.get(request.lane) ?? 0, request.openId));
+  const found = await openForRead(request);
+  if (!found.ok) return found.code === 'refused' ? fail('reader_failed', 'file') : fail(found.code);
+  if (__PEV_TEST_HOOKS__) testState.fileOpens += 1;
+  const opened = found.opened;
   try {
     const outcome = await lane.job(
       {

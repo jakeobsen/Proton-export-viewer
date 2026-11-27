@@ -7,6 +7,7 @@
 import {
   WINDOW_AFTER,
   WINDOW_BEFORE,
+  type EmlFile,
   type FolderRow,
   type ListPage,
   type ListRow,
@@ -260,4 +261,24 @@ export function rowDetails(
 export function threadOfMessage(db: Db, rowid: number): number | null {
   const row = db.stmt('SELECT thread_id FROM messages WHERE rowid = ?').get(rowid);
   return row ? asNumber(row.thread_id) : null;
+}
+
+/** Where the message file of a message is, as the scan last saw it; null for no such message. */
+export function emlFile(db: Db, rowid: number): EmlFile | null {
+  const r = db
+    .stmt(
+      `SELECT p.eml_rel AS rel, p.eml_size AS size, CAST(p.eml_mtime_ns AS TEXT) AS mtime,
+         CAST(p.eml_dev AS TEXT) AS dev, CAST(p.eml_ino AS TEXT) AS ino, p.body_state AS body_state
+       FROM messages m JOIN pairs p ON p.proton_id = m.proton_id WHERE m.rowid = ?`,
+    )
+    .get(rowid);
+  if (!r) return null;
+  return {
+    rel: r.rel === null || r.rel === undefined ? null : String(r.rel),
+    size: asNumber(r.size),
+    mtimeNs: String(r.mtime ?? '0'),
+    dev: String(r.dev ?? '0'),
+    ino: String(r.ino ?? '0'),
+    bodyState: asNumber(r.body_state),
+  };
 }

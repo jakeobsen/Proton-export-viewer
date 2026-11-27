@@ -161,6 +161,12 @@ test('a message without HTML has the HTML switch off', async ({ pev }) => {
   await expect(pane(pev).locator('.rp-html')).toHaveAttribute('title', 'No HTML version');
   await expect(pane(pev).locator('.rp-to')).toHaveText('to owner@example.com');
   await expect(pane(pev).locator('.rp-line')).toHaveCount(0);
+
+  // Opened as plain text, it still has no HTML to switch to.
+  await openInReader(pev, 2, 'plain');
+  await shownUrl(pev);
+  await expect(pane(pev).locator('.rp-plain')).toHaveAttribute('aria-pressed', 'true');
+  await expect(pane(pev).locator('.rp-html')).toBeDisabled();
 });
 
 test('HTML over 5 MB opens as plain text, and "Show HTML anyway" opens it as HTML', async ({

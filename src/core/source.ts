@@ -13,6 +13,7 @@
 // later, such as the outcome of a check, are looked at again under the lock
 // and dropped if their index is no longer the current one.
 
+import { closeSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import type {
@@ -26,7 +27,7 @@ import type {
   ResetRequest,
   ScanRequest,
 } from '../shared/core-protocol';
-import type { IndexOpened } from '../shared/index-types';
+import type { EmlFile, IndexOpened } from '../shared/index-types';
 import type { Logger } from '../shared/log/writer';
 import type { ScanSummary } from '../shared/sources';
 import {
@@ -34,6 +35,7 @@ import {
   addEntry,
   countRejections,
   emptyScan,
+  openWithRescan,
   pairCounts,
   resolveRoot,
   type Rejection,
@@ -44,7 +46,8 @@ import { runIdentity } from './identity';
 import { FamilyInUse, deleteFamily } from './index/family';
 import type { CheckResult } from './index/ops';
 import { ThreadError, type IndexThread, type ThreadRole } from './index/pool';
-import { probeMismatch } from './index/schema';
+import { BODY_STATE, probeMismatch } from './index/schema';
+import type { OpenedMessage } from './reader/source';
 import { overlaps } from '../shared/overlap';
 import { ConnectionRegistry, IndexService, type IndexOptions } from './index/service';
 
@@ -52,6 +55,18 @@ import { ConnectionRegistry, IndexService, type IndexOptions } from './index/ser
 const SCAN_SLICE = 2000;
 
 const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+/**
+ * The reader's open of a message file, or why there is none: no source or a
+ * newer generation or open, the run unavailable, no such message, its file
+ * missing, or a file the checks refused.
+ */
+export type ReaderFile =
+  | { ok: true; opened: OpenedMessage }
+  | {
+      ok: false;
+      code: 'no_source' | 'superseded' | 'unavailable' | 'not_found' | 'eml_missing' | 'refused';
+    };
 
 /** What the writer keeps about the open source until the index takes it over. */
 export interface SourceRecords {
@@ -448,6 +463,61 @@ export class SourceSession {
       answer,
       progress: { ...service.progress },
     });
+  }
+
+  /**
+   * The reader's source: the message file of an indexed message, under the
+   * current generation, opened only through the contained open. A file that
+   * changed since the scan is examined again and opened once more with its new
+   * identity; a link, a FIFO or another file type is never opened. `stale`
+   * tells whether a newer open has come in since, so nothing is opened for it.
+   */
+  async openForReader(
+    rowid: number,
+    generation: number,
+    stale: () => boolean,
+  ): Promise<ReaderFile> {
+    const current = this.gate.current;
+    if (!current) return { ok: false, code: 'no_source' };
+    if (current.generation !== generation) return { ok: false, code: 'superseded' };
+    const root = this.root;
+    if (root === null) return { ok: false, code: 'unavailable' };
+    const service = this.index;
+    if (!service || service.isDamaged) return { ok: false, code: 'not_found' };
+    const file = (await service.ask({ op: 'eml', rowid })) as EmlFile | null;
+    // Nothing is opened for a generation, an index or an open that moved on meanwhile.
+    if (!this.gate.isCurrent(current) || this.index !== service || service.isDamaged || stale()) {
+      return { ok: false, code: 'superseded' };
+    }
+    if (!file) return { ok: false, code: 'not_found' };
+    if (file.rel === null || file.bodyState === BODY_STATE.emlMissing) {
+      return { ok: false, code: 'eml_missing' };
+    }
+    const opened = openWithRescan(root, {
+      rel: file.rel,
+      kind: 'eml',
+      dev: BigInt(file.dev),
+      ino: BigInt(file.ino),
+      size: file.size,
+      mtimeNs: BigInt(file.mtimeNs),
+    });
+    if (!opened.ok) {
+      this.log.info('open.file_refused', {
+        reason: opened.gone ? 'eml_missing' : opened.rejection.kind,
+      });
+      return { ok: false, code: opened.gone ? 'eml_missing' : 'refused' };
+    }
+    const fd = opened.fd;
+    return {
+      ok: true,
+      opened: {
+        input: { kind: 'fd', fd },
+        close: () => {
+          closeSync(fd);
+          return Promise.resolve();
+        },
+      },
+    };
   }
 
   /** Scans the run for the index when no scan was accepted yet. */

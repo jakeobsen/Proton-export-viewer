@@ -9,7 +9,7 @@ import type { SidebarEntry, SidebarModel } from './folders';
 import { formatCount, fullDate, listDate, loadingText, participantsText } from './format';
 import { exportLabel } from './labels';
 import { ROW_HEIGHT, type Row } from './list';
-import { list, showFolder, useList, useMailbox } from './mailbox-state';
+import { list, selectRow, showFolder, useList, useMailbox } from './mailbox-state';
 import { switchRun } from './shell';
 
 /** Up to two initials from the account's local part: "sam.rivera@…" gives "SR". */
@@ -218,7 +218,7 @@ function ConversationRow({
       tabIndex={selected ? 0 : -1}
       data-thread={row.threadId}
       data-rowid={row.anchorRowid}
-      onClick={() => list.select(row)}
+      onClick={() => selectRow(row)}
     >
       {unread && <span className="udot" title="Unread" />}
       <div className="l1">
@@ -316,7 +316,7 @@ export function ConversationList() {
     const next = Math.max(0, Math.min(snap.total - 1, at + (e.key === 'ArrowDown' ? 1 : -1)));
     const row = list.rowAt(next);
     if (!row) return;
-    list.select(row);
+    selectRow(row);
     virtualizer.scrollToIndex(next);
     scrollRef.current
       ?.querySelector<HTMLElement>(`[data-thread="${row.threadId}"]`)

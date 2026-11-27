@@ -23,7 +23,7 @@ import {
 } from './limits';
 import { MetadataError, parseMetadata, type MessageRow } from './metadata';
 import type { IndexAnswer, IndexQuery } from '../../shared/index-types';
-import { listPage, listWindow, rowDetails, sidebar, threadOfMessage } from './queries';
+import { emlFile, listPage, listWindow, rowDetails, sidebar, threadOfMessage } from './queries';
 import {
   META,
   createSchema,
@@ -412,6 +412,8 @@ export class QueryState {
         };
       case 'window':
         return listWindow(db, call);
+      case 'eml':
+        return emlFile(db, call.rowid);
     }
   }
 

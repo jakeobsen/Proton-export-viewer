@@ -69,7 +69,7 @@ export type TestInput =
 export type ReaderInput = { kind: 'fd'; fd: number } | { kind: 'test'; input: TestInput };
 
 /** Why a reader job gave no body. The reader then shows its fallback. */
-export const READER_FAILURES = ['timeout', 'limit', 'crash', 'parse'] as const;
+export const READER_FAILURES = ['timeout', 'limit', 'crash', 'parse', 'file'] as const;
 export type ReaderFailure = (typeof READER_FAILURES)[number];
 
 /** main -> core: open one message for a window. */
