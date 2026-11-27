@@ -24,6 +24,7 @@ import {
 import { MetadataError, parseMetadata, type MessageRow } from './metadata';
 import type { IndexAnswer, IndexQuery } from '../../shared/index-types';
 import { listPage, rowDetails, sidebar, threadOfMessage } from './queries';
+import { searchPage } from './search';
 import {
   META,
   createSchema,
@@ -410,6 +411,8 @@ export class QueryState {
           conversations: scalar(db, 'SELECT count(*) FROM threads'),
           pairs: scalar(db, 'SELECT count(*) FROM pairs'),
         };
+      case 'search':
+        return searchPage(db, call);
     }
   }
 

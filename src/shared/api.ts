@@ -2,6 +2,7 @@
 // The typed surface between the shell renderer and the main process.
 
 import type { LinkAction } from './constants';
+import type { IndexProgress, SearchDateKey, SearchPage, SearchRankKey } from './index-types';
 import type { MessageHeaders, OpenMode } from './reader-protocol';
 import type { SourceOutcome, SourcesView } from './sources';
 
@@ -21,6 +22,7 @@ export const IPC = {
   locateExport: 'pev:locate-export',
   forgetExport: 'pev:forget-export',
   sourcesChanged: 'pev:sources-changed',
+  search: 'pev:search',
 } as const;
 
 export type RejectCode =
@@ -88,6 +90,16 @@ export interface LinkPrompt {
 
 export type LinkActionResult = { ok: true } | Rejected;
 
+/** A search of the open export: the text, the sort, and where the page continues. */
+export type SearchRequest =
+  | { text: string; sort: 'date'; after: SearchDateKey | null }
+  | { text: string; sort: 'relevance'; after: SearchRankKey | null };
+
+/** One page of results; `queryId` names the request it answers. */
+export type SearchResult =
+  | { ok: true; generation: number; queryId: number; page: SearchPage; progress: IndexProgress }
+  | Rejected;
+
 export type ErrorKind = 'uncaught' | 'rejection' | 'error';
 
 export interface ErrorReport {
@@ -122,4 +134,10 @@ export interface PevApi {
   forgetExport(sourceKey: string, generation: number): Promise<SourceActionResult>;
   /** Called when the open export or the list of exports changed. */
   onSourcesChanged(listener: () => void): () => void;
+  /**
+   * Searches the open export. A request made while this window's previous
+   * search is still running waits for it, and a newer one answers it as
+   * 'superseded'.
+   */
+  search(request: SearchRequest, generation: number): Promise<SearchResult>;
 }

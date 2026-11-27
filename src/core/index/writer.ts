@@ -29,6 +29,7 @@ import type { LabelEntry } from './labels';
 import { MAX_LABELS, addressText, conversationKeys, type MessageRow } from './metadata';
 import { BODY_STATE, META, META_STATE } from './schema';
 import { asNumber, type Db, type Row, type SqlValue } from './sql';
+import { stripMarks } from '../search/ranges';
 
 /** One file of a pair as the scan saw it. */
 export interface FileStat {
@@ -992,21 +993,23 @@ export class IndexWriter {
          WHERE thread_id = ?`,
       )
       .run(row.unread, attach, row.time, row.time, threadId);
-    const sender = addressText([row.sender]);
-    const recipients = addressText([...row.to, ...row.cc, ...row.bcc]);
+    // The characters snippets mark matches with never reach the full-text index.
+    const subject = stripMarks(row.subject);
+    const sender = stripMarks(addressText([row.sender]));
+    const recipients = stripMarks(addressText([...row.to, ...row.cc, ...row.bcc]));
     const kept =
       rowid !== null &&
       asNumber(
         this.db
           .stmt('UPDATE message_text SET subject = ?, sender = ?, recipients = ? WHERE rowid = ?')
-          .run(row.subject, sender, recipients, messageRowid).changes,
+          .run(subject, sender, recipients, messageRowid).changes,
       ) > 0;
     if (!kept) {
       this.db
         .stmt(
           'INSERT INTO message_text(rowid, subject, sender, recipients, body, attachments) VALUES (?, ?, ?, ?, ?, ?)',
         )
-        .run(messageRowid, row.subject, sender, recipients, '', '');
+        .run(messageRowid, subject, sender, recipients, '', '');
     }
   }
 }

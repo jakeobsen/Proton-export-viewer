@@ -16,6 +16,7 @@ import {
   type PingResult,
   type Rejected,
   type RejectCode,
+  type SearchResult,
   type SourceActionResult,
   type SourcesResult,
   type StateResult,
@@ -23,6 +24,7 @@ import {
 import type { SourceOutcome } from '../shared/sources';
 import { STALE, type Stale } from './sources/manager';
 import { APP_ORIGIN, LINK_ACTIONS } from '../shared/constants';
+import { MAX_QUERY_LENGTH, type SearchPage } from '../shared/index-types';
 import { isRendererLogCode } from '../shared/log/codes';
 import { OPEN_MODES } from '../shared/reader-protocol';
 import { CoreUnavailableError } from './core-host';
@@ -30,6 +32,7 @@ import type { AppContext, AppWindow } from './context';
 import { DIALOG_ID_RE } from './link-dialog';
 import { sameFrame } from './navigation';
 import { PLACEHOLDER } from './placeholder';
+import { SUPERSEDED, SearchLanes } from './search-lane';
 import { bodyUrl } from './views';
 
 const Generation = z
@@ -81,6 +84,36 @@ const ReportArgs = z.tuple([
       frames: z.array(z.string().max(200)).max(12),
     })
     .strict(),
+]);
+
+// A search: the text, the sort and its keyset, nothing else.
+const SearchThreadId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+const SearchText = z.string().max(MAX_QUERY_LENGTH);
+const SearchArgs = z.tuple([
+  z.discriminatedUnion('sort', [
+    z
+      .object({
+        text: SearchText,
+        sort: z.literal('date'),
+        after: z
+          .object({
+            time: z.number().int().min(Number.MIN_SAFE_INTEGER).max(Number.MAX_SAFE_INTEGER),
+            threadId: SearchThreadId,
+          })
+          .strict()
+          .nullable(),
+        generation: Generation,
+      })
+      .strict(),
+    z
+      .object({
+        text: SearchText,
+        sort: z.literal('relevance'),
+        after: z.object({ rank: z.number(), threadId: SearchThreadId }).strict().nullable(),
+        generation: Generation,
+      })
+      .strict(),
+  ]),
 ]);
 
 const SourceKey = z.uuid();
@@ -265,6 +298,34 @@ export function registerIpc(ctx: AppContext): void {
     if (!args.success) return reject('invalid', appWin);
     if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
     return { ok: true, generation: ctx.generation, sources: ctx.sources.view() };
+  });
+
+  /**
+   * A search of the open export, one page. Per window, one search runs in
+   * core and one waits; a newer request answers the waiting one as
+   * superseded, which isn't logged, since it is how typing works.
+   */
+  const searchLanes = new SearchLanes<AppWindow>();
+  let lastQueryId = 0;
+  guarded<SearchResult>(IPC.search, async (appWin, raw) => {
+    const args = SearchArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ generation, ...request }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    lastQueryId += 1;
+    const queryId = lastQueryId;
+    const outcome = await searchLanes.run(appWin, async () =>
+      // A search that waited is checked again when its turn comes.
+      generation === ctx.generation
+        ? ctx.sources.queryIndex({ op: 'search', queryId, ...request })
+        : null,
+    );
+    if (outcome === SUPERSEDED) return { ok: false, code: 'superseded' };
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    if (!outcome) return { ok: false, code: 'no_source' };
+    const page = outcome.answer as SearchPage | null;
+    if (page?.queryId !== queryId) return reject('invalid', appWin);
+    return { ok: true, generation, queryId, page, progress: outcome.progress };
   });
 
   /**

@@ -26,6 +26,11 @@ export interface Db {
   exec(sql: string): void;
   /** A prepared statement, cached per SQL text for the connection's lifetime. */
   stmt(sql: string): Statement;
+  /**
+   * A prepared statement that isn't cached, for SQL whose text varies, so the
+   * cache can't grow without bound. It is finalized once nothing holds it.
+   */
+  once(sql: string): Statement;
   close(): void;
 }
 
@@ -58,6 +63,7 @@ export function openDb(path: string, readOnly = false, immutable = false): Db {
       }
       return statement;
     },
+    once: (sql) => raw.prepare(sql) as unknown as Statement,
     close: () => {
       cache.clear();
       raw.close();
