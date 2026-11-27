@@ -4,6 +4,17 @@
 // name under leak-<nonce>.test, an IP from the documentation ranges, or
 // loopback. Images are built here, byte by byte; nothing comes from outside.
 
+import {
+  apng,
+  dimensionBombPng,
+  gif,
+  gifImage,
+  jpegImage,
+  paddedPng,
+  solidPng,
+  webpAnimated,
+  webpImage,
+} from './images.mjs';
 import { Random } from './random.mjs';
 import { base64Lines, exportId, rfcDate } from './text.mjs';
 
@@ -33,110 +44,45 @@ export const IP_LITERAL_FORMS = [
 
 // --- Images --------------------------------------------------------------------
 
-const CRC_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    table[n] = c >>> 0;
-  }
-  return table;
-})();
-
-function crc32(buffer) {
-  let c = 0xffffffff;
-  for (const byte of buffer) c = CRC_TABLE[(c ^ byte) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
-}
-
-function adler32(buffer) {
-  let a = 1;
-  let b = 0;
-  for (const byte of buffer) {
-    a = (a + byte) % 65521;
-    b = (b + a) % 65521;
-  }
-  return ((b << 16) | a) >>> 0;
-}
-
-function pngChunk(type, data) {
-  const head = Buffer.alloc(8);
-  head.writeUInt32BE(data.length, 0);
-  head.write(type, 4, 'ascii');
-  const crc = Buffer.alloc(4);
-  crc.writeUInt32BE(crc32(Buffer.concat([head.subarray(4), data])), 0);
-  return Buffer.concat([head, data, crc]);
-}
+export { dimensionBombPng, gif, paddedPng } from './images.mjs';
 
 /**
- * A 1-bit grayscale PNG that declares width x height pixels but carries one
- * row of image data, in an uncompressed (stored) zlib stream, so its bytes
- * never depend on a zlib version.
+ * Inline images the raster check must refuse, each as a `cid:` part
+ * (`inline_images/cid-<name>`) and as a `data:` image (`inline_images/data-<name>`),
+ * by the reason it gives. Each is within 1 MB.
  */
-export function dimensionBombPng(width, height) {
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0);
-  ihdr.writeUInt32BE(height, 4);
-  ihdr.set([1, 0, 0, 0, 0], 8);
-  const row = Buffer.alloc(1 + Math.ceil(width / 8));
-  const stored = Buffer.alloc(5);
-  stored[0] = 1;
-  stored.writeUInt16LE(row.length, 1);
-  stored.writeUInt16LE(~row.length & 0xffff, 3);
-  const adler = Buffer.alloc(4);
-  adler.writeUInt32BE(adler32(row), 0);
-  const zlib = Buffer.concat([Buffer.from([0x78, 0x01]), stored, row, adler]);
-  return Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    pngChunk('IHDR', ihdr),
-    pngChunk('IDAT', zlib),
-    pngChunk('IEND', Buffer.alloc(0)),
-  ]);
-}
+export const INLINE_BOMBS = {
+  // 6 frames of a 40 MP canvas: every other limit is met.
+  pixels: [() => gifImage(8000, 5000, 6), 'pixels'],
+  'apng-count': [() => apng(4, 4, 3, { declared: 2 }), 'container'],
+  'apng-frames': [() => apng(1, 1, 1001), 'frames'],
+  'webp-frames': [() => webpAnimated(1, 1, 1001), 'frames'],
+  'png-truncated': [() => solidPng(8, 8, [0, 0, 0]).subarray(0, -20), 'container'],
+  'gif-truncated': [() => gifImage(8, 8, 1, { full: true }).subarray(0, -5), 'container'],
+  'webp-truncated': [() => webpImage(8, 8).subarray(0, -4), 'container'],
+  'jpeg-canvas': [() => jpegImage(9000, 9000), 'canvas'],
+  'gif-outside': [
+    () => gifImage(10, 10, 2, { rect: { x: 5, y: 0, width: 10, height: 1 } }),
+    'container',
+  ],
+  'apng-outside': [
+    () => apng(10, 10, 2, { rect: { x: 0, y: 5, width: 1, height: 10 } }),
+    'container',
+  ],
+  'webp-outside': [
+    () => webpAnimated(10, 10, 2, { rect: { x: 4, y: 0, width: 8, height: 1 } }),
+    'container',
+  ],
+  'jpeg-scans': [() => jpegImage(8, 8, { scans: 101 }), 'frames'],
+};
 
-/** An animated GIF: a width x height canvas and `frames` 1x1 frames. */
-export function gif(width, height, frames) {
-  const parts = [Buffer.from('GIF89a', 'ascii')];
-  const screen = Buffer.alloc(7);
-  screen.writeUInt16LE(width, 0);
-  screen.writeUInt16LE(height, 2);
-  screen.set([0x80, 0, 0], 4);
-  parts.push(screen, Buffer.from([0, 0, 0, 255, 255, 255]));
-  parts.push(Buffer.from([0x21, 0xff, 0x0b, ...Buffer.from('NETSCAPE2.0'), 3, 1, 0, 0, 0]));
-  const frame = Buffer.from([
-    0x21, 0xf9, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0x02, 0x02,
-    0x44, 0x01, 0x00,
-  ]);
-  for (let i = 0; i < frames; i++) parts.push(frame);
-  parts.push(Buffer.from([0x3b]));
-  return Buffer.concat(parts);
-}
-
-/**
- * A PNG of `bytes` bytes or a little more: a valid 1x1 image whose size comes
- * from a private ancillary chunk of zeros, which decoders skip.
- */
-export function paddedPng(bytes) {
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(1, 0);
-  ihdr.writeUInt32BE(1, 4);
-  ihdr.set([1, 0, 0, 0, 0], 8);
-  // One row: filter byte 0 and one pixel byte, as a stored zlib block.
-  const row = Buffer.from([0, 0]);
-  const zlib = Buffer.concat([
-    Buffer.from([0x78, 0x01, 0x01, row.length, 0, ~row.length & 0xff, 0xff]),
-    row,
-    Buffer.alloc(4),
-  ]);
-  zlib.writeUInt32BE(adler32(row), zlib.length - 4);
-  const head = Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    pngChunk('IHDR', ihdr),
-  ]);
-  const tail = Buffer.concat([pngChunk('IDAT', zlib), pngChunk('IEND', Buffer.alloc(0))]);
-  const pad = Math.max(0, bytes - head.length - tail.length - 12);
-  return Buffer.concat([head, pngChunk('prVt', Buffer.alloc(pad)), tail]);
-}
+/** The colours of the inline images that must show, for a pixel check. */
+export const INLINE_COLORS = {
+  cid: [0, 160, 80],
+  data: [200, 0, 160],
+  first: [220, 30, 30],
+  second: [30, 30, 220],
+};
 
 // --- Messages ------------------------------------------------------------------
 
@@ -686,6 +632,133 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
       { attachments: [{ name: `${name}.${type.split('/')[1]}`, type, bytes: bytes.length }] },
     );
   }
+
+  // Inline images: cid: parts and data: images, shown only if they pass the
+  // raster check, and cid: references resolved in their HTML part's branch.
+  const inlineHtml = (inner) => page(inner);
+  const imagePart = (cid, bytes, type = 'image/png') => [
+    `Content-Type: ${type}`,
+    `Content-ID: <${cid}>`,
+    'Content-Disposition: inline',
+    'Content-Transfer-Encoding: base64',
+    '',
+    base64Lines(bytes),
+  ];
+  const htmlPart = (inner) => [`Content-Type: ${htmlType}`, '', inlineHtml(inner)];
+  /** A multipart body of the given parts, each a list of lines; nested ones are [type, parts]. */
+  const multipart = (type, parts, name) => {
+    const b = `i-${name}-${type.split('/')[1]}`;
+    const lines = [];
+    for (const part of parts) {
+      lines.push(`--${b}`);
+      if (Array.isArray(part[0])) {
+        const [innerType, innerParts] = part[0];
+        const inner = multipart(innerType, innerParts, `${name}-${lines.length}`);
+        lines.push(`Content-Type: ${innerType}; boundary="${inner.boundary}"`, '', inner.body);
+      } else {
+        lines.push(...part);
+      }
+    }
+    lines.push(`--${b}--`);
+    return { boundary: b, body: crlf(lines) };
+  };
+  const addInline = (name, type, parts) => {
+    const { boundary, body } = multipart(type, parts, name);
+    add('inline_images', name, `${type}; boundary="${boundary}"`, body, refs(0));
+  };
+  const img = (id, src, size = 40) =>
+    `<img id="${id}" alt="" width="${size}" height="${size}" src="${src}">`;
+
+  for (const [name, [make, reason]] of Object.entries(INLINE_BOMBS)) {
+    const bytes = make();
+    const cid = `${name}@example.org`;
+    addInline(`cid-${name}`, 'multipart/related', [
+      htmlPart(`<p>${reason}</p>${img('bomb', `cid:${cid}`)}`),
+      imagePart(cid, bytes),
+    ]);
+    add(
+      'inline_images',
+      `data-${name}`,
+      htmlType,
+      page(`<p>${reason}</p>${img('bomb', `data:image/png;base64,${bytes.toString('base64')}`)}`),
+      refs(0),
+    );
+  }
+  const color = (which) => INLINE_COLORS[which];
+  addInline('cid-valid', 'multipart/related', [
+    htmlPart(img('inline', 'cid:valid@example.org')),
+    imagePart('valid@example.org', solidPng(40, 40, color('cid'))),
+  ]);
+  add(
+    'inline_images',
+    'data-valid',
+    htmlType,
+    page(
+      img(
+        'inline',
+        `data:image/gif;base64,${gifImage(40, 40, 1, { rgb: color('data'), full: true }).toString('base64')}`,
+      ),
+    ),
+    refs(0),
+  );
+  // The same Content-ID in two alternatives: each HTML part shows its own.
+  for (const [name, wrapper] of [
+    ['scope-related', 'multipart/related'],
+    ['scope-mixed', 'multipart/mixed'],
+  ]) {
+    addInline(name, 'multipart/alternative', [
+      [
+        [
+          wrapper,
+          [
+            htmlPart(img('first', 'cid:same@example.org')),
+            imagePart('same@example.org', solidPng(40, 40, color('first'))),
+          ],
+        ],
+      ],
+      [
+        [
+          wrapper,
+          [
+            htmlPart(img('second', 'cid:same@example.org')),
+            imagePart('same@example.org', solidPng(40, 40, color('second'))),
+          ],
+        ],
+      ],
+    ]);
+  }
+  // Two parts in reach with one Content-ID, and an invalid escape: nothing shows.
+  addInline('scope-duplicate', 'multipart/related', [
+    htmlPart(img('duplicate', 'cid:twice@example.org')),
+    imagePart('twice@example.org', solidPng(40, 40, color('first'))),
+    imagePart('twice@example.org', solidPng(40, 40, color('second'))),
+  ]);
+  addInline('scope-escape', 'multipart/related', [
+    htmlPart(img('escape', 'cid:%zz@example.org')),
+    imagePart('%zz@example.org', solidPng(40, 40, color('first'))),
+  ]);
+  // A data: image stays only in <img src>.
+  const dot = `data:image/gif;base64,${gifImage(4, 4, 1, { rgb: color('data'), full: true }).toString('base64')}`;
+  add(
+    'inline_images',
+    'data-places',
+    htmlType,
+    page(
+      [
+        img('kept', dot),
+        `<img id="srcset" alt="" srcset="${dot} 1x">`,
+        `<picture><source srcset="${dot}"><img alt="" id="picture" src="cid:none"></picture>`,
+        `<table id="table" background="${dot}"><tr><td>cell</td></tr></table>`,
+        `<video id="video" poster="${dot}"></video>`,
+        `<div id="css" style="background:url('${dot}')">css</div>`,
+        `<div id="set" style="background-image:image-set('${dot}' 1x)">set</div>`,
+        `<style>p{background:url(${dot})}</style><p>style sheet</p>`,
+        `<input type="image" src="${dot}">`,
+        `<svg><image href="${dot}" width="4" height="4"/></svg>`,
+      ].join(''),
+    ),
+    refs(0),
+  );
 
   // Export structure.
   add('export_structure', 'unknown-label-ids', 'text/plain', 'unknown labels', refs(0), {

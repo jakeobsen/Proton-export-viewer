@@ -2,7 +2,6 @@
 // Reader worker. It builds message bodies: rendered messages, and the fixed
 // placeholder bodies.
 
-import { createReadStream } from 'node:fs';
 import { sep } from 'node:path';
 import type { Readable } from 'node:stream';
 import { getHeapStatistics } from 'node:v8';
@@ -10,6 +9,8 @@ import { parentPort, workerData } from 'node:worker_threads';
 import type { WorkerMessage, WorkerRequest } from '../shared/core-protocol';
 import { errorData } from '../shared/log/schema';
 import type { ReaderInput, WorkerRender, WorkerRendered } from '../shared/reader-protocol';
+import { fdRead, fdReread } from './reader/fd-input';
+import type { Reread } from './reader/images';
 import { renderMessage } from './reader/render';
 import { STUBS, type StubBuilder } from './stubs';
 
@@ -20,6 +21,15 @@ const roots: Array<[string, string]> = appRoot
 
 function post(message: WorkerMessage): void {
   parentPort?.postMessage(message);
+}
+
+/** Posts a rendered body, handing over its images' memory rather than copying it. */
+function postRendered(message: WorkerRendered): void {
+  const images = message.ok ? message.message.images : [];
+  parentPort?.postMessage(
+    message,
+    images.map((image) => image.bytes.buffer as ArrayBuffer),
+  );
 }
 
 function crash(code: 'worker.uncaught' | 'worker.rejection', err: unknown): void {
@@ -40,8 +50,7 @@ async function builderFor(stubId: string): Promise<StubBuilder | undefined> {
 
 async function inputStream(input: ReaderInput): Promise<Readable | null> {
   // The file is core's: read it by position and leave it open for core to close.
-  if (input.kind === 'fd')
-    return createReadStream('', { fd: input.fd, autoClose: false, start: 0 });
+  if (input.kind === 'fd') return fdRead(input.fd);
   if (__PEV_TEST_HOOKS__ && input.kind === 'test') {
     const hooks = await import('../testhooks/reader-input');
     return hooks.testStream(input.input);
@@ -64,6 +73,12 @@ async function render(request: WorkerRender): Promise<WorkerRendered> {
     code: 'parse',
   });
   try {
+    // Taken before the first read: the second read for inline images checks
+    // the file against it.
+    const reread: Reread =
+      request.input.kind === 'fd'
+        ? fdReread(request.input.fd)
+        : { open: () => inputStream(request.input) };
     const input = await inputStream(request.input);
     if (!input) return failed();
     const sanitize =
@@ -73,6 +88,17 @@ async function render(request: WorkerRender): Promise<WorkerRendered> {
     const message = await renderMessage(input, {
       mode: request.mode,
       assetBase: request.assetBase,
+      reread,
+      onImagesRefused: (refused) => {
+        for (const [reason, count] of refused) {
+          post({
+            type: 'log',
+            level: 'info',
+            code: 'reader.images_refused',
+            data: { reason, count },
+          });
+        }
+      },
       ...(sanitize ? { sanitize } : {}),
     });
     return { type: 'rendered', reqId: request.reqId, heldBytes: heldBytes(), ok: true, message };
@@ -84,7 +110,7 @@ async function render(request: WorkerRender): Promise<WorkerRendered> {
 
 parentPort?.on('message', (request: WorkerRequest) => {
   if (request.type === 'render') {
-    void render(request).then(post);
+    void render(request).then(postRendered);
     return;
   }
   if (request.type === 'build') {

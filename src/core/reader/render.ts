@@ -9,14 +9,17 @@
 // Each limit applies to the body being shown, and counts its encoded bytes
 // (before base64 or quoted-printable is undone), so an encoded body counts as
 // larger than its decoded text.
+// An HTML body comes with its inline images (see images.ts): the `cid:`
+// parts it names, read again from the message, and its `data:` images.
 
 import type { Readable } from 'node:stream';
 import type { AddressObject, HeaderLines, HeaderValue, Headers } from 'mailparser';
 import type { MessageHeaders, OpenMode, RenderedMessage } from '../../shared/reader-protocol';
 import { htmlTextParser } from '../text/html-to-text';
 import { KEEP_BYTES, extractMessage, type Body } from './extract';
+import { InlineImages, type ImageRefusal, type Reread } from './images';
 import { plainBody } from './plain';
-import { sanitizeHtml, type SanitizedBody } from './sanitize';
+import { sanitizeHtml, type HtmlSource, type ImageResolver, type SanitizedBody } from './sanitize';
 
 /** HTML bodies larger than this, in encoded bytes, open as plain text unless asked for anyway. */
 export const HTML_VIEW_BYTES = 5 * 1024 * 1024;
@@ -35,7 +38,15 @@ export interface RenderOptions {
   /** `mail-asset://v/<token>` of the view being opened. */
   assetBase: string;
   /** What makes the HTML body safe: the sanitizer, unless a test build replaces it. */
-  sanitize?: (html: string, assetBase: string) => SanitizedBody;
+  sanitize?: (
+    html: readonly HtmlSource[],
+    assetBase: string,
+    images: ImageResolver,
+  ) => SanitizedBody;
+  /** How to read the message again for its `cid:` images. Without it, none is shown. */
+  reread?: Reread;
+  /** Told, once the body is built, how many inline images weren't shown, by reason. */
+  onImagesRefused?: (refused: ReadonlyMap<ImageRefusal, number>) => void;
 }
 
 function cut(text: string, max: number): string {
@@ -144,18 +155,29 @@ export async function renderMessage(
   input: Readable,
   options: RenderOptions,
 ): Promise<RenderedMessage> {
-  const { headers: parsedHeaders, lines, text, html } = await extractMessage(input);
+  const extracted = await extractMessage(input);
+  const { headers: parsedHeaders, lines, text, html } = extracted;
   const headers = headerFields(parsedHeaders, lines);
   const hasHtml = html.content.length > 0 || html.cut;
   const htmlLimit = options.mode === 'html-anyway' ? HTML_ANYWAY_BYTES : HTML_VIEW_BYTES;
   if (options.mode !== 'plain' && hasHtml && html.bytes <= htmlLimit) {
-    const body = (options.sanitize ?? sanitizeHtml)(html.content, options.assetBase);
+    const images = new InlineImages(extracted.tree);
+    const sources = extracted.htmlParts.map(({ part, start, end }) => ({
+      html: html.content.slice(start, end),
+      part,
+    }));
+    const body = (options.sanitize ?? sanitizeHtml)(sources, options.assetBase, images);
+    const served = await images.load(body.cidTargets, options.reread ?? null);
+    if (images.refused.size > 0) options.onImagesRefused?.(images.refused);
     return {
       headers,
       html: body.html,
       links: body.links,
       format: 'html',
       remote: body.remote,
+      cids: body.cids,
+      images: served,
+      imagesRefused: images.refusedCount,
       hasHtml,
       htmlTooLarge: false,
       truncated: false,
@@ -169,6 +191,9 @@ export async function renderMessage(
     links: body.links,
     format: 'plain',
     remote: 0,
+    cids: 0,
+    images: [],
+    imagesRefused: 0,
     hasHtml,
     // HTML was asked for and not shown for its size alone: it can be shown anyway.
     htmlTooLarge:
