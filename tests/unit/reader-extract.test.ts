@@ -5,6 +5,8 @@
 import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import { extractMessage } from '../../src/core/reader/extract';
+import { MAX_MIME_PARTS } from '../../src/core/mime-limits';
+import { bodiesAfter, bodiesAround } from '../mime-parts';
 
 function read(eml: string, keepBytes?: number) {
   return extractMessage(Readable.from([Buffer.from(eml.replace(/\r?\n/g, '\r\n'))]), keepBytes);
@@ -152,5 +154,58 @@ describe('the bytes kept of each body kind', () => {
     expect(message.html.cut).toBe(false);
     expect(message.html.bytes).toBe(47);
     expect(message.html.content).toBe(`<p>${'c'.repeat(40)}</p>`);
+  });
+});
+
+describe('the part limit', () => {
+  const stream = (eml: string) => Readable.from([Buffer.from(eml)]);
+
+  it('reads bodies that come after more than 1,000 parts', async () => {
+    const message = await extractMessage(stream(bodiesAfter(1001)));
+    expect(message.stopped).toBe(false);
+    expect(message.text.content).toContain('Text after the parts.');
+    expect(message.html.content).toContain('HTML after the parts.');
+    expect(message.headers?.get('subject')).toBe('Many parts');
+  });
+
+  it('stops at the limit and keeps what came before', async () => {
+    const message = await extractMessage(stream(bodiesAround(MAX_MIME_PARTS + 10)));
+    expect(message.stopped).toBe(true);
+    expect(message.text.content).toContain('Text before the parts.');
+    expect(message.text.content).not.toContain('after the parts');
+    expect(message.html.content).toContain('HTML before the parts.');
+    expect(message.html.content).not.toContain('after the parts');
+    expect(message.headers?.get('subject')).toBe('Many parts');
+  });
+
+  it('stops at a header block over the limit and keeps what came before', async () => {
+    const eml = [
+      'Subject: Long header',
+      'Content-Type: multipart/mixed; boundary="m"',
+      '',
+      '--m',
+      'Content-Type: text/plain',
+      '',
+      'Before the long header.',
+      '--m',
+      'Content-Type: text/plain',
+      `X-Long: ${'h'.repeat(3 * 1024 * 1024)}`,
+      '',
+      'After it.',
+      '--m--',
+      '',
+    ].join('\r\n');
+    const message = await extractMessage(stream(eml));
+    expect(message.stopped).toBe(true);
+    expect(message.text.content).toContain('Before the long header.');
+    expect(message.text.content).not.toContain('After it.');
+  });
+
+  it('fails on any other read error', async () => {
+    async function* broken() {
+      yield Buffer.from('Subject: Broken\r\nContent-Type: text/plain\r\n\r\nSome text');
+      throw new Error('read failed');
+    }
+    await expect(extractMessage(Readable.from(broken()))).rejects.toThrow('read failed');
   });
 });
