@@ -264,8 +264,14 @@ test('core that exits on its own is restarted for the open export, and a switch 
   await pev.shell('chooseFolder', []);
   await phase1Done(pev, written.pairs);
   const before = await pev.main<Stamp>('sourceStamp');
-  // A body view is open when core goes.
-  expect(await pev.open('sample')).toMatchObject({ ok: true });
+  // The reader shows a message when core goes.
+  type Reader = { rowid: number | null; view: { url: string } | null };
+  const reader = () => pev.shell<Reader>('reader');
+  await pev.page.locator('[data-folder="5"]').dispatchEvent('click');
+  await pev.page.locator('.conv[role="option"]').first().dispatchEvent('click');
+  await expect.poll(async () => (await reader()).view?.url ?? null).not.toBeNull();
+  const shown = (await reader()).view!.url;
+  expect((await pev.main<{ status: number }>('fetchIn', 1, shown)).status).toBe(200);
 
   await pev.main('core', 'exit');
   await expect.poll(() => pev.hasLog('core.restart')).toBe(true);
@@ -273,7 +279,11 @@ test('core that exits on its own is restarted for the open export, and a switch 
     .poll(async () => (await pev.main<Stamp>('sourceStamp')).generation)
     .toBe(before.generation + 1);
   expect((await pev.main<Stamp>('sourceStamp')).sourceKey).toBe(before.sourceKey);
+  // Its view went with the old generation, and the pane closed.
   expect(pev.hasLog('view.revoked', { reason: 'generation' })).toBe(true);
+  expect((await pev.main<{ status: number }>('fetchIn', 1, shown)).status).toBe(404);
+  await expect.poll(async () => (await reader()).rowid).toBeNull();
+  await expect(pev.page.locator('.reader .rp')).toHaveCount(0);
   // The same index is opened again, and the list reads from it.
   await phase1Done(pev, written.pairs);
   expect((await view(pev)).active).toMatchObject({ status: 'online', closed: false });
