@@ -33,7 +33,9 @@ let state: ShellState = {
 const listeners = new Set<() => void>();
 
 function update(patch: Partial<ShellState>): void {
-  state = { ...state, ...patch };
+  // A new generation revokes every view, so a link dialog from the old one goes.
+  const moved = 'generation' in patch && patch.generation !== state.generation;
+  state = { ...state, ...patch, ...(moved ? { link: null } : {}) };
   for (const listener of listeners) listener();
 }
 
@@ -131,6 +133,11 @@ export const forgetExport = (sourceKey: string) =>
 
 export function showLink(prompt: LinkPrompt): void {
   update({ link: prompt });
+}
+
+/** Closes the link dialog without a choice. Main refuses its choices once its view is gone. */
+export function clearLink(): void {
+  if (state.link !== null) update({ link: null });
 }
 
 /** Closes the link dialog and tells main the user's choice. */

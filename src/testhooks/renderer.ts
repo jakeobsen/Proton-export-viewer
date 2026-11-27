@@ -2,6 +2,7 @@
 // Shell test hooks, reached by tests as window.__pevTest.
 
 import { reportError } from '../renderer/errors';
+import { list } from '../renderer/mailbox-state';
 import {
   chooseFolder,
   forgetExport,
@@ -13,6 +14,8 @@ import {
   refreshSources,
   switchRun,
 } from '../renderer/shell';
+import { closeReader, getReaderState, openInReader } from '../renderer/reader';
+import type { OpenMode } from '../shared/reader-protocol';
 import { markLoaded } from './marker';
 
 markLoaded();
@@ -24,8 +27,13 @@ function frame(): HTMLIFrameElement | null {
 export function install(): void {
   const api = {
     state: () => getShellState(),
+    listSelection: () => list.snapshot.selected,
     refreshGeneration,
     open: (id: string) => openMessage(id),
+    /** Opens a message in the reader pane. */
+    openInReader: (rowid: number, mode?: OpenMode) => openInReader(rowid, mode),
+    closeReader,
+    reader: () => getReaderState(),
     refreshSources,
     chooseFolder,
     openExport,

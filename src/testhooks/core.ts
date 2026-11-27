@@ -43,6 +43,39 @@ export interface CoreTestDeps {
   lane: ReaderLane<WorkerRequest, WorkerMessage>;
   setReaderSource: (source: ReaderSource) => void;
   readerSource: () => ReaderSource | null;
+  writeGate: WriteGate | null;
+}
+
+/** Holds phase 1's writes, while holding, until a test lets them through. */
+export class WriteGate {
+  private allowed = 0;
+  private readonly waiting: Array<() => void> = [];
+
+  constructor(private holding: boolean) {}
+
+  readonly beforeWrite = (): Promise<void> => {
+    if (!this.holding) return Promise.resolve();
+    if (this.allowed > 0) {
+      this.allowed -= 1;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => this.waiting.push(resolve));
+  };
+
+  /** Lets `count` more writes through; null stops holding. */
+  release(count: number | null): void {
+    if (count === null) this.holding = false;
+    else this.allowed += count;
+    while (this.waiting.length > 0 && (!this.holding || this.allowed > 0)) {
+      if (this.holding) this.allowed -= 1;
+      this.waiting.shift()?.();
+    }
+  }
+
+  /** Writes waiting to be let through. */
+  get held(): number {
+    return this.waiting.length;
+  }
 }
 
 function limits(payload: unknown): { heapMb?: number; timeoutMs?: number } | null {
@@ -92,6 +125,21 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
     }
     case 'held':
       ok(deps.state.held.length);
+      return;
+    case 'release-writes': {
+      const count = (request.payload as { count?: unknown } | undefined)?.count;
+      const valid =
+        count === null || (typeof count === 'number' && Number.isSafeInteger(count) && count > 0);
+      if (!deps.writeGate || !valid) {
+        deps.reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
+        return;
+      }
+      deps.writeGate.release(count as number | null);
+      ok();
+      return;
+    }
+    case 'held-writes':
+      ok(deps.writeGate?.held ?? 0);
       return;
     case 'log':
       deps.log.info('test.log', {

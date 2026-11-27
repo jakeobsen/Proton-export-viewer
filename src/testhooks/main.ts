@@ -6,13 +6,13 @@ import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { BrowserWindow, app, clipboard, dialog, shell } from 'electron';
-import { bumpGeneration, type AppContext } from '../main/context';
+import { bumpGeneration, notifySources, type AppContext } from '../main/context';
 import type { PolicyObserver } from '../main/harden';
 import { PROD_SWITCHES } from '../main/switches';
 import { ScopeError, type Picked } from '../main/sources/scope';
 import type { OrderStep } from '../main/sources/manager';
 import { createAppWindow } from '../main/windows';
-import type { CoreResult } from '../shared/core-protocol';
+import type { CoreResult, CoreTestInit } from '../shared/core-protocol';
 import type { IndexQuery } from '../shared/index-types';
 import { errorData } from '../shared/log/schema';
 import { TESTHOOKS_MARKER, markLoaded } from './marker';
@@ -245,6 +245,8 @@ export async function install(ctx: AppContext): Promise<boolean> {
     windows: () => [...ctx.windows.values()].map((w) => w.id),
     generation: () => ctx.generation,
     bumpGeneration: () => bumpGeneration(ctx),
+    /** Tells every shell window that the sources changed, as main does after its own switch. */
+    notifySources: () => notifySources(ctx),
     setBodyCsp: (on: boolean) => {
       bodyCsp = on;
     },
@@ -399,6 +401,24 @@ export async function install(ctx: AppContext): Promise<boolean> {
     heldSourceResults: () => heldResults.length,
     /** A read from the open source's index, as the shell will make it. */
     indexQuery: (query: IndexQuery) => ctx.sources.queryIndex(query),
+    /** How the next start of core runs phase 1: batch size, held writes, read order. */
+    indexTestSettings: (settings: CoreTestInit | null) => {
+      ctx.core.testInit = settings;
+    },
+    /** Lets `count` held phase 1 writes through; null stops holding them. */
+    releaseWrites: async (count: number | null) => {
+      const result = await ctx.core.request({
+        type: 'test',
+        action: 'release-writes',
+        payload: { count },
+      });
+      if (!result.ok) throw new Error('release-writes');
+    },
+    /** Phase 1 writes waiting to be let through. */
+    heldWrites: async () => {
+      const result = await core('held-writes');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
     indexDir: () => join(app.getPath('userData'), 'index'),
     /** Resets the app's data, as Settings will. */
     resetApp: () => ctx.sources.reset(),

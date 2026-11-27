@@ -21,7 +21,9 @@ test('the session request filter cancels a host name and an IP literal on each w
     const targets = [`https://leak-${nonce}.test/`, 'http://203.0.113.9/'];
     await pev.main('clearRequests');
     await pev.main('loadUrl', windowId, FETCH_PAGE);
-    expect(page.url()).toBe(FETCH_PAGE);
+    // Playwright learns of the navigation from its own event, which can come
+    // after main's load call returns.
+    await expect(page).toHaveURL(FETCH_PAGE);
 
     const results = await page.evaluate(
       (urls) =>

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The typed surface between the shell renderer and the main process.
 
+import type { IndexProgress, ListWindow, Sidebar, WindowQuery } from './index-types';
 import type { LinkAction } from './constants';
 import type { MessageHeaders, OpenMode } from './reader-protocol';
 import type { SourceOutcome, SourcesView } from './sources';
@@ -21,6 +22,8 @@ export const IPC = {
   locateExport: 'pev:locate-export',
   forgetExport: 'pev:forget-export',
   sourcesChanged: 'pev:sources-changed',
+  index: 'pev:index',
+  indexChanged: 'pev:index-changed',
 } as const;
 
 export type RejectCode =
@@ -70,6 +73,18 @@ export type MessageOpenResult =
     }
   | { ok: true; openId: number; outcome: 'fallback' }
   | Rejected;
+
+/** What the shell reads from the open export's index. */
+export type ShellIndexQuery = { op: 'sidebar' } | WindowQuery;
+
+export type IndexResult<T> =
+  { ok: true; generation: number; answer: T; progress: IndexProgress } | Rejected;
+
+/** Where the open export's index stands, sent by main as it changes. */
+export interface IndexUpdate {
+  generation: number;
+  progress: IndexProgress;
+}
 
 /** What the link dialog shows. Main keeps the URL it acts on. */
 export interface LinkPrompt {
@@ -122,4 +137,10 @@ export interface PevApi {
   forgetExport(sourceKey: string, generation: number): Promise<SourceActionResult>;
   /** Called when the open export or the list of exports changed. */
   onSourcesChanged(listener: () => void): () => void;
+  /** The open export's folders and labels, with their counts. */
+  sidebar(generation: number): Promise<IndexResult<Sidebar>>;
+  /** A stretch of a folder's or label's conversations. */
+  listWindow(query: WindowQuery, generation: number): Promise<IndexResult<ListWindow>>;
+  /** Called as indexing moves on or the index's state changes. */
+  onIndexChanged(listener: (update: IndexUpdate) => void): () => void;
 }
