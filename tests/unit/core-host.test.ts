@@ -74,6 +74,10 @@ const ports = () => fake.ports as FakePort[];
 
 function make(stopTimeoutMs?: number) {
   const codes: string[] = [];
+  /** Processes ended for good, by pid. */
+  const killed: number[] = [];
+  /** What the host reported as unplanned exits. */
+  const exits: Array<CoreSource | null> = [];
   const push = (code: string) => codes.push(code);
   const log = { log: (_l: unknown, c: string) => push(c), error: push, warn: push, info: push };
   const host = new CoreHost({
@@ -82,9 +86,11 @@ function make(stopTimeoutMs?: number) {
     indexDir: 'index',
     appRoot: 'app',
     log: log as unknown as Logger,
+    killProcess: (pid) => killed.push(pid),
     ...(stopTimeoutMs === undefined ? {} : { stopTimeoutMs }),
   });
-  return { host, codes };
+  host.onExit = (source) => exits.push(source);
+  return { host, codes, killed, exits };
 }
 
 /** Core `i` spawns and says it is ready. */
@@ -208,6 +214,55 @@ describe('stopping core', () => {
     await host.stop();
     await expect(pending).rejects.toBeInstanceOf(CoreUnavailableError);
     expect(host.running).toBe(false);
+  });
+});
+
+describe('an exit', () => {
+  it('that nobody asked for is reported with the source the core had', async () => {
+    const { host, exits } = make();
+    host.setSource(A1);
+    const first = host.start();
+    ready(0);
+    await first;
+    children()[0]!.emit('exit', 3);
+    expect(exits).toEqual([A1]);
+    expect(host.running).toBe(false);
+  });
+
+  it('of a stop, or late from a core given up on, is never reported', async () => {
+    const { host, exits, killed } = make(30);
+    host.setSource(A1);
+    const first = host.start();
+    ready(0);
+    await first;
+    await host.stop();
+    expect(exits).toEqual([]);
+
+    const second = host.startWith(A2);
+    ready(1);
+    await second;
+    children()[1]!.exitsOnKill = false;
+    await host.stop();
+    // It spawned and ignored its kill, so it was ended for good.
+    expect(killed).toEqual([1000]);
+    children()[1]!.emit('exit', 9);
+    expect(exits).toEqual([]);
+  });
+
+  it('of a core given up on before it spawned: no pid to end for good, then killed on spawn', async () => {
+    const { host, codes, killed } = make(30);
+    host.setSource(A1);
+    const first = host.start();
+    await host.stop();
+    await expect(first).rejects.toBeInstanceOf(CoreUnavailableError);
+    expect(codes).toContain('core.stop_timeout');
+    // Nothing to end for good: it had no pid yet.
+    expect(killed).toEqual([]);
+    children()[0]!.exitsOnKill = false;
+    children()[0]!.spawn();
+    expect(children()[0]!.kills).toBe(2);
+    expect(children()[0]!.inits).toEqual([]);
+    expect(codes).not.toContain('core.spawn');
   });
 });
 
