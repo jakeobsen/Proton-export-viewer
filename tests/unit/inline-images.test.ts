@@ -10,6 +10,7 @@ import {
   futimesSync,
   mkdirSync,
   openSync,
+  utimesSync,
   writeFileSync,
   writeSync,
 } from 'node:fs';
@@ -486,6 +487,25 @@ describe('caps on cid: images', () => {
     expect(refused).toEqual({ too_large: 1 });
   });
 
+  it('serves cid: parts that add up to exactly CID_TOTAL_BYTES', async () => {
+    const third = CID_TOTAL_BYTES - 2 * CID_IMAGE_BYTES;
+    const bytes = message(
+      related(
+        html('<img alt="a" src="cid:a@x"><img alt="b" src="cid:b@x"><img alt="c" src="cid:c@x">'),
+        image('a@x', paddedPng(CID_IMAGE_BYTES)),
+        image('b@x', paddedPng(CID_IMAGE_BYTES)),
+        image('c@x', paddedPng(third)),
+      ),
+    );
+    const { rendered, refused } = await render(bytes);
+    expect(rendered.images.map((i) => i.bytes.length)).toEqual([
+      CID_IMAGE_BYTES,
+      CID_IMAGE_BYTES,
+      third,
+    ]);
+    expect(refused).toEqual({});
+  });
+
   it('allows CID_TOTAL_BYTES per message, in message order', async () => {
     const third = CID_TOTAL_BYTES - 2 * CID_IMAGE_BYTES;
     const bytes = message(
@@ -502,6 +522,39 @@ describe('caps on cid: images', () => {
     expect((shown('b') as Buffer).length).toBe(CID_IMAGE_BYTES);
     expect(shown('c')).toBe('placeholder');
     expect(refused).toEqual({ total: 1 });
+  });
+
+  describe('MESSAGE_PIXELS', () => {
+    // MAX_TOTAL_PIXELS each: two make the whole budget.
+    const big = gifImage(8000, 5000, MAX_TOTAL_PIXELS / 40_000_000);
+    const dot = gifImage(1, 1, 1);
+    const url = (gif: Buffer) => `data:image/gif;base64,${gif.toString('base64')}`;
+
+    it('shows data: images that use exactly the budget, counting identical URLs each time, and refuses one pixel more', () => {
+      expect(2 * MAX_TOTAL_PIXELS).toBe(MESSAGE_PIXELS);
+      const images = new InlineImages(new PartTree());
+      expect(images.dataImage(url(big))).toBe(url(big));
+      expect(images.dataImage(url(big))).toBe(url(big));
+      expect(images.dataImage(url(dot))).toBe(PLACEHOLDER_DATA_URL);
+      expect(Object.fromEntries(images.refused)).toEqual({ budget: 1 });
+    });
+
+    it('shows a cid: image that uses exactly what is left, and refuses one pixel more', async () => {
+      const bytes = message(
+        related(
+          html(
+            `<img alt="data" src="${url(big)}"><img alt="cid" src="cid:big@x"><img alt="dot" src="cid:dot@x">`,
+          ),
+          image('big@x', big),
+          image('dot@x', dot),
+        ),
+      );
+      const { shown, refused } = await render(bytes);
+      expect(shown('data')).toBe(url(big));
+      expect(shown('cid')).toEqual(big);
+      expect(shown('dot')).toBe('placeholder');
+      expect(refused).toEqual({ budget: 1 });
+    });
   });
 
   it('counts pixels against MESSAGE_PIXELS: data: images first, then cid: images by id', async () => {
@@ -616,9 +669,13 @@ describe('the second read', () => {
     const dir = testDir('inline-images-fd');
     mkdirSync(dir, { recursive: true });
 
+    /** A whole second: what any file system keeps exactly. */
+    const SET_TIME = new Date(Date.UTC(2020, 0, 1));
+
     async function renderFile(change: ((fd: number, path: string) => void) | null) {
       const path = join(dir, `m${Math.random().toString(36).slice(2)}.eml`);
       writeFileSync(path, bytes);
+      utimesSync(path, SET_TIME, SET_TIME);
       const fd = openSync(path, 'r');
       try {
         const reread = fdReread(fd, async () => {
@@ -663,6 +720,15 @@ describe('the second read', () => {
         writeSync(out, swapped, 0, swapped.length, 0);
         futimesSync(out, new Date(2001, 0, 1), new Date(2001, 0, 1));
         closeSync(out);
+      });
+      expect(rendered.images).toEqual([]);
+      expect(refused).toEqual({ changed: 2 });
+    });
+
+    it('serves no cid: image when only the size changed between the reads', async () => {
+      const { rendered, refused } = await renderFile((_fd, path) => {
+        writeFileSync(path, Buffer.from('\r\n'), { flag: 'a' });
+        utimesSync(path, SET_TIME, SET_TIME);
       });
       expect(rendered.images).toEqual([]);
       expect(refused).toEqual({ changed: 2 });

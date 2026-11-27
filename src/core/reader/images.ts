@@ -67,7 +67,7 @@ export interface Reread {
   open: () => Promise<Readable | null>;
   /** False if the file changed since the first read began. */
   unchanged?: () => Promise<boolean>;
-  /** Test builds: runs between the reads. */
+  /** Test builds only: runs between the reads. */
   between?: () => Promise<void>;
 }
 
@@ -197,7 +197,7 @@ export class InlineImages {
   ): Promise<Map<number, Uint8Array | ImageRefusal>> {
     const all = (reason: ImageRefusal) => new Map([...wanted].map((part) => [part, reason]));
     if (!reread) return all('unreadable');
-    await reread.between?.();
+    if (__PEV_TEST_HOOKS__) await reread.between?.();
     const input = await reread.open().catch(() => null);
     if (!input) return all('unreadable');
     const found = await decodeParts(input, this.tree, wanted).catch(() => null);

@@ -125,6 +125,10 @@ describe('frames', () => {
     expect(reason(make(MAX_FRAMES + 1))).toBe('frames');
   });
 
+  it('refuses an APNG with MAX_FRAMES declared and one fcTL more, at the extra fcTL', () => {
+    expect(reason(apng(1, 1, MAX_FRAMES + 1, { declared: MAX_FRAMES }))).toBe('frames');
+  });
+
   it('refuses an APNG whose acTL declares more than MAX_FRAMES', () => {
     expect(reason(apng(1, 1, 2, { declared: MAX_FRAMES + 1 }))).toBe('frames');
   });
@@ -187,6 +191,26 @@ describe('frame rectangles', () => {
     const empty = { x: 0, y: 0, width: 0, height: 1 };
     expect(reason(gifImage(10, 10, 2, { rect: empty }))).toBe('container');
     expect(reason(apng(10, 10, 2, { rect: empty }))).toBe('container');
+  });
+});
+
+describe('the order of the checks', () => {
+  it.each([
+    ['png', dimensionBombPng(MAX_SIDE + 1, 10).subarray(0, 40)],
+    ['gif', gifImage(MAX_SIDE + 1, 10, 1).subarray(0, 20)],
+    ['webp', webpAnimated(MAX_SIDE + 1, 10, 2).subarray(0, 40)],
+    ['jpeg', jpegImage(MAX_SIDE + 1, 10).subarray(0, 20)],
+  ])('%s: a canvas over the cap in a cut file is refused as canvas', (_name, bytes) => {
+    expect(reason(bytes)).toBe('canvas');
+  });
+
+  const outside = { x: 8, y: 0, width: 4, height: 1 };
+  it.each([
+    ['gif', gifImage(10, 10, MAX_FRAMES + 1, { rect: outside })],
+    ['apng', apng(10, 10, MAX_FRAMES + 1, { declared: MAX_FRAMES, rect: outside })],
+    ['webp', webpAnimated(10, 10, MAX_FRAMES + 1, { rect: outside })],
+  ])('%s: frame 1001 outside the canvas is refused as frames', (_name, bytes) => {
+    expect(reason(bytes)).toBe('frames');
   });
 });
 
@@ -255,6 +279,42 @@ describe('truncated and inconsistent containers', () => {
     expect(reason(webpAnimated(4, 4, 2, { rect, bitstream: { width: 1, height: 2 } }))).toBe(
       'container',
     );
+  });
+
+  describe('a WebP chunk that runs past its end, in a RIFF of the right size', () => {
+    /** The offset of a chunk's size field, by its fourcc, searching from `from`. */
+    const sizeField = (bytes: Buffer, fourcc: string, from = 12) => bytes.indexOf(fourcc, from) + 4;
+    const patched = (fourcc: string, size: number, inside?: string) => {
+      const bytes = Buffer.from(webpAnimated(4, 4, 2));
+      const from = inside ? bytes.indexOf(inside, 12) + 8 : 12;
+      bytes.writeUInt32LE(size, sizeField(bytes, fourcc, from));
+      expect(bytes.readUInt32LE(4)).toBe(bytes.length - 8);
+      return bytes;
+    };
+
+    it('at the top level', () => {
+      // The last chunk, so nothing after it would show the overrun.
+      const bytes = Buffer.from(webpAnimated(4, 4, 2));
+      const field = bytes.lastIndexOf('ANMF') + 4;
+      bytes.writeUInt32LE(bytes.readUInt32LE(field) + 16, field);
+      expect(bytes.readUInt32LE(4)).toBe(bytes.length - 8);
+      expect(reason(bytes)).toBe('container');
+      expect(reason(patched('ANIM', 64))).toBe('container');
+    });
+
+    it('as an ANMF that claims about 4 GB, refused at once', () => {
+      const started = Date.now();
+      expect(reason(patched('ANMF', 0xfffffff0))).toBe('container');
+      expect(Date.now() - started).toBeLessThan(1000);
+    });
+
+    it('inside an ANMF', () => {
+      expect(reason(patched('VP8L', 64, 'ANMF'))).toBe('container');
+    });
+
+    it('inside an ANMF, claiming about 4 GB', () => {
+      expect(reason(patched('VP8L', 0xfffffff0, 'ANMF'))).toBe('container');
+    });
   });
 
   it('refuses an animated VP8X WebP without frames', () => {

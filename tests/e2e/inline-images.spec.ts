@@ -251,8 +251,15 @@ test('no Content-ID, file name or data: URL of a refused image reaches a log', a
       })
       .toBe(true);
   }
+  // Also as matched (lower case) and as written in a cid: URL (percent-encoded).
+  const more = MARKERS.flatMap((m) => [m.toLowerCase(), encodeURIComponent(m), cid(m).slice(4)]);
   const dir = pev.logsDir();
   for (const file of readdirSync(dir)) {
-    expect(findMarkers(readFileSync(join(dir, file), 'utf8')), file).toEqual([]);
+    const text = readFileSync(join(dir, file), 'utf8');
+    expect(findMarkers(text), file).toEqual([]);
+    expect(
+      more.filter((m) => text.toLowerCase().includes(m.toLowerCase())),
+      file,
+    ).toEqual([]);
   }
 });

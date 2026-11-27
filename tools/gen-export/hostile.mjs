@@ -685,9 +685,10 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
     );
   }
   const color = (which) => INLINE_COLORS[which];
+  // Declared as a JPEG: it is served as the PNG it is.
   addInline('cid-valid', 'multipart/related', [
     htmlPart(img('inline', 'cid:valid@example.org')),
-    imagePart('valid@example.org', solidPng(40, 40, color('cid'))),
+    imagePart('valid@example.org', solidPng(40, 40, color('cid')), 'image/jpeg'),
   ]);
   add(
     'inline_images',

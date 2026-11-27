@@ -224,19 +224,23 @@ interface WebpChunk {
   size: number;
 }
 
-/** The chunks between `from` and `end`, each padded to an even size. */
+/** The chunk at `at`, padded to an even size, which must end by `end`. */
+function webpChunkAt(b: Uint8Array, at: number, end: number): WebpChunk & { next: number } {
+  if (at + 8 > end) refuse('container');
+  const size = u32le(b, at + 4);
+  const data = at + 8;
+  const next = data + size + (size & 1);
+  if (next > end) refuse('container');
+  return { type: ascii(b, at, at + 4), data, size, next };
+}
+
+/** The chunks between `from` and `end`. */
 function webpChunks(b: Uint8Array, from: number, end: number): WebpChunk[] {
   const chunks: WebpChunk[] = [];
-  let at = from;
-  while (at < end) {
-    if (at + 8 > end) refuse('container');
-    const type = ascii(b, at, at + 4);
-    const size = u32le(b, at + 4);
-    const data = at + 8;
-    const next = data + size + (size & 1);
-    if (next > end) refuse('container');
-    chunks.push({ type, data, size });
-    at = next;
+  for (let at = from; at < end;) {
+    const chunk = webpChunkAt(b, at, end);
+    chunks.push(chunk);
+    at = chunk.next;
   }
   return chunks;
 }
@@ -270,24 +274,23 @@ function oneBitstream(b: Uint8Array, chunks: WebpChunk[]): { width: number; heig
 
 function webp(b: Uint8Array): Size {
   const end = 8 + u32le(b, 4);
-  if (end < 12 || end > b.length) refuse('container');
-  const chunks = webpChunks(b, 12, end);
-  const first = chunks[0];
-  if (!first) refuse('container');
+  // The header chunk first, as far as the file goes: the canvas is checked
+  // before the container is walked, as for the other formats.
+  const first = webpChunkAt(b, 12, Math.min(end, b.length));
   if (first.type !== 'VP8X') {
-    if (chunks.length !== 1 && chunks.some((c, i) => i > 0 && bitstreamSize(b, c))) {
-      refuse('container');
-    }
     const size = bitstreamSize(b, first);
     if (!size) refuse('container');
     checkCanvas(size.width, size.height);
+    if (end > b.length) refuse('container');
+    if (webpChunks(b, first.next, end).some((c) => bitstreamSize(b, c))) refuse('container');
     return { ...size, frames: 1 };
   }
   if (first.size < 10) refuse('container');
   const animated = ((b[first.data] ?? 0) & 0x02) !== 0;
   const canvas = { width: u24le(b, first.data + 4) + 1, height: u24le(b, first.data + 7) + 1 };
   checkCanvas(canvas.width, canvas.height);
-  const rest = chunks.slice(1);
+  if (end > b.length) refuse('container');
+  const rest = webpChunks(b, first.next, end);
   if (rest.some((c) => c.type === 'VP8X')) refuse('container');
   if (!animated) {
     if (rest.some((c) => c.type === 'ANMF')) refuse('container');

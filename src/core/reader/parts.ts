@@ -66,6 +66,8 @@ export class PartTree {
   private readonly indexOf = new Map<MimeNode, number>();
   private readonly childCount: number[] = [];
   private readonly byContentId = new Map<string, number[]>();
+  /** What a reference resolved to, by HTML part and key: many references can share one. */
+  private readonly resolved = new Map<string, CidTarget>();
 
   /** Records a part as it comes; returns its index. */
   add(node: MimeNode): number {
@@ -109,6 +111,16 @@ export class PartTree {
     const key = cidUrlKey(url);
     const named = key === null ? undefined : this.byContentId.get(key);
     if (!named) return { refused: 'missing' };
+    const cacheKey = `${from} ${key}`;
+    const known = this.resolved.get(cacheKey);
+    if (known) return known;
+    const target = this.find(from, named);
+    this.resolved.set(cacheKey, target);
+    return target;
+  }
+
+  /** Which of the parts `named` an HTML part can reach. */
+  private find(from: number, named: readonly number[]): CidTarget {
     // The HTML part's ancestors, itself first, up to its branch's top.
     const line = new Set<number>();
     for (let at = from; at >= 0; at = this.parts[at]?.parent ?? -1) {
