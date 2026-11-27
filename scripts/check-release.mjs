@@ -37,6 +37,7 @@ const FORBIDDEN_CONTENT = [
   'pev-selftest',
   'pev-script-marker',
   'pev-bench',
+  'pev-open-bench',
   'pev-reader-test-source',
   'better-sqlite3',
   'ws://localhost',

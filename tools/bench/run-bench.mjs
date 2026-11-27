@@ -259,7 +259,8 @@ export function removeContainerFile(folder, file, nonce) {
   return true;
 }
 
-function frontmost() {
+/** The name of the frontmost app, or null if it can't be read. */
+export function frontmost() {
   try {
     const front = execFileSync('lsappinfo', ['front'], { encoding: 'utf8' }).trim();
     const info = execFileSync('lsappinfo', ['info', '-only', 'name', front], { encoding: 'utf8' });
