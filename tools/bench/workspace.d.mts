@@ -3,6 +3,7 @@ import type { Stats } from 'node:fs';
 
 export const WORKSPACE_MARK: string;
 export const WORKSPACE_DIRS: string[];
+export function checkOutside(folder: string, path: string): string;
 export function createWorkspace(path: string, nonce: string, dirs?: string[]): string;
 export function checkWorkspace(path: string, nonce: string): string;
 export function checkInside(workspace: string, path: string): Stats | null;

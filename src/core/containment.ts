@@ -228,6 +228,45 @@ export function openContained(root: string, ref: FileRef): number {
   }
 }
 
+/** A file the scan accepted, opened; or why not, and whether it is gone. */
+export type ContainedOpen =
+  { ok: true; fd: number; ref: FileRef } | { ok: false; rejection: Rejection; gone: boolean };
+
+/**
+ * Opens a file the scan accepted, as openContained does. When the file
+ * changed since the scan, it is examined again and, if it is still an
+ * acceptable regular file, opened once more with its new identity. The caller
+ * closes the descriptor.
+ */
+export function openWithRescan(root: string, ref: FileRef, fs: ScanFs = realFs): ContainedOpen {
+  let current = ref;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return { ok: true, fd: openContained(root, current), ref: current };
+    } catch (err) {
+      if (!(err instanceof ContainmentError)) throw err;
+      if (err.kind !== 'changed' || attempt > 0) {
+        const kind: RejectKind = err.kind === 'root_unavailable' ? 'unreadable' : err.kind;
+        return { ok: false, rejection: { rel: current.rel, kind }, gone: err.errno === 'ENOENT' };
+      }
+      // Changed, or gone: the rescan tells which.
+      let again;
+      try {
+        again = examine(root, current.rel, fs);
+      } catch (e) {
+        const gone = (e as NodeJS.ErrnoException).code === 'ENOENT';
+        return { ok: false, rejection: { rel: current.rel, kind: 'changed' }, gone };
+      }
+      if (again === null) {
+        return { ok: false, rejection: { rel: current.rel, kind: 'changed' }, gone: false };
+      }
+      if ('rejected' in again) return { ok: false, rejection: again.rejected, gone: false };
+      current = again.ref;
+    }
+  }
+  return { ok: false, rejection: { rel: current.rel, kind: 'changed' }, gone: false };
+}
+
 /** Reads a whole contained file of at most `maxBytes`; a larger one is rejected. */
 export function readContained(root: string, ref: FileRef, maxBytes: number): Buffer {
   const fd = openContained(root, ref);

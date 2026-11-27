@@ -23,7 +23,7 @@ import {
 } from './limits';
 import { MetadataError, parseMetadata, type MessageRow } from './metadata';
 import type { IndexAnswer, IndexQuery } from '../../shared/index-types';
-import { listPage, rowDetails, sidebar, threadOfMessage } from './queries';
+import { emlFile, listPage, listWindow, rowDetails, sidebar, threadOfMessage } from './queries';
 import { searchPage } from './search';
 import {
   META,
@@ -411,6 +411,10 @@ export class QueryState {
           conversations: scalar(db, 'SELECT count(*) FROM threads'),
           pairs: scalar(db, 'SELECT count(*) FROM pairs'),
         };
+      case 'window':
+        return listWindow(db, call);
+      case 'eml':
+        return emlFile(db, call.rowid);
       case 'search':
         return searchPage(db, call);
     }

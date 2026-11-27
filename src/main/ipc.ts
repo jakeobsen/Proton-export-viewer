@@ -10,6 +10,7 @@ import { z } from 'zod';
 import {
   IPC,
   type ErrorKind,
+  type IndexResult,
   type LinkActionResult,
   type MessageOpenResult,
   type OpenResult,
@@ -21,16 +22,22 @@ import {
   type SourcesResult,
   type StateResult,
 } from '../shared/api';
+import {
+  MAX_QUERY_LENGTH,
+  WINDOW_AFTER,
+  WINDOW_BEFORE,
+  type SearchPage,
+} from '../shared/index-types';
 import type { SourceOutcome } from '../shared/sources';
 import { STALE, type Stale } from './sources/manager';
 import { APP_ORIGIN, LINK_ACTIONS } from '../shared/constants';
-import { MAX_QUERY_LENGTH, type SearchPage } from '../shared/index-types';
 import { isRendererLogCode } from '../shared/log/codes';
 import { OPEN_MODES } from '../shared/reader-protocol';
 import { CoreUnavailableError } from './core-host';
 import type { AppContext, AppWindow } from './context';
 import { DIALOG_ID_RE } from './link-dialog';
 import { sameFrame } from './navigation';
+import { OPEN_GAP_MS, OpenPacer } from './open-pacer';
 import { PLACEHOLDER } from './placeholder';
 import { SUPERSEDED, SearchLanes } from './search-lane';
 import { bodyUrl } from './views';
@@ -85,6 +92,39 @@ const ReportArgs = z.tuple([
     })
     .strict(),
 ]);
+
+const Rowid = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+const ListKey = z
+  .object({
+    time: z.number().int().min(Number.MIN_SAFE_INTEGER).max(Number.MAX_SAFE_INTEGER),
+    threadId: Rowid,
+  })
+  .strict();
+const ShellQuery = z.discriminatedUnion('op', [
+  z.object({ op: z.literal('sidebar') }).strict(),
+  z
+    .object({
+      op: z.literal('window'),
+      // A folder or label ID from labels.json; never a path.
+      labelId: z.string().min(1).max(256),
+      anchor: z
+        .object({
+          rowid: Rowid.optional(),
+          key: ListKey.optional(),
+          index: z
+            .number()
+            .int()
+            .nonnegative()
+            .max(2 ** 31),
+        })
+        .strict(),
+      before: z.number().int().min(0).max(WINDOW_BEFORE),
+      after: z.number().int().min(1).max(WINDOW_AFTER),
+      selected: Rowid.nullable(),
+    })
+    .strict(),
+]);
+const IndexArgs = z.tuple([z.object({ query: ShellQuery, generation: Generation }).strict()]);
 
 // A search: the text, the sort and its keyset, nothing else.
 const SearchThreadId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
@@ -185,7 +225,12 @@ export function registerIpc(ctx: AppContext): void {
     }
     let result;
     try {
-      result = await ctx.core.request({ type: 'open', openId, generation, token, stubId: id });
+      // Only a core already up for the open source: a call from the shell
+      // never starts one.
+      result = await ctx.core.requestRunning(
+        { type: 'open', openId, generation, token, stubId: id },
+        ctx.sources.stamp(),
+      );
     } catch (err) {
       if (!(err instanceof CoreUnavailableError)) throw err;
       ctx.log.warn('core.unavailable', { openId, windowId: appWin.id });
@@ -204,6 +249,9 @@ export function registerIpc(ctx: AppContext): void {
     return { ok: true, openId, url: bodyUrl(token) };
   });
 
+  const openPacer = new OpenPacer<AppWindow>(() =>
+    __PEV_TEST_HOOKS__ ? (ctx.openGapMs ?? OPEN_GAP_MS) : OPEN_GAP_MS,
+  );
   guarded<MessageOpenResult>(IPC.open, async (appWin, raw) => {
     const args = MessageOpenArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
@@ -214,17 +262,36 @@ export function registerIpc(ctx: AppContext): void {
     if (revoked > 0) {
       ctx.log.info('view.revoked', { reason: 'replaced', count: revoked, windowId: appWin.id });
     }
+    // An export that isn't there can't be read: nothing goes to core.
+    if (ctx.sources.isOffline()) {
+      appWin.views.abandon(openId);
+      return reject('offline', appWin);
+    }
+    // The body frame's opens are spaced out, and a newer open takes the place
+    // of one still waiting, so fast selection can't outrun the frame.
+    if (!(await openPacer.turn(appWin))) {
+      appWin.views.abandon(openId);
+      return reject('superseded', appWin);
+    }
+    if (appWin.win.isDestroyed()) return reject('superseded', appWin);
+    // While it waited, the source may have changed, a newer open come in, or
+    // the export gone: then nothing goes to core.
+    if (generation !== ctx.generation || openId !== appWin.views.latest) {
+      const reason = generation !== ctx.generation ? 'generation' : 'open_id';
+      appWin.views.abandon(openId);
+      ctx.log.info('open.stale', { reason, openId, windowId: appWin.id });
+      return reject(reason === 'generation' ? 'stale_generation' : 'superseded', appWin);
+    }
+    if (ctx.sources.isOffline()) {
+      appWin.views.abandon(openId);
+      return reject('offline', appWin);
+    }
     let result;
     try {
-      result = await ctx.core.request({
-        type: 'read',
-        openId,
-        generation,
-        token,
-        rowid,
-        mode,
-        lane: appWin.id,
-      });
+      result = await ctx.core.requestRunning(
+        { type: 'read', openId, generation, token, rowid, mode, lane: appWin.id },
+        ctx.sources.stamp(),
+      );
     } catch (err) {
       if (!(err instanceof CoreUnavailableError)) throw err;
       appWin.views.abandon(openId);
@@ -236,7 +303,8 @@ export function registerIpc(ctx: AppContext): void {
     if (!result.ok) {
       appWin.views.abandon(openId);
       if (result.code !== 'reader_failed') {
-        const known = ['no_source', 'not_found', 'superseded'] as const;
+        if (result.code === 'unavailable') return reject('offline', appWin);
+        const known = ['no_source', 'not_found', 'eml_missing', 'superseded'] as const;
         const code = known.find((c) => c === result.code);
         return reject(code ?? 'invalid', appWin);
       }
@@ -298,6 +366,22 @@ export function registerIpc(ctx: AppContext): void {
     if (!args.success) return reject('invalid', appWin);
     if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
     return { ok: true, generation: ctx.generation, sources: ctx.sources.view() };
+  });
+
+  /**
+   * A read from the open export's index. Before its index is open there is
+   * nothing to read; that answer isn't logged, as the shell asks again when
+   * the index reports.
+   */
+  guarded<IndexResult<unknown>>(IPC.index, async (appWin, raw) => {
+    const args = IndexArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ query, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    const result = await ctx.sources.queryIndex(query);
+    if (!result) return { ok: false, code: 'no_source' };
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    return { ok: true, generation, answer: result.answer, progress: result.progress };
   });
 
   /**

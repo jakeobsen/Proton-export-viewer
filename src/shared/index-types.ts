@@ -44,6 +44,8 @@ export interface ListRow {
   attachments: boolean;
   /** The conversation's newest message in this folder or label: a selection holds this. */
   anchorRowid: number;
+  /** The conversation's newest message in any folder or label: selecting it opens this. */
+  newestRowid: number;
 }
 
 export interface ListPage {
@@ -70,6 +72,48 @@ export interface IndexTotals {
   messages: number;
   conversations: number;
   pairs: number;
+}
+
+/**
+ * Where a list window is placed: at the conversation that holds message
+ * `rowid` if there is one, else at the conversation `key` if it is still
+ * listed, else at position `index`.
+ */
+export interface WindowAnchor {
+  rowid?: number;
+  key?: PageKey;
+  index: number;
+}
+
+/** The most rows a window holds before its anchor, and from it on. */
+export const WINDOW_BEFORE = 100;
+export const WINDOW_AFTER = 200;
+
+export interface WindowQuery {
+  op: 'window';
+  labelId: string;
+  anchor: WindowAnchor;
+  /** Rows wanted before the anchor row. */
+  before: number;
+  /** Rows wanted from the anchor row on. */
+  after: number;
+  /** A selected message, to find the conversation it is in now. */
+  selected: number | null;
+}
+
+/** A stretch of a folder's or label's list, newest first, read from one snapshot. */
+export interface ListWindow {
+  /** Conversations in the folder or label. */
+  total: number;
+  /** The position of the first row. */
+  start: number;
+  rows: ListRow[];
+  /** The details of each row, in the same order. */
+  details: RowDetails[];
+  /** The anchor row's position, or null if the window was placed by `index`. */
+  anchor: number | null;
+  /** The conversation the selected message is in now, or null if it is gone. */
+  selected: number | null;
 }
 
 export type SearchSort = 'date' | 'relevance';
@@ -155,10 +199,34 @@ export type IndexQuery =
   | { op: 'details'; threadIds: number[] }
   | { op: 'resolve'; rowid: number }
   | { op: 'totals' }
+  | { op: 'eml'; rowid: number }
+  | WindowQuery
   | SearchQuery;
 
 export type IndexAnswer =
-  Sidebar | ListPage | RowDetails[] | number | null | IndexTotals | SearchPage;
+  | Sidebar
+  | ListPage
+  | RowDetails[]
+  | number
+  | null
+  | IndexTotals
+  | ListWindow
+  | EmlFile
+  | SearchPage;
+
+/**
+ * Where a message's file is, as the scan last saw it: its name relative to the
+ * export's folder and its identity. Core only; it never leaves core.
+ */
+export interface EmlFile {
+  /** Null once the pair has no message file. */
+  rel: string | null;
+  size: number;
+  mtimeNs: string;
+  dev: string;
+  ino: string;
+  bodyState: number;
+}
 
 /**
  * The index's own state: 'verifying' while an index that was already there

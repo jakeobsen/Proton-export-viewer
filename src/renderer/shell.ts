@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Shell state: the current generation, the body URL main authorized, the
-// pending link, and the exports main knows about.
+// Shell state: the current generation, the pending link, and the exports main
+// knows about.
 
 import { useSyncExternalStore } from 'react';
-import type { LinkActionResult, LinkPrompt, OpenResult, SourceActionResult } from '../shared/api';
+import type { LinkActionResult, LinkPrompt, SourceActionResult } from '../shared/api';
 import type { LinkAction } from '../shared/constants';
 import type { SourcesView } from '../shared/sources';
 
 export interface ShellState {
   generation: number | null;
-  bodyUrl: string | null;
-  frameKey: number;
   /** The open link dialog. */
   link: LinkPrompt | null;
   /** Null until main has answered. */
@@ -23,8 +21,6 @@ export interface ShellState {
 
 let state: ShellState = {
   generation: null,
-  bodyUrl: null,
-  frameKey: 0,
   link: null,
   sources: null,
   busy: false,
@@ -33,7 +29,9 @@ let state: ShellState = {
 const listeners = new Set<() => void>();
 
 function update(patch: Partial<ShellState>): void {
-  state = { ...state, ...patch };
+  // A new generation revokes every view, so a link dialog from the old one goes.
+  const moved = 'generation' in patch && patch.generation !== state.generation;
+  state = { ...state, ...patch, ...(moved ? { link: null } : {}) };
   for (const listener of listeners) listener();
 }
 
@@ -55,20 +53,6 @@ export async function refreshGeneration(): Promise<number | null> {
   const result = await window.pev.state();
   update({ generation: result.ok ? result.generation : null });
   return result.ok ? result.generation : null;
-}
-
-/** Opens a message body. The old body is cleared at once; main has already revoked it. */
-export async function openMessage(id: string): Promise<OpenResult> {
-  const generation = state.generation ?? (await refreshGeneration());
-  update({ bodyUrl: null, link: null });
-  if (generation === null) return { ok: false, code: 'stale_generation' };
-  const result = await window.pev.openStub(id, generation);
-  if (result.ok) {
-    update({ bodyUrl: result.url, frameKey: state.frameKey + 1 });
-  } else if (result.code === 'stale_generation') {
-    await refreshGeneration();
-  }
-  return result;
 }
 
 /** Reloads the exports from main, after the generation it's at. */
@@ -109,11 +93,7 @@ async function sourceAction(
   }
   if (result.ok) {
     // The generation moved, so main has revoked the open body.
-    update({
-      generation: result.generation,
-      bodyUrl: null,
-      notice: NOTICES[result.outcome] ?? null,
-    });
+    update({ generation: result.generation, notice: NOTICES[result.outcome] ?? null });
   } else if (result.code === 'stale_generation') {
     await refreshGeneration();
   }
@@ -131,6 +111,11 @@ export const forgetExport = (sourceKey: string) =>
 
 export function showLink(prompt: LinkPrompt): void {
   update({ link: prompt });
+}
+
+/** Closes the link dialog without a choice. Main refuses its choices once its view is gone. */
+export function clearLink(): void {
+  if (state.link !== null) update({ link: null });
 }
 
 /** Closes the link dialog and tells main the user's choice. */

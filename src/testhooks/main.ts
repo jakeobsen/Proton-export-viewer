@@ -6,18 +6,19 @@ import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { BrowserWindow, app, clipboard, dialog, shell } from 'electron';
-import { bumpGeneration, type AppContext } from '../main/context';
+import { bumpGeneration, notifySources, type AppContext } from '../main/context';
 import type { PolicyObserver } from '../main/harden';
 import { PROD_SWITCHES } from '../main/switches';
 import { ScopeError, type Picked } from '../main/sources/scope';
 import type { OrderStep } from '../main/sources/manager';
 import { createAppWindow } from '../main/windows';
-import type { CoreResult } from '../shared/core-protocol';
+import type { CoreResult, CoreTestInit } from '../shared/core-protocol';
 import type { IndexQuery } from '../shared/index-types';
 import { errorData } from '../shared/log/schema';
 import { TESTHOOKS_MARKER, markLoaded } from './marker';
 import { TEST_PAGE, testRoute } from './pages';
 import { READER_SOURCE_ACTION, type SourceEntry } from './reader-source';
+import { READER_UNSANITIZED_ACTION } from './unsanitized';
 import { runControl, runFolderProof, type OpenDialog } from './proof/main';
 import { killRenderer } from './renderer-kill';
 import { runSelfTest } from './selftest';
@@ -30,6 +31,16 @@ interface WindowRequests {
   body: string[];
   asset: string[];
   blocked: string[];
+  /**
+   * Console messages of the window's frames, as main gets them. Some
+   * reports, such as a CSP refusal of a nested frame, reach only main.
+   */
+  console: Array<{ frame: string; text: string }>;
+  /**
+   * URLs the window's session was asked to preconnect to. A resource hint
+   * leaves no other trace: it never reaches the request filter.
+   */
+  sessionPreconnects: string[];
 }
 
 const DIALOG_METHODS = [
@@ -149,22 +160,53 @@ export async function install(ctx: AppContext): Promise<boolean> {
   });
 
   const requests = new Map<number, WindowRequests>();
+  /** When each window's body requests came, in ms on main's clock. */
+  const bodyTimes = new Map<number, number[]>();
   let bodyCsp = true;
 
   const recordsFor = (windowId: number): WindowRequests => {
     let rec = requests.get(windowId);
     if (!rec) {
-      rec = { app: [], body: [], asset: [], blocked: [] };
+      rec = { app: [], body: [], asset: [], blocked: [], console: [], sessionPreconnects: [] };
       requests.set(windowId, rec);
     }
     return rec;
   };
 
+  // Every frame's console messages and every preconnect request, per window.
+  // Windows are created after this; each has a session of its own.
+  const sessionsSeen = new WeakSet<Electron.Session>();
+  app.on('web-contents-created', (_event, contents) => {
+    if (!sessionsSeen.has(contents.session)) {
+      sessionsSeen.add(contents.session);
+      contents.session.on('preconnect', (_e, url) => {
+        const appWin = ctx.windows.get(contents.id);
+        if (appWin) recordsFor(appWin.id).sessionPreconnects.push(url);
+      });
+    }
+    contents.on('console-message', (details) => {
+      const appWin = ctx.windows.get(contents.id);
+      if (!appWin) return;
+      let frame = '';
+      try {
+        frame = details.frame?.url ?? '';
+      } catch {
+        // The frame is already gone.
+      }
+      recordsFor(appWin.id).console.push({ frame, text: details.message });
+    });
+  });
+
   ctx.observerFor = (windowId: number): PolicyObserver => {
     const rec = recordsFor(windowId);
     return {
       onAppRequest: (url) => rec.app.push(url),
-      onBodyRequest: (url) => rec.body.push(url),
+      onBodyRequest: (url) => {
+        rec.body.push(url);
+        const times = bodyTimes.get(windowId) ?? [];
+        times.push(performance.now());
+        bodyTimes.set(windowId, times);
+      },
       onAssetRequest: (url) => rec.asset.push(url),
       onBlocked: (url) => rec.blocked.push(url),
       bodyCspEnabled: () => bodyCsp,
@@ -210,17 +252,27 @@ export async function install(ctx: AppContext): Promise<boolean> {
     windows: () => [...ctx.windows.values()].map((w) => w.id),
     generation: () => ctx.generation,
     bumpGeneration: () => bumpGeneration(ctx),
+    /** Tells every shell window that the sources changed, as main does after its own switch. */
+    notifySources: () => notifySources(ctx),
     setBodyCsp: (on: boolean) => {
       bodyCsp = on;
     },
     requests: (windowId: number) => recordsFor(windowId),
+    bodyRequestTimes: (windowId: number) => [...(bodyTimes.get(windowId) ?? [])],
+    /** Sets the least time between a window's opens; null restores the usual one. */
+    openGap: (ms: number | null) => {
+      ctx.openGapMs = ms ?? undefined;
+    },
     clearRequests: () => {
+      bodyTimes.clear();
       // Each session's observer keeps its record object, so empty it in place.
       for (const rec of requests.values()) {
         rec.app.length = 0;
         rec.body.length = 0;
         rec.asset.length = 0;
         rec.blocked.length = 0;
+        rec.console.length = 0;
+        rec.sessionPreconnects.length = 0;
       }
     },
     linkDialogs: () => [...ctx.linkDialog.shown],
@@ -302,6 +354,9 @@ export async function install(ctx: AppContext): Promise<boolean> {
       }),
     readerLimits: (limits: { heapMb?: number; timeoutMs?: number }) =>
       ctx.core.request({ type: 'test', action: 'reader-limits', payload: limits }),
+    /** Serves later HTML bodies without the sanitizer and the CSS filter, or with them again. */
+    readerUnsanitized: (on: boolean) =>
+      ctx.core.request({ type: 'test', action: READER_UNSANITIZED_ACTION, payload: on }),
     /** Opens a gate of the reader's test source; lookups waiting there go on. */
     readerGate: (name: string) =>
       ctx.core.request({ type: 'test', action: 'reader-gate', payload: name }),
@@ -359,6 +414,24 @@ export async function install(ctx: AppContext): Promise<boolean> {
     heldSourceResults: () => heldResults.length,
     /** A read from the open source's index, as the shell will make it. */
     indexQuery: (query: IndexQuery) => ctx.sources.queryIndex(query),
+    /** How the next start of core runs phase 1: batch size, held writes, read order. */
+    indexTestSettings: (settings: CoreTestInit | null) => {
+      ctx.core.testInit = settings;
+    },
+    /** Lets `count` held phase 1 writes through; null stops holding them. */
+    releaseWrites: async (count: number | null) => {
+      const result = await ctx.core.request({
+        type: 'test',
+        action: 'release-writes',
+        payload: { count },
+      });
+      if (!result.ok) throw new Error('release-writes');
+    },
+    /** Phase 1 writes waiting to be let through. */
+    heldWrites: async () => {
+      const result = await core('held-writes');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
     indexDir: () => join(app.getPath('userData'), 'index'),
     /** Resets the app's data, as Settings will. */
     resetApp: () => ctx.sources.reset(),
@@ -374,10 +447,15 @@ export async function install(ctx: AppContext): Promise<boolean> {
     void bench.runBench(ctx, process.argv);
     return true;
   }
+  const openBench = await import('./open-bench');
+  if (openBench.openBenchRequested(process.argv)) {
+    void openBench.runOpenBench(ctx, process.argv, windowEvents);
+    return true;
+  }
 
   const selfTest = process.argv.includes('--pev-selftest');
   if (selfTest) {
-    await runSelfTest(ctx, process.argv, windowEvents);
+    await runSelfTest(ctx, process.argv, windowEvents, api.queuePick);
     return true;
   }
   return false;

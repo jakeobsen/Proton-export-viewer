@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Starts the core utility process and talks to it over a MessagePort.
-// Core is started on demand and restarted on the next request after it exits.
-// It starts with the source set at that moment, and keeps it until it exits:
-// changing the source takes a stop and a new start.
+// Main's own requests start core on demand, and start it again after it
+// exits. Calls the shell makes go only to a core already up for the open
+// source (requestRunning): they never start one.
+// Core starts with the source set at that moment, and keeps it until it
+// exits: changing the source takes a stop and a new start.
 
 import {
   MessageChannelMain,
@@ -16,10 +18,15 @@ import type {
   CoreRequest,
   CoreResult,
   CoreSource,
+  CoreTestInit,
 } from '../shared/core-protocol';
 import type { Logger } from '../shared/log/writer';
+import type { Stamp } from '../shared/sources';
 
 type Pending = { resolve: (r: CoreResult) => void; reject: (e: Error) => void };
+
+/** How long a stop waits for core to exit before it gives up on that core. */
+export const STOP_TIMEOUT_MS = 5_000;
 
 export interface CoreHostOptions {
   corePath: string;
@@ -28,6 +35,19 @@ export interface CoreHostOptions {
   indexDir: string;
   appRoot: string;
   log: Logger;
+  /** Tests only: a shorter wait for a core that doesn't exit. */
+  stopTimeoutMs?: number;
+  /** Tests only: ends a process for good once its kill went unanswered. */
+  killProcess?: (pid: number) => void;
+}
+
+/** Ends a process for good. It may be gone already. */
+function killHard(pid: number): void {
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    // Already gone.
+  }
 }
 
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
@@ -39,15 +59,29 @@ export class CoreHost {
   private child: UtilityProcess | null = null;
   private port: MessagePortMain | null = null;
   private starting: Promise<void> | null = null;
+  /** Fails the start under way, for a core that is gone before it was ready. */
+  private failStart: ((err: Error) => void) | null = null;
   private seq = 0;
   private readonly pending = new Map<number, Pending>();
   private source: CoreSource | null = null;
   /** The source the running core was started with. */
   private childSource: CoreSource | null = null;
+  /** The running core has said it is ready. */
+  private childReady = false;
+  /** The cores being stopped on purpose: their exit is planned. */
+  private readonly stopping = new WeakSet<UtilityProcess>();
   /** Receives what core reports without being asked. */
   onEvent: ((event: CoreEvent) => void) | null = null;
+  /**
+   * Told when the current core exits without being stopped, with the source
+   * it was started with. A core already given up on, or being stopped, is
+   * never reported.
+   */
+  onExit: ((source: CoreSource | null) => void) | null = null;
   /** The run folders of the exports the app knows, for the next start of core. */
   exports: () => string[] = () => [];
+  /** Builds with test hooks only: what the next start of core gets for its tests. */
+  testInit: CoreTestInit | null = null;
 
   constructor(private readonly options: CoreHostOptions) {}
 
@@ -65,11 +99,10 @@ export class CoreHost {
   }
 
   /**
-   * Starts core with this source. A core that was started with another one
-   * (a request can start core while a switch is under way) is stopped first.
-   * Resolves true if one was stopped.
+   * Starts core with this source, or with none. A core that was started with
+   * another one is stopped first. Resolves true if one was stopped.
    */
-  async startWith(source: CoreSource): Promise<boolean> {
+  async startWith(source: CoreSource | null): Promise<boolean> {
     this.setSource(source);
     let replaced = false;
     if (this.child && !sameSource(this.childSource, this.source)) {
@@ -84,7 +117,7 @@ export class CoreHost {
     if (this.starting) return this.starting;
     const source = this.source;
     this.childSource = source;
-    this.starting = new Promise<void>((resolve, reject) => {
+    const starting = new Promise<void>((resolve, reject) => {
       const child = utilityProcess.fork(this.options.corePath, [], {
         serviceName: 'Core',
         stdio: 'ignore',
@@ -92,7 +125,8 @@ export class CoreHost {
       const { port1, port2 } = new MessageChannelMain();
       this.child = child;
       this.port = port1;
-      let ready = false;
+      this.childReady = false;
+      this.failStart = reject;
       port1.on('message', (event) => {
         const message = event.data as CoreResult | CoreEvent | { type: 'ready' };
         if (message.type === 'event') {
@@ -101,7 +135,9 @@ export class CoreHost {
           return;
         }
         if (message.type === 'ready') {
-          ready = true;
+          if (this.child !== child) return;
+          this.childReady = true;
+          this.failStart = null;
           this.options.log.info('core.ready');
           resolve();
           return;
@@ -114,6 +150,11 @@ export class CoreHost {
       });
       port1.start();
       child.once('spawn', () => {
+        // A core given up on before it spawned gets nothing, and is ended.
+        if (this.child !== child) {
+          child.kill();
+          return;
+        }
         this.options.log.info('core.spawn');
         const init: CoreInit = {
           type: 'init',
@@ -122,27 +163,66 @@ export class CoreHost {
           indexDir: this.options.indexDir,
           source,
           exports: this.exports(),
+          ...(__PEV_TEST_HOOKS__ && this.testInit ? { test: { ...this.testInit } } : {}),
         };
         child.postMessage(init, [port2]);
       });
       child.once('exit', (code) => {
         this.options.log.warn('core.exit', { exitCode: code });
-        this.child = null;
-        this.port?.close();
-        this.port = null;
-        this.starting = null;
-        for (const entry of this.pending.values()) entry.reject(new CoreUnavailableError());
-        this.pending.clear();
-        if (!ready) reject(new CoreUnavailableError());
+        const unplanned = this.child === child && !this.stopping.has(child);
+        this.release(child);
+        if (unplanned) this.onExit?.(source);
       });
     });
-    return this.starting;
+    // Whoever started core gets the failure; nothing else has to wait for it.
+    starting.catch(() => undefined);
+    this.starting = starting;
+    return starting;
+  }
+
+  /**
+   * Forgets a core that exited, or that a stop gave up on: its requests fail,
+   * and the next start makes a new one. A later exit of an older core changes
+   * nothing.
+   */
+  private release(child: UtilityProcess): void {
+    if (this.child !== child) return;
+    this.child = null;
+    this.childReady = false;
+    this.childSource = null;
+    this.port?.close();
+    this.port = null;
+    this.starting = null;
+    this.failStart?.(new CoreUnavailableError());
+    this.failStart = null;
+    for (const entry of this.pending.values()) entry.reject(new CoreUnavailableError());
+    this.pending.clear();
+  }
+
+  /**
+   * A request only for a core already started for this stamp: the open
+   * source's, or none when no source is open. It waits for that core to be
+   * ready, but never starts one, so a call made while the source is being
+   * switched can't start a core in the middle of the switch.
+   */
+  async requestRunning(call: CoreCall, stamp: Stamp | null): Promise<CoreResult> {
+    const starting = this.starting;
+    if (!this.child || !starting || !sameStamp(this.childSource, stamp)) {
+      throw new CoreUnavailableError();
+    }
+    await starting;
+    if (this.starting !== starting) throw new CoreUnavailableError();
+    return this.send(call);
   }
 
   async request(call: CoreCall): Promise<CoreResult> {
     await this.start();
+    return this.send(call);
+  }
+
+  private send(call: CoreCall): Promise<CoreResult> {
     const port = this.port;
-    if (!port) throw new CoreUnavailableError();
+    if (!port) return Promise.reject(new CoreUnavailableError());
     this.seq += 1;
     const reqId = this.seq;
     return new Promise<CoreResult>((resolve, reject) => {
@@ -151,14 +231,46 @@ export class CoreHost {
     });
   }
 
-  /** Ends core; resolves once it has exited. The next request starts a new one. */
+  /**
+   * Ends core; resolves once it has exited. A core that hasn't spawned yet
+   * can't be killed, so it is killed as soon as it has. A core that doesn't
+   * exit in time is given up on, so a stop always ends: one that spawned is
+   * ended for good, and one that spawns later is still killed. The next
+   * request starts a new one.
+   */
   stop(): Promise<void> {
     const child = this.child;
     if (!child) return Promise.resolve();
-    const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
-    child.kill();
-    return exited;
+    this.stopping.add(child);
+    const ms = this.options.stopTimeoutMs ?? STOP_TIMEOUT_MS;
+    return new Promise<void>((resolve) => {
+      const kill = () => {
+        child.kill();
+      };
+      const exited = () => {
+        clearTimeout(timer);
+        child.removeListener('spawn', kill);
+        this.release(child);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        this.options.log.warn('core.stop_timeout', { ms });
+        child.removeListener('exit', exited);
+        // One that spawns later is no longer the current core: the spawn handler kills it.
+        child.removeListener('spawn', kill);
+        if (child.pid !== undefined) (this.options.killProcess ?? killHard)(child.pid);
+        this.release(child);
+        resolve();
+      }, ms);
+      child.once('exit', exited);
+      if (!child.kill()) child.once('spawn', kill);
+    });
   }
+}
+
+function sameStamp(source: CoreSource | null, stamp: Stamp | null): boolean {
+  if (source === null || stamp === null) return source === stamp;
+  return source.sourceKey === stamp.sourceKey && source.generation === stamp.generation;
 }
 
 function sameSource(a: CoreSource | null, b: CoreSource | null): boolean {

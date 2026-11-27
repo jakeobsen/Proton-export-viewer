@@ -2,7 +2,15 @@
 // The typed surface between the shell renderer and the main process.
 
 import type { LinkAction } from './constants';
-import type { IndexProgress, SearchDateKey, SearchPage, SearchRankKey } from './index-types';
+import type {
+  IndexProgress,
+  ListWindow,
+  SearchDateKey,
+  SearchPage,
+  SearchRankKey,
+  Sidebar,
+  WindowQuery,
+} from './index-types';
 import type { MessageHeaders, OpenMode } from './reader-protocol';
 import type { SourceOutcome, SourcesView } from './sources';
 
@@ -22,6 +30,8 @@ export const IPC = {
   locateExport: 'pev:locate-export',
   forgetExport: 'pev:forget-export',
   sourcesChanged: 'pev:sources-changed',
+  index: 'pev:index',
+  indexChanged: 'pev:index-changed',
   search: 'pev:search',
 } as const;
 
@@ -38,6 +48,8 @@ export type RejectCode =
   | 'unknown_run'
   | 'no_source'
   | 'not_found'
+  | 'eml_missing'
+  | 'offline'
   | 'unknown_dialog';
 
 export type Rejected = { ok: false; code: RejectCode };
@@ -72,6 +84,18 @@ export type MessageOpenResult =
     }
   | { ok: true; openId: number; outcome: 'fallback' }
   | Rejected;
+
+/** What the shell reads from the open export's index. */
+export type ShellIndexQuery = { op: 'sidebar' } | WindowQuery;
+
+export type IndexResult<T> =
+  { ok: true; generation: number; answer: T; progress: IndexProgress } | Rejected;
+
+/** Where the open export's index stands, sent by main as it changes. */
+export interface IndexUpdate {
+  generation: number;
+  progress: IndexProgress;
+}
 
 /** What the link dialog shows. Main keeps the URL it acts on. */
 export interface LinkPrompt {
@@ -134,6 +158,12 @@ export interface PevApi {
   forgetExport(sourceKey: string, generation: number): Promise<SourceActionResult>;
   /** Called when the open export or the list of exports changed. */
   onSourcesChanged(listener: () => void): () => void;
+  /** The open export's folders and labels, with their counts. */
+  sidebar(generation: number): Promise<IndexResult<Sidebar>>;
+  /** A stretch of a folder's or label's conversations. */
+  listWindow(query: WindowQuery, generation: number): Promise<IndexResult<ListWindow>>;
+  /** Called as indexing moves on or the index's state changes. */
+  onIndexChanged(listener: (update: IndexUpdate) => void): () => void;
   /**
    * Searches the open export. A request made while this window's previous
    * search is still running waits for it, and a newer one answers it as

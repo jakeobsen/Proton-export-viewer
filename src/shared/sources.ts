@@ -69,6 +69,8 @@ export interface ActiveExport extends ExportRow {
   status: 'online' | 'offline';
   /** The state of its index, once known. */
   index: IndexCondition | null;
+  /** Core kept failing, so the export was closed; opening it again restarts it. */
+  closed: boolean;
   /** The runs found in the same picked folder; the run picker shows when there's more than one. */
   runs: RunChoice[];
 }

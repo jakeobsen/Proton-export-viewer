@@ -18,9 +18,11 @@ import { errorData } from '../shared/log/schema';
 import { LogWriter, type Logger } from '../shared/log/writer';
 import type { ReadRequest, ReaderFailure } from '../shared/reader-protocol';
 import { WorkerThread, type ThreadRole } from './index/pool';
+import type { IndexOptions } from './index/service';
 import { READER_RETIRE_MB, ReaderLane } from './reader/lane';
+import { OpenTracker } from './reader/opens';
 import type { ReaderSource } from './reader/source';
-import { SourceSession } from './source';
+import { SourceSession, type ReaderFile } from './source';
 
 process.umask(0o077);
 
@@ -60,7 +62,15 @@ const lane = new ReaderLane<WorkerRequest, WorkerMessage>({
 let session: SourceSession | null = null;
 
 /** Test builds can hold opens in core to keep them pending. */
-const testState = { holding: false, held: [] as Array<OpenRequest | ReadRequest> };
+const testState = {
+  holding: false,
+  held: [] as Array<OpenRequest | ReadRequest>,
+  /** Message files opened for the reader. */
+  fileOpens: 0,
+  unsanitized: false,
+};
+/** Test builds can hold phase 1's writes. */
+let writeGate: import('../testhooks/core').WriteGate | null = null;
 
 process.on('uncaughtException', (err) => log?.error('core.uncaught', errorData(err, roots)));
 process.on('unhandledRejection', (reason) =>
@@ -104,16 +114,54 @@ function build(request: OpenRequest): void {
   });
 }
 
-/** Opens one message from the reader source and renders it in the reader lane. */
+/** Each window's newest open, while one of its opens is under way. */
+const opens = new OpenTracker();
+
+/** The message to read: from the test source if a test set one, else from the open export. */
+async function openForRead(
+  request: ReadRequest,
+  stale: () => boolean,
+): Promise<ReaderFile | { ok: false; code: 'no_source' }> {
+  if (__PEV_TEST_HOOKS__ && readerSource) {
+    const opened = await readerSource.open(request.rowid).catch(() => null);
+    return opened ? { ok: true, opened } : { ok: false, code: 'not_found' };
+  }
+  if (!session) return { ok: false, code: 'no_source' };
+  return session
+    .openForReader(request.rowid, request.generation, stale)
+    .catch((): ReaderFile => ({ ok: false, code: 'not_found' }));
+}
+
+/** Answers a read that failed. */
+type ReadFail = (
+  code: 'no_source' | 'not_found' | 'superseded' | 'unavailable' | 'eml_missing' | 'reader_failed',
+  reason?: ReaderFailure,
+) => void;
+
+/**
+ * Opens one message and renders it in the reader lane. Of a window's opens,
+ * one is rendered and the newest waits; an older one ends as superseded, and
+ * nothing is opened for it once a newer one has come in.
+ */
 async function read(request: ReadRequest): Promise<void> {
   const { reqId } = request;
-  const fail = (
-    code: 'no_source' | 'not_found' | 'superseded' | 'reader_failed',
-    reason?: ReaderFailure,
-  ) => reply({ type: 'result', reqId, ok: false, code, ...(reason ? { reason } : {}) });
-  if (!readerSource) return fail('no_source');
-  const opened = await readerSource.open(request.rowid).catch(() => null);
-  if (!opened) return fail('not_found');
+  const fail: ReadFail = (code, reason) =>
+    reply({ type: 'result', reqId, ok: false, code, ...(reason ? { reason } : {}) });
+  const open = opens.begin(request.lane, request.openId);
+  try {
+    await readOpen(request, open.stale, fail);
+  } finally {
+    open.end();
+  }
+}
+
+/** The part of `read` between taking its place among the window's opens and leaving it. */
+async function readOpen(request: ReadRequest, stale: () => boolean, fail: ReadFail): Promise<void> {
+  const { reqId } = request;
+  const found = await openForRead(request, stale);
+  if (!found.ok) return found.code === 'refused' ? fail('reader_failed', 'file') : fail(found.code);
+  if (__PEV_TEST_HOOKS__) testState.fileOpens += 1;
+  const opened = found.opened;
   try {
     const outcome = await lane.job(
       {
@@ -122,6 +170,7 @@ async function read(request: ReadRequest): Promise<void> {
         input: opened.input,
         mode: request.mode,
         assetBase: `${ASSET_SCHEME}://${VIEW_HOST}/${request.token}`,
+        ...(__PEV_TEST_HOOKS__ && testState.unsanitized ? { unsanitized: true as const } : {}),
       },
       { key: request.lane, order: request.openId },
     );
@@ -174,6 +223,7 @@ function handle(request: CoreRequest): void {
             },
             readerSource: () => readerSource,
             session,
+            writeGate,
           }),
         );
         return;
@@ -213,16 +263,33 @@ function handle(request: CoreRequest): void {
   }
 }
 
-process.parentPort.once('message', (event) => {
+process.parentPort.once('message', (event) => void init(event));
+
+async function init(event: Electron.MessageEvent): Promise<void> {
   const init = event.data as CoreInit;
   roots = [[init.appRoot + sep, '']];
   log = new LogWriter(init.logsDir, 'core', 'core');
   workerLog = log.forProc('worker');
+  let options: IndexOptions | undefined;
+  if (__PEV_TEST_HOOKS__ && init.test) {
+    const hooks = await import('../testhooks/core');
+    writeGate = new hooks.WriteGate(init.test.holdWrites === true);
+    options = {
+      ...(init.test.batchPairs ? { batchPairs: init.test.batchPairs } : {}),
+      readByName: init.test.readByName === true,
+      beforeWrite: writeGate.beforeWrite,
+    };
+  }
   session = new SourceSession(
     init.source,
     log,
     reply,
-    { dir: init.indexDir, thread: indexThread, exports: init.exports },
+    {
+      dir: init.indexDir,
+      thread: indexThread,
+      exports: init.exports,
+      ...(options ? { options } : {}),
+    },
     (event) => port?.postMessage(event),
   );
   const p = event.ports[0];
@@ -232,4 +299,4 @@ process.parentPort.once('message', (event) => {
   port.start();
   lane.start();
   port.postMessage({ type: 'ready' });
-});
+}

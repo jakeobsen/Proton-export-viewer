@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { BrowserWindow, Session } from 'electron';
-import { IPC } from '../shared/api';
+import { IPC, type IndexUpdate } from '../shared/api';
+import type { IndexProgress } from '../shared/index-types';
 import type { LogWriter } from '../shared/log/writer';
 import type { CoreHost } from './core-host';
 import type { PolicyObserver } from './harden';
@@ -40,12 +41,22 @@ export interface AppContext {
   shellCsp: string;
   /** Set only in builds with test hooks: observes one window's session policy. */
   observerFor?: ((windowId: number) => PolicyObserver) | undefined;
+  /** Set only in builds with test hooks: the least time between a window's opens. */
+  openGapMs?: number | undefined;
 }
 
 /** Tells every shell window that the sources changed. */
 export function notifySources(ctx: AppContext): void {
   for (const appWin of ctx.windows.values()) {
     if (!appWin.win.isDestroyed()) appWin.win.webContents.send(IPC.sourcesChanged);
+  }
+}
+
+/** Tells every shell window where the open export's index stands, for the current generation. */
+export function notifyIndex(ctx: AppContext, progress: IndexProgress): void {
+  const update: IndexUpdate = { generation: ctx.generation, progress };
+  for (const appWin of ctx.windows.values()) {
+    if (!appWin.win.isDestroyed()) appWin.win.webContents.send(IPC.indexChanged, update);
   }
 }
 

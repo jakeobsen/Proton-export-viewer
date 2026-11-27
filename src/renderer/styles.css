@@ -3,15 +3,21 @@
 :root {
   color-scheme: light dark;
   --bg: #ffffff;
-  --fg: #1d1d1f;
-  --muted: #6e6e73;
-  --line: #d2d2d7;
-  --panel: #f5f5f7;
-  --accent: #0a62c9;
+  --fg: #1c1b23;
+  --fg-2: #525166;
+  --muted: #7f7e94;
+  --line: #e3e3ea;
+  --panel: #f0f0f4;
+  --panel-3: #e8e8ee;
+  --accent: #6d4aff;
+  --accent-text: #5634e6;
+  --accent-soft: #eeeaff;
+  --sel: #ebe6ff;
+  --hover: #ededf2;
   --danger: #c0262e;
   --danger-line: #f0c0c3;
   font:
-    14px/1.4 -apple-system,
+    13px/1.45 -apple-system,
     BlinkMacSystemFont,
     'Segoe UI',
     sans-serif;
@@ -19,12 +25,18 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #1c1c1e;
-    --fg: #f5f5f7;
-    --muted: #a1a1a6;
-    --line: #3a3a3c;
-    --panel: #2c2c2e;
-    --accent: #4c9bf5;
+    --bg: #1c1b22;
+    --fg: #ecebf2;
+    --fg-2: #b6b5c7;
+    --muted: #82819a;
+    --line: #2d2c36;
+    --panel: #18171d;
+    --panel-3: #2a2933;
+    --accent: #8a6dff;
+    --accent-text: #b6a6ff;
+    --accent-soft: #2b2452;
+    --sel: #29234d;
+    --hover: #24232c;
     --danger: #ff8a90;
     --danger-line: #6b3038;
   }
@@ -68,40 +80,10 @@ body,
   min-height: 0;
 }
 
-.list {
-  width: 280px;
-  border-right: 1px solid var(--line);
-  padding: 8px;
-}
-
-.row {
-  display: block;
-  width: 100%;
-  padding: 8px 10px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-}
-
-.row:hover,
-.row:focus-visible {
-  background: var(--panel);
-}
-
 .reader {
   flex: 1;
   min-width: 0;
   display: flex;
-}
-
-.body-frame {
-  flex: 1;
-  border: 0;
-  background: #ffffff;
 }
 
 .empty {
@@ -130,13 +112,6 @@ body,
   color: #ffffff;
 }
 
-.index-state {
-  padding: 6px 16px;
-  border-bottom: 1px solid var(--line);
-  color: var(--muted);
-  font-size: 12px;
-}
-
 .btn.ghost {
   border-color: transparent;
   background: transparent;
@@ -146,26 +121,6 @@ body,
 .btn.danger {
   border-color: var(--danger-line);
   color: var(--danger);
-}
-
-.export-bar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-left: 16px;
-  min-width: 0;
-  color: var(--muted);
-}
-
-.export-account {
-  color: var(--fg);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.run-picker {
-  font: inherit;
 }
 
 .banner {
@@ -270,4 +225,372 @@ body,
   color: var(--muted);
   font-size: 12px;
   text-align: right;
+}
+
+/* The open export: sidebar, conversation list and reader. */
+
+.sidebar {
+  display: flex;
+  flex: 0 0 236px;
+  flex-direction: column;
+  min-width: 0;
+  border-right: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.acct-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 8px 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  min-width: 0;
+}
+
+.avatar {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.acct-txt {
+  flex: 1;
+  min-width: 0;
+}
+
+.export-account,
+.export-run {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.export-account {
+  font-weight: 600;
+}
+
+.export-run {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+/* A clipped account or export shows in full while the box has focus. */
+.acct-box:focus-within .export-account,
+.acct-box:focus-within .export-run {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.run-picker {
+  max-width: 100%;
+  font: inherit;
+  font-size: 11.5px;
+}
+
+.side-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 4px 8px 12px;
+}
+
+.nav-h {
+  padding: 14px 8px 4px;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.nav-item:hover {
+  background: var(--hover);
+}
+
+.nav-item.active {
+  background: var(--sel);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.nav-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-count {
+  margin-left: auto;
+  font-size: 11.5px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.dot {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.dot.plain {
+  background: var(--muted);
+}
+
+.side-foot {
+  padding: 9px 12px 10px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.bar-track {
+  height: 4px;
+  margin: 5px 0 2px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--panel-3);
+}
+
+.bar-track span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+.list {
+  display: flex;
+  flex: 0 0 384px;
+  flex-direction: column;
+  min-width: 0;
+  border-right: 1px solid var(--line);
+  background: var(--bg);
+}
+
+.list-head {
+  padding: 10px 12px 9px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.list-head h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.list-head .cnt {
+  display: block;
+  margin-top: 1px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.list-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  outline: none;
+}
+
+.list-inner {
+  position: relative;
+  width: 100%;
+}
+
+.slot {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+}
+
+.conv {
+  position: relative;
+  height: 100%;
+  padding: 9px 14px 10px 24px;
+  border-bottom: 1px solid var(--line);
+  cursor: default;
+}
+
+.conv:hover {
+  background: var(--hover);
+}
+
+.conv.selected {
+  background: var(--sel);
+}
+
+.conv.selected::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 3px;
+  background: var(--accent);
+  content: '';
+}
+
+.conv.placeholder:hover {
+  background: transparent;
+}
+
+.conv .l1 {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.conv .from,
+.conv .subj .t {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fg-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conv .date {
+  flex: none;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.conv .subj {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin-top: 1px;
+}
+
+.conv.unread .from,
+.conv.unread .subj .t {
+  color: var(--fg);
+  font-weight: 650;
+}
+
+.udot {
+  position: absolute;
+  top: 15px;
+  left: 9px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.cnt-badge {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  min-width: 18px;
+  height: 17px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--panel-3);
+  color: var(--fg-2);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+}
+
+/* A paper clip, drawn with borders. */
+.clip {
+  flex: none;
+  width: 7px;
+  height: 12px;
+  border: 1.5px solid var(--muted);
+  border-radius: 4px;
+  transform: rotate(35deg);
+}
+
+/* Chips that don't fit wrap to a second line, which is hidden: only whole
+   chips show, and a name too long for the row ends in an ellipsis. */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  height: 19px;
+  margin-top: 5px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.chip {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  height: 19px;
+  padding: 0 7px;
+  border-radius: 10px;
+  background: var(--panel-3);
+  color: var(--fg-2);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.chip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chip .dot {
+  width: 7px;
+  height: 7px;
+}
+
+@media (max-width: 1150px) {
+  .sidebar {
+    flex-basis: 212px;
+  }
+
+  .list {
+    flex-basis: 318px;
+  }
 }
