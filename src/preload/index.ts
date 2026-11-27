@@ -9,6 +9,7 @@ import {
   type LinkPrompt,
   type PevApi,
 } from '../shared/api';
+import { TEST_IPC } from '../shared/test-ipc';
 
 /** True for a link prompt as main sends it. */
 function isPrompt(value: unknown): value is LinkPrompt {
@@ -29,7 +30,6 @@ function isPrompt(value: unknown): value is LinkPrompt {
 const api: PevApi = {
   state: () => ipcRenderer.invoke(IPC.state),
   ping: (generation) => ipcRenderer.invoke(IPC.ping, { generation }),
-  openStub: (id, generation) => ipcRenderer.invoke(IPC.openStub, { id, generation }),
   open: (rowid, mode, generation) => ipcRenderer.invoke(IPC.open, { rowid, mode, generation }),
   log: (level, code, generation, data) =>
     ipcRenderer.send(
@@ -86,7 +86,7 @@ contextBridge.exposeInMainWorld('pev', api);
 if (__PEV_TEST_HOOKS__) {
   // Builds with test hooks only: raw access to the app's channels, so tests can
   // send malformed requests and check that the main process rejects them itself.
-  const channels: readonly string[] = Object.values(IPC);
+  const channels: readonly string[] = [...Object.values(IPC), ...Object.values(TEST_IPC)];
   const known = (channel: unknown): channel is string =>
     typeof channel === 'string' && channels.includes(channel);
   contextBridge.exposeInMainWorld('__pevTestIpc', {

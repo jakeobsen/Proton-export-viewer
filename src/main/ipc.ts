@@ -13,7 +13,6 @@ import {
   type IndexResult,
   type LinkActionResult,
   type MessageOpenResult,
-  type OpenResult,
   type PingResult,
   type Rejected,
   type RejectCode,
@@ -42,7 +41,7 @@ import { PLACEHOLDER } from './placeholder';
 import { SUPERSEDED, SearchLanes } from './search-lane';
 import { bodyUrl } from './views';
 
-const Generation = z
+export const Generation = z
   .number()
   .int()
   .nonnegative()
@@ -50,9 +49,6 @@ const Generation = z
 // Each schema covers the full argument list, so extra arguments are rejected too.
 const StateArgs = z.tuple([]);
 const PingArgs = z.tuple([z.object({ generation: Generation }).strict()]);
-const OpenArgs = z.tuple([
-  z.object({ id: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/), generation: Generation }).strict(),
-]);
 const MessageOpenArgs = z.tuple([
   z
     .object({
@@ -184,12 +180,22 @@ export function checkSender(ctx: AppContext, event: Event): AppWindow | RejectCo
   return appWin;
 }
 
-export function registerIpc(ctx: AppContext): void {
+export interface IpcGuard {
+  /** Logs a rejected request and returns its result. */
+  reject(code: RejectCode, appWin?: AppWindow): Rejected;
+  /** Handles `channel` for requests whose sender passes `checkSender`. */
+  guarded<T>(
+    channel: string,
+    run: (appWin: AppWindow, args: unknown[]) => Promise<T | Rejected> | T | Rejected,
+  ): void;
+}
+
+/** The sender check and the logged rejection every handler shares. */
+export function ipcGuard(ctx: AppContext): IpcGuard {
   const reject = (code: RejectCode, appWin?: AppWindow): Rejected => {
     ctx.log.warn('ipc.rejected', appWin ? { reason: code, windowId: appWin.id } : { reason: code });
     return { ok: false, code };
   };
-
   const guarded = <T>(
     channel: string,
     run: (appWin: AppWindow, args: unknown[]) => Promise<T | Rejected> | T | Rejected,
@@ -200,6 +206,11 @@ export function registerIpc(ctx: AppContext): void {
       return run(sender, args);
     });
   };
+  return { reject, guarded };
+}
+
+export function registerIpc(ctx: AppContext): void {
+  const { reject, guarded } = ipcGuard(ctx);
 
   guarded<StateResult>(IPC.state, (appWin, raw) => {
     if (!StateArgs.safeParse(raw).success) return reject('invalid', appWin);
@@ -211,42 +222,6 @@ export function registerIpc(ctx: AppContext): void {
     if (!args.success) return reject('invalid', appWin);
     if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
     return { ok: true, generation: ctx.generation };
-  });
-
-  guarded<OpenResult>(IPC.openStub, async (appWin, raw) => {
-    const args = OpenArgs.safeParse(raw);
-    if (!args.success) return reject('invalid', appWin);
-    const [{ id, generation }] = args.data;
-    if (generation !== ctx.generation) return reject('stale_generation', appWin);
-
-    const { openId, token, revoked } = appWin.views.accept();
-    if (revoked > 0) {
-      ctx.log.info('view.revoked', { reason: 'replaced', count: revoked, windowId: appWin.id });
-    }
-    let result;
-    try {
-      // Only a core already up for the open source: a call from the shell
-      // never starts one.
-      result = await ctx.core.requestRunning(
-        { type: 'open', openId, generation, token, stubId: id },
-        ctx.sources.stamp(),
-      );
-    } catch (err) {
-      if (!(err instanceof CoreUnavailableError)) throw err;
-      ctx.log.warn('core.unavailable', { openId, windowId: appWin.id });
-      return reject('core_unavailable', appWin);
-    }
-    if (!result.ok)
-      return reject(result.code === 'unknown_stub' ? 'unknown_stub' : 'invalid', appWin);
-    if (!result.body || appWin.win.isDestroyed()) return reject('superseded', appWin);
-
-    const outcome = appWin.views.install(openId, token, generation, ctx.generation, result.body);
-    if (!outcome.ok) {
-      ctx.log.info('open.stale', { reason: outcome.reason, openId, windowId: appWin.id });
-      return reject(outcome.reason === 'generation' ? 'stale_generation' : 'superseded', appWin);
-    }
-    ctx.log.info('view.installed', { openId, windowId: appWin.id });
-    return { ok: true, openId, url: bodyUrl(token) };
   });
 
   const openPacer = new OpenPacer<AppWindow>(() =>

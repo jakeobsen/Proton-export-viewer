@@ -124,7 +124,6 @@ export const REASONS = [
   'bad_origin',
   'stale_generation',
   'superseded',
-  'unknown_stub',
   'core_unavailable',
   'unknown_source',
   'unknown_run',

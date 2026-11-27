@@ -44,18 +44,21 @@ export interface CoreTestInit {
   readByName?: boolean;
 }
 
+/** Test builds only: an asset of a fixed placeholder body. */
 export interface StubAssetMessage {
   id: string;
   contentType: string;
   bytes: Uint8Array;
 }
 
+/** Test builds only: a fixed placeholder body, as the test hooks build it. */
 export interface StubBodyMessage {
   html: string;
   assets: StubAssetMessage[];
   links?: BodyLink[];
 }
 
+/** Test builds only: opens a fixed placeholder body. */
 export interface OpenRequest {
   type: 'open';
   reqId: number;
@@ -247,7 +250,6 @@ export type CoreResult =
       reqId: number;
       ok: false;
       code:
-        | 'unknown_stub'
         | 'worker_failed'
         | 'invalid'
         | 'stale'
@@ -268,6 +270,7 @@ export type CoreResult =
       stamp?: Stamp;
     };
 
+/** Test builds only: builds a fixed placeholder body in the reader worker. */
 export interface WorkerBuild {
   type: 'build';
   reqId: number;
@@ -294,5 +297,5 @@ export type WorkerMessage =
   | WorkerRendered
   | { type: 'result'; reqId: number; ok: true; body: StubBodyMessage }
   | { type: 'proof-read'; reqId: number; reads: ProofFileRead[] }
-  | { type: 'result'; reqId: number; ok: false; code: 'unknown_stub' }
+  | { type: 'result'; reqId: number; ok: false; code: 'invalid' }
   | { type: 'log'; level: 'error' | 'warn' | 'info'; code: string; data?: Record<string, unknown> };

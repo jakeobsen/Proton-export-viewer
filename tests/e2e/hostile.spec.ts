@@ -69,32 +69,14 @@ async function source(pev: PevApp, plans: HostilePlan[]): Promise<void> {
   expect(result.ok).toBe(true);
 }
 
+/** Opens a message in the reader pane, as the shell does. */
 function openRow(pev: PevApp, rowid: number, mode: OpenMode): Promise<MessageOpenResult> {
-  return pev.page.evaluate(
-    async ([r, m]) => {
-      const state = await window.pev.state();
-      if (!state.ok) return state;
-      return window.pev.open(r as number, m as OpenMode, state.generation);
-    },
-    [rowid, mode] as const,
-  );
+  return pev.paneOpen(rowid, mode);
 }
 
-/**
- * Gives the window a body frame, before the open under test: the sample open
- * that makes one would revoke a view opened earlier.
- */
-async function ensureFrame(pev: PevApp): Promise<void> {
-  if ((await pev.shell('frameSrc')) === null) {
-    const sample = await pev.open('sample');
-    await pev.bodyFrame(sample.url as string);
-  }
-}
-
-/** Shows a view in the window's body frame. */
+/** The reader pane's frame once it shows the view, after anything it starts late. */
 async function show(pev: PevApp, url: string): Promise<Frame> {
-  await pev.shell('setFrameSrc', [url]);
-  const frame = await pev.bodyFrame(url);
+  const frame = await pev.paneFrame(url);
   await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
   return frame;
 }
@@ -203,7 +185,7 @@ function loadedImages(frame: Frame): Promise<string[]> {
   );
 }
 
-test('every hostile message on the normal path: declared rewrites, only its own requests, CSP reports only for its own ids, no script, links only open the dialog', async ({
+test('every hostile message on the normal path: declared rewrites, only its own requests, CSP reports only for its own ids, no script, links only open the dialog @pane', async ({
   pev,
 }) => {
   test.setTimeout(300_000);
@@ -218,7 +200,6 @@ test('every hostile message on the normal path: declared rewrites, only its own 
     // Plain text has its links as well.
     const modes: OpenMode[] = categoryOf(plan) === 'plain_text' ? ['html', 'plain'] : ['html'];
     for (const mode of modes) {
-      await ensureFrame(pev);
       await pev.main('clearRequests');
       const opened = await openRow(pev, i + 1, mode);
       // Each message ends in a view or the fallback.
@@ -309,7 +290,7 @@ test('every hostile message on the normal path: declared rewrites, only its own 
   console.log('hostile normal path:', JSON.stringify(summary));
 });
 
-test('the recorders work: on the unsanitized path each declared load is cancelled or reported, and nothing else', async ({
+test('the recorders work: on the unsanitized path each declared load is cancelled or reported, and nothing else @pane', async ({
   pev,
 }) => {
   test.setTimeout(300_000);
@@ -322,7 +303,6 @@ test('the recorders work: on the unsanitized path each declared load is cancelle
   let withLoads = 0;
   for (const [i, plan] of plans.entries()) {
     const name = nameOf(plan);
-    await ensureFrame(pev);
     await pev.main('clearRequests');
     const opened = await openRow(pev, i + 1, 'html');
     expect(opened.ok, name).toBe(true);
@@ -402,7 +382,7 @@ test('positive control: the script detector sees the marker where scripts run', 
     .toBe(true);
 });
 
-test('positive control: the preconnect recorder sees a hint that nothing stops', async ({
+test('positive control: the preconnect recorder sees a hint that nothing stops @pane', async ({
   pev,
 }) => {
   // Unsanitized and without the body's CSP; the resolver rule stays on.
@@ -413,7 +393,6 @@ test('positive control: the preconnect recorder sees a hint that nothing stops',
   await source(pev, [plan]);
   expect((await pev.main<{ ok: boolean }>('readerUnsanitized', true)).ok).toBe(true);
   await pev.main('setBodyCsp', false);
-  await ensureFrame(pev);
   await pev.main('clearRequests');
   const opened = await openRow(pev, 1, 'html');
   if (!opened.ok || opened.outcome !== 'view') throw new Error('no view');
@@ -448,7 +427,6 @@ test('without the resolver rule, the filter and the CSP still stop every IP lite
         await pev.main('setBodyCsp', csp);
         for (const [i, plan] of plans.entries()) {
           const name = `${nameOf(plan)} ${unsanitized ? 'unsanitized' : 'normal'} csp ${csp ? 'on' : 'off'}`;
-          await ensureFrame(pev);
           await pev.main('clearRequests');
           const opened = await openRow(pev, i + 1, 'html');
           if (!opened.ok || opened.outcome !== 'view') throw new Error(`${name}: no view`);
@@ -518,6 +496,9 @@ test('without the resolver rule, the filter and the CSP still stop every IP lite
     expect(windows.filter((w) => w.visible || w.focused)).toEqual([]);
     expect(await pev.main('windowEvents')).toEqual([]);
     expect(await pev.main('dialogCalls')).toEqual([]);
+    // Every body showed in the reader pane's frame: no stub open, no stub frame.
+    expect(await pev.main('stubOpens')).toBe(0);
+    expect(await pev.page.locator('iframe.body-frame').count()).toBe(0);
   } finally {
     await pev.close();
   }

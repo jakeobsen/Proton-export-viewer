@@ -79,16 +79,10 @@ function viewUrl(result: MessageOpenResult): string {
   return result.url;
 }
 
-/** Opens a message and shows it in the window's body frame. */
+/** Opens a message in the window's reader pane and waits for its body frame. */
 async function show(pev: PevApp, rowid: number, mode: OpenMode, page: Page = pev.page) {
-  if ((await pev.shell('frameSrc', [], page)) === null) {
-    const sample = await pev.open('sample', page);
-    await pev.bodyFrame(sample.url as string, page);
-  }
-  const url = viewUrl(await openRow(pev, rowid, mode, page));
-  await pev.shell('setFrameSrc', [url], page);
-  const frame = await pev.bodyFrame(url, page);
-  return { frame, url, token: tokenOf(url) };
+  const { frame, url, token } = await pev.showInPane(rowid, mode, page);
+  return { frame, url, token };
 }
 
 const linkUrl = (token: string, id: string) => `mail-asset://v/${token}/${id}`;
@@ -132,7 +126,7 @@ async function dialogShown(pev: PevApp, frame: Frame, url: string, windows = 1) 
   expect(pev.app.windows()).toHaveLength(windows);
 }
 
-test('each warning shows only when it applies, with the host marked', async ({ pev }) => {
+test('each warning shows only when it applies, with the host marked @pane', async ({ pev }) => {
   await source(pev);
   const { frame, url } = await show(pev, 1, 'html');
   const dialog = pev.page.locator('.link-dialog');
@@ -261,7 +255,7 @@ test('each warning shows only when it applies, with the host marked', async ({ p
   expect(await external(pev)).toEqual([]);
 });
 
-test('Open in browser and Copy link go to the recorded stubs; the other choices do nothing', async ({
+test('Open in browser and Copy link go to the recorded stubs; the other choices do nothing @pane', async ({
   pev,
 }) => {
   await source(pev);
@@ -317,7 +311,7 @@ test('Open in browser and Copy link go to the recorded stubs; the other choices 
   expect(await external(pev)).toHaveLength(2);
 });
 
-test('the shell sends only a dialog id and a choice, for its own dialog', async ({ pev }) => {
+test('the shell sends only a dialog id and a choice, for its own dialog @pane', async ({ pev }) => {
   await source(pev);
   const { frame, url } = await show(pev, 1, 'html');
   await click(frame, '#plain');
@@ -355,7 +349,7 @@ test('the shell sends only a dialog id and a choice, for its own dialog', async 
   expect(pev.app.windows()).toHaveLength(2);
 });
 
-test('plain-text links go through the same ids', async ({ pev }) => {
+test('plain-text links go through the same ids @pane', async ({ pev }) => {
   await source(pev);
   const { frame, url, token } = await show(pev, 2, 'plain');
   expect(
@@ -374,7 +368,7 @@ test('plain-text links go through the same ids', async ({ pev }) => {
     .toEqual([{ method: 'clipboard.writeText', args: ['https://shop.example/a?b=1'] }]);
 });
 
-test('an unknown, revoked, other-window or stale-generation id opens no dialog', async ({
+test('an unknown, revoked, other-window or stale-generation id opens no dialog @pane', async ({
   pev,
 }) => {
   await source(pev);
@@ -412,7 +406,7 @@ test('an unknown, revoked, other-window or stale-generation id opens no dialog',
   expect(await external(pev)).toEqual([]);
 });
 
-test('a choice after a revoke or a generation bump does nothing', async ({ pev }) => {
+test('a choice after a revoke or a generation bump does nothing @pane', async ({ pev }) => {
   await source(pev);
   const dialog = pev.page.locator('.link-dialog');
   const rejected = (reason: string) =>
@@ -449,6 +443,9 @@ test('a choice after a revoke or a generation bump does nothing', async ({ pev }
   expect(pev.hasLog('nav.link_action', { action: 'copy' })).toBe(false);
 });
 
+// The sanitizer never puts a link id in an image or CSS reference, nor a link
+// id with a target other than a new window, so the next two bodies exist only
+// as stubs of the test hooks, in their own frame.
 test('an image or CSS reference to a link id loads nothing', async ({ pev }) => {
   await pev.main('clearRequests');
   const opened = await pev.open('link-refs');

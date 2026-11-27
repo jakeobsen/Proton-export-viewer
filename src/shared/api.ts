@@ -17,7 +17,6 @@ import type { SourceOutcome, SourcesView } from './sources';
 export const IPC = {
   state: 'pev:state',
   ping: 'pev:ping',
-  openStub: 'pev:open-stub',
   open: 'pev:open',
   log: 'pev:log',
   report: 'pev:report',
@@ -42,7 +41,6 @@ export type RejectCode =
   | 'bad_origin'
   | 'stale_generation'
   | 'superseded'
-  | 'unknown_stub'
   | 'core_unavailable'
   | 'unknown_source'
   | 'unknown_run'
@@ -136,7 +134,6 @@ export interface ErrorReport {
 export interface PevApi {
   state(): Promise<StateResult>;
   ping(generation: number): Promise<PingResult>;
-  openStub(id: string, generation: number): Promise<OpenResult>;
   open(rowid: number, mode: OpenMode, generation: number): Promise<MessageOpenResult>;
   log(
     level: 'error' | 'warn' | 'info',

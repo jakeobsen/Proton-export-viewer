@@ -17,15 +17,30 @@ import {
 import { closeReader, getReaderState, openInReader } from '../renderer/reader';
 import type { OpenResult } from '../shared/api';
 import { BODY_IFRAME_REFERRER, BODY_IFRAME_SANDBOX } from '../shared/constants';
+import { TEST_IPC } from '../shared/test-ipc';
 import type { OpenMode } from '../shared/reader-protocol';
 import { markLoaded } from './marker';
 import type { TimedOpen } from './open-bench-types';
 
 markLoaded();
 
+/** The raw IPC the preload of builds with test hooks exposes. */
+function testIpc(): { invoke(channel: string, ...args: unknown[]): Promise<unknown> } {
+  return (
+    window as unknown as {
+      __pevTestIpc: { invoke(channel: string, ...args: unknown[]): Promise<unknown> };
+    }
+  ).__pevTestIpc;
+}
+
 /** The stub body's frame, outside the shell's own tree. */
 function frame(): HTMLIFrameElement | null {
   return document.querySelector('iframe.body-frame');
+}
+
+/** The reader pane's body frame: the one the shell ships. */
+function paneFrame(): HTMLIFrameElement | null {
+  return document.querySelector('iframe.rp-frame');
 }
 
 /**
@@ -37,7 +52,7 @@ async function openStub(id: string): Promise<OpenResult> {
   clearLink();
   const generation = getShellState().generation ?? (await refreshGeneration());
   if (generation === null) return { ok: false, code: 'stale_generation' };
-  const result = await window.pev.openStub(id, generation);
+  const result = (await testIpc().invoke(TEST_IPC.openStub, { id, generation })) as OpenResult;
   if (result.ok) {
     const f = document.createElement('iframe');
     f.className = 'body-frame';
@@ -136,10 +151,11 @@ export function install(): void {
     switchRun,
     locateExport,
     forgetExport,
-    frameSrc: () => frame()?.getAttribute('src') ?? null,
-    frameSandbox: () => frame()?.getAttribute('sandbox') ?? null,
+    /** The reader pane's body frame: its address and sandbox, and a way to load another address. */
+    frameSrc: () => paneFrame()?.getAttribute('src') ?? null,
+    frameSandbox: () => paneFrame()?.getAttribute('sandbox') ?? null,
     setFrameSrc: (url: string) => {
-      const f = frame();
+      const f = paneFrame();
       if (f) f.src = url;
     },
     readyFrame,

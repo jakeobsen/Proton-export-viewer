@@ -16,6 +16,7 @@ import type { CoreResult, CoreTestInit } from '../shared/core-protocol';
 import type { IndexQuery } from '../shared/index-types';
 import { errorData } from '../shared/log/schema';
 import { TESTHOOKS_MARKER, markLoaded } from './marker';
+import { registerOpenStub, stubOpens } from './open-stub';
 import { TEST_PAGE, testRoute } from './pages';
 import { READER_SOURCE_ACTION, type SourceEntry } from './reader-source';
 import { READER_UNSANITIZED_ACTION } from './unsanitized';
@@ -112,6 +113,7 @@ function seccompMode(pid: number): string | null {
 }
 
 export async function install(ctx: AppContext): Promise<boolean> {
+  registerOpenStub(ctx);
   // Only the folder-proof build uses the real folder picker; it is kept
   // before the stubs replace it.
   const realOpenDialog = dialog.showOpenDialog.bind(dialog) as OpenDialog;
@@ -276,6 +278,7 @@ export async function install(ctx: AppContext): Promise<boolean> {
       }
     },
     linkDialogs: () => [...ctx.linkDialog.shown],
+    stubOpens: () => stubOpens(),
     liveViews: (windowId: number) => byId(windowId).views.liveCount,
     authorizedUrl: (windowId: number) => byId(windowId).views.authorizedUrl(),
     spellcheck: (windowId: number) => byId(windowId).session.isSpellCheckerEnabled(),

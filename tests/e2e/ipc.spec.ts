@@ -2,8 +2,9 @@
 // IPC: generation-bound requests, and requests from a frame that is not the main frame.
 
 import { expect, test } from './app';
+import { SAMPLE, paneSource } from './pane-messages';
 
-test('stale generations are rejected by the real main handler', async ({ pev }) => {
+test('stale generations are rejected by the real main handler @pane', async ({ pev }) => {
   const ok = await pev.page.evaluate(() => window.pev.ping(1));
   expect(ok).toEqual({ ok: true, generation: 1 });
 
@@ -12,7 +13,7 @@ test('stale generations are rejected by the real main handler', async ({ pev }) 
     ok: false,
     code: 'stale_generation',
   });
-  expect(await pev.page.evaluate(() => window.pev.openStub('sample', 1))).toEqual({
+  expect(await pev.page.evaluate(() => window.pev.open(1, 'html', 1))).toEqual({
     ok: false,
     code: 'stale_generation',
   });
@@ -28,10 +29,13 @@ test('stale generations are rejected by the real main handler', async ({ pev }) 
     .toBe(2);
 });
 
-test('a message open from the shell never starts core', async ({ pev }) => {
-  // With nothing to open, core runs without a source from launch.
-  expect(await pev.page.evaluate(() => window.pev.openStub('sample', 1))).toMatchObject({
+test('a message open from the shell never starts core @pane', async ({ pev }) => {
+  // With no export open, core runs without a source from launch: the reader's
+  // test source serves the message.
+  await paneSource(pev, SAMPLE);
+  expect(await pev.page.evaluate(() => window.pev.open(1, 'html', 1))).toMatchObject({
     ok: true,
+    outcome: 'view',
   });
   await pev.main('core', 'exit');
   await expect.poll(() => pev.hasLog('core.exit', { exitCode: 3 })).toBe(true);
@@ -39,7 +43,7 @@ test('a message open from the shell never starts core', async ({ pev }) => {
   const before = spawns();
 
   const unavailable = { ok: false, code: 'core_unavailable' };
-  expect(await pev.page.evaluate(() => window.pev.openStub('sample', 1))).toEqual(unavailable);
+  expect(await pev.page.evaluate(() => window.pev.open(1, 'html', 1))).toEqual(unavailable);
   expect(await pev.page.evaluate(() => window.pev.open(1, 'plain', 1))).toEqual(unavailable);
   await pev.page.waitForTimeout(500);
   expect(spawns()).toBe(before);
@@ -73,7 +77,7 @@ test('renderer logs and error reports for a stale generation are dropped', async
   await expect.poll(() => pev.logs('renderer').filter((l) => l.code === 'test.log').length).toBe(2);
 });
 
-test('state takes no arguments; every channel rejects a missing generation or extra arguments', async ({
+test('state takes no arguments; every channel rejects a missing generation or extra arguments @pane', async ({
   pev,
 }) => {
   const invoke = (channel: string, ...args: unknown[]) =>
@@ -88,7 +92,7 @@ test('state takes no arguments; every channel rejects a missing generation or ex
   expect(await invoke('pev:state', undefined)).toEqual(invalid);
   expect(await invoke('pev:ping', {})).toEqual(invalid);
   expect(await invoke('pev:ping', { generation: 1 }, 'extra')).toEqual(invalid);
-  expect(await invoke('pev:open-stub', { id: 'sample' })).toEqual(invalid);
+  expect(await invoke('pev:open', { rowid: 1, mode: 'html' })).toEqual(invalid);
 
   await send('pev:log', { level: 'info', code: 'test.log' });
   await send('pev:log', { generation: 1, level: 'info', code: 'test.log' }, 'extra');
@@ -103,17 +107,21 @@ test('state takes no arguments; every channel rejects a missing generation or ex
   expect(pev.logs('renderer')).toEqual([]);
 });
 
-test('malformed arguments are rejected', async ({ pev }) => {
+test('malformed arguments are rejected @pane', async ({ pev }) => {
   const bad = await pev.page.evaluate(() =>
-    (window.pev.openStub as unknown as (a: unknown, b: unknown) => Promise<unknown>)('../x', 1),
+    (window.pev.open as unknown as (a: unknown, b: unknown, c: unknown) => Promise<unknown>)(
+      '../x',
+      'html',
+      1,
+    ),
   );
   expect(bad).toEqual({ ok: false, code: 'invalid' });
   expect(pev.hasLog('ipc.rejected', { reason: 'invalid' })).toBe(true);
 });
 
-test('the body frame has no preload API', async ({ pev }) => {
-  const opened = await pev.open('sample');
-  const frame = await pev.bodyFrame(opened.url as string);
+test('the body frame has no preload API @pane', async ({ pev }) => {
+  await paneSource(pev, SAMPLE);
+  const { frame } = await pev.showInPane(1, 'html');
   expect(await frame.evaluate(() => typeof (window as unknown as { pev?: unknown }).pev)).toBe(
     'undefined',
   );

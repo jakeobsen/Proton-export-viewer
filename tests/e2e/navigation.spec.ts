@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Navigation: link ids go to the link dialog, nothing navigates, and only the
-// authorized body URL can be (re)loaded.
+// authorized body URL can be (re)loaded. Bodies open in the reader pane; those
+// the sanitizer would clean go through the reader's unsanitized path.
 
 import type { Frame } from '@playwright/test';
 import { expect, test, type PevApp } from './app';
+import { LINKS, RAW_LINKS, REFRESH, SAMPLE, paneSource, unsanitized } from './pane-messages';
 
 interface Shown {
   windowId: number;
@@ -55,11 +57,12 @@ test.afterEach(async ({ pev }) => {
   expect(await pev.main('externalCalls')).toEqual([]);
 });
 
-test('a link click in the body opens the link dialog and nothing navigates', async ({ pev }) => {
-  const opened = await pev.open('sample');
-  const url = opened.url as string;
-  const frame = await pev.bodyFrame(url);
-  await clickToDialog(pev, frame, '#stub-link', 1);
+test('a link click in the body opens the link dialog and nothing navigates @pane', async ({
+  pev,
+}) => {
+  await paneSource(pev, SAMPLE);
+  const { url, frame } = await pev.showInPane(1, 'html');
+  await clickToDialog(pev, frame, '#link', 1);
   expect(await dialogs(pev)).toEqual([{ windowId: 1, url: 'https://example.com/' }]);
   await expect(pev.page.locator('.link-url')).toHaveText('https://example.com/');
   await expect(pev.page.locator('.link-title')).toHaveText('example.com');
@@ -68,9 +71,10 @@ test('a link click in the body opens the link dialog and nothing navigates', asy
   expect(pev.app.windows()).toHaveLength(1);
 });
 
-test('target=_blank link ids go to the dialog', async ({ pev }) => {
-  const opened = await pev.open('links');
-  const frame = await pev.bodyFrame(opened.url as string);
+test('target=_blank link ids go to the dialog @pane', async ({ pev }) => {
+  await paneSource(pev, LINKS);
+  const opened = await pev.showInPane(1, 'html');
+  const frame = opened.frame;
   await clickToDialog(pev, frame, '#link-blank', 1);
   expect(await dialogs(pev)).toEqual([{ windowId: 1, url: 'https://example.org/blank' }]);
   // The link dialog covers the body; cancel it like a user before the next link.
@@ -90,9 +94,10 @@ test('target=_blank link ids go to the dialog', async ({ pev }) => {
 });
 
 for (const id of ['#link-self', '#link-plain']) {
-  test(`a ${id.slice(6)} https link in the body is denied`, async ({ pev }) => {
-    const opened = await pev.open('links');
-    const frame = await pev.bodyFrame(opened.url as string);
+  test(`a ${id.slice(6)} https link in the body is denied @pane`, async ({ pev }) => {
+    await paneSource(pev, RAW_LINKS);
+    await unsanitized(pev);
+    const { frame } = await pev.showInPane(1, 'html');
     await pev.main('clearRequests');
     // The shell CSP (frame-src mail-body:) stops the frame navigation before any request.
     const stoppedByCsp = () =>
@@ -125,20 +130,17 @@ for (const id of ['#link-self', '#link-plain']) {
   });
 }
 
-test('a raw URL, a javascript: or data: link, or an id without a link scheme opens no dialog', async ({
-  pev,
-}) => {
-  const opened = await pev.open('links');
-  const url = opened.url as string;
-  const frame = await pev.bodyFrame(url);
+test('a raw URL, or a javascript: or data: link opens no dialog @pane', async ({ pev }) => {
+  await paneSource(pev, RAW_LINKS);
+  await unsanitized(pev);
+  const { url, frame } = await pev.showInPane(1, 'html');
   const denied = (reason: string, scheme: string) =>
     pev.hasLog('nav.window_open_denied', { reason, scheme });
-  for (const id of ['#link-js', '#link-data', '#link-raw', '#link-poisoned']) {
+  for (const id of ['#link-js', '#link-data', '#link-raw']) {
     await frame.evaluate((s) => (document.querySelector(s) as HTMLElement).click(), id);
   }
   await expect.poll(() => denied('not_link', 'data')).toBe(true);
   await expect.poll(() => denied('not_link', 'https')).toBe(true);
-  await expect.poll(() => denied('scheme', 'mail-asset')).toBe(true);
   expect(await dialogs(pev)).toEqual([]);
   await expect(pev.page.locator('.link-dialog')).toHaveCount(0);
   expect(frame.url()).toBe(url);
@@ -146,29 +148,46 @@ test('a raw URL, a javascript: or data: link, or an id without a link scheme ope
   expect(pev.app.windows()).toHaveLength(1);
 });
 
-test('window.open from the shell opens the dialog only for a link id of the live view', async ({
+// The sanitizer only maps http, https and mailto URLs to link ids, so this body
+// exists only as a stub of the test hooks.
+test('a link id without a link scheme opens no dialog (stub frame)', async ({ pev }) => {
+  const opened = await pev.open('links');
+  const url = opened.url as string;
+  const frame = await pev.bodyFrame(url);
+  await frame.evaluate(() => (document.querySelector('#link-poisoned') as HTMLElement).click());
+  await expect
+    .poll(() => pev.hasLog('nav.window_open_denied', { reason: 'scheme', scheme: 'mail-asset' }))
+    .toBe(true);
+  expect(await dialogs(pev)).toEqual([]);
+  await expect(pev.page.locator('.link-dialog')).toHaveCount(0);
+  expect(frame.url()).toBe(url);
+  expect(pev.page.url()).toBe('app://shell/index.html');
+  expect(pev.app.windows()).toHaveLength(1);
+});
+
+test('window.open from the shell opens the dialog only for a link id of the live view @pane', async ({
   pev,
 }) => {
-  const opened = await pev.open('links');
+  await paneSource(pev, LINKS);
+  const opened = await pev.showInPane(1, 'html');
   await pev.shell('windowOpen', ['https://example.org/popup']);
   await expect.poll(() => pev.hasLog('nav.window_open_denied', { reason: 'not_link' })).toBe(true);
-  await pev.shell('windowOpen', [
-    `${(opened.url as string).replace('mail-body:', 'mail-asset:')}/l1`,
-  ]);
+  await pev.shell('windowOpen', [`${opened.url.replace('mail-body:', 'mail-asset:')}/l1`]);
   await expect
     .poll(() => dialogs(pev))
     .toEqual([{ windowId: 1, url: 'https://example.org/blank' }]);
   expect(pev.app.windows()).toHaveLength(1);
 });
 
-test('the body frame cannot load an old or guessed token', async ({ pev }) => {
-  const first = await pev.open('sample');
-  const second = await pev.open('sample');
-  const current = second.url as string;
-  const frame = await pev.bodyFrame(current);
+test('the body frame cannot load an old or guessed token @pane', async ({ pev }) => {
+  await paneSource(pev, SAMPLE);
+  const first = await pev.showInPane(1, 'html');
+  const second = await pev.showInPane(1, 'html');
+  const current = second.url;
+  const frame = second.frame;
 
   let denied = 0;
-  for (const target of [first.url as string, `mail-body://v/${'f'.repeat(32)}`]) {
+  for (const target of [first.url, `mail-body://v/${'f'.repeat(32)}`]) {
     const before = await bodyRequests(pev, target);
     await pev.shell('setFrameSrc', [target]);
     denied += 1;
@@ -184,10 +203,12 @@ test('the body frame cannot load an old or guessed token', async ({ pev }) => {
   }
 });
 
-test('meta refresh in a body is denied', async ({ pev }) => {
+test('meta refresh in a body is denied @pane', async ({ pev }) => {
+  await paneSource(pev, REFRESH);
+  await unsanitized(pev);
   await pev.main('clearRequests');
-  const refresh = await pev.open('refresh');
-  const frame = await pev.bodyFrame(refresh.url as string);
+  const refresh = await pev.showInPane(1, 'html');
+  const frame = refresh.frame;
   // The iframe sandbox (no allow-scripts) refuses the refresh before it navigates.
   await expect
     .poll(() =>
@@ -217,13 +238,12 @@ test('main-frame navigation is denied', async ({ pev }) => {
   expect(pev.page.url()).toBe('app://shell/index.html');
 });
 
-test('the authorized reload of the current token works', async ({ pev }) => {
-  const opened = await pev.open('sample');
-  const url = opened.url as string;
-  await pev.bodyFrame(url);
+test('the authorized reload of the current token works @pane', async ({ pev }) => {
+  await paneSource(pev, SAMPLE);
+  const { url } = await pev.showInPane(1, 'html');
   expect(await bodyRequests(pev, url)).toBe(1);
   await pev.shell('setFrameSrc', [url]);
   await expect.poll(() => bodyRequests(pev, url)).toBe(2);
-  const frame = await pev.bodyFrame(url);
-  expect(await frame.locator('#stub-title').textContent()).toBe('Sample message');
+  const frame = await pev.paneFrame(url);
+  expect(await frame.locator('#title').textContent()).toBe('Sample message');
 });
