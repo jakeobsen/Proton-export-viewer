@@ -193,17 +193,21 @@ async function scrollToEnd(pev: PevApp, rows: number): Promise<SearchState> {
   return state(pev);
 }
 
-/** The conversations of a folder, newest first, with their list anchors. */
+/** Every conversation of a folder, newest first, read a window of up to 200 at a time. */
 async function folderRows(pev: PevApp, labelId: string) {
-  const window_ = (await ask<ListWindow>(pev, {
-    op: 'window',
-    labelId,
-    anchor: { index: 0 },
-    before: 0,
-    after: 200,
-    selected: null,
-  }))!.answer;
-  return window_.rows.map((row, i) => ({ ...row, subject: window_.details[i]!.subject }));
+  const rows: Array<ListWindow['rows'][number] & { subject: string }> = [];
+  for (;;) {
+    const window_ = (await ask<ListWindow>(pev, {
+      op: 'window',
+      labelId,
+      anchor: { index: rows.length },
+      before: 0,
+      after: 200,
+      selected: null,
+    }))!.answer;
+    rows.push(...window_.rows.map((row, i) => ({ ...row, subject: window_.details[i]!.subject })));
+    if (window_.rows.length === 0 || rows.length >= window_.total) return rows;
+  }
 }
 
 /** The conversation whose earliest subject is this. */
@@ -271,6 +275,23 @@ test('a search runs once typing pauses, and its results replace the list until t
     expect(text, file).not.toContain('zebra');
     expect(text, file).not.toContain('yak');
   }
+});
+
+test('a search that gets no answer says so, and the box takes at most 1,000 characters', async ({
+  pev,
+}) => {
+  const { root, pairs } = animals('sbox-failed');
+  await open(pev, root, pairs);
+  await expect(pev.page.locator('.search-box')).toHaveAttribute('maxlength', '1000');
+  // Text past the limit, set as typing could not: main refuses it, and no answer comes.
+  await typeText(pev.page, 'zebra '.repeat(200));
+  await expect.poll(async () => (await state(pev)).failed).toBe(true);
+  await expect(pev.page.locator('.results .no-results')).toHaveText("Couldn't search");
+  // The next search that gets an answer takes the line's place.
+  await typeText(pev.page, 'zebra');
+  expect((await settled(pev, 'zebra')).total).toBe(6);
+  await expect(pev.page.locator('.results .no-results')).toHaveCount(0);
+  await expect(pev.page.locator('.results .conv[data-thread]')).toHaveCount(6);
 });
 
 test('only the latest search installs: an older answer that comes late is dropped, and a waiting one is replaced', async ({
@@ -532,6 +553,13 @@ test('by relevance, a page read after the index changed shows no conversation tw
   for (let i = 0; i < 200; i += 1) {
     specs.push({ id: `S${String(i).padStart(3, '0')}`, subject: 'zebra zebra', time: t + i });
   }
+  // The first conversation also has a reply that matches weakly.
+  specs.push({
+    id: 'R000',
+    subject: 'zebra with a long tail of other words that make it a weak match',
+    time: t + 1000,
+    replyTo: 'S000',
+  });
   for (let j = 0; j < 5; j += 1) {
     specs.push({ id: `W${j}`, subject: `zebra weaker ${j} match`, time: t + 500 + j });
   }
@@ -539,9 +567,14 @@ test('by relevance, a page read after the index changed shows no conversation tw
   const other = craft('sbox-rank-other', [{ id: 'X1', subject: 'Other', time: t }]);
   await open(pev, root, pairs);
   const key = (await pev.main<Stamp>('sourceStamp')).sourceKey;
+  // Its reply makes it the folder's newest conversation.
+  const [newest] = await folderRows(pev, '5');
+  expect(newest).toMatchObject({ subject: 'zebra zebra', count: 2 });
+  const weakened = newest!.threadId;
 
-  // One of the strongest conversations gets a weak match: it falls behind every other one.
-  resubject(run, [['S000', 'zebra with a long tail of other words that make it a weak match']]);
+  // Its strong match stops matching: only the weak reply is left, so it falls
+  // behind every other conversation, and keeps its ID.
+  resubject(run, [['S000', 'Lunch']]);
   await reopenHeld(pev, key, other.root);
   await typeText(pev.page, 'zebra');
   await settled(pev, 'zebra');
@@ -549,13 +582,16 @@ test('by relevance, a page read after the index changed shows no conversation tw
   await expect.poll(async () => (await state(pev)).sort).toBe('relevance');
   const first = await settled(pev, 'zebra');
   expect(first.threadIds).toHaveLength(200);
+  expect(first.threadIds).toContain(weakened);
 
   await pev.main('releaseWrites', null);
   await phase1Done(pev, pairs);
+  expect(await threadBySubject(pev, 'Lunch')).toBe(weakened);
   const all = await scrollToEnd(pev, 205);
   // At least the weakened conversation came again on core's next page, and was left out.
   expect(all.skipped).toBeGreaterThan(0);
   expect(new Set(all.threadIds).size).toBe(205);
+  expect(all.threadIds.filter((t_) => t_ === weakened)).toHaveLength(1);
 });
 
 test("the snippets channel takes a query ID and up to 50 conversations, for the window's current search", async ({

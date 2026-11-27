@@ -4,7 +4,7 @@
 
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useCallback, useEffect, useLayoutEffect, useRef, type KeyboardEvent } from 'react';
-import type { MarkedSnippet, SearchSort } from '../shared/index-types';
+import { MAX_QUERY_LENGTH, type MarkedSnippet, type SearchSort } from '../shared/index-types';
 import type { SidebarModel } from './folders';
 import { formatCount, fullDate, listDate, participantsText } from './format';
 import {
@@ -35,6 +35,7 @@ export function SearchBox() {
       aria-label="Search mail"
       spellCheck={false}
       autoComplete="off"
+      maxLength={MAX_QUERY_LENGTH}
       value={text}
       onChange={(e) => setSearchText(e.target.value)}
       onKeyDown={(e) => {
@@ -207,6 +208,11 @@ export function SearchResults() {
         onKeyDown={onKeyDown}
       >
         {empty && <div className="no-results">No results</div>}
+        {snap.failed && (
+          <div className="no-results" role="status">
+            Couldn&apos;t search
+          </div>
+        )}
         <div className="list-inner" style={{ height: virtualizer.getTotalSize() }}>
           {items.map((item) => {
             const row = snap.rows[item.index];

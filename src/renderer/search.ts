@@ -92,7 +92,10 @@ function rowsOf(page: SearchPage): ResultRow[] {
 export class SearchModel {
   private snap: SearchSnapshot = IDLE;
   private timer: ReturnType<typeof setTimeout> | null = null;
-  /** Searches started; an answer for an older one is dropped. */
+  /**
+   * Bumped whenever the shown search is left behind: an edit, a new search
+   * or an emptied box. An answer asked for before that is dropped.
+   */
   private seq = 0;
   /** The shown search's text, and where its next page starts. */
   private shownText: string | null = null;
@@ -136,6 +139,10 @@ export class SearchModel {
       this.stop({ text });
       return;
     }
+    // The shown search no longer matches the box. Its rows stay on screen
+    // until the next search answers, but nothing more of it is asked for or
+    // installed while typing pauses.
+    this.detach();
     this.set({ text });
     this.timer = setTimeout(() => {
       this.timer = null;
@@ -159,18 +166,14 @@ export class SearchModel {
   }
 
   private stop(patch: Partial<SearchSnapshot>): void {
-    this.seq += 1;
-    this.forget();
+    this.detach();
     this.set({ ...IDLE, sort: this.snap.sort, shownId: this.snap.shownId, ...patch });
   }
 
   private start(): void {
-    this.seq += 1;
+    this.detach();
     const seq = this.seq;
     const { text, sort } = this.snap;
-    // Pages and snippets still coming for the previous search no longer count.
-    this.loading = false;
-    this.askingSnippets = false;
     this.set({ active: true, searching: true, failed: false });
     const request: SearchRequest = { text, sort, after: null } as SearchRequest;
     void this.run(request)
@@ -213,6 +216,15 @@ export class SearchModel {
         this.readMore();
         this.readSnippets();
       });
+  }
+
+  /**
+   * Answers still coming for the shown search no longer count, and none of
+   * its pages or snippets are asked for again. Its rows stay as they are.
+   */
+  private detach(): void {
+    this.seq += 1;
+    this.forget();
   }
 
   /** Drops what belongs to the shown search. */

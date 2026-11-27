@@ -427,7 +427,6 @@ export async function install(ctx: AppContext): Promise<boolean> {
       });
       if (!result.ok) throw new Error('release-writes');
     },
-    /** Phase 1 writes waiting to be let through. */
     /** Searches that reached core since it started. */
     coreSearches: async () => {
       const result = await core('searches');
@@ -442,10 +441,12 @@ export async function install(ctx: AppContext): Promise<boolean> {
       const result = await core('release-searches');
       return result.ok ? (result.value ?? 0) : 0;
     },
+    /** Searches and snippet requests core holds now. */
     heldSearches: async () => {
       const result = await core('held-searches');
       return result.ok ? (result.value ?? 0) : 0;
     },
+    /** Phase 1 writes waiting to be let through. */
     heldWrites: async () => {
       const result = await core('held-writes');
       return result.ok ? (result.value ?? 0) : 0;

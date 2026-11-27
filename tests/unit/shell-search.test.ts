@@ -217,6 +217,103 @@ describe('answers', () => {
   });
 });
 
+describe('while typing pauses', () => {
+  const dateKey = (threadId: number): SearchKey => ({ time: 1000 - threadId, threadId });
+  const marked = (threadId: number): ThreadSnippet => ({
+    threadId,
+    snippet: { text: `zebra ${threadId}`, ranges: [[0, 5]] },
+  });
+
+  it("an older search's first page that answers during the pause installs nothing, and one search runs per pause", async () => {
+    typeAndPause('zebra');
+    await answer(runner.last, page([1, 2], { total: 2 }));
+    typeAndPause('zebu');
+    const older = runner.last;
+    model.setText('yak');
+    await answer(older, page([3, 4], { total: 2 }));
+    // The rows shown before stay; the answer for the edited text is dropped.
+    expect(model.snapshot).toMatchObject({ text: 'yak', resultsFor: 'zebra', total: 2 });
+    expect(model.snapshot.rows.map((r) => r.threadId)).toEqual([1, 2]);
+    expect(runner.calls).toHaveLength(2);
+    vi.advanceTimersByTime(TYPING_PAUSE_MS - 1);
+    expect(runner.calls).toHaveLength(2);
+    vi.advanceTimersByTime(1);
+    expect(runner.calls).toHaveLength(3);
+    expect(runner.last.request).toEqual({ text: 'yak', sort: 'date', after: null });
+    await answer(runner.last, page([5], { total: 1 }));
+    expect(model.snapshot).toMatchObject({ resultsFor: 'yak', total: 1 });
+    expect(model.snapshot.rows.map((r) => r.threadId)).toEqual([5]);
+    expect(runner.calls).toHaveLength(3);
+  });
+
+  it('a later page that answers during the pause installs nothing, and a scroll then reads no page', async () => {
+    typeAndPause('zebra');
+    await answer(runner.last, page(range(1, 200), { next: dateKey(200) }));
+    model.setViewport(199, 199);
+    const later = runner.last;
+    expect(later.request.after).toEqual(dateKey(200));
+    model.setText('zebras');
+    await answer(later, page([201, 202], { next: dateKey(202) }));
+    expect(model.snapshot.rows.map((r) => r.threadId)).toEqual(range(1, 200));
+    model.setViewport(199, 199);
+    expect(runner.calls).toHaveLength(2);
+    vi.advanceTimersByTime(TYPING_PAUSE_MS);
+    expect(runner.calls).toHaveLength(3);
+    expect(runner.last.request).toEqual({ text: 'zebras', sort: 'date', after: null });
+  });
+
+  it('a scroll during the pause asks for no page or snippet of the shown search', async () => {
+    typeAndPause('zebra');
+    await answer(runner.last, page(range(1, 200), { queryId: 1, next: dateKey(200) }));
+    // The first row's snippet is asked for at once; no answer comes for it.
+    expect(snippetRunner.last.request).toEqual({ queryId: 1, threadIds: [1] });
+    snippetRunner.last.resolve(null);
+    await flush();
+    model.setText('zebras');
+    model.setViewport(190, 199);
+    expect(runner.calls).toHaveLength(1);
+    expect(snippetRunner.calls).toHaveLength(1);
+    vi.advanceTimersByTime(TYPING_PAUSE_MS);
+    expect(runner.calls).toHaveLength(2);
+    await answer(runner.last, page(range(301, 200), { next: dateKey(500) }));
+    model.setViewport(199, 199);
+    expect(runner.last.request).toEqual({ text: 'zebras', sort: 'date', after: dateKey(500) });
+  });
+
+  it('snippets that answer during the pause install nothing, and a scroll then asks for none', async () => {
+    model.setViewport(0, 9);
+    typeAndPause('zebra');
+    await answer(runner.last, page(range(1, 20), { queryId: 1 }));
+    const late = snippetRunner.last;
+    expect(late.request).toEqual({ queryId: 1, threadIds: range(1, 10) });
+    model.setText('zebras');
+    late.resolve(range(1, 10).map(marked));
+    await flush();
+    expect(model.snapshot.rows.every((r) => r.snippet === null)).toBe(true);
+    model.setViewport(10, 19);
+    expect(snippetRunner.calls).toHaveLength(1);
+    vi.advanceTimersByTime(TYPING_PAUSE_MS);
+    // The new results start at the top, as many rows on screen as before.
+    await answer(runner.last, page(range(1, 20), { queryId: 2 }));
+    expect(snippetRunner.last.request).toEqual({ queryId: 2, threadIds: range(1, 10) });
+  });
+
+  it("while a new search's first page is awaited, no snippet of the shown one is asked for", async () => {
+    model.setViewport(0, 9);
+    typeAndPause('zebra');
+    await answer(runner.last, page(range(1, 20), { queryId: 1 }));
+    snippetRunner.last.resolve(null);
+    await flush();
+    expect(snippetRunner.calls).toHaveLength(1);
+    model.setSort('relevance');
+    expect(model.snapshot.searching).toBe(true);
+    model.setViewport(0, 9);
+    expect(snippetRunner.calls).toHaveLength(1);
+    await answer(runner.last, page(range(1, 20), { queryId: 2, sort: 'relevance' }));
+    expect(snippetRunner.last.request).toEqual({ queryId: 2, threadIds: range(1, 10) });
+  });
+});
+
 describe('pages', () => {
   const dateKey = (threadId: number): SearchKey => ({ time: 1000 - threadId, threadId });
 
