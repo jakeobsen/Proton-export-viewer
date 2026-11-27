@@ -16,6 +16,7 @@ import { createAppWindow } from '../main/windows';
 import { checkNewFile, checkWorkspace } from '../../tools/bench/workspace.mjs';
 import type { TimedOpen } from './open-bench-types';
 import { READER_SOURCE_ACTION } from './reader-source';
+import type { WindowEventRecorder } from './window-events';
 
 const FLAG = '--pev-open-bench=';
 /** How long the shell, the restore at launch and each step may take. */
@@ -84,7 +85,11 @@ async function paced(js: <T>(code: string) => Promise<T>, rowids: number[]): Pro
   return out;
 }
 
-export async function runOpenBench(ctx: AppContext, argv: string[]): Promise<void> {
+export async function runOpenBench(
+  ctx: AppContext,
+  argv: string[],
+  windowEvents: WindowEventRecorder,
+): Promise<void> {
   const result: Record<string, unknown> = { ok: false, startedAt: new Date().toISOString() };
   let out: { workspace: string; nonce: string; path: string } | null = null;
   try {
@@ -157,6 +162,8 @@ export async function runOpenBench(ctx: AppContext, argv: string[]): Promise<voi
     result.error = (err as Error).message;
   } finally {
     result.finishedAt = new Date().toISOString();
+    // Every show and focus event of the run's windows; the runner fails a run with any.
+    result.windowEvents = windowEvents.events();
     try {
       if (out) {
         checkNewFile(out.workspace, out.nonce, out.path);

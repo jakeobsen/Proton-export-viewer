@@ -13,6 +13,7 @@ import {
   percentile,
   pickSample,
   summarizeRun,
+  stayedHidden,
   verdict,
 } from '../../tools/bench/run-open-bench.mjs';
 import type { TimedOpen } from '../../src/testhooks/open-bench-types';
@@ -93,7 +94,12 @@ describe('the corpus check', () => {
 });
 
 describe('the verdict', () => {
-  const run = (opens: TimedOpen[]) => ({ summary: summarizeRun(opens) });
+  const HIDDEN = { visible: false, focused: false };
+  const run = (opens: TimedOpen[]) => ({
+    summary: summarizeRun(opens),
+    window: HIDDEN,
+    windowEvents: [],
+  });
 
   it('is the median of the launches’ p95s', () => {
     const runs = [10, 20, 30, 40].map((base) => run(views(range(100).map((i) => base + i / 10))));
@@ -104,6 +110,7 @@ describe('the verdict', () => {
       p95s: [19.5, 29.5, 39.5, 49.5],
       target: 150,
       within: true,
+      windowEvents: 0,
     });
     expect(verdict(runs, 30).within).toBe(false);
   });
@@ -119,15 +126,28 @@ describe('the verdict', () => {
     const late = run([...views([5]), { rowid: 2, ms: null, outcome: 'timeout', format: 'html' }]);
     expect(late.summary).toMatchObject({ opens: 2, views: 1, timeouts: [2] });
     expect(verdict([late]).valid).toBe(false);
-    expect(verdict([run(views([1])), { summary: null }]).valid).toBe(false);
+    expect(
+      verdict([run(views([1])), { summary: null, window: null, windowEvents: null }]).valid,
+    ).toBe(false);
+  });
+
+  it('is invalid when a window was shown or focused, or the launch recorded no events', () => {
+    const ok = run(views([5, 6]));
+    expect(stayedHidden(ok)).toBe(true);
+    expect(verdict([ok]).valid).toBe(true);
+    const shown = { ...ok, windowEvents: [{ window: 1, event: 'show' }] };
+    expect(stayedHidden(shown)).toBe(false);
+    expect(verdict([ok, shown])).toMatchObject({ valid: false, medianP95: 6, windowEvents: 1 });
+    const focused = { ...ok, windowEvents: [{ window: 1, event: 'focus' }] };
+    expect(verdict([focused]).valid).toBe(false);
+    expect(verdict([{ ...ok, window: { visible: true, focused: false } }]).valid).toBe(false);
+    expect(verdict([{ ...ok, window: { visible: false, focused: true } }]).valid).toBe(false);
+    expect(verdict([{ ...ok, windowEvents: null }]).valid).toBe(false);
+    expect(verdict([{ ...ok, window: null }]).valid).toBe(false);
   });
 
   it('writes a markdown report that names both events and the verdict', () => {
-    const runs = [run(views([10, 12]))].map((r) => ({
-      ...r,
-      exit: { code: 0 },
-      window: { visible: false, focused: false },
-    }));
+    const runs = [run(views([10, 12]))].map((r) => ({ ...r, exit: { code: 0 } }));
     const text = markdown({
       verdict: verdict(runs),
       events: { start: 'START', end: 'END' },
@@ -142,6 +162,6 @@ describe('the verdict', () => {
     expect(text).toContain('**Median of the p95s: 12 ms** (target ≤ 150 ms): within.');
     expect(text).toContain('- Start: START.');
     expect(text).toContain('- End: END.');
-    expect(text).toContain('| 1 | 2/2 | 0 | 0 | 0 | 2 | 0 | 10 | 12 | 12 | true | 0 |');
+    expect(text).toContain('| 1 | 2/2 | 0 | 0 | 0 | 2 | 0 | 10 | 12 | 12 | true | 0 | 0 |');
   });
 });

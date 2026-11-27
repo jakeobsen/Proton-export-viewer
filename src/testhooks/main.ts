@@ -376,7 +376,7 @@ export async function install(ctx: AppContext): Promise<boolean> {
   }
   const openBench = await import('./open-bench');
   if (openBench.openBenchRequested(process.argv)) {
-    void openBench.runOpenBench(ctx, process.argv);
+    void openBench.runOpenBench(ctx, process.argv, windowEvents);
     return true;
   }
 

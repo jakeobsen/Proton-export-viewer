@@ -32,8 +32,15 @@ export interface RunSummary {
   max: number | null;
 }
 export function summarizeRun(opens: TimedOpen[]): RunSummary;
+export interface LaunchRecord {
+  summary: RunSummary | null;
+  window: { visible: boolean; focused: boolean } | null;
+  /** The show and focus events the app recorded; null when it wrote no result. */
+  windowEvents: Array<{ window: number; event: string }> | null;
+}
+export function stayedHidden(run: Pick<LaunchRecord, 'window' | 'windowEvents'>): boolean;
 export function verdict(
-  runs: Array<{ summary: RunSummary | null }>,
+  runs: LaunchRecord[],
   target?: number,
 ): {
   valid: boolean;
@@ -41,5 +48,7 @@ export function verdict(
   p95s: Array<number | null>;
   target: number;
   within: boolean;
+  /** Show and focus events over all launches. */
+  windowEvents: number;
 };
 export function markdown(report: unknown): string;

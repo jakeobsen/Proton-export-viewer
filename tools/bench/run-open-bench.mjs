@@ -99,20 +99,37 @@ export function summarizeRun(opens) {
   };
 }
 
+/** A launch stayed in the background: its window was never shown or focused. */
+export function stayedHidden(run) {
+  return (
+    Array.isArray(run.windowEvents) &&
+    run.windowEvents.length === 0 &&
+    run.window != null &&
+    !run.window.visible &&
+    !run.window.focused
+  );
+}
+
 /**
  * The verdict over all launches. Every launch must open every message as a
- * view, or the run is invalid.
+ * view and stay in the background (no show or focus event, window hidden),
+ * or the run is invalid.
  */
 export function verdict(runs, target = OPEN_P95_TARGET_MS) {
   const complete = runs.every((r) => r.summary && r.summary.views === r.summary.opens);
+  const hidden = runs.every(stayedHidden);
   const p95s = runs.map((r) => r.summary?.p95 ?? null);
   const value = complete && p95s.every((p) => p !== null) ? round(median(p95s)) : null;
   return {
-    valid: complete && value !== null,
+    valid: complete && hidden && value !== null,
     medianP95: value,
     p95s,
     target,
     within: value !== null && value <= target,
+    windowEvents: runs.reduce(
+      (n, r) => n + (Array.isArray(r.windowEvents) ? r.windowEvents.length : 0),
+      0,
+    ),
   };
 }
 
@@ -165,18 +182,19 @@ export function markdown(report) {
       .map(([name, n]) => `${name} ${n}`)
       .join(', ')}.`,
     '',
-    '| Launch | Views | Fallbacks | Refused | Timeouts | HTML | Plain | p50 ms | p95 ms | Max ms | Window hidden | Exit |',
-    '|---|---|---|---|---|---|---|---|---|---|---|---|',
+    '| Launch | Views | Fallbacks | Refused | Timeouts | HTML | Plain | p50 ms | p95 ms | Max ms | Window hidden | Show/focus events | Exit |',
+    '|---|---|---|---|---|---|---|---|---|---|---|---|---|',
   ];
   for (const [i, r] of report.runs.entries()) {
     const s = r.summary;
-    const hidden = r.window ? !r.window.visible && !r.window.focused : null;
+    const hidden = stayedHidden(r);
+    const events = Array.isArray(r.windowEvents) ? r.windowEvents.length : '-';
     lines.push(
       `| ${i + 1} | ${s?.views ?? '-'}/${s?.opens ?? '-'} | ${s?.fallbacks ?? '-'} | ${
         s?.rejected ?? '-'
       } | ${s?.timeouts?.length ?? '-'} | ${s?.html ?? '-'} | ${s?.plain ?? '-'} | ${s?.p50 ?? '-'} | ${s?.p95 ?? '-'} | ${
         s?.max ?? '-'
-      } | ${hidden ?? '-'} | ${r.exit.code ?? r.exit.signal ?? 'timeout'} |`,
+      } | ${hidden} | ${events} | ${r.exit.code ?? r.exit.signal ?? 'timeout'} |`,
     );
   }
   return lines.join('\n') + '\n';
@@ -282,6 +300,7 @@ async function main() {
         error: valid ? null : (result?.error ?? 'no result'),
         idle: result?.idle ?? null,
         window: result?.window ?? null,
+        windowEvents: result?.windowEvents ?? null,
         app: result?.app ?? null,
         timedWallMs: result?.timedWallMs ?? null,
         paceMs: result?.paceMs ?? null,
@@ -337,7 +356,9 @@ async function main() {
     process.exit(1);
   }
   if (!report.verdict.valid) {
-    console.error('open bench: run invalid: a launch failed or a message did not open as a view');
+    console.error(
+      'open bench: run invalid: a launch failed, a message did not open as a view, or a window was shown or focused',
+    );
     process.exit(1);
   }
 }

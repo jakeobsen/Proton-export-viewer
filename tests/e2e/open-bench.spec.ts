@@ -4,7 +4,7 @@
 // and quits, all without showing a window.
 
 import { createHash, randomBytes } from 'node:crypto';
-import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { _electron as electron } from '@playwright/test';
 import type { TimedOpen } from '../../src/testhooks/open-bench-types';
@@ -40,19 +40,25 @@ function snapshot(root: string): Record<string, string> {
 }
 
 test('the open bench times every open in a hidden window, reads its folder only, and quits', async () => {
-  const root = testDir('open-bench-corpus');
+  const parent = testDir('open-bench-corpus');
+  const root = join(parent, 'corpus');
+  mkdirSync(root);
   writeFileSync(join(root, 'plain.eml'), message('Plain', 'text/plain', 'Hello.'));
   writeFileSync(
     join(root, 'html.eml'),
     message('HTML', 'text/html', '<p>Hi</p><img src="https://example.com/a.png">'),
   );
+  // A real message beside the folder: the test source refuses it as outside, not as missing.
+  const outside = join(parent, 'outside.eml');
+  writeFileSync(outside, message('Outside', 'text/plain', 'Not in the folder.'));
   const before = snapshot(root);
+  const outsideBefore = readFileSync(outside);
 
   const nonce = randomBytes(8).toString('hex');
   const workspace = join(testDir('open-bench-run'), 'ws');
   createWorkspace(workspace, nonce, []);
   const config = join(workspace, 'config.json');
-  // Message 3 is outside the folder, so the test source refuses it.
+  // Message 3 is the file beside the folder, so the test source refuses it.
   writeFileSync(
     config,
     JSON.stringify({
@@ -81,6 +87,7 @@ test('the open bench times every open in a hidden window, reads its folder only,
     warmup: { count: number; views: number };
     idle: { exportOpen: boolean };
     window: { visible: boolean; focused: boolean };
+    windowEvents: Array<{ window: number; event: string }>;
     events: { start: string; end: string };
   };
   expect(result.error).toBeUndefined();
@@ -88,6 +95,8 @@ test('the open bench times every open in a hidden window, reads its folder only,
   expect(result.warmup).toEqual({ count: 1, views: 1 });
   expect(result.idle.exportOpen).toBe(false);
   expect(result.window).toEqual({ visible: false, focused: false });
+  // No window was shown or focused during the run.
+  expect(result.windowEvents).toEqual([]);
   expect(result.events.start).toContain('window.pev.open');
   expect(result.events.end).toContain('load');
   expect(result.opens.map((o) => [o.rowid, o.outcome, o.format ?? null])).toEqual([
@@ -99,6 +108,7 @@ test('the open bench times every open in a hidden window, reads its folder only,
     expect(open.ms).toBeGreaterThan(0);
     expect(open.ms).toBeLessThan(10_000);
   }
-  // The folder is only read.
+  // The folder and the file beside it are only read.
   expect(snapshot(root)).toEqual(before);
+  expect(readFileSync(outside)).toEqual(outsideBefore);
 });
