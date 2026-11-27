@@ -179,8 +179,9 @@ test("the sidebar and the list show the export's folders, labels and conversatio
 test('rows that arrive while the export loads never move the anchored row', async ({ pev }) => {
   const root = realpathSync(testDir('list-anchor'));
   const written = writeExport(root, { seed: 42, messages: 160 });
-  // Read in name order, not the folder's order, which differs between file
-  // systems: the names are random, so rows arrive above and below the anchor.
+  // Read and written in name order, not the folder's order, which differs
+  // between file systems, nor the order reads end, which differs between
+  // runs: the names are random, so rows arrive above and below the anchor.
   await pev.main('indexTestSettings', { batchPairs: 10, holdWrites: true, readByName: true });
   await pev.main('queuePick', root, 'bm1');
   await pev.shell('chooseFolder', []);
@@ -196,9 +197,10 @@ test('rows that arrive while the export loads never move the anchored row', asyn
   /**
    * Lets one more write through and waits until the list shows it: the row of
    * the conversation that holds message `rowid` is where the index puts it.
-   * Returns that conversation; it changes when the conversation is merged.
+   * Returns that conversation, which changes when the conversation is merged,
+   * and its position in the index.
    */
-  const step = async (loaded: number, rowid: number): Promise<number> => {
+  const step = async (loaded: number, rowid: number) => {
     await pev.main('releaseWrites', 1);
     await expect.poll(async () => (await progress(pev))?.loaded).toBe(loaded);
     const at = (await ask<ListWindow>(pev, {
@@ -214,33 +216,45 @@ test('rows that arrive while the export loads never move the anchored row', asyn
     await expect
       .poll(() => pev.page.locator(`.conv[data-thread="${thread}"]`).getAttribute('aria-posinset'))
       .toBe(String(at.anchor! + 1));
-    return thread;
+    return { thread, index: at.anchor! };
   };
 
   // The top row on screen is the anchor: scrolled down a little first.
   await scrollList(pev.page, 4 * 82);
   await expect.poll(async () => (await rowsOnScreen(pev.page))[0]?.pos).toBe(5);
   const anchor = (await rowsOnScreen(pev.page))[0]!;
-  let moved = false;
+  const tops = [];
   for (let loaded = 60; loaded <= 100; loaded += 10) {
-    const thread = await step(loaded, anchor.rowid);
+    const { thread, index } = await step(loaded, anchor.rowid);
     const top = (await rowsOnScreen(pev.page))[0]!;
-    expect(top.thread).toBe(thread);
-    expect(Math.abs(top.y - anchor.y)).toBeLessThanOrEqual(1);
-    if (top.pos > anchor.pos) moved = true;
+    tops.push({ index, top, thread });
   }
-  // Rows did arrive above it.
-  expect(moved).toBe(true);
+  // Rows were written above it: its position in the index rose.
+  expect(tops.at(-1)!.index).toBeGreaterThan(anchor.pos - 1);
+  // It stayed the top row, at the same place on screen.
+  for (const { index, top, thread } of tops) {
+    expect(top.thread).toBe(thread);
+    expect(top.pos).toBe(index + 1);
+    expect(Math.abs(top.y - anchor.y)).toBeLessThanOrEqual(1);
+  }
 
   // A selected row on screen is the anchor.
   const chosen = (await rowsOnScreen(pev.page))[3]!;
   await press(pev.page, `.conv[data-thread="${chosen.thread}"]`);
   await expect.poll(async () => (await rowsOnScreen(pev.page))[3]?.selected).toBe(true);
+  const picks = [];
   for (let loaded = 110; loaded <= 140; loaded += 10) {
-    const thread = await step(loaded, chosen.rowid);
-    const now = (await rowsOnScreen(pev.page)).find((r) => r.thread === thread)!;
-    expect(now.selected).toBe(true);
-    expect(Math.abs(now.y - chosen.y)).toBeLessThanOrEqual(1);
+    const { thread, index } = await step(loaded, chosen.rowid);
+    const now = (await rowsOnScreen(pev.page)).find((r) => r.thread === thread);
+    picks.push({ index, now });
+  }
+  // Rows were written above it too.
+  expect(picks.at(-1)!.index).toBeGreaterThan(chosen.pos - 1);
+  // It stayed selected, at the same place on screen.
+  for (const { index, now } of picks) {
+    expect(now?.pos).toBe(index + 1);
+    expect(now?.selected).toBe(true);
+    expect(Math.abs(now!.y - chosen.y)).toBeLessThanOrEqual(1);
   }
 
   await pev.main('releaseWrites', null);

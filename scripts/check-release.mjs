@@ -38,6 +38,7 @@ const FORBIDDEN_CONTENT = [
   'pev-script-marker',
   'pev-bench',
   'pev-reader-test-source',
+  'readByName',
   'better-sqlite3',
   'ws://localhost',
   "style-src 'self' 'unsafe-inline'",

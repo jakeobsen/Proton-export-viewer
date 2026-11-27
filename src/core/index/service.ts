@@ -128,7 +128,10 @@ export interface IndexOptions {
   batchPairs?: number;
   /** Builds with test hooks only: awaited before each phase 1 write. */
   beforeWrite?: () => Promise<void>;
-  /** Builds with test hooks only: read new metadata files in name order. */
+  /**
+   * Builds with test hooks only: read new metadata files in name order, and
+   * write their batches in that order.
+   */
   readByName?: boolean;
 }
 
@@ -635,6 +638,11 @@ export class IndexService {
     const stale = (count: number): void => {
       this.deps.log.info('writer.stale_dropped', { generation: stamp.generation, count }, this.src);
     };
+    // A batch's writes are queued once it has been read, so batches read
+    // together can be written in either order. Builds with test hooks can
+    // keep the order the batches were made in.
+    const inOrder = __PEV_TEST_HOOKS__ && this.deps.options?.readByName === true;
+    let queued: Promise<void> = Promise.resolve();
     for (const batch of batches) {
       if (failure) break;
       if (!this.current()) {
@@ -642,6 +650,10 @@ export class IndexService {
         failure = new ThreadError('STALE');
         break;
       }
+      // Settles once the batch before this one has queued its writes or failed.
+      const turn = queued;
+      let done = (): void => undefined;
+      if (inOrder) queued = new Promise<void>((resolve) => (done = resolve));
       const job = writer
         .call<ApplyResult>('apply', { stamp, items: batch })
         .then((applied) => {
@@ -656,6 +668,7 @@ export class IndexService {
             revs,
           );
         })
+        .then((sized) => (inOrder ? turn.then(() => sized) : sized))
         .then((sized) => {
           // The budget again, on the bytes actually read: a file can have
           // grown since the scan.
@@ -680,10 +693,12 @@ export class IndexService {
               }
             }
           });
+          done();
           return writes;
         })
         .catch((err: unknown) => {
           failure ??= err;
+          done();
         });
       const tracked = job.finally(() => inFlight.delete(tracked));
       inFlight.add(tracked);
