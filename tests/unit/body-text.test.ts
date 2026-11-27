@@ -403,6 +403,19 @@ describe('the attachment list', () => {
     expect(long.body.trim()).toBe('see attached');
   });
 
+  it('fails on an input error, even one that carries the limit code, as only the splitter ends a read early', async () => {
+    const failing = (error: Error) =>
+      Readable.from(
+        (async function* () {
+          yield Buffer.from('Subject: Broken\r\nContent-Type: text/plain\r\n\r\nSome text');
+          throw error;
+        })(),
+      );
+    await expect(extractBody(failing(new Error('read failed')))).rejects.toThrow('read failed');
+    const limitCode = Object.assign(new Error('input limit'), { code: 'EMAXLEN' });
+    await expect(extractBody(failing(limitCode))).rejects.toThrow('input limit');
+  });
+
   it('cuts a long name at 255 units without splitting a character outside the BMP', async () => {
     const long = 'n'.repeat(300);
     const astral = `${'a'.repeat(NAME_UNITS - 1)}😀tail`;

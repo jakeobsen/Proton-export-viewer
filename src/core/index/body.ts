@@ -21,7 +21,7 @@
 // its body counts as truncated and its list as cut. The two characters
 // snippets mark matches with are removed from all of it.
 
-import type { Readable } from 'node:stream';
+import type { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { Splitter, type MimeNode } from '@zone-eu/mailsplit';
 import iconv from 'iconv-lite';
@@ -371,7 +371,24 @@ export async function extractBody(
     }
   };
 
-  const read = pipeline(input, count, splitter, async (source: AsyncIterable<SplitChunk>) => {
+  // Only the splitter's own limit error ends the read early. The input's
+  // errors and the reader's own reach the splitter too, as the pipeline
+  // passes them on, so each is told apart by where it was raised first.
+  const raisedElsewhere = new WeakSet<object>();
+  const noteElsewhere = (err: unknown) => {
+    if (typeof err === 'object' && err !== null) raisedElsewhere.add(err);
+  };
+  input.on('error', noteElsewhere);
+  let splitterLimit: unknown = null;
+  // The splitter's types name only its data events; it is a Transform stream.
+  (splitter as Transform).on('error', (err: unknown) => {
+    const code = (err as { code?: unknown } | null)?.code;
+    if (splitterLimit === null && code === 'EMAXLEN' && !raisedElsewhere.has(err as object)) {
+      splitterLimit = err;
+    }
+  });
+
+  const consume = async (source: AsyncIterable<SplitChunk>): Promise<void> => {
     for await (const chunk of source) {
       if (chunk.type === 'node') {
         finish();
@@ -407,11 +424,19 @@ export async function extractBody(
       emit(text, text.transfer.write(value));
     }
     finish();
+  };
+  const read = pipeline(input, count, splitter, async (source: AsyncIterable<SplitChunk>) => {
+    try {
+      await consume(source);
+    } catch (err) {
+      noteElsewhere(err);
+      throw err;
+    }
   });
   try {
     await read;
   } catch (err) {
-    if ((err as { code?: unknown }).code !== 'EMAXLEN') throw err;
+    if (splitterLimit === null || err !== splitterLimit) throw err;
     stopped = true;
     finish();
   }
