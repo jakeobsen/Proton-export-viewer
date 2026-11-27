@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The hostile corpus end to end, generated afresh for each run. Every message
 // opens on the normal path and on the test-only unsanitized path, judged by
-// the app's own request records and the body's CSP reports; every link in it
-// is clicked; and the IP-literal messages open again with the resolver rule
-// dropped.
+// the app's own request records, the body's CSP reports and the session's
+// preconnect requests; every link in it is clicked; and the IP-literal
+// messages open again with the resolver rule dropped.
 
 import { randomBytes } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
@@ -26,6 +26,7 @@ interface Requests {
   asset: string[];
   blocked: string[];
   console: Array<{ frame: string; text: string }>;
+  sessionPreconnects: string[];
 }
 
 type Shown = LinkPrompt & { windowId: number };
@@ -266,6 +267,7 @@ test('every hostile message on the normal path: declared rewrites, only its own 
       const seen = await pev.main<Requests>('requests', 1);
       const markerLogged = seen.console.some((m) => m.text === SCRIPT_MARKER);
       expect(seen.blocked, name).toEqual([]);
+      expect(seen.sessionPreconnects, name).toEqual([]);
       expect(markerLogged, name).toBe(false);
       expect(
         seen.body.filter((u) => u !== opened.url),
@@ -294,6 +296,7 @@ test('every hostile message on the normal path: declared rewrites, only its own 
         rewritten: opened.remote,
         webRequest: seen.blocked.length,
         csp: reported.length,
+        preconnect: seen.sessionPreconnects.length,
         hintsDeclared: plan.refs.hints.length,
         hintsRemoved: plan.refs.hints.length - dom.hintsLeft.length,
         scriptMarker: dom.marker !== null || markerLogged,
@@ -349,7 +352,7 @@ test('the recorders work: on the unsanitized path each declared load is cancelle
       await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
     }
     const { blocked, reported, all } = await observe();
-    const logged = (await pev.main<Requests>('requests', 1)).console;
+    const { console: logged, sessionPreconnects } = await pev.main<Requests>('requests', 1);
     const markerLogged = logged.some((m) => m.text === SCRIPT_MARKER);
     expect(markerLogged, name).toBe(false);
     expect(compare(plan.refs.loads, all), name).toEqual({ missing: [], extra: [] });
@@ -367,6 +370,7 @@ test('the recorders work: on the unsanitized path each declared load is cancelle
       declared: plan.refs.loads.length,
       webRequest: blocked.length,
       csp: reported.length,
+      preconnect: sessionPreconnects.length,
       scriptMarker: marker !== null || markerLogged,
     };
   }
@@ -396,6 +400,29 @@ test('positive control: the script detector sees the marker where scripts run', 
       ),
     )
     .toBe(true);
+});
+
+test('positive control: the preconnect recorder sees a hint that nothing stops', async ({
+  pev,
+}) => {
+  // Unsanitized and without the body's CSP; the resolver rule stays on.
+  const plan = corpus().find((p) => nameOf(p) === 'script_markup/link-hints');
+  if (!plan) throw new Error('no link-hints fixture');
+  const hint = plan.refs.hints.find((h) => h.startsWith('https:'));
+  if (!hint) throw new Error('no preconnect hint');
+  await source(pev, [plan]);
+  expect((await pev.main<{ ok: boolean }>('readerUnsanitized', true)).ok).toBe(true);
+  await pev.main('setBodyCsp', false);
+  await ensureFrame(pev);
+  await pev.main('clearRequests');
+  const opened = await openRow(pev, 1, 'html');
+  if (!opened.ok || opened.outcome !== 'view') throw new Error('no view');
+  await show(pev, opened.url);
+  await expect
+    .poll(async () =>
+      (await pev.main<Requests>('requests', 1)).sessionPreconnects.map((u) => new URL(u).origin),
+    )
+    .toContain(new URL(hint).origin);
 });
 
 test('without the resolver rule, the filter and the CSP still stop every IP literal, and nothing loads', async () => {
@@ -454,6 +481,7 @@ test('without the resolver rule, the filter and the CSP still stop every IP lite
             // The sanitizer leaves nothing to request.
             expect(opened.remote, name).toBe(plan.refs.rewrite);
             expect(seen.blocked, name).toEqual([]);
+            expect(seen.sessionPreconnects, name).toEqual([]);
             expect(reported, name).toEqual([]);
           } else if (csp) {
             expect(reported, name).toEqual(loads);
@@ -473,7 +501,11 @@ test('without the resolver rule, the filter and the CSP still stop every IP lite
             name,
           ).toEqual([]);
           expect(remoteFrames(pev), name).toEqual([]);
-          summary[name] = { webRequest: blocked.length, csp: reported.length };
+          summary[name] = {
+            webRequest: blocked.length,
+            csp: reported.length,
+            preconnect: seen.sessionPreconnects.length,
+          };
         }
       }
     }

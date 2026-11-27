@@ -40,6 +40,7 @@ const FORBIDDEN_CONTENT = [
   'pev-reader-test-source',
   'pev-reader-unsanitized',
   'pev-no-resolver-rule',
+  'sessionPreconnects',
   'better-sqlite3',
   'ws://localhost',
   "style-src 'self' 'unsafe-inline'",

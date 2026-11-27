@@ -36,6 +36,11 @@ interface WindowRequests {
    * reports, such as a CSP refusal of a nested frame, reach only main.
    */
   console: Array<{ frame: string; text: string }>;
+  /**
+   * URLs the window's session was asked to preconnect to. A resource hint
+   * leaves no other trace: it never reaches the request filter.
+   */
+  sessionPreconnects: string[];
 }
 
 const DIALOG_METHODS = [
@@ -160,14 +165,23 @@ export async function install(ctx: AppContext): Promise<boolean> {
   const recordsFor = (windowId: number): WindowRequests => {
     let rec = requests.get(windowId);
     if (!rec) {
-      rec = { app: [], body: [], asset: [], blocked: [], console: [] };
+      rec = { app: [], body: [], asset: [], blocked: [], console: [], sessionPreconnects: [] };
       requests.set(windowId, rec);
     }
     return rec;
   };
 
-  // Every frame's console messages, per window. Windows are created after this.
+  // Every frame's console messages and every preconnect request, per window.
+  // Windows are created after this; each has a session of its own.
+  const sessionsSeen = new WeakSet<Electron.Session>();
   app.on('web-contents-created', (_event, contents) => {
+    if (!sessionsSeen.has(contents.session)) {
+      sessionsSeen.add(contents.session);
+      contents.session.on('preconnect', (_e, url) => {
+        const appWin = ctx.windows.get(contents.id);
+        if (appWin) recordsFor(appWin.id).sessionPreconnects.push(url);
+      });
+    }
     contents.on('console-message', (details) => {
       const appWin = ctx.windows.get(contents.id);
       if (!appWin) return;
@@ -243,6 +257,7 @@ export async function install(ctx: AppContext): Promise<boolean> {
         rec.asset.length = 0;
         rec.blocked.length = 0;
         rec.console.length = 0;
+        rec.sessionPreconnects.length = 0;
       }
     },
     linkDialogs: () => [...ctx.linkDialog.shown],
