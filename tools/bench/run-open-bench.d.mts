@@ -37,8 +37,14 @@ export interface LaunchRecord {
   window: { visible: boolean; focused: boolean } | null;
   /** The show and focus events the app recorded; null when it wrote no result. */
   windowEvents: Array<{ window: number; event: string }> | null;
+  /** How the app ended; `timedOut` when it was killed at the launch's time limit. */
+  exit: { code: number | null; signal: string | null; timedOut: boolean } | null;
+  /** Warm-up opens asked for, run, and shown as a view; null counts when it wrote no result. */
+  warmup: { requested: number; count: number | null; views: number | null } | null;
 }
 export function stayedHidden(run: Pick<LaunchRecord, 'window' | 'windowEvents'>): boolean;
+export function exitedCleanly(run: Pick<LaunchRecord, 'exit'>): boolean;
+export function warmedUp(run: Pick<LaunchRecord, 'warmup'>): boolean;
 export function verdict(
   runs: LaunchRecord[],
   target?: number,

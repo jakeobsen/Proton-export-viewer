@@ -30,7 +30,7 @@ import { PRODUCT_NAME, appPath } from '../../scripts/package.mjs';
 import { Random } from '../gen-export/random.mjs';
 import { digest, diskBytes, walk } from '../gen-export/tree.mjs';
 import { freeSpace, frontmost } from './run-bench.mjs';
-import { checkNewFile, createWorkspace, removeInside } from './workspace.mjs';
+import { checkNewFile, checkOutside, createWorkspace, removeInside } from './workspace.mjs';
 
 /** The open target, in ms, for the median of the p95s. */
 export const OPEN_P95_TARGET_MS = 150;
@@ -110,18 +110,31 @@ export function stayedHidden(run) {
   );
 }
 
+/** A launch ended on its own with code 0: not stopped at its time limit, not killed. */
+export function exitedCleanly(run) {
+  return run.exit != null && run.exit.code === 0 && run.exit.signal === null && !run.exit.timedOut;
+}
+
+/** Every warm-up open the launch was asked for ran and showed a view. */
+export function warmedUp(run) {
+  const w = run.warmup;
+  return w != null && w.count === w.requested && w.views === w.requested;
+}
+
 /**
- * The verdict over all launches. Every launch must open every message as a
- * view and stay in the background (no show or focus event, window hidden),
- * or the run is invalid.
+ * The verdict over all launches. Every launch must exit cleanly, show every
+ * warm-up message, open every timed message as a view and stay in the
+ * background (no show or focus event, window hidden), or the run is invalid.
  */
 export function verdict(runs, target = OPEN_P95_TARGET_MS) {
   const complete = runs.every((r) => r.summary && r.summary.views === r.summary.opens);
   const hidden = runs.every(stayedHidden);
+  const clean = runs.every(exitedCleanly);
+  const warm = runs.every(warmedUp);
   const p95s = runs.map((r) => r.summary?.p95 ?? null);
   const value = complete && p95s.every((p) => p !== null) ? round(median(p95s)) : null;
   return {
-    valid: complete && hidden && value !== null,
+    valid: complete && hidden && clean && warm && value !== null,
     medianP95: value,
     p95s,
     target,
@@ -182,19 +195,22 @@ export function markdown(report) {
       .map(([name, n]) => `${name} ${n}`)
       .join(', ')}.`,
     '',
-    '| Launch | Views | Fallbacks | Refused | Timeouts | HTML | Plain | p50 ms | p95 ms | Max ms | Window hidden | Show/focus events | Exit |',
-    '|---|---|---|---|---|---|---|---|---|---|---|---|---|',
+    '| Launch | Warm-up views | Views | Fallbacks | Refused | Timeouts | HTML | Plain | p50 ms | p95 ms | Max ms | Window hidden | Show/focus events | Exit |',
+    '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|',
   ];
   for (const [i, r] of report.runs.entries()) {
     const s = r.summary;
     const hidden = stayedHidden(r);
     const events = Array.isArray(r.windowEvents) ? r.windowEvents.length : '-';
+    const exit = r.exit?.timedOut ? 'timeout' : (r.exit?.signal ?? r.exit?.code ?? '-');
     lines.push(
-      `| ${i + 1} | ${s?.views ?? '-'}/${s?.opens ?? '-'} | ${s?.fallbacks ?? '-'} | ${
+      `| ${i + 1} | ${r.warmup?.views ?? '-'}/${r.warmup?.requested ?? '-'} | ${s?.views ?? '-'}/${
+        s?.opens ?? '-'
+      } | ${s?.fallbacks ?? '-'} | ${
         s?.rejected ?? '-'
       } | ${s?.timeouts?.length ?? '-'} | ${s?.html ?? '-'} | ${s?.plain ?? '-'} | ${s?.p50 ?? '-'} | ${s?.p95 ?? '-'} | ${
         s?.max ?? '-'
-      } | ${hidden} | ${events} | ${r.exit.code ?? r.exit.signal ?? 'timeout'} |`,
+      } | ${hidden} | ${events} | ${exit} |`,
     );
   }
   return lines.join('\n') + '\n';
@@ -232,6 +248,8 @@ async function main() {
   const manifest = JSON.parse(readFileSync(resolve(values.manifest), 'utf8'));
   const out = resolve(values.out);
   if (!isAbsolute(out) || existsSync(out)) throw new Error(`${out} must be a new folder`);
+  // The corpus is only read: an output folder in it is refused before anything is written.
+  checkOutside(corpus, out);
   const app = resolve(values.app ?? appPath('test'));
   const executable = join(app, 'Contents', 'MacOS', PRODUCT_NAME);
   const asar = join(app, 'Contents', 'Resources', 'app.asar');
@@ -281,21 +299,28 @@ async function main() {
           [`--pev-open-bench=${config}`, `--pev-user-data=${userData}`],
           { stdio: 'ignore' },
         );
+        let timedOut = false;
+        // Past the limit the app is killed, and the launch counts as timed out once it has gone.
         const timer = setTimeout(() => {
+          timedOut = true;
           child.kill('SIGKILL');
-          done({ code: null, signal: null, timedOut: true });
         }, RUN_TIMEOUT_MS);
         child.once('exit', (code, signal) => {
           clearTimeout(timer);
-          done({ code, signal, timedOut: false });
+          done({ code, signal, timedOut });
         });
       });
       const resultFile = join(workspace, `open-result-${runNonce}.json`);
       const result = existsSync(resultFile) ? JSON.parse(readFileSync(resultFile, 'utf8')) : null;
       const valid = result?.nonce === runNonce && result.ok === true;
-      runs.push({
+      const record = {
         wallMs: Date.now() - started,
         exit,
+        warmup: {
+          requested: warmup,
+          count: valid ? (result.warmup?.count ?? null) : null,
+          views: valid ? (result.warmup?.views ?? null) : null,
+        },
         ok: valid,
         error: valid ? null : (result?.error ?? 'no result'),
         idle: result?.idle ?? null,
@@ -306,7 +331,15 @@ async function main() {
         paceMs: result?.paceMs ?? null,
         summary: valid ? summarizeRun(result.opens) : null,
         resultFile,
-      });
+      };
+      if (record.ok && !exitedCleanly(record)) {
+        record.ok = false;
+        record.error = 'the app did not exit cleanly';
+      } else if (record.ok && !warmedUp(record)) {
+        record.ok = false;
+        record.error = 'a warm-up open did not show a view';
+      }
+      runs.push(record);
       // The app's own profile (logs, caches) isn't kept; the result holds what counts.
       removeInside(out, nonce, userData);
     }
@@ -357,7 +390,7 @@ async function main() {
   }
   if (!report.verdict.valid) {
     console.error(
-      'open bench: run invalid: a launch failed, a message did not open as a view, or a window was shown or focused',
+      'open bench: run invalid: a launch failed or did not exit cleanly, a message (warm-up or timed) did not open as a view, or a window was shown or focused',
     );
     process.exit(1);
   }

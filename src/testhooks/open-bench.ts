@@ -7,13 +7,14 @@
 // read-only, and only if it is a regular file inside that folder.
 
 import { once } from 'node:events';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { cpus, release, totalmem } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { join } from 'node:path';
 import { app } from 'electron';
 import type { AppContext } from '../main/context';
 import { createAppWindow } from '../main/windows';
-import { checkNewFile, checkWorkspace } from '../../tools/bench/workspace.mjs';
+import { checkNewFile } from '../../tools/bench/workspace.mjs';
+import { readConfig } from './open-bench-config';
 import type { TimedOpen } from './open-bench-types';
 import { READER_SOURCE_ACTION } from './reader-source';
 import type { WindowEventRecorder } from './window-events';
@@ -28,40 +29,7 @@ const STEP_TIMEOUT_MS = 60_000;
  */
 export const OPEN_PACE_MS = 60;
 
-export interface OpenBenchConfig {
-  nonce: string;
-  /** The run's workspace, created fresh and marked by the runner. The result goes inside. */
-  workspace: string;
-  /** The folder the messages are read from. */
-  root: string;
-  /** Message files, relative to `root`. File i is rowid i + 1. */
-  files: string[];
-  /** How many of the first files open once before the timed opens, untimed. */
-  warmup: number;
-}
-
 export const openBenchRequested = (argv: string[]): boolean => argv.some((a) => a.startsWith(FLAG));
-
-function parseConfig(value: unknown): OpenBenchConfig {
-  const c = value as Partial<OpenBenchConfig>;
-  const ok =
-    typeof c === 'object' &&
-    c !== null &&
-    typeof c.nonce === 'string' &&
-    /^[0-9a-f]{16}$/.test(c.nonce) &&
-    typeof c.workspace === 'string' &&
-    isAbsolute(c.workspace) &&
-    typeof c.root === 'string' &&
-    isAbsolute(c.root) &&
-    Array.isArray(c.files) &&
-    c.files.length > 0 &&
-    c.files.every((f) => typeof f === 'string' && f.length > 0) &&
-    Number.isSafeInteger(c.warmup) &&
-    (c.warmup as number) >= 0 &&
-    (c.warmup as number) <= c.files.length;
-  if (!ok) throw new Error('invalid open bench config');
-  return c as OpenBenchConfig;
-}
 
 async function until(check: () => boolean | Promise<boolean>, what: string): Promise<number> {
   const start = performance.now();
@@ -94,8 +62,8 @@ export async function runOpenBench(
   let out: { workspace: string; nonce: string; path: string } | null = null;
   try {
     const file = argv.find((a) => a.startsWith(FLAG))?.slice(FLAG.length) ?? '';
-    const config = parseConfig(JSON.parse(readFileSync(file, 'utf8')));
-    checkWorkspace(config.workspace, config.nonce);
+    // Refused unless the workspace is this run's and outside the message folder.
+    const config = readConfig(file);
     out = {
       workspace: config.workspace,
       nonce: config.nonce,

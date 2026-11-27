@@ -8,7 +8,7 @@ import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { _electron as electron } from '@playwright/test';
 import type { TimedOpen } from '../../src/testhooks/open-bench-types';
-import { createWorkspace } from '../../tools/bench/workspace.mjs';
+import { WORKSPACE_MARK, createWorkspace } from '../../tools/bench/workspace.mjs';
 import { REPO_ROOT, testDir } from '../paths';
 // This test's own folders are removed once it passes.
 import { expect, test } from './app';
@@ -27,15 +27,18 @@ function message(subject: string, type: string, body: string): string {
   ].join('\r\n');
 }
 
-/** Every file in the folder with the SHA-256 of its content. */
-function snapshot(root: string): Record<string, string> {
+/** Every file and folder under the folder, files with the SHA-256 of their content. */
+function snapshot(root: string, at = ''): Record<string, string> {
   return Object.fromEntries(
-    readdirSync(root).map((name) => [
-      name,
-      createHash('sha256')
-        .update(readFileSync(join(root, name)))
-        .digest('hex'),
-    ]),
+    readdirSync(join(root, at), { withFileTypes: true }).flatMap((entry) => {
+      const rel = join(at, entry.name);
+      if (entry.isDirectory())
+        return [[`${rel}/`, 'folder'], ...Object.entries(snapshot(root, rel))];
+      const hash = createHash('sha256')
+        .update(readFileSync(join(root, rel)))
+        .digest('hex');
+      return [[rel, hash]];
+    }),
   );
 }
 
@@ -111,4 +114,33 @@ test('the open bench times every open in a hidden window, reads its folder only,
   // The folder and the file beside it are only read.
   expect(snapshot(root)).toEqual(before);
   expect(readFileSync(outside)).toEqual(outsideBefore);
+});
+
+test('the open bench writes nothing when its workspace is in the folder it reads', async () => {
+  const parent = testDir('open-bench-inside');
+  const root = join(parent, 'corpus');
+  mkdirSync(root);
+  writeFileSync(join(root, 'plain.eml'), message('Plain', 'text/plain', 'Hello.'));
+  const nonce = randomBytes(8).toString('hex');
+  // A run's workspace, marked as the runner marks it, inside the folder.
+  const workspace = createWorkspace(join(root, 'ws'), nonce, []);
+  const before = snapshot(root);
+  const config = join(parent, 'config.json');
+  writeFileSync(
+    config,
+    JSON.stringify({ nonce, workspace, root, files: ['plain.eml'], warmup: 0 }),
+  );
+  const app = await electron.launch({
+    args: [
+      join(REPO_ROOT, 'out-test'),
+      `--pev-user-data=${testDir('open-bench-inside-profile')}`,
+      `--pev-open-bench=${config}`,
+    ],
+    cwd: REPO_ROOT,
+    chromiumSandbox: true,
+  });
+  await app.waitForEvent('close', { timeout: 60_000 });
+  // The app quit without a result: the workspace holds only its mark.
+  expect(readdirSync(workspace)).toEqual([WORKSPACE_MARK]);
+  expect(snapshot(root)).toEqual(before);
 });
