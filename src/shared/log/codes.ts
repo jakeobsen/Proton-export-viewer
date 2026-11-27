@@ -81,6 +81,7 @@ export const LOG_CODES = [
   'index.stale_dropped',
   'index.rebuild',
   'index.reconciled',
+  'index.rejected',
   'source.forgotten',
   'source.forget_refused',
   'source.refused',

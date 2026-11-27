@@ -31,7 +31,7 @@ import { BODY_STATE, META, META_STATE } from './schema';
 import { asNumber, type Db, type Row, type SqlValue } from './sql';
 import { stripMarks } from '../search/ranges';
 
-/** One file of a pair as the scan saw it. */
+/** One file of a pair with its identity, as an lstat or the fstat of its read saw it. */
 export interface FileStat {
   rel: string;
   size: number;
@@ -40,19 +40,49 @@ export interface FileStat {
   ino: bigint;
 }
 
+/** A file of a new pair that the listing found by name; its read gives it an identity. */
+export interface ListedName {
+  rel: string;
+}
+
+export type PairFile = FileStat | ListedName;
+
+/** Whether a pair's file has its identity. */
+export const hasStat = (f: PairFile): f is FileStat => 'ino' in f;
+
+/** A pair's files, each with its identity. */
 export interface PairFiles {
   protonId: string;
   meta: FileStat | null;
   eml: FileStat | null;
 }
 
+/** A pair's files as phase 1 has them: with their identity, or a new pair's by name. */
+export interface PairRefs {
+  protonId: string;
+  meta: PairFile | null;
+  eml: PairFile | null;
+}
+
 export interface Phase1Item {
-  pair: PairFiles;
+  pair: PairRefs;
   /** The rev the pair had when its metadata was queued to be read. */
   expectedRev: number;
   row: MessageRow | null;
   /** Why the metadata couldn't be used, when `row` is null. */
   error: string | null;
+  /**
+   * For a pair whose message file was listed by name: that file as the read
+   * found it, with its identity, or null if it was gone or not a regular
+   * file. Absent: the pair's message file stays as stored.
+   */
+  eml?: FileStat | null;
+  /**
+   * The read found the metadata file not there in the listing's terms: gone,
+   * or refused for its size or type. The pair is then as if it had no
+   * metadata file, and goes if it has no message file either.
+   */
+  absent?: boolean;
 }
 
 /** What reconcile does to a pair's metadata: nothing, read it (again), or take its message out. */
@@ -81,8 +111,8 @@ export interface ReconcilePlan {
 
 export interface ApplyItem {
   change: PairChange;
-  /** The pair's files as the scan saw them. */
-  files: PairFiles;
+  /** The pair's files as the scan saw them; a new pair's may be known by name only. */
+  files: PairRefs;
 }
 
 /** What regrouping did in one transaction. */
@@ -110,6 +140,8 @@ export interface Phase1Stats extends GroupStats {
   failed: number;
   /** Items dropped because their pair's rev had moved on or the pair is gone. */
   dropped: number;
+  /** Pairs whose metadata file turned out not to be there when it was read. */
+  absent: number;
   newThreads: number;
   capped: Array<{ fileId: string; capped: number }>;
   errors: Array<{ fileId: string; code: string }>;
@@ -175,6 +207,7 @@ const emptyStats = (): Phase1Stats => ({
   removed: 0,
   failed: 0,
   dropped: 0,
+  absent: 0,
   newThreads: 0,
   capped: [],
   errors: [],
@@ -213,11 +246,15 @@ interface StoredFile {
   ino: string;
 }
 
-const sameContent = (stored: StoredFile, f: FileStat): boolean =>
-  stored.rel === f.rel && stored.size === f.size && stored.mtimeNs === String(f.mtimeNs);
+// A file without its identity is never the same as the stored one.
+const sameContent = (stored: StoredFile, f: PairFile): boolean =>
+  hasStat(f) &&
+  stored.rel === f.rel &&
+  stored.size === f.size &&
+  stored.mtimeNs === String(f.mtimeNs);
 
-const sameNumbers = (stored: StoredFile, f: FileStat): boolean =>
-  stored.dev === String(f.dev) && stored.ino === String(f.ino);
+const sameNumbers = (stored: StoredFile, f: PairFile): boolean =>
+  hasStat(f) && stored.dev === String(f.dev) && stored.ino === String(f.ino);
 
 /**
  * What a stored pair needs, given the files the scan found for it; null for
@@ -226,8 +263,8 @@ const sameNumbers = (stored: StoredFile, f: FileStat): boolean =>
  */
 export function classify(
   stored: StoredPair,
-  meta: FileStat | undefined,
-  eml: FileStat | undefined,
+  meta: PairFile | undefined,
+  eml: PairFile | undefined,
 ): PairChange | null {
   const base = { protonId: stored.protonId, fresh: false, gone: false, refresh: false };
   if (!meta && !eml) return { ...base, gone: true, meta: 'remove', eml: 'missing' };
@@ -340,8 +377,12 @@ function storedFile(r: Row, side: 'meta' | 'eml'): StoredFile | null {
   };
 }
 
-const fileValues = (f: FileStat | null): SqlValue[] =>
-  f ? [f.rel, f.size, f.mtimeNs, f.dev, f.ino] : [null, null, null, null, null];
+const fileValues = (f: PairFile | null): SqlValue[] =>
+  !f
+    ? [null, null, null, null, null]
+    : hasStat(f)
+      ? [f.rel, f.size, f.mtimeNs, f.dev, f.ino]
+      : [f.rel, null, null, null, null];
 
 export class IndexWriter {
   private revSeq: number;
@@ -444,11 +485,21 @@ export class IndexWriter {
     });
   }
 
+  /** The message IDs of every stored pair. */
+  knownIds(): string[] {
+    return this.db
+      .stmt('SELECT proton_id FROM pairs')
+      .all()
+      .map((r) => String(r.proton_id));
+  }
+
   /**
    * Compares the scan with the stored pairs, writing nothing: every pair with
-   * something to do, and which labels.json the stored labels came from.
+   * something to do, and which labels.json the stored labels came from. The
+   * files of stored pairs come with their identity; a new pair's files may
+   * be known by name only.
    */
-  planReconcile(metadata: Map<string, FileStat>, eml: Map<string, FileStat>): ReconcilePlan {
+  planReconcile(metadata: Map<string, PairFile>, eml: Map<string, PairFile>): ReconcilePlan {
     const changes: PairChange[] = [];
     const known = new Set<string>();
     const rows = this.db
@@ -575,7 +626,7 @@ export class IndexWriter {
   }
 
   /** Registers a new pair with the next rev; its metadata, if any, is still to be read. */
-  private registerPair(files: PairFiles): number {
+  private registerPair(files: PairRefs): number {
     this.revSeq += 1;
     this.db
       .stmt(
@@ -618,7 +669,9 @@ export class IndexWriter {
    * against its pair's current rev inside the transaction, and dropped unless
    * it matches and the pair still waits for it. A message already in the index is taken out of its
    * conversation and placed again with its new metadata, keeping its rowid and
-   * its body; one whose new metadata can't be used is taken out.
+   * its body; one whose new metadata can't be used is taken out. A message
+   * file that was listed by name gets the identity its read found, or is
+   * recorded as missing.
    */
   phase1Batch(stamp: Stamp, items: Phase1Item[]): Phase1Stats {
     const stats = emptyStats();
@@ -633,6 +686,11 @@ export class IndexWriter {
         `UPDATE pairs SET meta_rel = ?, meta_size = ?, meta_mtime_ns = ?, meta_dev = ?, meta_ino = ?,
            meta_state = ?, error_code = ? WHERE proton_id = ?`,
       );
+      const emlOf = this.db.stmt('SELECT eml_rel FROM pairs WHERE proton_id = ?');
+      const setEml = this.db.stmt(
+        `UPDATE pairs SET eml_rel = ?, eml_size = ?, eml_mtime_ns = ?, eml_dev = ?, eml_ino = ?,
+           body_state = CASE WHEN ? THEN body_state ELSE ? END WHERE proton_id = ?`,
+      );
       for (const item of items) {
         this.step();
         const id = item.pair.protonId;
@@ -642,12 +700,27 @@ export class IndexWriter {
           !pair ||
           asNumber(pair.rev) !== item.expectedRev ||
           asNumber(pair.meta_state) !== META_STATE.pending ||
-          !item.pair.meta
+          (!item.pair.meta && !item.absent)
         ) {
           stats.dropped += 1;
           continue;
         }
         const fileId = String(pair.file_id);
+        if (item.eml !== undefined) {
+          if (item.eml === null) this.clearBody(id);
+          setEml.run(...fileValues(item.eml), item.eml ? 1 : 0, BODY_STATE.emlMissing, id);
+        }
+        if (item.absent) {
+          // As if the listing had not found the metadata file.
+          if (this.removeMessage(id, stats)) stats.removed += 1;
+          stats.absent += 1;
+          if (emlOf.get(id)?.eml_rel === null) {
+            this.db.stmt('DELETE FROM pairs WHERE proton_id = ?').run(id);
+          } else {
+            setMeta.run(...fileValues(null), META_STATE.missing, PAIR_META_MISSING, id);
+          }
+          continue;
+        }
         const old = messageOf.get(id);
         const oldRowid = old ? asNumber(old.rowid) : null;
         if (item.row) {

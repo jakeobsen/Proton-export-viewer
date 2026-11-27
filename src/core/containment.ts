@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Reading an export run folder without leaving it. The root is resolved once
-// with realpath. Entries are examined with lstat, so links are never followed.
-// Only regular files of the three export kinds are used: labels.json,
-// <ID>.metadata.json (up to 4 MiB) and <ID>.eml. Every open is non-blocking
-// and refuses links, and it checks that the open file is the regular file the
-// scan saw (same device and inode). A file that changed is rejected and has to
-// be scanned again.
+// with realpath. The folder is listed with each entry's type, as the
+// directory gives it; an entry of unknown type is looked at with lstat. Links
+// are never followed. Only regular files of the three export kinds are used:
+// labels.json, <ID>.metadata.json and <ID>.eml. The listing records metadata
+// and message files by name only; their identity (device, inode, size and
+// time) comes from their first contained open, or from an lstat where no open
+// is made. Every open is non-blocking and refuses links, checks that the open
+// file is a regular file and, once a file has an identity, that it is still
+// the same file. A file that changed is rejected and has to be looked at
+// again. Reads stop one byte past the file kind's limit, whatever size the
+// file claims.
 
 import {
   closeSync,
@@ -17,7 +22,9 @@ import {
   readSync,
   realpathSync,
   type BigIntStats,
+  type Dirent,
 } from 'node:fs';
+import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { REJECT_KINDS, type RejectKind } from '../shared/sources';
 
@@ -32,14 +39,28 @@ export const EML_SUFFIX = '.eml';
 
 export type FileKind = 'labels' | 'metadata' | 'eml';
 
-/** A regular file the scan accepted. `rel` is its name relative to the root. */
-export interface FileRef {
+/**
+ * A metadata or message file the listing found, by name only. `rel` is its
+ * name relative to the root. It has no identity yet: a name-only listing
+ * can't tell one regular file from another put in its place, so the first
+ * contained open of the file defines which file it is.
+ */
+export interface ListedFile {
   rel: string;
   kind: FileKind;
+}
+
+/** A regular file with its identity, from an lstat or from the fstat of its open. */
+export interface FileRef extends ListedFile {
   dev: bigint;
   ino: bigint;
   size: number;
   mtimeNs: bigint;
+}
+
+/** Whether a file has an identity that an open must match. */
+export function hasIdentity(file: ListedFile | FileRef): file is FileRef {
+  return 'ino' in file;
 }
 
 export interface Rejection {
@@ -52,23 +73,64 @@ export interface RunScan {
   root: string;
   labels: FileRef | null;
   /** By message ID. */
-  metadata: Map<string, FileRef>;
+  metadata: Map<string, ListedFile>;
   /** By message ID. */
-  eml: Map<string, FileRef>;
+  eml: Map<string, ListedFile>;
   rejected: Rejection[];
   /** Regular files that aren't one of the three kinds; they are never read. */
   ignored: number;
 }
 
+/** An entry's type as the listing gives it; `unknown` where the directory doesn't say. */
+export type EntryType = 'file' | 'symlink' | 'directory' | 'fifo' | 'socket' | 'device' | 'unknown';
+
+export interface ListedEntry {
+  name: string;
+  type: EntryType;
+}
+
 /** The file-system calls the scan makes; tests replace them. */
 export interface ScanFs {
+  /** The folder's entries with their types. */
+  list(path: string): ListedEntry[];
+  /** The folder's entry names only. */
   readdir(path: string): string[];
   lstat(path: string): BigIntStats;
 }
 
+/** The same listing calls, made off the main thread. */
+export interface ListFs {
+  list(path: string): Promise<ListedEntry[]>;
+  readdir(path: string): Promise<string[]>;
+}
+
+/**
+ * An entry's type from a directory entry. Node looks at an entry of unknown
+ * type with lstat itself; a type it can't name stays unknown here and is
+ * looked at again.
+ */
+export function typeOf(entry: Dirent): EntryType {
+  if (entry.isFile()) return 'file';
+  if (entry.isSymbolicLink()) return 'symlink';
+  if (entry.isDirectory()) return 'directory';
+  if (entry.isFIFO()) return 'fifo';
+  if (entry.isSocket()) return 'socket';
+  if (entry.isBlockDevice() || entry.isCharacterDevice()) return 'device';
+  return 'unknown';
+}
+
+const typed = (entries: Dirent[]): ListedEntry[] =>
+  entries.map((entry) => ({ name: entry.name, type: typeOf(entry) }));
+
 export const realFs: ScanFs = {
+  list: (path) => typed(readdirSync(path, { withFileTypes: true })),
   readdir: (path) => readdirSync(path),
   lstat: (path) => lstatSync(path, { bigint: true }),
+};
+
+export const realListFs: ListFs = {
+  list: async (path) => typed(await readdir(path, { withFileTypes: true })),
+  readdir: (path) => readdir(path),
 };
 
 export class ContainmentError extends Error {
@@ -123,10 +185,16 @@ function isPlainName(name: string): boolean {
   );
 }
 
+/** A FileRef from an lstat or fstat result. */
+export function refOf(rel: string, kind: FileKind, st: BigIntStats): FileRef {
+  return { rel, kind, dev: st.dev, ino: st.ino, size: Number(st.size), mtimeNs: st.mtimeNs };
+}
+
 /**
- * Looks at one entry of the run folder: a FileRef for a regular export file,
- * a rejection for anything else that isn't an ordinary ignored file, or null
- * for a regular file of another kind.
+ * Looks at one entry of the run folder with lstat: a FileRef for a regular
+ * export file, a rejection for anything else that isn't an ordinary ignored
+ * file, or null for a regular file of another kind. Sizes are not judged
+ * here: the size limits apply to the bytes a read gets.
  */
 export function examine(
   root: string,
@@ -139,30 +207,46 @@ export function examine(
   if (type !== 'file') return { rejected: { rel: name, kind: type } };
   const kind = fileKindOf(name);
   if (!kind) return null;
-  const size = Number(st.size);
-  if (
-    (kind.kind === 'metadata' && size > MAX_METADATA_BYTES) ||
-    (kind.kind === 'labels' && size > MAX_LABELS_BYTES)
-  ) {
-    return { rejected: { rel: name, kind: 'too_large' } };
-  }
-  return {
-    ref: { rel: name, kind: kind.kind, dev: st.dev, ino: st.ino, size, mtimeNs: st.mtimeNs },
-    id: kind.id,
-  };
+  return { ref: refOf(name, kind.kind, st), id: kind.id };
 }
 
 export function emptyScan(root: string): RunScan {
   return { root, labels: null, metadata: new Map(), eml: new Map(), rejected: [], ignored: 0 };
 }
 
-/** Adds one entry of the run folder to a scan. */
-export function addEntry(scan: RunScan, name: string, fs: ScanFs = realFs): void {
+/**
+ * Adds one listed entry of the run folder to a scan. A regular metadata or
+ * message file is recorded by name; labels.json, and an entry the listing
+ * gave no type for, are looked at with lstat. Any other type is rejected
+ * without a look.
+ */
+export function addEntry(scan: RunScan, entry: ListedEntry, fs: ScanFs = realFs): void {
+  const { name, type } = entry;
+  if (!isPlainName(name)) {
+    scan.ignored += 1;
+    return;
+  }
+  if (type !== 'file' && type !== 'unknown') {
+    scan.rejected.push({ rel: name, kind: type });
+    return;
+  }
+  const kind = fileKindOf(name);
+  if (type === 'file' && kind && kind.id !== null) {
+    (kind.kind === 'metadata' ? scan.metadata : scan.eml).set(kind.id, {
+      rel: name,
+      kind: kind.kind,
+    });
+    return;
+  }
+  if (type === 'file' && !kind) {
+    scan.ignored += 1;
+    return;
+  }
   let found;
   try {
     found = examine(scan.root, name, fs);
   } catch {
-    // The entry went away between readdir and lstat.
+    // The entry went away between the listing and lstat.
     return;
   }
   if (found === null) {
@@ -172,14 +256,45 @@ export function addEntry(scan: RunScan, name: string, fs: ScanFs = realFs): void
   } else if (found.ref.kind === 'labels') {
     scan.labels = found.ref;
   } else if (found.id !== null) {
-    (found.ref.kind === 'metadata' ? scan.metadata : scan.eml).set(found.id, found.ref);
+    (found.ref.kind === 'metadata' ? scan.metadata : scan.eml).set(found.id, {
+      rel: found.ref.rel,
+      kind: found.ref.kind,
+    });
   }
 }
 
-/** Scans a run folder: one readdir and one lstat per entry, nothing followed or opened. */
+/** The names of a listing that has no types: each is looked at with lstat. */
+const untyped = (names: string[]): ListedEntry[] =>
+  names.map((name) => ({ name, type: 'unknown' }));
+
+/**
+ * The run folder's entries with their types. Node looks at an entry of
+ * unknown type with lstat while it lists, and an entry that goes away in
+ * that moment fails the whole listing; the folder is then listed by name
+ * only, and every entry is looked at on its own. If that fails too, so does
+ * the listing.
+ */
+export function listRun(root: string, fs: ScanFs = realFs): ListedEntry[] {
+  try {
+    return fs.list(root);
+  } catch {
+    return untyped(fs.readdir(root));
+  }
+}
+
+/** The same listing as `listRun`, off the main thread. */
+export async function listRunAsync(root: string, fs: ListFs = realListFs): Promise<ListedEntry[]> {
+  try {
+    return await fs.list(root);
+  } catch {
+    return untyped(await fs.readdir(root));
+  }
+}
+
+/** Scans a run folder: one listing, nothing followed or opened, lstat only where it's needed. */
 export function scanRun(root: string, fs: ScanFs = realFs): RunScan {
   const scan = emptyScan(root);
-  for (const name of fs.readdir(root)) addEntry(scan, name, fs);
+  for (const entry of listRun(root, fs)) addEntry(scan, entry, fs);
   return scan;
 }
 
@@ -199,19 +314,23 @@ export function pairCounts(scan: RunScan): {
 }
 
 /**
- * Opens a file the scan accepted: read-only, without following a link and
- * without blocking (a FIFO swapped in after the scan can't hold the open), then
- * checks that it is still a regular file with the scanned device and inode.
+ * Opens a listed file: read-only, without following a link and without
+ * blocking (a FIFO put in its place can't hold the open), then checks with
+ * fstat that it is a regular file. A file with an identity must still have
+ * its device and inode. A file listed by name only gets its identity from
+ * this open: any regular file at that name when it is opened is the file.
+ * Returns the descriptor and the identity of the file opened; the caller
+ * closes the descriptor.
  */
-export function openContained(root: string, ref: FileRef): number {
+export function openListed(root: string, file: ListedFile | FileRef): { fd: number; ref: FileRef } {
   let fd: number;
   try {
     fd = openSync(
-      join(root, ref.rel),
+      join(root, file.rel),
       constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
     );
   } catch (err) {
-    // A link swapped in fails with ELOOP; a file that went away, with ENOENT.
+    // A link put in its place fails with ELOOP; a file that went away, with ENOENT.
     const code = (err as NodeJS.ErrnoException).code ?? null;
     const kind = code === 'ELOOP' ? 'symlink' : code === 'ENOENT' ? 'changed' : 'unreadable';
     throw new ContainmentError(kind, code);
@@ -220,12 +339,19 @@ export function openContained(root: string, ref: FileRef): number {
     const st = fstatSync(fd, { bigint: true });
     const type = entryType(st);
     if (type !== 'file') throw new ContainmentError(type);
-    if (st.dev !== ref.dev || st.ino !== ref.ino) throw new ContainmentError('changed');
-    return fd;
+    if (hasIdentity(file) && (st.dev !== file.dev || st.ino !== file.ino)) {
+      throw new ContainmentError('changed');
+    }
+    return { fd, ref: refOf(file.rel, file.kind, st) };
   } catch (err) {
     closeSync(fd);
     throw err;
   }
+}
+
+/** Opens a file with an identity, as openListed does; returns the descriptor. */
+export function openContained(root: string, ref: FileRef): number {
+  return openListed(root, ref).fd;
 }
 
 /** A file the scan accepted, opened; or why not, and whether it is gone. */
@@ -267,25 +393,52 @@ export function openWithRescan(root: string, ref: FileRef, fs: ScanFs = realFs):
   return { ok: false, rejection: { rel: current.rel, kind: 'changed' }, gone: false };
 }
 
-/** Reads a whole contained file of at most `maxBytes`; a larger one is rejected. */
-export function readContained(root: string, ref: FileRef, maxBytes: number): Buffer {
-  const fd = openContained(root, ref);
+/** Bytes asked for per read. */
+const READ_CHUNK = 64 * 1024;
+let scratch: Buffer | null = null;
+
+/**
+ * Reads an open file to its end, but never more than `maxBytes` + 1 bytes,
+ * in chunks of at most 64 KiB; past `maxBytes` the file is too large. Only
+ * the bytes the reads return count: no size the file claims decides the
+ * limit or the memory taken.
+ */
+export function readCapped(fd: number, maxBytes: number): Buffer {
+  scratch ??= Buffer.allocUnsafe(READ_CHUNK);
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const want = Math.min(READ_CHUNK, maxBytes + 1 - total);
+    if (want <= 0) break;
+    const n = readSync(fd, scratch, 0, want, null);
+    if (n === 0) break;
+    chunks.push(Buffer.from(scratch.subarray(0, n)));
+    total += n;
+  }
+  if (total > maxBytes) throw new ContainmentError('too_large');
+  return chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, total);
+}
+
+/**
+ * Reads a whole listed file of at most `maxBytes` through openListed; a
+ * larger one is rejected. Returns the bytes and the identity of the file read.
+ */
+export function readListed(
+  root: string,
+  file: ListedFile | FileRef,
+  maxBytes: number,
+): { bytes: Buffer; ref: FileRef } {
+  const { fd, ref } = openListed(root, file);
   try {
-    const size = Number(fstatSync(fd, { bigint: true }).size);
-    if (size > maxBytes) throw new ContainmentError('too_large');
-    // Read one byte more than allowed, so a file that grows is caught too.
-    const buffer = Buffer.alloc(Math.min(size, maxBytes) + 1);
-    let filled = 0;
-    while (filled < buffer.length) {
-      const n = readSync(fd, buffer, filled, buffer.length - filled, null);
-      if (n === 0) break;
-      filled += n;
-    }
-    if (filled > maxBytes) throw new ContainmentError('too_large');
-    return buffer.subarray(0, filled);
+    return { bytes: readCapped(fd, maxBytes), ref };
   } finally {
     closeSync(fd);
   }
+}
+
+/** Reads a whole contained file of at most `maxBytes`; a larger one is rejected. */
+export function readContained(root: string, ref: ListedFile | FileRef, maxBytes: number): Buffer {
+  return readListed(root, ref, maxBytes).bytes;
 }
 
 /** The size limit for reading a file of this kind. */
@@ -296,24 +449,22 @@ export function limitFor(kind: FileKind): number {
 }
 
 /**
- * Reads a file the scan accepted. When the file changed since the scan, it is
- * examined again and, if it is still an acceptable regular file, read once
- * more with its new identity. Returns the bytes and the ref they were read
- * with, or the rejection.
+ * Reads a listed file. A file with an identity that changed since it was
+ * looked at, or one that went away, is examined again and, if it is still
+ * an acceptable regular file, read once more with its new identity. Returns
+ * the bytes and the identity of the file they were read from (its fstat), or
+ * the rejection.
  */
 export function readWithRescan(
   root: string,
-  ref: FileRef,
+  file: ListedFile | FileRef,
   fs: ScanFs = realFs,
 ): { ok: true; bytes: Buffer; ref: FileRef } | { ok: false; rejection: Rejection } {
-  let current = ref;
+  let current: ListedFile | FileRef = file;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      return {
-        ok: true,
-        bytes: readContained(root, current, limitFor(current.kind)),
-        ref: current,
-      };
+      const read = readListed(root, current, limitFor(current.kind));
+      return { ok: true, bytes: read.bytes, ref: read.ref };
     } catch (err) {
       if (!(err instanceof ContainmentError)) throw err;
       if (err.kind !== 'changed' || attempt > 0) {
@@ -333,6 +484,38 @@ export function readWithRescan(
   }
   return { ok: false, rejection: { rel: current.rel, kind: 'changed' } };
 }
+
+/**
+ * Looks at a listed file with lstat (never following a link): its identity
+ * if it is a regular file, the rejection if it is now of another type, or
+ * null if it is gone or can't be looked at.
+ */
+export function statListed(
+  root: string,
+  file: ListedFile,
+  fs: ScanFs = realFs,
+): { ref: FileRef } | { rejected: Rejection } | null {
+  let st: BigIntStats;
+  try {
+    st = fs.lstat(join(root, file.rel));
+  } catch {
+    return null;
+  }
+  const type = entryType(st);
+  if (type !== 'file') return { rejected: { rel: file.rel, kind: type } };
+  return { ref: refOf(file.rel, file.kind, st) };
+}
+
+/** The rejection kinds the listing and the looks after it report; the others are pair codes only. */
+export const SCAN_KINDS: readonly RejectKind[] = [
+  'symlink',
+  'directory',
+  'fifo',
+  'socket',
+  'device',
+  'other_type',
+  'too_large',
+];
 
 /** Counts of rejections by kind, every kind present. */
 export function countRejections(rejected: readonly Rejection[]): Record<RejectKind, number> {
