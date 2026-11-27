@@ -6,6 +6,8 @@ import type { IndexCondition } from '../shared/index-types';
 import type { ActiveExport } from '../shared/sources';
 import { exportLabel } from './labels';
 import { LinkDialog } from './LinkDialog';
+import { closeReader, generationChanged, useReaderState } from './reader';
+import { ReaderPane } from './ReaderPane';
 import {
   locateExport,
   openMessage,
@@ -53,18 +55,24 @@ function ExportBar({ active, busy }: { active: ActiveExport; busy: boolean }) {
 
 export function App() {
   const state = useShellState();
+  const reader = useReaderState();
 
   useEffect(() => window.pev.onLinkDialog(showLink), []);
   useEffect(() => window.pev.onSourcesChanged(() => void refreshSources()), []);
   useEffect(() => {
     void refreshSources();
   }, []);
+  useEffect(() => generationChanged(state.generation), [state.generation]);
 
   const active = state.sources?.active ?? null;
   // The welcome screen shows while no export is open or being opened again,
   // unless a body is open.
   const welcome =
-    state.sources !== null && !state.sources.restoring && active === null && state.bodyUrl === null;
+    state.sources !== null &&
+    !state.sources.restoring &&
+    active === null &&
+    state.bodyUrl === null &&
+    reader.rowid === null;
 
   return (
     <div className="shell">
@@ -95,12 +103,21 @@ export function App() {
       ) : (
         <main className="content">
           <nav className="list" aria-label="Messages">
-            <button type="button" className="row" onClick={() => void openMessage('sample')}>
+            <button
+              type="button"
+              className="row"
+              onClick={() => {
+                closeReader();
+                void openMessage('sample');
+              }}
+            >
               Sample message
             </button>
           </nav>
           <section className="reader">
-            {state.bodyUrl ? (
+            {reader.rowid !== null ? (
+              <ReaderPane />
+            ) : state.bodyUrl ? (
               <iframe
                 key={state.frameKey}
                 className="body-frame"
