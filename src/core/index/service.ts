@@ -75,6 +75,8 @@ export const POOL_SIZE = 2;
 export const BATCHES_AHEAD = 2;
 /** Caches are released after this long without a query or a write. */
 export const IDLE_MS = 20_000;
+/** Progress is reported at most this often, and once more after the last change. */
+export const PROGRESS_MS = 250;
 
 /** One registered connection: which thread holds it, on which database. */
 export interface Connection {
@@ -122,6 +124,15 @@ export interface IndexOptions {
   idleMs?: number;
   /** A cap on the index's size on disk, with its WAL and shared memory; none by default. */
   capBytes?: number | null;
+  /** Pairs per write transaction; at most the default. */
+  batchPairs?: number;
+  /** Builds with test hooks only: awaited before each phase 1 write. */
+  beforeWrite?: () => Promise<void>;
+  /**
+   * Builds with test hooks only: read new metadata files in name order, and
+   * write their batches in that order.
+   */
+  readByName?: boolean;
 }
 
 export interface IndexServiceDeps {
@@ -144,7 +155,10 @@ export interface IndexServiceDeps {
   onDamage?: (reason: string) => void;
   /** Called with the outcome of the check of an existing index. */
   onChecked?: (result: CheckResult | null, ms: number) => void;
-  /** Called when `progress.condition` changes. */
+  /**
+   * Called when `progress` changes: at once for its condition and phase, and
+   * at most every PROGRESS_MS for its counts.
+   */
   onChange?: () => void;
 }
 
@@ -242,6 +256,15 @@ export class IndexService {
   private readonly metaJob: number;
   private readonly idleMs: number;
   private readonly capBytes: number | null;
+  private readonly batchPairs: number;
+  /** When progress was last reported, on the monotonic clock. */
+  private lastReport = -Infinity;
+  private reportTimer: ReturnType<typeof setTimeout> | null = null;
+  private endClosing: () => void = () => {};
+  /** Resolves when the teardown begins. */
+  private readonly closing = new Promise<void>((resolve) => {
+    this.endClosing = resolve;
+  });
 
   constructor(private readonly deps: IndexServiceDeps) {
     this.dbPath = join(deps.indexDir, `${deps.stamp.sourceKey}.sqlite`);
@@ -252,6 +275,7 @@ export class IndexService {
     this.metaJob = o.metaJob ?? META_JOB;
     this.idleMs = o.idleMs ?? IDLE_MS;
     this.capBytes = o.capBytes ?? null;
+    this.batchPairs = Math.max(1, Math.min(WRITE_BATCH_PAIRS, o.batchPairs ?? WRITE_BATCH_PAIRS));
   }
 
   private get src() {
@@ -276,7 +300,27 @@ export class IndexService {
   setCondition(condition: IndexCondition): void {
     if (this.progress.condition === condition) return;
     this.progress.condition = condition;
-    this.deps.onChange?.();
+    this.report(true);
+  }
+
+  /**
+   * Tells the source that progress changed: now if `now` is set or the last
+   * report is PROGRESS_MS old, else once that time is up.
+   */
+  private report(now = false): void {
+    if (this.closed || !this.deps.onChange) return;
+    const wait = this.lastReport + PROGRESS_MS - performance.now();
+    if (!now && wait > 0) {
+      this.reportTimer ??= setTimeout(() => {
+        this.reportTimer = null;
+        this.report(true);
+      }, wait);
+      return;
+    }
+    if (this.reportTimer) clearTimeout(this.reportTimer);
+    this.reportTimer = null;
+    this.lastReport = performance.now();
+    this.deps.onChange();
   }
 
   /** Reports damage once; the source's lifecycle decides what happens next. */
@@ -524,6 +568,7 @@ export class IndexService {
       // Loading starts at what the index already has, so a reopen never shows 0.
       this.progress.loaded = scan.metadata.size - toRead.length;
       this.progress.phase = 'loading';
+      this.report(true);
       // Changes that need nothing read: at most 1,000 pairs per transaction.
       const reconciled = performance.now();
       for (const part of chunk(now, WRITE_BATCH_PAIRS)) {
@@ -541,11 +586,15 @@ export class IndexService {
           this.src,
         );
       }
+      if (__PEV_TEST_HOOKS__ && this.deps.options?.readByName) {
+        toRead.sort((a, b) => (a.files.protonId < b.files.protonId ? -1 : 1));
+      }
       await this.readAndWrite(pool, writer, toRead, scan.metadata);
       if (!this.current()) throw new ThreadError('STALE');
       await writer.call('finish', { stamp });
       this.progress.phase = 'done';
-      if (this.progress.condition === 'rebuilding') this.setCondition('ok');
+      if (this.progress.condition === 'rebuilding') this.progress.condition = 'ok';
+      this.report(true);
       this.deps.log.info(
         'index.phase1_done',
         { count: this.progress.loaded, ms: Math.round(performance.now() - started) },
@@ -553,6 +602,7 @@ export class IndexService {
       );
     } catch (err) {
       this.progress.phase = 'failed';
+      this.report(true);
       this.watch(err);
       const code = err instanceof ThreadError ? err.code : 'FAILED';
       this.deps.log.warn('index.phase1_failed', { reason: failureReason(code) }, this.src);
@@ -578,7 +628,7 @@ export class IndexService {
     const stamp = this.deps.stamp;
     const batches = splitBatches(
       toRead,
-      WRITE_BATCH_PAIRS,
+      this.batchPairs,
       TXN_INPUT_BYTES,
       (u) => u.files.meta?.size ?? 0,
     );
@@ -588,6 +638,11 @@ export class IndexService {
     const stale = (count: number): void => {
       this.deps.log.info('writer.stale_dropped', { generation: stamp.generation, count }, this.src);
     };
+    // A batch's writes are queued once it has been read, so batches read
+    // together can be written in either order. Builds with test hooks can
+    // keep the order the batches were made in.
+    const inOrder = __PEV_TEST_HOOKS__ && this.deps.options?.readByName === true;
+    let queued: Promise<void> = Promise.resolve();
     for (const batch of batches) {
       if (failure) break;
       if (!this.current()) {
@@ -595,6 +650,10 @@ export class IndexService {
         failure = new ThreadError('STALE');
         break;
       }
+      // Settles once the batch before this one has queued its writes or failed.
+      const turn = queued;
+      let done = (): void => undefined;
+      if (inOrder) queued = new Promise<void>((resolve) => (done = resolve));
       const job = writer
         .call<ApplyResult>('apply', { stamp, items: batch })
         .then((applied) => {
@@ -609,12 +668,16 @@ export class IndexService {
             revs,
           );
         })
+        .then((sized) => (inOrder ? turn.then(() => sized) : sized))
         .then((sized) => {
           // The budget again, on the bytes actually read: a file can have
           // grown since the scan.
-          const parts = splitBatches(sized, WRITE_BATCH_PAIRS, TXN_INPUT_BYTES, (s) => s.bytes);
+          const parts = splitBatches(sized, this.batchPairs, TXN_INPUT_BYTES, (s) => s.bytes);
           writes = writes.then(async () => {
             for (const part of parts) {
+              if (__PEV_TEST_HOOKS__ && this.deps.options?.beforeWrite) {
+                await Promise.race([this.deps.options.beforeWrite(), this.closing]);
+              }
               if (failure) return;
               const items = part.map((s) => s.item);
               if (!this.current()) {
@@ -630,10 +693,12 @@ export class IndexService {
               }
             }
           });
+          done();
           return writes;
         })
         .catch((err: unknown) => {
           failure ??= err;
+          done();
         });
       const tracked = job.finally(() => inFlight.delete(tracked));
       inFlight.add(tracked);
@@ -746,6 +811,7 @@ export class IndexService {
     this.progress.loaded += handled;
     this.progress.failed += result.failed;
     this.progress.capped += result.capped.length;
+    this.report();
     for (const { fileId, capped } of result.capped) {
       for (const list of CAPPED_LISTS) {
         if (capped & CAPPED[list]) {
@@ -770,6 +836,9 @@ export class IndexService {
    */
   async close(): Promise<void> {
     this.closed = true;
+    this.endClosing();
+    if (this.reportTimer) clearTimeout(this.reportTimer);
+    this.reportTimer = null;
     Atomics.store(new Int32Array(this.cancel), 0, 1);
     if (this.idleTimer) clearInterval(this.idleTimer);
     this.idleTimer = null;

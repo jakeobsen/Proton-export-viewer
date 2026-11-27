@@ -72,14 +72,58 @@ export interface IndexTotals {
   pairs: number;
 }
 
+/**
+ * Where a list window is placed: at the conversation that holds message
+ * `rowid` if there is one, else at the conversation `key` if it is still
+ * listed, else at position `index`.
+ */
+export interface WindowAnchor {
+  rowid?: number;
+  key?: PageKey;
+  index: number;
+}
+
+/** The most rows a window holds before its anchor, and from it on. */
+export const WINDOW_BEFORE = 100;
+export const WINDOW_AFTER = 200;
+
+export interface WindowQuery {
+  op: 'window';
+  labelId: string;
+  anchor: WindowAnchor;
+  /** Rows wanted before the anchor row. */
+  before: number;
+  /** Rows wanted from the anchor row on. */
+  after: number;
+  /** A selected message, to find the conversation it is in now. */
+  selected: number | null;
+}
+
+/** A stretch of a folder's or label's list, newest first, read from one snapshot. */
+export interface ListWindow {
+  /** Conversations in the folder or label. */
+  total: number;
+  /** The position of the first row. */
+  start: number;
+  rows: ListRow[];
+  /** The details of each row, in the same order. */
+  details: RowDetails[];
+  /** The anchor row's position, or null if the window was placed by `index`. */
+  anchor: number | null;
+  /** The conversation the selected message is in now, or null if it is gone. */
+  selected: number | null;
+}
+
 export type IndexQuery =
   | { op: 'sidebar' }
   | { op: 'page'; labelId: string; after: PageKey | null; limit?: number }
   | { op: 'details'; threadIds: number[] }
   | { op: 'resolve'; rowid: number }
-  | { op: 'totals' };
+  | { op: 'totals' }
+  | WindowQuery;
 
-export type IndexAnswer = Sidebar | ListPage | RowDetails[] | number | null | IndexTotals;
+export type IndexAnswer =
+  Sidebar | ListPage | RowDetails[] | number | null | IndexTotals | ListWindow;
 
 /**
  * The index's own state: 'verifying' while an index that was already there

@@ -6,7 +6,7 @@ import { app, protocol } from 'electron';
 import { SHELL_CSP } from '../shared/constants';
 import { errorData } from '../shared/log/schema';
 import { LogWriter } from '../shared/log/writer';
-import { bumpGeneration, notifySources, type AppContext, type Paths } from './context';
+import { bumpGeneration, notifyIndex, notifySources, type AppContext, type Paths } from './context';
 import { CoreHost } from './core-host';
 import { systemPicker, systemScopes } from './sources/access';
 import { SourceManager } from './sources/manager';
@@ -45,7 +45,13 @@ if (__PEV_TEST_HOOKS__) {
   }
 }
 
-applySwitches(app.commandLine);
+// A test run can drop the resolver rule, to show that the request filter and
+// the body's CSP stop IP literals on their own.
+const droppedSwitches: string[] = [];
+if (__PEV_TEST_HOOKS__ && process.argv.includes('--pev-no-resolver-rule')) {
+  droppedSwitches.push('host-resolver-rules');
+}
+applySwitches(app.commandLine, droppedSwitches);
 app.enableSandbox();
 
 protocol.registerSchemesAsPrivileged([
@@ -108,6 +114,7 @@ async function start(): Promise<void> {
       log.stop();
       rendererLog.stop();
     },
+    indexChanged: (progress) => notifyIndex(ctx, progress),
     picker: systemPicker,
     scopes: systemScopes,
   });

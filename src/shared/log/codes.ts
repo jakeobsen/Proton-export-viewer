@@ -10,6 +10,7 @@ export const LOG_CODES = [
   'core.spawn',
   'core.ready',
   'core.exit',
+  'core.stop_timeout',
   'core.uncaught',
   'core.rejection',
   'core.unavailable',

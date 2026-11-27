@@ -23,7 +23,7 @@ import { parseMetadata, type MessageRow } from '../../src/core/index/metadata';
 import { QueryState, WriterState } from '../../src/core/index/ops';
 import { IndexService, type IndexOptions } from '../../src/core/index/service';
 import { openDb } from '../../src/core/index/sql';
-import type { ThreadRole } from '../../src/core/index/pool';
+import type { IndexThread, ThreadRole } from '../../src/core/index/pool';
 import type { IndexTotals, ListPage, Sidebar } from '../../src/shared/index-types';
 import type { Logger } from '../../src/shared/log/writer';
 import { sanitizeEvent } from '../../src/shared/log/schema';
@@ -50,6 +50,7 @@ function harness(
   indexDir: string,
   options: IndexOptions = {},
   hang: (role: ThreadRole, op: string, args: unknown) => boolean = () => false,
+  wrap: (role: ThreadRole, thread: IndexThread) => IndexThread = (_, thread) => thread,
 ): Harness {
   const threads: InlineThread[] = [];
   const logs: Logged[] = [];
@@ -77,7 +78,7 @@ function harness(
     thread: (role) => {
       const t = new InlineThread(role, (op, args) => hang(role, op, args));
       threads.push(t);
-      return t;
+      return wrap(role, t);
     },
     isCurrent: () => current,
     options,
@@ -401,6 +402,67 @@ describe('phase 1', () => {
       'stale_generation',
     );
     await h.service.close();
+  });
+
+  it('writes batches in name order with readByName, even when a later batch is read first', async () => {
+    /**
+     * Runs phase 1 with the first batch's read held until the second batch's
+     * read has ended. Returns the IDs of each read and each write, in order.
+     */
+    const runHeld = async (readByName: boolean) => {
+      const { run, indexDir } = exportAt(`order-${readByName}`, 30, 11);
+      const reads: string[][] = [];
+      const writes: string[][] = [];
+      let secondRead = (): void => undefined;
+      const secondDone = new Promise<void>((resolve) => (secondRead = resolve));
+      const ids = (args: unknown, key: 'protonId' | 'pair') =>
+        (args as { items: Array<Record<string, unknown>> }).items.map((i) =>
+          key === 'pair' ? String((i.pair as { protonId: string }).protonId) : String(i.protonId),
+        );
+      const wrap = (role: ThreadRole, inner: IndexThread): IndexThread => ({
+        get respawns() {
+          return inner.respawns;
+        },
+        get onRespawn() {
+          return inner.onRespawn;
+        },
+        set onRespawn(f) {
+          inner.onRespawn = f;
+        },
+        stop: () => inner.stop(),
+        call: <T>(op: string, args?: unknown, timeoutMs?: number): Promise<T> => {
+          if (role === 'writer' && op === 'phase1') writes.push(ids(args, 'pair'));
+          if (role !== 'parse' || op !== 'meta') return inner.call<T>(op, args, timeoutMs);
+          reads.push(ids(args, 'protonId'));
+          const n = reads.length;
+          if (n === 1) return secondDone.then(() => inner.call<T>(op, args, timeoutMs));
+          const read = inner.call<T>(op, args, timeoutMs);
+          if (n === 2) void read.finally(secondRead);
+          return read;
+        },
+      });
+      const scan = scanRun(run);
+      const h = harness(run, indexDir, { batchPairs: 10, readByName }, undefined, wrap);
+      await h.service.open(null);
+      await h.service.startPhase1(scan);
+      expect(h.service.progress).toMatchObject({ phase: 'done', loaded: 30, total: 30, failed: 0 });
+      expect(dbPartition(h.service.dbPath)).toEqual(partitionOfFiles(run));
+      await h.service.close();
+      return { reads, writes };
+    };
+
+    // Without it, the held first batch is written after the second.
+    const free = await runHeld(false);
+    expect(free.reads).toHaveLength(3);
+    expect(free.writes[0]).toEqual(free.reads[1]);
+    expect(free.writes).not.toEqual(free.reads);
+
+    // With it, every batch is written in the order it was made: name order.
+    const ordered = await runHeld(true);
+    expect(ordered.reads).toHaveLength(3);
+    expect(ordered.writes).toEqual(ordered.reads);
+    const all = ordered.writes.flat();
+    expect(all).toEqual([...all].sort());
   });
 });
 

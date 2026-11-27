@@ -66,9 +66,14 @@ async function render(request: WorkerRender): Promise<WorkerRendered> {
   try {
     const input = await inputStream(request.input);
     if (!input) return failed();
+    const sanitize =
+      __PEV_TEST_HOOKS__ && request.unsanitized
+        ? (await import('../testhooks/unsanitized')).unsanitized
+        : undefined;
     const message = await renderMessage(input, {
       mode: request.mode,
       assetBase: request.assetBase,
+      ...(sanitize ? { sanitize } : {}),
     });
     return { type: 'rendered', reqId: request.reqId, heldBytes: heldBytes(), ok: true, message };
   } catch (err) {
