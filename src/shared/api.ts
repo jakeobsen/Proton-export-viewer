@@ -104,12 +104,16 @@ export interface LinkPrompt {
   title: string;
   /** The URL, with any non-ASCII host in punycode. */
   url: string;
-  /** Where the host is in `url`, or null when there is none. */
+  /** Where the host, or a mail link's first domain, is in `url`; null when there is none. */
   host: { start: number; end: number } | null;
   /** The title names a host other than the URL's. */
   mismatch: boolean;
-  /** The URL's host has non-ASCII characters. */
+  /** The URL's host, or a mail recipient's domain, has non-ASCII characters. */
   lookalike: boolean;
+  /** The link writes an email: the open choice goes to the mail app. */
+  mail: boolean;
+  /** A mail recipient's address can be read more than one way. */
+  unclear: boolean;
 }
 
 export type LinkActionResult = { ok: true } | Rejected;

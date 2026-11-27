@@ -21,6 +21,8 @@ function isPrompt(value: unknown): value is LinkPrompt {
     typeof p.url === 'string' &&
     typeof p.mismatch === 'boolean' &&
     typeof p.lookalike === 'boolean' &&
+    typeof p.mail === 'boolean' &&
+    typeof p.unclear === 'boolean' &&
     (host === null ||
       (typeof host === 'object' && typeof host.start === 'number' && typeof host.end === 'number'))
   );
