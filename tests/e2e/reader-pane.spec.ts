@@ -241,6 +241,9 @@ test('many parts: bodies after 1,000 show whole; past the part limit only part s
   expect(text).toContain('Text before the parts.');
   expect(text).not.toContain('after the parts');
   await expect(pane(pev).locator('.rp-truncated')).toHaveText('Only part of this message shown');
+  // Each read that stopped at the limit left core's file open for core to close, once.
+  expect(pev.hasLog('core.rejection')).toBe(false);
+  expect(pev.hasLog('core.uncaught')).toBe(false);
 });
 
 test('the fallback offers the message as plain text', async ({ pev }) => {
