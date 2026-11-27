@@ -9,6 +9,8 @@
 //            --pev-selftest-timing-ms=<how long the timing waits for phase 1>
 //            --pev-selftest-timing-keep (the export stays known, for a reopen)
 //            --pev-selftest-timing-reopen (times the reopen at launch; no pick)
+//            --pev-selftest-timing-held=<rowid>,<rowid> (with -reopen: the scan is
+//              held while the stored list and those messages are opened)
 // The result goes to selftest-result-<nonce>.json, so concurrent runs that share
 // a sandbox container never overwrite each other's result.
 //
@@ -305,7 +307,19 @@ export interface Timing {
   /** The most memory core's processes held at a sample, in MB. */
   peakCoreMb: number;
   forgotten: string | null;
+  /** With the scan held on a reopen: what showed and opened meanwhile. */
+  held: HeldScan | null;
   error: string | null;
+}
+
+/** A reopen with its scan held: the stored list, and opens of stored messages. */
+export interface HeldScan {
+  /** List rows drawn while the scan was held. */
+  listRows: number;
+  /** Each message opened, and its outcome or the code it was refused with. */
+  opens: Array<{ rowid: number; outcome: string }>;
+  /** The scan was still held after the opens. */
+  stillHeld: boolean;
 }
 
 /** How often the timing looks, in milliseconds. */
@@ -323,7 +337,7 @@ async function runTiming(
   root: string,
   queuePick: (path: string, bookmark: string) => void,
   limitMs: number,
-  mode: { keep: boolean; reopen: boolean },
+  mode: { keep: boolean; reopen: boolean; held: number[] },
 ): Promise<Timing> {
   const timing: Timing = {
     chosen: null,
@@ -336,6 +350,7 @@ async function runTiming(
     pairs: null,
     peakCoreMb: 0,
     forgotten: null,
+    held: null,
     error: null,
   };
   const shell = <T>(code: string) => appWin.win.webContents.executeJavaScript(code) as Promise<T>;
@@ -343,8 +358,11 @@ async function runTiming(
   const since = () => Math.round(performance.now() - start);
   try {
     if (mode.reopen) {
+      // The core the reopen starts holds its scan, when asked to.
+      if (mode.held.length > 0) ctx.core.testInit = { holdScans: true };
       // The self-test skips the launch's own reopen, so it starts it here.
       void ctx.sources.restore();
+      if (mode.held.length > 0) timing.held = await whileHeld(ctx, shell, mode.held, limitMs);
     } else {
       queuePick(root, 'timing');
       void shell<SourceActionResult>('window.__pevTest.chooseFolder()').then(
@@ -392,6 +410,41 @@ async function runTiming(
     timing.error = err instanceof Error ? err.message : String(err);
   }
   return timing;
+}
+
+/**
+ * With the reopen's scan held: waits for the stored list, opens each message
+ * in the reader, notes whether the scan is still held, then lets it go.
+ */
+async function whileHeld(
+  ctx: AppContext,
+  shell: <T>(code: string) => Promise<T>,
+  rowids: number[],
+  limitMs: number,
+): Promise<HeldScan> {
+  const heldScans = async () => {
+    const r = await ctx.core.request({ type: 'test', action: 'held-scans' }).catch(() => null);
+    return r?.ok ? Number(r.value ?? 0) : 0;
+  };
+  const rows = () =>
+    shell<number>(`document.querySelectorAll('.list-scroll .conv:not(.placeholder)').length`);
+  await until(async () => ((await heldScans()) > 0 ? true : null), limitMs, 'held scan');
+  const listRows = await until(
+    async () => {
+      const n = await rows();
+      return n > 0 ? n : null;
+    },
+    limitMs,
+    'stored list',
+  );
+  const opens: HeldScan['opens'] = [];
+  for (const rowid of rowids) {
+    const r = await shell<MessageOpenResult>(`window.__pevTest.openInReader(${rowid}, 'plain')`);
+    opens.push({ rowid, outcome: outcomeOf(r) });
+  }
+  const stillHeld = (await heldScans()) > 0;
+  await ctx.core.request({ type: 'test', action: 'release-scans', payload: { count: null } });
+  return { listRows, opens, stillHeld };
 }
 
 /** The result file for a run; a nonce that isn't plain hex is not used in the name. */
@@ -457,6 +510,10 @@ export async function runSelfTest(
       result.timing = await runTiming(ctx, appWin, timingRoot, queuePick, limitMs, {
         keep: argv.includes('--pev-selftest-timing-keep'),
         reopen: argv.includes('--pev-selftest-timing-reopen'),
+        held: (argValue(argv, 'pev-selftest-timing-held') ?? '')
+          .split(',')
+          .map(Number)
+          .filter((n) => Number.isSafeInteger(n) && n > 0),
       });
     }
   } catch (err) {
