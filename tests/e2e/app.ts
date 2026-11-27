@@ -22,7 +22,7 @@ import {
   type LidState,
   type PowerEvent,
 } from '../../scripts/power-state.mjs';
-import { stderrCodes } from '../app-exit';
+import { StderrTail, stderrCodes } from '../app-exit';
 import { REPO_ROOT, removeTestDirs, takeTestDirs, testDir } from '../paths';
 
 export interface LogLine {
@@ -58,7 +58,7 @@ const STDERR_TAIL = 400;
 export class PevApp {
   readonly consoleMessages: Array<{ type: string; text: string }> = [];
   private ended: AppExit | null = null;
-  private readonly stderrTail: string[] = [];
+  private readonly stderrTail = new StderrTail(STDERR_TAIL);
 
   constructor(
     readonly app: ElectronApplication,
@@ -70,10 +70,7 @@ export class PevApp {
     proc.once('exit', (code, signal) => {
       this.ended = { code, signal };
     });
-    proc.stderr?.on('data', (chunk: Buffer | string) => {
-      this.stderrTail.push(...String(chunk).split('\n'));
-      this.stderrTail.splice(0, Math.max(0, this.stderrTail.length - STDERR_TAIL));
-    });
+    proc.stderr?.on('data', (chunk: Buffer | string) => this.stderrTail.push(chunk));
   }
 
   /** How the app's process ended, or null while it runs. */
@@ -81,12 +78,17 @@ export class PevApp {
     return this.ended;
   }
 
+  /** Chromium's log codes in the app's stderr so far, and how many other lines there were. */
+  stderrReport(): ClosedReport['stderr'] {
+    return stderrCodes(this.stderrTail.lines());
+  }
+
   /** Why the app closed under a test: its exit, its stderr codes, the lid and the sleeps since `since`. */
   closedReport(since: Date): ClosedReport {
     const power = readPowerEvents(since, new Date());
     return {
       exit: this.ended,
-      stderr: stderrCodes(this.stderrTail),
+      stderr: this.stderrReport(),
       lid: readLidState(),
       power,
       slept: slept(power),
@@ -307,14 +309,15 @@ export const test = base.extend<{ pev: PevApp; testDirs: void }>({
     expect(await pev.main('dialogsStubbed')).toBe(true);
     expect(await pev.main('externalStubbed')).toBe(true);
     await use(pev);
-    const passed = testInfo.status === testInfo.expectedStatus;
+    // A test that failed with its app closed is reported, one expected to fail included.
+    const failed = testInfo.status !== 'passed' && testInfo.status !== 'skipped';
     const closed =
       pev.exited() !== null ||
       testInfo.errors.some((e) => (e.message ?? '').includes('has been closed'));
-    if (!passed && closed) reportClosed(pev, since, testInfo);
+    if (failed && closed) reportClosed(pev, since, testInfo);
     // Test runs stay in the background: no window was ever shown or focused,
     // and no native dialog was opened.
-    if (passed) {
+    if (!failed && testInfo.status === testInfo.expectedStatus) {
       const windows = await pev.main<Array<{ visible: boolean; focused: boolean }>>('windowState');
       expect(windows.length).toBeGreaterThan(0);
       expect(windows.filter((w) => w.visible || w.focused)).toEqual([]);

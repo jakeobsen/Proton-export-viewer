@@ -11,7 +11,7 @@ import {
   slept,
   stepOutcome,
 } from '../../scripts/power-state.mjs';
-import { stderrCodes } from '../app-exit';
+import { StderrTail, stderrCodes } from '../app-exit';
 
 describe('the lid state', () => {
   it('reads closed and whether closing sleeps the Mac', () => {
@@ -129,5 +129,61 @@ describe("an app's stderr in a report", () => {
     );
     const { codes } = stderrCodes(lines, 3);
     expect(codes).toEqual(['INFO file.cc(47)', 'INFO file.cc(48)', 'INFO file.cc(49)']);
+  });
+});
+
+describe("an app's stderr as it arrives", () => {
+  const LINE = '[38477:1127/195842.857:ERROR:gpu_process_host.cc(1007)] some text';
+
+  const tailOf = (chunks: Array<string | Buffer>, max?: number, maxLine?: number) => {
+    const tail = new StderrTail(max, maxLine);
+    for (const chunk of chunks) tail.push(chunk);
+    return tail;
+  };
+
+  it('matches a prefix split over two chunks once its line is complete', () => {
+    for (let cut = 1; cut < LINE.length; cut += 1) {
+      const tail = tailOf([LINE.slice(0, cut), `${LINE.slice(cut)}\n`]);
+      expect(stderrCodes(tail.lines()), String(cut)).toEqual({
+        codes: ['ERROR gpu_process_host.cc(1007)'],
+        dropped: 0,
+      });
+    }
+  });
+
+  it('never takes a chunk that starts inside a line for the start of one', () => {
+    const tail = tailOf(['text before it, then ', `${LINE}\n`, 'and a line ', LINE]);
+    expect(tail.lines()).toEqual([`text before it, then ${LINE}`, `and a line ${LINE}`]);
+    expect(stderrCodes(tail.lines())).toEqual({ codes: [], dropped: 2 });
+  });
+
+  it('keeps the line under way, which starts a line too', () => {
+    const tail = tailOf([`${LINE}\n`, LINE.slice(0, 30)]);
+    expect(tail.lines()).toEqual([LINE, LINE.slice(0, 30)]);
+    tail.push(`${LINE.slice(30)}\n`);
+    expect(stderrCodes(tail.lines()).codes).toHaveLength(2);
+  });
+
+  it('decodes a character split over two chunks', () => {
+    const bytes = Buffer.from('é\n', 'utf8');
+    const tail = tailOf([bytes.subarray(0, 1), bytes.subarray(1)]);
+    expect(tail.lines()).toEqual(['é']);
+  });
+
+  it('keeps at most max lines, each cut to maxLine characters, the line under way included', () => {
+    const many = tailOf([Array.from({ length: 10 }, (_, i) => `line ${i}\n`).join('')], 3);
+    expect(many.lines()).toEqual(['line 7', 'line 8', 'line 9']);
+    const long = tailOf([LINE, 'x'.repeat(10_000), 'y'.repeat(10_000)], 3, 100);
+    expect(long.lines()).toEqual([`${LINE}${'x'.repeat(100 - LINE.length)}`]);
+    long.push('\nnext');
+    expect(long.lines()).toEqual([`${LINE}${'x'.repeat(100 - LINE.length)}`, 'next']);
+    expect(stderrCodes(long.lines()).codes).toEqual(['ERROR gpu_process_host.cc(1007)']);
+    const whole = tailOf([`${'z'.repeat(200)}\nlast\n`], 3, 100);
+    expect(whole.lines()).toEqual(['z'.repeat(100), 'last']);
+    const under = tailOf(
+      [`${Array.from({ length: 10 }, (_, i) => `line ${i}\n`).join('')}tail`],
+      3,
+    );
+    expect(under.lines()).toEqual(['line 8', 'line 9', 'tail']);
   });
 });
