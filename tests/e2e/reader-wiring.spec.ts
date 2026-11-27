@@ -205,7 +205,7 @@ test('a conversation whose newest message is in another folder opens that messag
     .sort();
   const t0 = 1_750_000_000;
   const inboxOnly = ['0', ALL];
-  // S: its first message is in the inbox, its newer reply only in Sent.
+  // S: its first message is in the inbox, its reply only in Sent, at the same time.
   rewrite(written.run, ids[0]!, 'S1', {
     headers: 'Message-ID: <s1@example.com>\r\n',
     time: t0,
@@ -214,7 +214,7 @@ test('a conversation whose newest message is in another folder opens that messag
   });
   rewrite(written.run, ids[1]!, 'S2', {
     headers: 'Message-ID: <s2@example.com>\r\nIn-Reply-To: <s1@example.com>\r\n',
-    time: t0 + 3600,
+    time: t0,
     subject: 'Re: Plan',
     labelIds: ['7', ALL],
   });
@@ -231,6 +231,9 @@ test('a conversation whose newest message is in another folder opens that messag
     subject: 'Third',
     labelIds: inboxOnly,
   });
+  // Read and written in name order, so S2 gets the later rowid: of two
+  // messages at the same time, it is the newest.
+  await pev.main('indexTestSettings', { readByName: true });
   await pev.main('queuePick', root, 'bm1');
   await pev.shell('chooseFolder', []);
   await phase1Done(pev, 4);
@@ -247,7 +250,7 @@ test('a conversation whose newest message is in another folder opens that messag
   expect(rows.map((r) => r.count)).toEqual([1, 1, 2]);
   const split = rows[2]!;
   // In the inbox its anchor is S1; its newest message of all is S2, in Sent.
-  expect(split.newestRowid).not.toBe(split.anchorRowid);
+  expect(split.newestRowid).toBeGreaterThan(split.anchorRowid);
   const fileOf = async (rowid: number) =>
     (await ask<EmlFile>(pev, { op: 'eml', rowid }))!.answer.rel;
   expect(await fileOf(split.anchorRowid)).toMatch(/(^|\/)S1\.eml$/);

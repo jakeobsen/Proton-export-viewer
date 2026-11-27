@@ -183,7 +183,7 @@ export function refusedText(code: RejectCode): string | null {
     case 'not_found':
       return 'Message no longer in the export';
     default:
-      return "Couldn't open this message.";
+      return "Couldn't render this message";
   }
 }
 

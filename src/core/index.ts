@@ -20,6 +20,7 @@ import type { ReadRequest, ReaderFailure } from '../shared/reader-protocol';
 import { WorkerThread, type ThreadRole } from './index/pool';
 import type { IndexOptions } from './index/service';
 import { READER_RETIRE_MB, ReaderLane } from './reader/lane';
+import { OpenTracker } from './reader/opens';
 import type { ReaderSource } from './reader/source';
 import { SourceSession, type ReaderFile } from './source';
 
@@ -112,23 +113,29 @@ function build(request: OpenRequest): void {
   });
 }
 
-/** The newest open each window's lane has asked for. */
-const newestOpen = new Map<number, number>();
+/** Each window's newest open, while one of its opens is under way. */
+const opens = new OpenTracker();
 
 /** The message to read: from the test source if a test set one, else from the open export. */
 async function openForRead(
   request: ReadRequest,
+  stale: () => boolean,
 ): Promise<ReaderFile | { ok: false; code: 'no_source' }> {
   if (__PEV_TEST_HOOKS__ && readerSource) {
     const opened = await readerSource.open(request.rowid).catch(() => null);
     return opened ? { ok: true, opened } : { ok: false, code: 'not_found' };
   }
   if (!session) return { ok: false, code: 'no_source' };
-  const stale = () => (newestOpen.get(request.lane) ?? 0) > request.openId;
   return session
     .openForReader(request.rowid, request.generation, stale)
     .catch((): ReaderFile => ({ ok: false, code: 'not_found' }));
 }
+
+/** Answers a read that failed. */
+type ReadFail = (
+  code: 'no_source' | 'not_found' | 'superseded' | 'unavailable' | 'eml_missing' | 'reader_failed',
+  reason?: ReaderFailure,
+) => void;
 
 /**
  * Opens one message and renders it in the reader lane. Of a window's opens,
@@ -137,13 +144,20 @@ async function openForRead(
  */
 async function read(request: ReadRequest): Promise<void> {
   const { reqId } = request;
-  const fail = (
-    code:
-      'no_source' | 'not_found' | 'superseded' | 'unavailable' | 'eml_missing' | 'reader_failed',
-    reason?: ReaderFailure,
-  ) => reply({ type: 'result', reqId, ok: false, code, ...(reason ? { reason } : {}) });
-  newestOpen.set(request.lane, Math.max(newestOpen.get(request.lane) ?? 0, request.openId));
-  const found = await openForRead(request);
+  const fail: ReadFail = (code, reason) =>
+    reply({ type: 'result', reqId, ok: false, code, ...(reason ? { reason } : {}) });
+  const open = opens.begin(request.lane, request.openId);
+  try {
+    await readOpen(request, open.stale, fail);
+  } finally {
+    open.end();
+  }
+}
+
+/** The part of `read` between taking its place among the window's opens and leaving it. */
+async function readOpen(request: ReadRequest, stale: () => boolean, fail: ReadFail): Promise<void> {
+  const { reqId } = request;
+  const found = await openForRead(request, stale);
   if (!found.ok) return found.code === 'refused' ? fail('reader_failed', 'file') : fail(found.code);
   if (__PEV_TEST_HOOKS__) testState.fileOpens += 1;
   const opened = found.opened;
