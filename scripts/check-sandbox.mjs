@@ -312,55 +312,59 @@ async function main() {
   const smokeNonce = randomBytes(8).toString('hex');
   const smokeRoot = join(container, 'Data', `smoke-export-${smokeNonce}`);
   const written = writeSmokeExport(smokeRoot);
-  check(written.bytes <= SMOKE_MAX_BYTES, `smoke: the export is ${written.bytes} bytes`);
-  const logsDir = join(appData, 'logs');
-  const logsBefore = logSizes(logsDir);
-  const smokeRun = await run(
-    join(app, 'Contents', 'MacOS', PRODUCT_NAME),
-    ['--pev-selftest', `--pev-selftest-nonce=${smokeNonce}`, `--pev-selftest-smoke=${smokeRoot}`],
-    120_000,
-  );
-  const smokeResult = readResult(resultIn(smokeNonce), smokeNonce);
-  const smoke = smokeResult?.smoke ?? null;
-  check(
-    !smokeRun.timedOut && smokeRun.code === 0,
-    `smoke: self-test exited 0 (${JSON.stringify(smokeRun)})`,
-  );
-  check(smoke !== null && smoke.error === null, `smoke: ran to the end (${smoke?.error})`);
-  if (smoke) {
-    check(smoke.chosen === 'opened', `smoke: the export opened (${smoke.chosen})`);
-    check(
-      smoke.totals?.pairs === written.messages && smoke.totals?.messages === written.messages,
-      `smoke: phase 1 indexed ${written.messages} messages (${JSON.stringify(smoke.totals)})`,
+  // The export goes afterwards, whatever happened.
+  try {
+    check(written.bytes <= SMOKE_MAX_BYTES, `smoke: the export is ${written.bytes} bytes`);
+    const logsDir = join(appData, 'logs');
+    const logsBefore = logSizes(logsDir);
+    const smokeRun = await run(
+      join(app, 'Contents', 'MacOS', PRODUCT_NAME),
+      ['--pev-selftest', `--pev-selftest-nonce=${smokeNonce}`, `--pev-selftest-smoke=${smokeRoot}`],
+      120_000,
     );
+    const smokeResult = readResult(resultIn(smokeNonce), smokeNonce);
+    const smoke = smokeResult?.smoke ?? null;
     check(
-      smoke.newest?.body === 200,
-      `smoke: the newest message opens (${JSON.stringify(smoke.newest)})`,
+      !smokeRun.timedOut && smokeRun.code === 0,
+      `smoke: self-test exited 0 (${JSON.stringify(smokeRun)})`,
     );
+    check(smoke !== null && smoke.error === null, `smoke: ran to the end (${smoke?.error})`);
+    if (smoke) {
+      check(smoke.chosen === 'opened', `smoke: the export opened (${smoke.chosen})`);
+      check(
+        smoke.totals?.pairs === written.messages && smoke.totals?.messages === written.messages,
+        `smoke: phase 1 indexed ${written.messages} messages (${JSON.stringify(smoke.totals)})`,
+      );
+      check(
+        smoke.newest?.body === 200,
+        `smoke: the newest message opens (${JSON.stringify(smoke.newest)})`,
+      );
+      check(
+        smoke.plain?.format === 'plain' && smoke.plain.body === 200 && smoke.plain.oldBody === 404,
+        `smoke: plain text opens with a new token (${JSON.stringify(smoke.plain)})`,
+      );
+      check(
+        smoke.link?.dialogs === 1,
+        `smoke: a link click adds one dialog record (${JSON.stringify(smoke.link)})`,
+      );
+      check(
+        smoke.missing?.code === 'eml_missing' && smoke.missing.text === 'Message file missing',
+        `smoke: the missing message file shows its state (${JSON.stringify(smoke.missing)})`,
+      );
+      check(smoke.forgotten === 'forgotten', `smoke: the export is forgotten (${smoke.forgotten})`);
+      check(
+        smokeResult.shownWindows === 0 && noWindowEvents(smokeResult),
+        'smoke: no window was shown or focused',
+      );
+    }
+    const errors = newLogLines(logsDir, logsBefore).filter((l) => l.level === 'error');
     check(
-      smoke.plain?.format === 'plain' && smoke.plain.body === 200 && smoke.plain.oldBody === 404,
-      `smoke: plain text opens with a new token (${JSON.stringify(smoke.plain)})`,
+      errors.length === 0,
+      `smoke: nothing logged as an error (${errors.map((e) => e.code).join(', ') || 'none'})`,
     );
-    check(
-      smoke.link?.dialogs === 1,
-      `smoke: a link click adds one dialog record (${JSON.stringify(smoke.link)})`,
-    );
-    check(
-      smoke.missing?.code === 'eml_missing' && smoke.missing.text === 'Message file missing',
-      `smoke: the missing message file shows its state (${JSON.stringify(smoke.missing)})`,
-    );
-    check(smoke.forgotten === 'forgotten', `smoke: the export is forgotten (${smoke.forgotten})`);
-    check(
-      smokeResult.shownWindows === 0 && noWindowEvents(smokeResult),
-      'smoke: no window was shown or focused',
-    );
+  } finally {
+    rmSync(smokeRoot, { recursive: true, force: true });
   }
-  const errors = newLogLines(logsDir, logsBefore).filter((l) => l.level === 'error');
-  check(
-    errors.length === 0,
-    `smoke: nothing logged as an error (${errors.map((e) => e.code).join(', ') || 'none'})`,
-  );
-  rmSync(smokeRoot, { recursive: true, force: true });
   check(!existsSync(smokeRoot), 'smoke: the export is removed');
 
   // Positive control: the same self-test, unsandboxed, from the e2e build.
