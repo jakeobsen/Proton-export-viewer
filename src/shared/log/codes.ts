@@ -13,6 +13,7 @@ export const LOG_CODES = [
   'core.stop_timeout',
   'core.restart',
   'core.restart_gave_up',
+  'core.restart_failed',
   'core.uncaught',
   'core.rejection',
   'core.unavailable',

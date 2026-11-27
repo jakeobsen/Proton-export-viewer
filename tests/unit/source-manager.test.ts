@@ -83,12 +83,21 @@ class FakeCore implements CoreControl {
   onStop: (() => void) | null = null;
   /** Called once a core has started. */
   onStarted: (() => void) | null = null;
+  /** Starts that fail: core exits before it is ready, and says so through `onExit`. */
+  failStarts = 0;
+  /** Told when core exits on its own, with the source it had, as core-host does. */
+  onExit: ((source: CoreSource | null) => void) | null = null;
 
   setSource(source: CoreSource | null) {
     this.next = source && { ...source };
   }
 
   start() {
+    if (!this.running && this.failStarts > 0) {
+      this.failStarts -= 1;
+      this.onExit?.(this.next);
+      return Promise.reject(new Error('core exited before it was ready'));
+    }
     if (!this.running) {
       this.running = true;
       this.current = this.next;
@@ -761,7 +770,9 @@ describe('core exiting on its own', () => {
     );
     expect(restarts(t)).toBe(3);
     expect(t.core.started.length).toBe(started);
-    expect(t.generation()).toBe(generation);
+    // The open views go: a new generation, with no core.
+    expect(t.generation()).toBe(generation + 1);
+    expect(t.core.running).toBe(false);
     expect(t.manager.view().active?.closed).toBe(true);
     expect(t.notified()).toBeGreaterThan(notified);
 
@@ -773,6 +784,106 @@ describe('core exiting on its own', () => {
     await crashAndRestart(t);
     expect(restarts(t)).toBe(4);
     expect(t.manager.view().active?.closed).toBe(false);
+  });
+
+  it('restarts again when the new core exits before it is ready, up to the limit, and leaves nothing unhandled', async () => {
+    const t = setup('mgr-restart-unready');
+    t.picks.push({ path: tool('mgr-restart-unready-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    const key = t.manager.stamp()!.sourceKey;
+    const unhandled: unknown[] = [];
+    const note = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', note);
+    try {
+      t.core.onExit = (source) => t.manager.coreExited(source);
+      // Every new core ends before it is ready.
+      t.core.failStarts = 10;
+      t.manager.coreExited(t.core.crash());
+      await vi.waitFor(
+        () => expect(t.lines.filter((l) => l.includes('"core.restart_gave_up"'))).toHaveLength(1),
+        WAIT,
+      );
+      expect(restarts(t)).toBe(3);
+      expect(t.lines.filter((l) => l.includes('"core.restart_failed"'))).toHaveLength(3);
+      expect(t.manager.view().active?.closed).toBe(true);
+      expect(t.core.running).toBe(false);
+      // Nothing more is queued, and nothing was left unhandled.
+      await settle();
+      expect(restarts(t)).toBe(3);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', note);
+    }
+
+    // Reopen works once core starts again.
+    t.core.failStarts = 0;
+    expect(await t.manager.openRecent(key, t.generation())).toBe('opened');
+    await indexOpened(t, t.manager.stamp()!.generation);
+    expect(t.manager.view().active?.closed).toBe(false);
+    expect(t.core.running).toBe(true);
+  });
+
+  it('recovers when the new core exits before it is ready once, and then starts', async () => {
+    const t = setup('mgr-restart-unready-once');
+    t.picks.push({ path: tool('mgr-restart-unready-once-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    const generation = t.manager.stamp()!.generation;
+    t.core.onExit = (source) => t.manager.coreExited(source);
+    t.core.failStarts = 1;
+    t.manager.coreExited(t.core.crash());
+    // The first restart failed; its exit brought the second, which works.
+    await indexOpened(t, generation + 2);
+    expect(restarts(t)).toBe(2);
+    expect(t.core.running).toBe(true);
+    expect(t.manager.view().active).toMatchObject({ status: 'online', closed: false });
+  });
+
+  it('restarts again when the new core exits right after it is ready, before its export settled', async () => {
+    const t = setup('mgr-restart-ready-exit');
+    t.picks.push({ path: tool('mgr-restart-ready-exit-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    const generation = t.manager.stamp()!.generation;
+    const started = t.core.started.length;
+    // The first new core is ready, then exits at once, while the restart
+    // that started it is still settling the export.
+    t.core.onStarted = () => {
+      t.core.onStarted = null;
+      t.manager.coreExited(t.core.crash());
+    };
+    t.manager.coreExited(t.core.crash());
+    await indexOpened(t, generation + 2);
+    expect(restarts(t)).toBe(2);
+    expect(t.core.started.length).toBe(started + 2);
+    expect(t.core.running).toBe(true);
+    expect(t.manager.view().active).toMatchObject({ status: 'online', closed: false });
+  });
+
+  it('is not restarted once quit began, also when the exit was queued before', async () => {
+    const t = setup('mgr-restart-quit');
+    t.picks.push({ path: tool('mgr-restart-quit-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    const stamp = t.manager.stamp()!;
+    // An open holds the queue: its dialog is up.
+    let pick: ((p: Picked | null) => void) | undefined;
+    t.manager.setAccess({ picker: () => new Promise((r) => (pick = r)) });
+    const inProgress = t.manager.chooseFolder(null, t.generation());
+    await vi.waitFor(() => expect(pick).toBeDefined(), WAIT);
+    const started = t.core.started.length;
+    // Core exits; its restart waits in the queue. Then quit begins.
+    t.manager.coreExited(t.core.crash());
+    t.manager.close();
+    pick!(null);
+    await inProgress;
+    // An exit reported after quit began.
+    t.manager.coreExited(stamp);
+    await settle();
+    expect(restarts(t)).toBe(0);
+    expect(t.core.started.length).toBe(started);
+    expect(t.core.running).toBe(false);
   });
 
   it('is not restarted for an earlier generation, or once a switch, Forget or Reset began', async () => {

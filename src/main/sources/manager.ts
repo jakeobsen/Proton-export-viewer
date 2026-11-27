@@ -399,8 +399,9 @@ export class SourceManager {
     }, expected);
   }
 
-  /** At quit: releases the folder scope. */
+  /** At quit: nothing opens or restarts any more, and the folder scope is released. */
   close(): void {
+    this.admitting = false;
     this.releaseScope(this.deps.generation(), 'quit');
   }
 
@@ -778,17 +779,21 @@ export class SourceManager {
    * closed until it is opened again.
    */
   coreExited(source: Stamp | null): void {
-    const active = this.active;
-    if (!this.admitting || !active || !source || !sameStamp(source, this.stamp())) return;
+    if (!this.admitting || !this.active || !source || !sameStamp(source, this.stamp())) return;
     void this.serial(async () => {
-      // Only if nothing moved on meanwhile: no switch, Forget or Reset.
-      if (!this.admitting || this.active !== active || !sameStamp(source, this.stamp())) return;
+      // Only if nothing moved on meanwhile: no switch, Forget, Reset or quit.
+      // The open source is compared by its stamp: an open that settled since
+      // made a new entry for the same one.
+      const active = this.active;
+      if (!this.admitting || !active || !sameStamp(source, this.stamp())) return;
       const record = this.registry.source(source.sourceKey);
       if (!record) return;
       const at = { generation: source.generation };
       const now = performance.now();
       this.restarts = this.restarts.filter((t) => now - t < RESTART_WINDOW_MS);
       if (this.restarts.length >= RESTART_LIMIT) {
+        // The open views go with the core that served them.
+        this.deps.bumpGeneration();
         active.closed = true;
         this.deps.log.warn('core.restart_gave_up', at, { src: source.sourceKey });
         this.deps.notify();
@@ -796,15 +801,21 @@ export class SourceManager {
       }
       this.restarts.push(now);
       this.deps.log.warn('core.restart', at, { src: source.sourceKey });
-      await this.activate({
-        pick: active.pick,
-        run: runOf(record),
-        known: record,
-        verify: false,
-        onMismatch: 'offline',
-        runs: active.runs,
-        again: true,
-      });
+      try {
+        await this.activate({
+          pick: active.pick,
+          run: runOf(record),
+          known: record,
+          verify: false,
+          onMismatch: 'offline',
+          runs: active.runs,
+          again: true,
+        });
+      } catch {
+        // The new core ended before it was ready. Its exit was reported too,
+        // and is next in the queue: another restart, or the end of them.
+        this.deps.log.warn('core.restart_failed', at, { src: source.sourceKey });
+      }
     });
   }
 
