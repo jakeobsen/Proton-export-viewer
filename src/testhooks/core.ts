@@ -37,6 +37,8 @@ export interface CoreTestDeps {
     held: Array<OpenRequest | ReadRequest>;
     fileOpens: number;
     unsanitized: boolean;
+    holdingOpened: boolean;
+    heldOpened: Array<() => void>;
   };
   open: (request: OpenRequest | ReadRequest) => void;
   toWorker: (message: WorkerRequest) => void;
@@ -130,6 +132,20 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
     }
     case 'held':
       ok(deps.state.held.length);
+      return;
+    case 'hold-opened':
+      deps.state.holdingOpened = true;
+      ok();
+      return;
+    case 'release-opened': {
+      deps.state.holdingOpened = false;
+      const held = deps.state.heldOpened.splice(0);
+      for (const go of held) go();
+      ok(held.length);
+      return;
+    }
+    case 'held-opened':
+      ok(deps.state.heldOpened.length);
       return;
     case 'file-opens':
       ok(deps.state.fileOpens);

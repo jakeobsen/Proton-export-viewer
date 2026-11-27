@@ -68,6 +68,9 @@ const testState = {
   /** Message files opened for the reader. */
   fileOpens: 0,
   unsanitized: false,
+  /** Holds reads once their message file is open, before the parse. */
+  holdingOpened: false,
+  heldOpened: [] as Array<() => void>,
 };
 /** Test builds can hold phase 1's writes. */
 let writeGate: import('../testhooks/core').WriteGate | null = null;
@@ -163,6 +166,9 @@ async function readOpen(request: ReadRequest, stale: () => boolean, fail: ReadFa
   if (__PEV_TEST_HOOKS__) testState.fileOpens += 1;
   const opened = found.opened;
   try {
+    if (__PEV_TEST_HOOKS__ && testState.holdingOpened) {
+      await new Promise<void>((resolve) => testState.heldOpened.push(resolve));
+    }
     const outcome = await lane.job(
       {
         type: 'render',
