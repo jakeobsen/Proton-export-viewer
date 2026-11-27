@@ -165,16 +165,20 @@ const HOST_CHARS_RE = /^[\p{L}\p{N}\p{M}.-]+$/u;
 const RECIPIENT_FIELDS = new Set(['to', 'cc', 'bcc']);
 
 /**
- * An address domain in ASCII form, or null when its decoded form is not a
- * plain host name: one with a separator, a space or another character a host
- * can't hold, or one without an ASCII form made of letters, digits and hyphens.
+ * An address domain in ASCII form, or null when it is not a plain host name:
+ * one with a separator, a space or another character a host can't hold, or one
+ * without an ASCII form made of letters, digits and hyphens. `name` is decoded.
  */
-function mailDomain(domain: string): string | null {
-  const name = decoded(domain);
+function mailDomain(name: string): string | null {
   if (!HOST_CHARS_RE.test(name)) return null;
   const ascii = asciiHost(name);
   return LDH_HOST_RE.test(ascii) ? ascii : null;
 }
+
+// RFC 5322 specials other than the list comma: text holding one may be a
+// quoted local part, a display name, a comment or a group, which a mail app
+// reads as another address than the plain one shown.
+const SPECIALS_RE = /["<>()[\];:\\]/;
 
 interface Recipient {
   /** The part before the domain, with its `@`, as written. */
@@ -188,38 +192,70 @@ interface Recipient {
 }
 
 /**
- * One address. It is unclear when it has no domain, when its domain is not a
- * plain host name, or when its decoded local part holds a comma or another
- * `@`: a mail app that decodes before it splits could then write to a
- * different address than the one shown.
+ * One address, as written, with `decode` giving the text each of its parts
+ * stands for (its parts decoded once). It is unclear when it has no domain,
+ * when its domain is not a plain host name, when its local part holds a comma,
+ * another `@` or white space, or when `unclear` says so already: the path or
+ * the field value it came from holds a special.
  */
-function recipient(address: string): Recipient {
+function recipient(address: string, decode: (s: string) => string, unclear: boolean): Recipient {
   const at = address.lastIndexOf('@');
+  const local = at < 0 ? address : address.slice(0, at);
   const domain = at < 0 ? '' : address.slice(at + 1);
-  const ascii = domain === '' ? null : mailDomain(domain);
-  const unclear = ascii === null || /[,@]/.test(decoded(address.slice(0, Math.max(at, 0))));
+  const localText = decode(local);
+  const domainText = decode(domain);
+  const ascii = domain === '' ? null : mailDomain(domainText);
+  const odd = unclear || ascii === null || /[,@\s]/u.test(localText);
   return {
-    local: at < 0 ? address : address.slice(0, at + 1),
+    local: at < 0 ? address : `${local}@`,
     domain,
-    host: unclear ? null : ascii,
-    lookalike: isLookalike(decoded(domain)),
-    unclear,
+    host: odd ? null : ascii,
+    lookalike: isLookalike(domainText),
+    unclear: odd,
   };
+}
+
+/**
+ * The fields of a `mailto:` URL's query, each name and value decoded once. A
+ * `+` stays a `+`: in a `mailto:` URL it is part of an address, never a space.
+ * A field that can't be decoded keeps its value as written, marked.
+ */
+function mailFields(search: string): Array<{ name: string; value: string; bad: boolean }> {
+  if (search.length <= 1) return [];
+  return search
+    .slice(1)
+    .split('&')
+    .map((pair) => {
+      const eq = pair.indexOf('=');
+      const name = eq < 0 ? pair : pair.slice(0, eq);
+      const value = eq < 0 ? '' : pair.slice(eq + 1);
+      try {
+        return { name: decodeURIComponent(name), value: decodeURIComponent(value), bad: false };
+      } catch {
+        return { name: decoded(name), value, bad: true };
+      }
+    });
 }
 
 /**
  * A `mailto:` link's recipients: the addresses in its path, and those in its
  * `to`, `cc` and `bcc` fields. Each one is checked, so a look-alike domain or
- * an unclear address anywhere in the URL warns.
+ * an unclear address anywhere in the URL warns. A path or a field value that
+ * holds a special anywhere makes every address in it unclear, as its commas
+ * may then not separate addresses.
  */
 function mailTarget(url: URL): Target {
-  const inPath = url.pathname === '' ? [] : url.pathname.split(',').map(recipient);
+  const path = url.pathname;
+  const pathOdd = SPECIALS_RE.test(decoded(path));
+  const inPath =
+    path === '' ? [] : path.split(',').map((address) => recipient(address, decoded, pathOdd));
   const inFields: Recipient[] = [];
-  for (const [name, value] of url.searchParams) {
+  for (const { name, value, bad } of mailFields(url.search)) {
     if (!RECIPIENT_FIELDS.has(name.toLowerCase())) continue;
+    const odd = bad || SPECIALS_RE.test(value);
     for (const address of value.split(',')) {
       const trimmed = address.trim();
-      if (trimmed !== '') inFields.push(recipient(trimmed));
+      if (trimmed !== '') inFields.push(recipient(trimmed, (s) => s, odd));
     }
   }
   // A percent-encoded domain shows in its ASCII form; any other shows as it

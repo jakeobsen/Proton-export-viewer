@@ -370,7 +370,6 @@ describe('linkPrompt for mailto: links', () => {
       'mailto:a@evil.test%2C@paypal.com',
       'mailto:a%40evil.test@paypal.com',
       'mailto:a%2Cb@paypal.com',
-      'mailto:help@shop.example?cc=a%2540evil.test@paypal.com',
       'mailto:help@shop.example,a@evil.test%2C@paypal.com',
     ]) {
       const p = prompt(url, 'paypal.com');
@@ -381,6 +380,50 @@ describe('linkPrompt for mailto: links', () => {
     expect(prompt('mailto:a@evil.test%2C@paypal.com', 'Write')).toMatchObject({
       mismatch: false,
       unclear: true,
+    });
+  });
+
+  it('decodes the fields once, and keeps a + as a +', () => {
+    // An encoded list is two clear recipients.
+    const list = prompt('mailto:?to=a%40x.test%2Cb%40y.test', 'x.test');
+    expect(list).toMatchObject({ unclear: false, mismatch: true });
+    expect(prompt('mailto:?to=a%40x.test%2Cb%40x.test', 'x.test')).toMatchObject({
+      unclear: false,
+      mismatch: false,
+    });
+    // A + is part of the address: decoded as a space, it would make it unclear.
+    expect(prompt('mailto:?to=a+b@x.test', 'x.test')).toMatchObject({
+      unclear: false,
+      mismatch: false,
+    });
+    expect(prompt('mailto:?to=a%20b@x.test', 'x.test')).toMatchObject({ unclear: true });
+    // Decoded once: %2540 is the text %40, not an @.
+    expect(prompt('mailto:?to=a%2540evil.test@paypal.com', 'paypal.com')).toMatchObject({
+      unclear: false,
+      mismatch: false,
+    });
+    // A value that can't be decoded is unclear.
+    expect(prompt('mailto:?to=a%E0%A4@x.test', 'Write')).toMatchObject({ unclear: true });
+  });
+
+  it('calls a quoted local part, a display name, a comment or a group unclear', () => {
+    for (const url of [
+      // Quoted, with a comma that is no separator: one address at bank.com.
+      'mailto:?to=%22evil%40attacker.com%2C%22%40bank.com',
+      new URL('mailto:?to="evil@attacker.com,"@bank.com').href,
+      'mailto:%22a%2Cb%22@bank.com',
+      new URL('mailto:?to=Bank <x@evil.test>').href,
+      new URL('mailto:?cc=x@evil.test (bank.com)').href,
+      new URL('mailto:?bcc=Friends: a@x.test, b@y.test;').href,
+      'mailto:a%5C@bank.com',
+    ]) {
+      expect(prompt(url, 'Write'), url).toMatchObject({ unclear: true, mismatch: false });
+      expect(prompt(url, 'bank.com'), url).toMatchObject({ unclear: true, mismatch: true });
+    }
+    // Spaces around the list's commas are not part of an address.
+    expect(prompt('mailto:?to=a@x.test,%20b@x.test', 'x.test')).toMatchObject({
+      unclear: false,
+      mismatch: false,
     });
   });
 
