@@ -1,0 +1,224 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// The index report over a generated export with one file of each kind that
+// needs attention: counts by reason, the rows in order, and the plain text.
+
+import { spawnSync } from 'node:child_process';
+import {
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { join } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { scanRun } from '../../src/core/containment';
+import { MAX_ATTACHMENTS, MAX_LABELS, MAX_RECIPIENTS } from '../../src/core/index/metadata';
+import { SYSTEM_IDS } from '../../src/core/index/ops';
+import { indexReport, pairReason, withScan } from '../../src/core/index/report';
+import { openDb } from '../../src/core/index/sql';
+import { IndexService, type IndexOptions } from '../../src/core/index/service';
+import type { ThreadRole } from '../../src/core/index/pool';
+import type { IndexReport } from '../../src/shared/index-types';
+import { REPORT_ROWS } from '../../src/shared/index-types';
+import type { Logger } from '../../src/shared/log/writer';
+import { LIST_LIMITS, reasonText, reportText, tookText } from '../../src/shared/report-text';
+import { writeExport } from '../exports';
+import { InlineThread, STAMP } from '../index-helpers';
+import { testDir } from '../paths';
+
+const silent: Logger = { log: () => {}, error: () => {}, warn: () => {}, info: () => {} };
+
+function service(
+  root: string,
+  indexDir: string,
+  options: IndexOptions = {},
+  hang: (role: ThreadRole, op: string, args: unknown) => boolean = () => false,
+): IndexService {
+  return new IndexService({
+    indexDir,
+    stamp: STAMP,
+    root,
+    log: silent,
+    thread: (role) => new InlineThread(role, (op, args) => hang(role, op, args)),
+    isCurrent: () => true,
+    options,
+  });
+}
+
+/** Rewrites one metadata file's payload. */
+function editMeta(run: string, id: string, edit: (payload: Record<string, unknown>) => void) {
+  const path = join(run, `${id}.metadata.json`);
+  const doc = JSON.parse(readFileSync(path, 'utf8')) as { Payload: Record<string, unknown> };
+  edit(doc.Payload);
+  writeFileSync(path, JSON.stringify(doc));
+}
+
+describe('the index report', () => {
+  it('counts and lists one file of each kind that needs attention', async () => {
+    const dir = testDir('report');
+    const written = writeExport(join(dir, 'export'), { seed: 7, messages: 30 });
+    const run = realpathSync(written.run);
+    const ids = readdirSync(run)
+      .filter((n) => n.endsWith('.eml'))
+      .map((n) => n.slice(0, -'.eml'.length))
+      .sort();
+    expect(ids).toHaveLength(30);
+    const [metaGone, emlGone, badJson, badShape, badId, swapped, slow, wide, unknown, jsonNoEml] =
+      ids as [string, string, string, string, string, string, string, string, string, string];
+    rmSync(join(run, `${metaGone}.metadata.json`));
+    rmSync(join(run, `${emlGone}.eml`));
+    writeFileSync(join(run, `${badJson}.metadata.json`), '{"Version": 1, "Payload": {');
+    writeFileSync(join(run, `${badShape}.metadata.json`), '{"Version": 1, "Payload": 5}');
+    // Metadata that can't be used and no message file: counted and listed once, as the metadata.
+    writeFileSync(join(run, `${jsonNoEml}.metadata.json`), '{"Version": 1, "Payload": [');
+    rmSync(join(run, `${jsonNoEml}.eml`));
+    editMeta(run, badId, (p) => (p.ID = 'another-id'));
+    editMeta(run, wide, (p) => {
+      p.ToList = Array.from({ length: MAX_RECIPIENTS + 1 }, (_, i) => ({
+        Name: '',
+        Address: `t${i}@example.com`,
+      }));
+    });
+    editMeta(run, unknown, (p) => {
+      p.LabelIDs = [...(p.LabelIDs as string[]), 'not-in-labels-json'];
+    });
+    // Refused by the scan: a link, a folder and a FIFO with names it would read.
+    symlinkSync(join(run, `${ids[10]}.eml`), join(run, 'zz-link.metadata.json'));
+    mkdirSync(join(run, 'zz-folder.eml'));
+    expect(spawnSync('/usr/bin/mkfifo', [join(run, 'zz-pipe.metadata.json')]).status).toBe(0);
+    const scan = scanRun(run);
+    // Refused when read: a metadata file becomes a FIFO after the scan.
+    rmSync(join(run, `${swapped}.metadata.json`));
+    expect(spawnSync('/usr/bin/mkfifo', [join(run, `${swapped}.metadata.json`)]).status).toBe(0);
+
+    const s = service(run, join(dir, 'index'), { jobMs: 1000 }, (role, op, args) => {
+      if (role !== 'parse' || op !== 'meta') return false;
+      return (args as { items: Array<{ protonId: string }> }).items.some(
+        (i) => i.protonId === slow,
+      );
+    });
+    await s.open(null);
+    await s.startIndexing(scan);
+    expect(s.progress.phase).toBe('done');
+    expect(s.took).toEqual(expect.any(Number));
+
+    const part = (await s.ask({ op: 'report' })) as IndexReport;
+    const report = withScan(part, scan.rejected, s.took);
+    // 30 pairs, less the seven whose metadata is missing or couldn't be used.
+    expect(report.messages).toBe(23);
+    expect(report.rejected).toEqual({ symlink: 1, directory: 1, fifo: 2 });
+    expect(report.metaMissing).toBe(1);
+    expect(report.emlMissing).toBe(1);
+    expect(report.failed).toEqual({ meta_json: 2, meta_shape: 1, meta_id: 1 });
+    expect(report.timeouts).toBe(1);
+    expect(report.capped).toEqual({ to: 1 });
+    expect(report.hiddenLabelIds).toBe(1);
+    expect(report.attention).toBe(12);
+    expect(report.took).toBe(s.took);
+
+    const meta = (id: string) => `${id}.metadata.json`;
+    expect(report.rows).toEqual([
+      { result: 'skipped', file: 'zz-folder.eml', reason: 'directory' },
+      { result: 'skipped', file: 'zz-link.metadata.json', reason: 'symlink' },
+      { result: 'skipped', file: 'zz-pipe.metadata.json', reason: 'fifo' },
+      { result: 'skipped', file: meta(badJson), reason: 'meta_json' },
+      { result: 'skipped', file: meta(badShape), reason: 'meta_shape' },
+      { result: 'skipped', file: meta(badId), reason: 'meta_id' },
+      { result: 'skipped', file: meta(swapped), reason: 'fifo' },
+      { result: 'skipped', file: meta(slow), reason: 'timeout' },
+      { result: 'skipped', file: meta(jsonNoEml), reason: 'meta_json' },
+      { result: 'skipped', file: `${metaGone}.eml`, reason: 'meta_missing' },
+      { result: 'listed', file: meta(emlGone), reason: 'eml_missing' },
+      { result: 'truncated', file: meta(wide), reason: 'capped', lists: ['to'] },
+    ]);
+
+    // The text names files relative to the run: no path, no account.
+    const text = reportText(report);
+    expect(text).not.toContain(run);
+    expect(text).not.toContain(dir);
+    expect(text).not.toContain(written.account);
+    expect(text).toContain('Messages: 23\n');
+    expect(text).toContain('Files refused: 4 (directory 1, fifo 2, symlink 1)\n');
+    expect(text).toContain('Metadata not usable: 4 (meta_id 1, meta_json 2, meta_shape 1)\n');
+    expect(text).toContain('Lists cut to their limit: 1 (to 1)\n');
+    expect(text).toContain('Unknown label IDs hidden: 1\n');
+    expect(text).toContain('12 files need attention\n');
+    expect(text).toContain(
+      `Truncated\t${meta(wide)}\tOver 1,000 To addresses. First 1,000 kept. (capped: to)\n`,
+    );
+    expect(text).toContain(`Listed\t${meta(emlGone)}\tMessage file missing. (eml_missing)\n`);
+    await s.close();
+
+    // Core's part keeps at most `limit` rows of its own, in the same order.
+    const file = readdirSync(join(dir, 'index')).find((n) => n.endsWith('.sqlite'));
+    const db = openDb(join(dir, 'index', file!), true);
+    try {
+      const own = report.rows.slice(3);
+      expect(indexReport(db, SYSTEM_IDS, 3).rows).toEqual(own.slice(0, 3));
+      expect(indexReport(db, SYSTEM_IDS, own.length).rows).toEqual(own);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('carries at most a fixed number of rows, and counts the rest', () => {
+    const refused = Array.from({ length: REPORT_ROWS + 5 }, (_, i) => ({
+      rel: `l${String(i).padStart(4, '0')}.eml`,
+      kind: 'symlink' as const,
+    }));
+    const part = {
+      messages: 0,
+      folders: 0,
+      rejected: { fifo: 1 },
+      metaMissing: 0,
+      emlMissing: 0,
+      failed: {},
+      timeouts: 0,
+      capped: {},
+      hiddenLabelIds: 0,
+      attention: 1,
+      rows: [{ result: 'skipped' as const, file: 'p.metadata.json', reason: 'fifo' as const }],
+    };
+    // The scan's order isn't the rows' order: they go by name.
+    const report = withScan(part, [...refused].reverse(), null);
+    expect(report.rows).toHaveLength(REPORT_ROWS);
+    expect(report.rows.map((r) => r.file)).toEqual(refused.slice(0, REPORT_ROWS).map((r) => r.rel));
+    expect(report.attention).toBe(REPORT_ROWS + 6);
+    expect(report.rejected).toEqual({ symlink: REPORT_ROWS + 5, fifo: 1 });
+    const text = reportText(report);
+    expect(text).not.toContain('Took:');
+    expect(text.trimEnd().split('\n').at(-1)).toBe('and 6 more');
+  });
+
+  it('maps every pair code to a reason', () => {
+    expect(pairReason('META_JSON')).toEqual({ kind: 'failed', reason: 'meta_json' });
+    expect(pairReason('META_SHAPE')).toEqual({ kind: 'failed', reason: 'meta_shape' });
+    expect(pairReason('META_ID')).toEqual({ kind: 'failed', reason: 'meta_id' });
+    expect(pairReason('META_TIMEOUT')).toBe('timeout');
+    expect(pairReason('META_FAILED')).toEqual({ kind: 'failed', reason: 'failed' });
+    expect(pairReason('FILE_CHANGED')).toEqual({ kind: 'rejected', reason: 'changed' });
+    expect(pairReason('FILE_TOO_LARGE')).toEqual({ kind: 'rejected', reason: 'too_large' });
+    expect(pairReason('FILE_OTHER_TYPE')).toEqual({ kind: 'rejected', reason: 'other_type' });
+    expect(pairReason('FILE_NOPE')).toEqual({ kind: 'failed', reason: 'failed' });
+  });
+
+  it("states each list's limit as the index applies it", () => {
+    expect(LIST_LIMITS).toEqual({
+      labels: MAX_LABELS,
+      attachments: MAX_ATTACHMENTS,
+      to: MAX_RECIPIENTS,
+      cc: MAX_RECIPIENTS,
+      bcc: MAX_RECIPIENTS,
+      replyTo: MAX_RECIPIENTS,
+    });
+    expect(reasonText({ reason: 'capped', lists: ['labels', 'cc'] })).toBe(
+      'Over 200 labels. First 200 kept. Over 1,000 Cc addresses. First 1,000 kept.',
+    );
+    expect(tookText(1234)).toBe('1.2 s');
+    expect(tookText(14_400)).toBe('14 s');
+    expect(tookText(185_000)).toBe('3 min 05 s');
+  });
+});

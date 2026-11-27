@@ -5,11 +5,12 @@
 // rejected. The one exception is `state`, the bootstrap call: it takes no
 // arguments and returns the current generation.
 
-import { ipcMain, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
+import { clipboard, ipcMain, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
 import { z } from 'zod';
 import {
   IPC,
   type CloseViewResult,
+  type CopyResult,
   type ErrorKind,
   type IndexResult,
   type LinkActionResult,
@@ -32,9 +33,11 @@ import {
   MAX_SNIPPET_THREADS,
   WINDOW_AFTER,
   WINDOW_BEFORE,
+  type IndexReport,
   type SearchPage,
   type SearchSnippets,
 } from '../shared/index-types';
+import { reportText } from '../shared/report-text';
 import type { SourceOutcome } from '../shared/sources';
 import { STALE, type Stale } from './sources/manager';
 import { APP_ORIGIN, LINK_ACTIONS } from '../shared/constants';
@@ -109,6 +112,7 @@ const ListKey = z
   .strict();
 const ShellQuery = z.discriminatedUnion('op', [
   z.object({ op: z.literal('sidebar') }).strict(),
+  z.object({ op: z.literal('report') }).strict(),
   z
     .object({
       op: z.literal('window'),
@@ -529,6 +533,24 @@ export function registerIpc(ctx: AppContext): void {
     const answer = outcome.answer as SearchSnippets | null;
     if (answer?.queryId !== queryId) return reject('invalid', appWin);
     return { ok: true, generation, queryId, snippets: answer.snippets };
+  });
+
+  /**
+   * Copies the open export's index report as plain text. Main reads the
+   * report itself; the shell sends nothing but the generation.
+   */
+  guarded<CopyResult>(IPC.copyReport, async (appWin, raw) => {
+    const args = GenerationArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    const result = await ctx.sources.queryIndex({ op: 'report' });
+    if (!result) return { ok: false, code: 'no_source' };
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    const report = result.answer as IndexReport;
+    clipboard.writeText(reportText(report));
+    ctx.log.info('report.copied', { count: report.attention, windowId: appWin.id });
+    return { ok: true, generation };
   });
 
   /**

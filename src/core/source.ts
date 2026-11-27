@@ -27,7 +27,7 @@ import type {
   ResetRequest,
   ScanRequest,
 } from '../shared/core-protocol';
-import type { EmlFile, IndexOpened } from '../shared/index-types';
+import type { EmlFile, IndexOpened, IndexReport } from '../shared/index-types';
 import type { Logger } from '../shared/log/writer';
 import type { ScanSummary } from '../shared/sources';
 import {
@@ -50,6 +50,7 @@ import { BODY_STATE, mismatchOf, probeIdentity } from './index/schema';
 import type { OpenedMessage } from './reader/source';
 import { overlaps } from '../shared/overlap';
 import { ConnectionRegistry, IndexService, type IndexOptions } from './index/service';
+import { withScan } from './index/report';
 
 /** Entries scanned between yields, so core keeps answering during a long scan. */
 const SCAN_SLICE = 2000;
@@ -463,6 +464,10 @@ export class SourceSession {
     let answer: Awaited<ReturnType<IndexService['ask']>>;
     try {
       answer = await service.ask(request.query);
+      // The report adds what the last scan refused, which only the source holds.
+      if (request.query.op === 'report' && answer !== null && typeof answer === 'object') {
+        answer = withScan(answer as IndexReport, this.records.rejected, service.took);
+      }
     } catch (err) {
       if (service.isDamaged) return damaged();
       throw err;

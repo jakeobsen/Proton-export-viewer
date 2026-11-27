@@ -9,6 +9,7 @@ import type { IndexResult, IndexUpdate, SearchRequest, SnippetsRequest } from '.
 import type {
   CardRow,
   IndexProgress,
+  IndexReport,
   SearchSort,
   Sidebar,
   ThreadSnippet,
@@ -26,9 +27,20 @@ export interface MailboxState {
   sidebar: SidebarModel | null;
   folder: string;
   progress: IndexProgress | null;
+  /** The index report, read while it is on screen and once phase 1 is done. */
+  report: IndexReport | null;
+  /** The index report is on screen instead of the list. */
+  reportOpen: boolean;
 }
 
-let state: MailboxState = { key: null, sidebar: null, folder: INBOX, progress: null };
+let state: MailboxState = {
+  key: null,
+  sidebar: null,
+  folder: INBOX,
+  progress: null,
+  report: null,
+  reportOpen: false,
+};
 const listeners = new Set<() => void>();
 
 function update(patch: Partial<MailboxState>): void {
@@ -246,6 +258,7 @@ export function syncMailbox(): void {
       void readSidebar();
       list.refresh();
       cards.refresh();
+      refreshReport();
     }
     return;
   }
@@ -253,7 +266,7 @@ export function syncMailbox(): void {
   const folder = sameExport ? state.folder : INBOX;
   // Results belong to the generation that answered them.
   search.clear();
-  update({ key, sidebar: null, progress: null, folder });
+  update({ key, sidebar: null, progress: null, folder, report: null, reportOpen: false });
   list.reset(key === null ? null : folder);
   // A new export or generation: main revoked the reader's view, and nothing is selected.
   cards.hide();
@@ -267,6 +280,64 @@ export function indexChanged(update_: IndexUpdate): void {
   void readSidebar();
   list.refresh();
   cards.refresh();
+  refreshReport();
+}
+
+/** The report is read at most this often while phase 1 runs. */
+export const REPORT_MS = 1000;
+let readingReport = false;
+let reportAgain = false;
+let lastReport = -Infinity;
+let reportTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function readReport(): Promise<void> {
+  if (readingReport) {
+    reportAgain = true;
+    return;
+  }
+  readingReport = true;
+  lastReport = performance.now();
+  const key = state.key;
+  try {
+    const answer = await ask((generation) => window.pev.indexReport(generation));
+    if (answer && state.key === key) update({ report: answer });
+  } finally {
+    readingReport = false;
+    if (reportAgain) {
+      reportAgain = false;
+      refreshReport();
+    }
+  }
+}
+
+/**
+ * Reads the report again if it is on screen, or if phase 1 is done (the list
+ * header names the files that need attention): at most once per REPORT_MS.
+ */
+function refreshReport(): void {
+  if (state.key === null || !(state.reportOpen || state.progress?.phase === 'done')) return;
+  if (reportTimer) return;
+  // The monotonic clock: a wall clock set back can't hold the next read.
+  const wait = lastReport + REPORT_MS - performance.now();
+  if (wait > 0) {
+    reportTimer = setTimeout(() => {
+      reportTimer = null;
+      refreshReport();
+    }, wait);
+    return;
+  }
+  void readReport();
+}
+
+export function openReport(): void {
+  if (state.key === null || state.reportOpen) return;
+  update({ reportOpen: true });
+  lastReport = -Infinity;
+  refreshReport();
+}
+
+export function closeReport(): void {
+  if (state.reportOpen) update({ reportOpen: false });
 }
 
 export function showFolder(id: string): void {
