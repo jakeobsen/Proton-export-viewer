@@ -45,7 +45,13 @@ if (__PEV_TEST_HOOKS__) {
   }
 }
 
-applySwitches(app.commandLine);
+// A test run can drop the resolver rule, to show that the request filter and
+// the body's CSP stop IP literals on their own.
+const droppedSwitches: string[] = [];
+if (__PEV_TEST_HOOKS__ && process.argv.includes('--pev-no-resolver-rule')) {
+  droppedSwitches.push('host-resolver-rules');
+}
+applySwitches(app.commandLine, droppedSwitches);
 app.enableSandbox();
 
 protocol.registerSchemesAsPrivileged([

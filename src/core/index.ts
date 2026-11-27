@@ -61,7 +61,11 @@ const lane = new ReaderLane<WorkerRequest, WorkerMessage>({
 let session: SourceSession | null = null;
 
 /** Test builds can hold opens in core to keep them pending. */
-const testState = { holding: false, held: [] as Array<OpenRequest | ReadRequest> };
+const testState = {
+  holding: false,
+  held: [] as Array<OpenRequest | ReadRequest>,
+  unsanitized: false,
+};
 /** Test builds can hold phase 1's writes. */
 let writeGate: import('../testhooks/core').WriteGate | null = null;
 
@@ -125,6 +129,7 @@ async function read(request: ReadRequest): Promise<void> {
         input: opened.input,
         mode: request.mode,
         assetBase: `${ASSET_SCHEME}://${VIEW_HOST}/${request.token}`,
+        ...(__PEV_TEST_HOOKS__ && testState.unsanitized ? { unsanitized: true as const } : {}),
       },
       { key: request.lane, order: request.openId },
     );
