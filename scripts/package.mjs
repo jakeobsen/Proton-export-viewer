@@ -8,6 +8,11 @@
 //   mas-folderproof  Mac App Store flavor, sandboxed, the folder-access proof
 //                 (from out-proof/), with its own bundle ID. It shows the
 //                 system folder picker, so tests never launch it.
+//   mas-local     Mac App Store flavor, sandboxed, no test hooks       (from out/)
+//                 The build to run on one's own Mac outside the App Store:
+//                 its own bundle ID and app group, so its data never shares a
+//                 container with a test build, and no Downloads write access.
+//                 Tests never launch it.
 
 import { existsSync, readdirSync, rmSync, rmdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -19,6 +24,8 @@ export const APP_ID = 'com.example.pev';
 // The app group in the entitlements, APP_ID, is a prefix of this bundle ID, as
 // the Mac App Store build of Electron requires.
 export const FOLDER_PROOF_APP_ID = `${APP_ID}.folderproof2`;
+// The local build's bundle ID is also its own app group.
+export const LOCAL_APP_ID = `${APP_ID}.viewer`;
 export const PRODUCT_NAME = appName();
 
 export const FUSES = {
@@ -37,6 +44,12 @@ const FLAVORS = {
   'mas-selftest': { out: 'out-test', mas: true },
   test: { out: 'out-test', mas: false },
   'mas-folderproof': { out: 'out-proof', mas: true, appId: FOLDER_PROOF_APP_ID },
+  'mas-local': {
+    out: 'out',
+    mas: true,
+    appId: LOCAL_APP_ID,
+    entitlements: 'build/entitlements.mas-local.plist',
+  },
 };
 
 export function appPath(flavor) {
@@ -86,7 +99,10 @@ export async function packageFlavor(flavor) {
   signAdHoc(
     app,
     spec.mas
-      ? { app: 'build/entitlements.mas.plist', helper: 'build/entitlements.mas.inherit.plist' }
+      ? {
+          app: spec.entitlements ?? 'build/entitlements.mas.plist',
+          helper: 'build/entitlements.mas.inherit.plist',
+        }
       : null,
   );
   console.log(`package: ${flavor} -> ${app}`);

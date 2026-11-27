@@ -455,7 +455,7 @@ export async function install(ctx: AppContext): Promise<boolean> {
 
   const selfTest = process.argv.includes('--pev-selftest');
   if (selfTest) {
-    await runSelfTest(ctx, process.argv, windowEvents);
+    await runSelfTest(ctx, process.argv, windowEvents, api.queuePick);
     return true;
   }
   return false;

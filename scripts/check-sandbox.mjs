@@ -1,23 +1,37 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Sandboxed-build checks (no debugging port):
-// 1. in the sandboxed self-test build and in the MAS release build, every
-//    nested bundle and every Mach-O file is listed; the app's executable and
-//    every other executable carry exactly the expected entitlements, and no
-//    login-item helper is shipped;
+// 1. in the sandboxed self-test build, the MAS release build and the local
+//    build, every nested bundle and every Mach-O file is listed; the app's
+//    executable and every other executable carry exactly the entitlements
+//    expected for that flavor, and no login-item helper is shipped;
 // 2. the in-app self-test passes in the sandbox: core and its worker answer,
 //    the protocols serve, and both a write outside the container and a
 //    loopback connect fail with a sandbox denial;
 // 3. positive control: the same self-test unsandboxed makes the write and the
-//    connect succeed, and the listener sees the connection.
+//    connect succeed, and the listener sees the connection;
+// 4. smoke: the sandboxed self-test opens a small generated export from its
+//    container through the shell and the production source, opens messages,
+//    switches to plain text, clicks a link, opens a message whose file is
+//    missing and forgets the export. Nothing is logged as an error, and the
+//    export is removed afterwards.
 
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { createRequire } from 'node:module';
 import { createConnection, createServer } from 'node:net';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { APP_ID, PRODUCT_NAME, appPath } from './package.mjs';
+import { dirname, join, resolve } from 'node:path';
+import { RUN_FOLDER, accountAddress, entries } from '../tools/gen-export/generator.mjs';
+import { APP_ID, LOCAL_APP_ID, PRODUCT_NAME, appPath } from './package.mjs';
 import { bundleContents } from './bundle-contents.mjs';
 import { removeOutputDir, testOutputOf } from './test-output.mjs';
 
@@ -33,12 +47,75 @@ export const APP_ENTITLEMENTS = {
   'com.apple.security.files.downloads.read-write': true,
   'com.apple.security.files.user-selected.read-only': true,
 };
+// The local build: its own app group, and no Downloads write access.
+export const LOCAL_APP_ENTITLEMENTS = {
+  'com.apple.security.app-sandbox': true,
+  'com.apple.security.application-groups': [LOCAL_APP_ID],
+  'com.apple.security.files.bookmarks.app-scope': true,
+  'com.apple.security.files.user-selected.read-only': true,
+};
+const APP_ENTITLEMENTS_OF = {
+  'mas-selftest': APP_ENTITLEMENTS,
+  'mas-release': APP_ENTITLEMENTS,
+  'mas-local': LOCAL_APP_ENTITLEMENTS,
+};
 export const HELPER_ENTITLEMENTS = {
   'com.apple.security.app-sandbox': true,
   'com.apple.security.inherit': true,
 };
 
 const DENIED = new Set(['EPERM', 'EACCES']);
+
+/** The smoke's export: at most this many messages, and at most 20 MB. */
+const SMOKE_MESSAGES = 20;
+const SMOKE_MAX_BYTES = 20 * 1024 * 1024;
+
+/**
+ * Writes a small generated export under `root`, in the export tool's layout,
+ * with the first message's .eml left out. Returns the message count and size.
+ */
+function writeSmokeExport(root) {
+  const run = join(root, accountAddress('small', 7), RUN_FOLDER);
+  mkdirSync(run, { recursive: true });
+  const ids = new Set();
+  let bytes = 0;
+  for (const entry of entries('small', { seed: 7 })) {
+    if ('meta' in entry || entry.type !== 'file' || !entry.data) continue;
+    const name = entry.path.slice(entry.path.lastIndexOf('/') + 1);
+    const id = name === 'labels.json' ? null : name.replace(/\.(?:metadata\.json|eml)$/, '');
+    if (id !== null && !ids.has(id)) {
+      if (ids.size >= SMOKE_MESSAGES) continue;
+      ids.add(id);
+    }
+    mkdirSync(dirname(join(run, name)), { recursive: true });
+    writeFileSync(join(run, name), entry.data);
+    bytes += entry.data.length;
+  }
+  const missing = [...ids].sort()[0];
+  rmSync(join(run, `${missing}.eml`));
+  return { messages: ids.size, bytes };
+}
+
+/** The size of each log file, to read only what a run appends. */
+function logSizes(dir) {
+  if (!existsSync(dir)) return new Map();
+  return new Map(readdirSync(dir).map((f) => [f, statSync(join(dir, f)).size]));
+}
+
+/** The log lines appended since `before`. */
+function newLogLines(dir, before) {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((f) => f.endsWith('.jsonl'))
+    .flatMap((f) =>
+      readFileSync(join(dir, f))
+        .subarray(before.get(f) ?? 0)
+        .toString('utf8')
+        .split('\n')
+        .filter((l) => l.trim() !== '')
+        .map((l) => JSON.parse(l)),
+    );
+}
 const failures = [];
 const check = (ok, message) => {
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${message}`);
@@ -92,12 +169,19 @@ function checkEntitlements(flavor) {
   check(executables.length >= 2, `${flavor}: ${executables.length} executables found`);
 
   for (const executable of executables) {
-    const expected = executable === mainExecutable ? APP_ENTITLEMENTS : HELPER_ENTITLEMENTS;
+    const expected =
+      executable === mainExecutable ? APP_ENTITLEMENTS_OF[flavor] : HELPER_ENTITLEMENTS;
     const actual = entitlementsOf(join(app, executable));
     check(
       canonical(actual) === canonical(expected),
       `${flavor}: ${executable} entitlements ${canonical(actual)}`,
     );
+    if (flavor === 'mas-local') {
+      check(
+        !('com.apple.security.files.downloads.read-write' in actual),
+        `${flavor}: ${executable} has no Downloads write access`,
+      );
+    }
   }
 }
 
@@ -165,6 +249,7 @@ function noWindowEvents(result) {
 async function main() {
   checkEntitlements('mas-selftest');
   checkEntitlements('mas-release');
+  checkEntitlements('mas-local');
 
   const sandboxOutput = join(testOutputOf(), 'sandbox');
   const outDir = join(sandboxOutput, `${Date.now()}`);
@@ -183,15 +268,9 @@ async function main() {
     `--pev-selftest-nonce=${sandboxNonce}`,
   ]);
   const container = join(homedir(), 'Library', 'Containers', APP_ID);
-  const sandboxResultFile = join(
-    container,
-    'Data',
-    'Library',
-    'Application Support',
-    PRODUCT_NAME,
-    `selftest-result-${sandboxNonce}.json`,
-  );
-  const sandboxed = readResult(sandboxResultFile, sandboxNonce);
+  const appData = join(container, 'Data', 'Library', 'Application Support', PRODUCT_NAME);
+  const resultIn = (nonce) => join(appData, `selftest-result-${nonce}.json`);
+  const sandboxed = readResult(resultIn(sandboxNonce), sandboxNonce);
   check(
     !sandboxRun.timedOut && sandboxRun.code === 0,
     `sandboxed self-test exited 0 (${JSON.stringify(sandboxRun)})`,
@@ -228,6 +307,65 @@ async function main() {
   }
   check(!existsSync(sandboxTarget), 'sandboxed: the write target does not exist');
   check(listener.count() === 0, `sandboxed: the listener saw ${listener.count()} connections`);
+
+  // Smoke: a generated export in the container, opened as a user would.
+  const smokeNonce = randomBytes(8).toString('hex');
+  const smokeRoot = join(container, 'Data', `smoke-export-${smokeNonce}`);
+  const written = writeSmokeExport(smokeRoot);
+  // The export goes afterwards, whatever happened.
+  try {
+    check(written.bytes <= SMOKE_MAX_BYTES, `smoke: the export is ${written.bytes} bytes`);
+    const logsDir = join(appData, 'logs');
+    const logsBefore = logSizes(logsDir);
+    const smokeRun = await run(
+      join(app, 'Contents', 'MacOS', PRODUCT_NAME),
+      ['--pev-selftest', `--pev-selftest-nonce=${smokeNonce}`, `--pev-selftest-smoke=${smokeRoot}`],
+      120_000,
+    );
+    const smokeResult = readResult(resultIn(smokeNonce), smokeNonce);
+    const smoke = smokeResult?.smoke ?? null;
+    check(
+      !smokeRun.timedOut && smokeRun.code === 0,
+      `smoke: self-test exited 0 (${JSON.stringify(smokeRun)})`,
+    );
+    check(smoke !== null && smoke.error === null, `smoke: ran to the end (${smoke?.error})`);
+    if (smoke) {
+      check(smoke.chosen === 'opened', `smoke: the export opened (${smoke.chosen})`);
+      check(
+        smoke.totals?.pairs === written.messages && smoke.totals?.messages === written.messages,
+        `smoke: phase 1 indexed ${written.messages} messages (${JSON.stringify(smoke.totals)})`,
+      );
+      check(
+        smoke.newest?.body === 200,
+        `smoke: the newest message opens (${JSON.stringify(smoke.newest)})`,
+      );
+      check(
+        smoke.plain?.format === 'plain' && smoke.plain.body === 200 && smoke.plain.oldBody === 404,
+        `smoke: plain text opens with a new token (${JSON.stringify(smoke.plain)})`,
+      );
+      check(
+        smoke.link?.dialogs === 1,
+        `smoke: a link click adds one dialog record (${JSON.stringify(smoke.link)})`,
+      );
+      check(
+        smoke.missing?.code === 'eml_missing' && smoke.missing.text === 'Message file missing',
+        `smoke: the missing message file shows its state (${JSON.stringify(smoke.missing)})`,
+      );
+      check(smoke.forgotten === 'forgotten', `smoke: the export is forgotten (${smoke.forgotten})`);
+      check(
+        smokeResult.shownWindows === 0 && noWindowEvents(smokeResult),
+        'smoke: no window was shown or focused',
+      );
+    }
+    const errors = newLogLines(logsDir, logsBefore).filter((l) => l.level === 'error');
+    check(
+      errors.length === 0,
+      `smoke: nothing logged as an error (${errors.map((e) => e.code).join(', ') || 'none'})`,
+    );
+  } finally {
+    rmSync(smokeRoot, { recursive: true, force: true });
+  }
+  check(!existsSync(smokeRoot), 'smoke: the export is removed');
 
   // Positive control: the same self-test, unsandboxed, from the e2e build.
   const userData = join(outDir, 'control-user-data');

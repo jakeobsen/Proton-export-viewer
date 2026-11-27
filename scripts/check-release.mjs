@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Release-build checks, on the standard release build and the Mac App Store
-// release build (both without test hooks, so no debugging port):
+// Release-build checks, on the standard release build, the Mac App Store
+// release build and the local build (all without test hooks, so no debugging
+// port):
 // 1. the fuses read back from the packaged binary;
 // 2. the packaged main bundle carries the production shell CSP literal and no
 //    development CSP (the e2e suite checks that this same code serves it);
-// 3. no test hook, probe, test page or local path is in the package.
+// 3. no test hook, probe, test page or local path is in the package; the test
+//    build, as a control, holds the self-test's own strings.
 
+import { readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { FuseState, FuseV1Options, getCurrentFuseWire } from '@electron/fuses';
@@ -27,6 +30,9 @@ const EXPECTED_FUSES = {
   GrantFileProtocolExtraPrivileges: FuseState.DISABLE,
 };
 
+// Strings only the self-test's smoke has; the test build must hold them (a control).
+const SELFTEST_ONLY = ['debugger.attach', 'Page.createIsolatedWorld'];
+
 // Strings that only exist in test hooks, test pages, test stubs or the dev server setup.
 const FORBIDDEN_CONTENT = [
   'pev-testhooks-present',
@@ -44,6 +50,8 @@ const FORBIDDEN_CONTENT = [
   'sessionPreconnects',
   'readByName',
   'openGapMs',
+  // The self-test's smoke drives the body frame through the DevTools protocol.
+  ...SELFTEST_ONLY,
   'better-sqlite3',
   'ws://localhost',
   "style-src 'self' 'unsafe-inline'",
@@ -113,7 +121,17 @@ async function checkFlavor(flavor) {
   check(true, `${flavor}: scanned ${files.length} packaged files for test-only content`);
 }
 
-for (const flavor of ['release', 'mas-release']) await checkFlavor(flavor);
+for (const flavor of ['release', 'mas-release', 'mas-local']) await checkFlavor(flavor);
+
+// Control: the test build holds the self-test's strings, so the scan above
+// would find them if they ever reached a release package.
+const testMain = readdirSync(join('out-test', 'main'), { recursive: true })
+  .filter((f) => String(f).endsWith('.js'))
+  .map((f) => readFileSync(join('out-test', 'main', String(f)), 'utf8'))
+  .join('\n');
+for (const s of SELFTEST_ONLY) {
+  check(testMain.includes(s), `control: the test build holds ${s}`);
+}
 
 if (failures.length > 0) {
   console.error(`check-release: ${failures.length} failure(s)`);
