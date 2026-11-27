@@ -131,6 +131,7 @@ async function start(): Promise<void> {
     shellCsp: SHELL_CSP,
   };
   core.onEvent = (event) => sources.handleCoreEvent(event);
+  core.onExit = (source) => sources.coreExited(source);
   core.exports = () => sources.exportRoots();
   app.on('will-quit', () => sources.close());
   registerIpc(ctx);

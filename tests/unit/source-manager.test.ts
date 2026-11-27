@@ -81,6 +81,8 @@ class FakeCore implements CoreControl {
   /** Called when core is asked to reset or stopped, to see what was on disk then. */
   onReset: (() => void) | null = null;
   onStop: (() => void) | null = null;
+  /** Called once a core has started. */
+  onStarted: (() => void) | null = null;
 
   setSource(source: CoreSource | null) {
     this.next = source && { ...source };
@@ -91,6 +93,7 @@ class FakeCore implements CoreControl {
       this.running = true;
       this.current = this.next;
       this.started.push(this.current);
+      this.onStarted?.();
     }
     return Promise.resolve();
   }
@@ -108,6 +111,14 @@ class FakeCore implements CoreControl {
     if (stray) await this.stop();
     await this.start();
     return stray;
+  }
+
+  /** Core ends on its own; returns the source it had. */
+  crash(): CoreSource | null {
+    const had = this.current;
+    this.running = false;
+    this.current = null;
+    return had;
   }
 
   /** Calls made while no core was up for their stamp. */
@@ -693,6 +704,187 @@ describe('the logs', () => {
     const all = t.lines.join('\n');
     for (const secret of ['secret.account', root, 'mail_2025', 'bm1']) {
       expect(all).not.toContain(secret);
+    }
+  });
+});
+
+describe('core exiting on its own', () => {
+  const restarts = (t: ReturnType<typeof setup>) =>
+    t.lines.filter((l) => l.includes('"core.restart"')).length;
+  /** Core ends on its own; waits until the restart has opened the index again. */
+  const crashAndRestart = async (t: ReturnType<typeof setup>) => {
+    const next = t.manager.stamp()!.generation + 1;
+    t.manager.coreExited(t.core.crash());
+    await indexOpened(t, next);
+  };
+
+  it('opens the source again under a new generation, with a new core and its index', async () => {
+    const t = setup('mgr-restart');
+    t.picks.push({ path: tool('mgr-restart-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    const stamp = t.manager.stamp()!;
+    const dbUuid = t.manager.registry.source(stamp.sourceKey)!.dbUuid;
+    const started = t.core.started.length;
+    t.order.length = 0;
+
+    await crashAndRestart(t);
+    const now = t.manager.stamp()!;
+    expect(now).toEqual({ sourceKey: stamp.sourceKey, generation: stamp.generation + 1 });
+    // The core was gone already, so nothing was stopped.
+    expect(steps(t.order)).toEqual(['scope.keep', 'core.spawn']);
+    expect(t.core.started.length).toBe(started + 1);
+    expect(t.core.started.at(-1)).toMatchObject(now);
+    // The same index is opened again, with its checks.
+    expect(t.core.indexCalls.at(-1)).toEqual({ stamp: now, dbUuid, rebuild: false });
+    expect(restarts(t)).toBe(1);
+    expect(t.manager.view().active).toMatchObject({ status: 'online', closed: false });
+  });
+
+  it('restarts it at most 3 times a minute; then the export stays closed until it is opened again', async () => {
+    const t = setup('mgr-restart-limit');
+    t.picks.push({ path: tool('mgr-restart-limit-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    for (let i = 0; i < 3; i += 1) {
+      await crashAndRestart(t);
+    }
+    expect(restarts(t)).toBe(3);
+    const started = t.core.started.length;
+    const generation = t.generation();
+    const notified = t.notified();
+
+    t.manager.coreExited(t.core.crash());
+    await vi.waitFor(
+      () => expect(t.lines.filter((l) => l.includes('"core.restart_gave_up"'))).toHaveLength(1),
+      WAIT,
+    );
+    expect(restarts(t)).toBe(3);
+    expect(t.core.started.length).toBe(started);
+    expect(t.generation()).toBe(generation);
+    expect(t.manager.view().active?.closed).toBe(true);
+    expect(t.notified()).toBeGreaterThan(notified);
+
+    // Opening it again clears the state and the count.
+    const key = t.manager.stamp()!.sourceKey;
+    expect(await t.manager.openRecent(key, t.generation())).toBe('opened');
+    expect(t.manager.view().active?.closed).toBe(false);
+    await indexOpened(t, t.manager.stamp()!.generation);
+    await crashAndRestart(t);
+    expect(restarts(t)).toBe(4);
+    expect(t.manager.view().active?.closed).toBe(false);
+  });
+
+  it('is not restarted for an earlier generation, or once a switch, Forget or Reset began', async () => {
+    const t = setup('mgr-restart-moved');
+    const one = tool('mgr-restart-moved-1');
+    const two = runAt(join(realpathSync(testDir('mgr-restart-moved-2')), 'mail_20250701_090000'), [
+      'x',
+    ]);
+    t.picks.push({ path: one, bookmark: 'bm1' }, { path: two, bookmark: 'bm2' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    const stamp = t.manager.stamp()!;
+    t.manager.coreExited({ ...stamp, generation: stamp.generation - 1 });
+    // An exit reported while a switch is under way, for the source it leaves.
+    t.hooks.onScopeStart = () => t.manager.coreExited(stamp);
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('opened');
+    t.hooks.onScopeStart = undefined;
+    await indexOpened(t, t.manager.stamp()!.generation);
+    const after = t.manager.stamp()!;
+    expect(after.sourceKey).not.toBe(stamp.sourceKey);
+
+    // Forget of the open export, then an exit of its core.
+    const forgetting = t.manager.forget(after.sourceKey, t.generation());
+    t.manager.coreExited(after);
+    await forgetting;
+    await t.manager.reset();
+    t.manager.coreExited(after);
+    await settle();
+    expect(restarts(t)).toBe(0);
+  });
+
+  it('is not restarted once a switch queued before it has run', async () => {
+    const t = setup('mgr-restart-queued');
+    const one = tool('mgr-restart-queued-1');
+    const two = runAt(join(realpathSync(testDir('mgr-restart-queued-2')), 'mail_20250701_090000'), [
+      'x',
+    ]);
+    t.picks.push({ path: one, bookmark: 'bm1' }, { path: two, bookmark: 'bm2' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    const stamp = t.manager.stamp()!;
+    // The switch is queued first; the exit of the old core arrives while it waits.
+    const switching = t.manager.chooseFolder(null, t.generation());
+    t.manager.coreExited(stamp);
+    expect(await switching).toBe('opened');
+    await indexOpened(t, t.manager.stamp()!.generation);
+    const after = t.manager.stamp()!;
+    expect(after.sourceKey).not.toBe(stamp.sourceKey);
+    expect(restarts(t)).toBe(0);
+  });
+
+  it('starts the count afresh when the same run is opened from another place', async () => {
+    const t = setup('mgr-restart-other');
+    const root = tool('mgr-restart-other-tool');
+    t.picks.push({ path: root, bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    for (let i = 0; i < 3; i += 1) {
+      await crashAndRestart(t);
+    }
+    const copy = realpathSync(testDir('mgr-restart-other-copy'));
+    cpSync(join(root, 'secret.account@example.com'), join(copy, 'secret.account@example.com'), {
+      recursive: true,
+    });
+    t.picks.push({ path: copy, bookmark: 'bm2' });
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('opened');
+    await indexOpened(t, t.manager.stamp()!.generation);
+    await crashAndRestart(t);
+    expect(restarts(t)).toBe(4);
+    expect(t.manager.view().active?.closed).toBe(false);
+  });
+
+  it('is not started again by the scan or the index open when it ended right after its restart', async () => {
+    const t = setup('mgr-restart-early');
+    t.picks.push({ path: tool('mgr-restart-early-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    const started = t.core.started.length;
+    t.core.calls.length = 0;
+    t.core.onStarted = () => {
+      t.core.onStarted = null;
+      t.core.crash();
+    };
+    t.manager.coreExited(t.core.crash());
+    // The restart started core, and the scan after it was refused.
+    await vi.waitFor(() => {
+      expect(restarts(t)).toBe(1);
+      expect(t.core.refused).toBeGreaterThan(0);
+    }, WAIT);
+    // Nothing that came after it starts core again.
+    await settle();
+    expect(restarts(t)).toBe(1);
+    expect(t.core.started.length).toBe(started + 1);
+    expect(t.core.calls).toEqual([]);
+    expect(t.core.refused).toBeGreaterThan(0);
+  });
+
+  it('counts only the restarts of the last minute', async () => {
+    const t = setup('mgr-restart-window');
+    t.picks.push({ path: tool('mgr-restart-window-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    let now = 1_000_000;
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+    try {
+      for (let i = 0; i < 3; i += 1) await crashAndRestart(t);
+      now += 60_001;
+      await crashAndRestart(t);
+      expect(restarts(t)).toBe(4);
+      expect(t.manager.view().active?.closed).toBe(false);
+    } finally {
+      clock.mockRestore();
     }
   });
 });

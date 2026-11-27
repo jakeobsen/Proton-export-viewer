@@ -11,6 +11,8 @@ export const LOG_CODES = [
   'core.ready',
   'core.exit',
   'core.stop_timeout',
+  'core.restart',
+  'core.restart_gave_up',
   'core.uncaught',
   'core.rejection',
   'core.unavailable',

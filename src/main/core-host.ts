@@ -37,6 +37,17 @@ export interface CoreHostOptions {
   log: Logger;
   /** Tests only: a shorter wait for a core that doesn't exit. */
   stopTimeoutMs?: number;
+  /** Tests only: ends a process for good once its kill went unanswered. */
+  killProcess?: (pid: number) => void;
+}
+
+/** Ends a process for good. It may be gone already. */
+function killHard(pid: number): void {
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    // Already gone.
+  }
 }
 
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
@@ -57,8 +68,16 @@ export class CoreHost {
   private childSource: CoreSource | null = null;
   /** The running core has said it is ready. */
   private childReady = false;
+  /** The cores being stopped on purpose: their exit is planned. */
+  private readonly stopping = new WeakSet<UtilityProcess>();
   /** Receives what core reports without being asked. */
   onEvent: ((event: CoreEvent) => void) | null = null;
+  /**
+   * Told when the current core exits without being stopped, with the source
+   * it was started with. A core already given up on, or being stopped, is
+   * never reported.
+   */
+  onExit: ((source: CoreSource | null) => void) | null = null;
   /** The run folders of the exports the app knows, for the next start of core. */
   exports: () => string[] = () => [];
   /** Builds with test hooks only: what the next start of core gets for its tests. */
@@ -150,7 +169,9 @@ export class CoreHost {
       });
       child.once('exit', (code) => {
         this.options.log.warn('core.exit', { exitCode: code });
+        const unplanned = this.child === child && !this.stopping.has(child);
         this.release(child);
+        if (unplanned) this.onExit?.(source);
       });
     });
     // Whoever started core gets the failure; nothing else has to wait for it.
@@ -213,29 +234,35 @@ export class CoreHost {
   /**
    * Ends core; resolves once it has exited. A core that hasn't spawned yet
    * can't be killed, so it is killed as soon as it has. A core that doesn't
-   * exit in time is given up on, so a stop always ends. The next request
-   * starts a new one.
+   * exit in time is given up on, so a stop always ends: one that spawned is
+   * ended for good, and one that spawns later is still killed. The next
+   * request starts a new one.
    */
   stop(): Promise<void> {
     const child = this.child;
     if (!child) return Promise.resolve();
+    this.stopping.add(child);
     const ms = this.options.stopTimeoutMs ?? STOP_TIMEOUT_MS;
     return new Promise<void>((resolve) => {
       const kill = () => {
         child.kill();
       };
-      const done = () => {
+      const exited = () => {
         clearTimeout(timer);
-        child.removeListener('exit', done);
         child.removeListener('spawn', kill);
         this.release(child);
         resolve();
       };
       const timer = setTimeout(() => {
         this.options.log.warn('core.stop_timeout', { ms });
-        done();
+        child.removeListener('exit', exited);
+        // One that spawns later is no longer the current core: the spawn handler kills it.
+        child.removeListener('spawn', kill);
+        if (child.pid !== undefined) (this.options.killProcess ?? killHard)(child.pid);
+        this.release(child);
+        resolve();
       }, ms);
-      child.once('exit', done);
+      child.once('exit', exited);
       if (!child.kill()) child.once('spawn', kill);
     });
   }
