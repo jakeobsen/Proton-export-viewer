@@ -13,7 +13,7 @@ test('a body with <style>, a style attribute and a remote image placeholder rend
   const { frame } = await pev.showInPane(1, 'html');
 
   const styles = await frame.evaluate(() => {
-    const title = document.getElementById('title') as HTMLElement;
+    const title = document.getElementById('heading') as HTMLElement;
     const inline = document.getElementById('inline') as HTMLElement;
     return {
       titleColor: getComputedStyle(title).color,

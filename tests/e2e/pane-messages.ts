@@ -25,12 +25,13 @@ function htmlMessage(subject: string, body: string[]): string {
 /**
  * A body the sanitizer keeps: a style sheet, a style attribute, a remote image
  * (shown as the view's placeholder `r1`) and a link (the view's link `l1`).
+ * Its ids are none the sanitizer drops as DOM clobbering (such as `title`).
  */
 export const SAMPLE = htmlMessage('Sample', [
   '<html><head><style>',
-  '.title { color: rgb(18, 52, 86); font-weight: 700; }',
+  '.heading { color: rgb(18, 52, 86); font-weight: 700; }',
   '</style></head><body>',
-  '<p class="title" id="title">Sample message</p>',
+  '<p class="heading" id="heading">Sample message</p>',
   '<p id="inline" style="color: rgb(120, 30, 60); letter-spacing: 2px">Sample text.</p>',
   '<img id="remote" alt="" width="16" height="16" src="https://images.example.org/a.png">',
   '<p><a id="link" href="https://example.com/">example.com</a></p>',

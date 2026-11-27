@@ -245,5 +245,5 @@ test('the authorized reload of the current token works @pane', async ({ pev }) =
   await pev.shell('setFrameSrc', [url]);
   await expect.poll(() => bodyRequests(pev, url)).toBe(2);
   const frame = await pev.paneFrame(url);
-  expect(await frame.locator('#title').textContent()).toBe('Sample message');
+  expect(await frame.locator('#heading').textContent()).toBe('Sample message');
 });
