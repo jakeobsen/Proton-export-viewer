@@ -39,6 +39,8 @@ export type RejectCode =
   | 'unknown_run'
   | 'no_source'
   | 'not_found'
+  | 'eml_missing'
+  | 'offline'
   | 'unknown_dialog';
 
 export type Rejected = { ok: false; code: RejectCode };

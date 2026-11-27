@@ -4,7 +4,8 @@
 // images, size limits and the fallback.
 
 import { useState } from 'react';
-import { BODY_IFRAME_SANDBOX } from '../shared/constants';
+import type { RejectCode } from '../shared/api';
+import { BODY_IFRAME_REFERRER, BODY_IFRAME_SANDBOX } from '../shared/constants';
 import type { MessageHeaders } from '../shared/reader-protocol';
 import {
   avatarColor,
@@ -169,10 +170,39 @@ function Lines({ rowid, view }: { rowid: number; view: ReaderView }) {
   );
 }
 
+/** What the pane says when main refused the open; a newer open owns the pane otherwise. */
+export function refusedText(code: RejectCode): string | null {
+  switch (code) {
+    case 'superseded':
+    case 'stale_generation':
+      return null;
+    case 'eml_missing':
+      return 'Message file missing';
+    case 'offline':
+      return 'Export not found.';
+    case 'not_found':
+      return 'Message no longer in the export';
+    default:
+      return "Couldn't render this message";
+  }
+}
+
 export function ReaderPane() {
   const reader = useReaderState();
   const { rowid, view, pending } = reader;
   if (rowid === null) return null;
+  if (reader.refused !== null) {
+    const text = refusedText(reader.refused);
+    return (
+      <div className="rp">
+        {text !== null && (
+          <div className="rp-line rp-state" role="status">
+            <b>{text}</b>
+          </div>
+        )}
+      </div>
+    );
+  }
   const shown = view?.format ?? null;
   // HTML was asked for and plain text came back: this open can't show the HTML
   // ("Show HTML anyway" is offered when its size alone kept it back).
@@ -225,10 +255,10 @@ export function ReaderPane() {
         {view && (
           <iframe
             key={view.url}
-            className="body-frame rp-frame"
+            className="rp-frame"
             title="Message body"
             sandbox={BODY_IFRAME_SANDBOX}
-            referrerPolicy="no-referrer"
+            referrerPolicy={BODY_IFRAME_REFERRER}
             src={view.url}
           />
         )}

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect } from 'react';
-import { BODY_IFRAME_SANDBOX } from '../shared/constants';
 import type { IndexCondition } from '../shared/index-types';
 import { indexChanged, syncMailbox } from './mailbox-state';
 import { ConversationList, Sidebar } from './Mailbox';
@@ -34,13 +33,9 @@ export function App() {
   useEffect(syncMailbox, [state.sources, state.generation]);
 
   // The welcome screen shows while no export is open or being opened again,
-  // unless a body is open.
+  // unless a message is open.
   const welcome =
-    state.sources !== null &&
-    !state.sources.restoring &&
-    active === null &&
-    state.bodyUrl === null &&
-    reader.rowid === null;
+    state.sources !== null && !state.sources.restoring && active === null && reader.rowid === null;
   const banner = active?.index ? INDEX_BANNERS[active.index] : undefined;
 
   return (
@@ -86,18 +81,7 @@ export function App() {
           {active && <Sidebar active={active} busy={state.busy} />}
           {active && <ConversationList />}
           <section className="reader" aria-label="Conversation">
-            {reader.rowid !== null ? (
-              <ReaderPane />
-            ) : state.bodyUrl ? (
-              <iframe
-                key={state.frameKey}
-                className="body-frame"
-                title="Message body"
-                sandbox={BODY_IFRAME_SANDBOX}
-                referrerPolicy="no-referrer"
-                src={state.bodyUrl}
-              />
-            ) : null}
+            <ReaderPane />
           </section>
         </main>
       )}

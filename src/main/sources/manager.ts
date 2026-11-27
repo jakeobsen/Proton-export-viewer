@@ -207,6 +207,11 @@ export class SourceManager {
       : null;
   }
 
+  /** True while the open source's run is unavailable: its messages can't be opened. */
+  isOffline(): boolean {
+    return this.active !== null && !this.active.online;
+  }
+
   /** The open source's last scan, when one finished for its current stamp. */
   scanSummary(): ScanSummary | null {
     return this.active?.scan ?? null;

@@ -31,6 +31,7 @@ import { CoreUnavailableError } from './core-host';
 import type { AppContext, AppWindow } from './context';
 import { DIALOG_ID_RE } from './link-dialog';
 import { sameFrame } from './navigation';
+import { OPEN_GAP_MS, OpenPacer } from './open-pacer';
 import { PLACEHOLDER } from './placeholder';
 import { bodyUrl } from './views';
 
@@ -211,6 +212,9 @@ export function registerIpc(ctx: AppContext): void {
     return { ok: true, openId, url: bodyUrl(token) };
   });
 
+  const openPacer = new OpenPacer<AppWindow>(() =>
+    __PEV_TEST_HOOKS__ ? (ctx.openGapMs ?? OPEN_GAP_MS) : OPEN_GAP_MS,
+  );
   guarded<MessageOpenResult>(IPC.open, async (appWin, raw) => {
     const args = MessageOpenArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
@@ -220,6 +224,30 @@ export function registerIpc(ctx: AppContext): void {
     const { openId, token, revoked } = appWin.views.accept();
     if (revoked > 0) {
       ctx.log.info('view.revoked', { reason: 'replaced', count: revoked, windowId: appWin.id });
+    }
+    // An export that isn't there can't be read: nothing goes to core.
+    if (ctx.sources.isOffline()) {
+      appWin.views.abandon(openId);
+      return reject('offline', appWin);
+    }
+    // The body frame's opens are spaced out, and a newer open takes the place
+    // of one still waiting, so fast selection can't outrun the frame.
+    if (!(await openPacer.turn(appWin))) {
+      appWin.views.abandon(openId);
+      return reject('superseded', appWin);
+    }
+    if (appWin.win.isDestroyed()) return reject('superseded', appWin);
+    // While it waited, the source may have changed, a newer open come in, or
+    // the export gone: then nothing goes to core.
+    if (generation !== ctx.generation || openId !== appWin.views.latest) {
+      const reason = generation !== ctx.generation ? 'generation' : 'open_id';
+      appWin.views.abandon(openId);
+      ctx.log.info('open.stale', { reason, openId, windowId: appWin.id });
+      return reject(reason === 'generation' ? 'stale_generation' : 'superseded', appWin);
+    }
+    if (ctx.sources.isOffline()) {
+      appWin.views.abandon(openId);
+      return reject('offline', appWin);
     }
     let result;
     try {
@@ -238,7 +266,8 @@ export function registerIpc(ctx: AppContext): void {
     if (!result.ok) {
       appWin.views.abandon(openId);
       if (result.code !== 'reader_failed') {
-        const known = ['no_source', 'not_found', 'superseded'] as const;
+        if (result.code === 'unavailable') return reject('offline', appWin);
+        const known = ['no_source', 'not_found', 'eml_missing', 'superseded'] as const;
         const code = known.find((c) => c === result.code);
         return reject(code ?? 'invalid', appWin);
       }

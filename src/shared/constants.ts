@@ -35,6 +35,8 @@ export const BODY_CSP =
   "default-src 'none'; img-src mail-asset: data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors app:";
 
 export const BODY_IFRAME_SANDBOX = 'allow-popups';
+/** The body frame sends no referrer. */
+export const BODY_IFRAME_REFERRER = 'no-referrer';
 
 /** Link schemes that may be offered to the user for opening outside the app. */
 export const LINK_SCHEMES: readonly string[] = ['http:', 'https:', 'mailto:'];

@@ -32,7 +32,12 @@ markLoaded();
 export interface CoreTestDeps {
   log: LogWriter;
   roots: Array<[string, string]>;
-  state: { holding: boolean; held: Array<OpenRequest | ReadRequest>; unsanitized: boolean };
+  state: {
+    holding: boolean;
+    held: Array<OpenRequest | ReadRequest>;
+    fileOpens: number;
+    unsanitized: boolean;
+  };
   open: (request: OpenRequest | ReadRequest) => void;
   toWorker: (message: WorkerRequest) => void;
   reply: (result: CoreResult) => void;
@@ -125,6 +130,9 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
     }
     case 'held':
       ok(deps.state.held.length);
+      return;
+    case 'file-opens':
+      ok(deps.state.fileOpens);
       return;
     case 'release-writes': {
       const count = (request.payload as { count?: unknown } | undefined)?.count;

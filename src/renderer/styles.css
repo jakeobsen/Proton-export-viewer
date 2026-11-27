@@ -86,12 +86,6 @@ body,
   display: flex;
 }
 
-.body-frame {
-  flex: 1;
-  border: 0;
-  background: #ffffff;
-}
-
 .empty {
   margin: auto;
   color: var(--muted);

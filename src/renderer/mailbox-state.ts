@@ -7,7 +7,8 @@ import { useSyncExternalStore } from 'react';
 import type { IndexResult, IndexUpdate } from '../shared/api';
 import type { IndexProgress, Sidebar } from '../shared/index-types';
 import { INBOX, sidebarModel, type SidebarModel } from './folders';
-import { ListModel } from './list';
+import { ListModel, type Row } from './list';
+import { closeReader, getReaderState, openInReader } from './reader';
 import { getShellState, refreshGeneration } from './shell';
 
 export interface MailboxState {
@@ -148,4 +149,18 @@ export function showFolder(id: string): void {
   if (id === state.folder) return;
   update({ folder: id });
   list.reset(id);
+  // Nothing is selected in the new folder, so nothing is open.
+  closeReader();
+}
+
+/**
+ * Selects a conversation, by a click or a key, and opens its newest message,
+ * in whatever folder or label it is, in the reader. The message already open
+ * there stays as it is, unless its open was refused.
+ */
+export function selectRow(row: Row): void {
+  list.select(row);
+  const reader = getReaderState();
+  if (reader.rowid === row.newestRowid && reader.refused === null) return;
+  void openInReader(row.newestRowid);
 }

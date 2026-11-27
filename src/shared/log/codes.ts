@@ -55,6 +55,7 @@ export const LOG_CODES = [
   'scan.rejected',
   'writer.stale_dropped',
   'open.fallback',
+  'open.file_refused',
   'reader.timeout',
   'reader.limit',
   'reader.parse_failed',
@@ -181,6 +182,9 @@ export const REASONS = [
   'unknown_link',
   'unknown_dialog',
   'open_failed',
+  'eml_missing',
+  'offline',
+  'file',
 ] as const;
 
 /** The lists of a message whose entries can be cut to a limit when indexed. */

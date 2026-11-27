@@ -163,7 +163,7 @@ test("the sidebar and the list show the export's folders, labels and conversatio
     );
   }
 
-  // A selection shows on its row; the reader stays empty.
+  // A selection shows on its row, and the reader opens its newest message here.
   const second = index.rows[1]!.threadId;
   await press(pev.page, `.conv[data-thread="${second}"]`);
   await expect(pev.page.locator(`.conv[data-thread="${second}"]`)).toHaveAttribute(
@@ -171,7 +171,10 @@ test("the sidebar and the list show the export's folders, labels and conversatio
     'true',
   );
   await expect(pev.page.locator('.conv[aria-selected="true"]')).toHaveCount(1);
-  await expect(pev.page.locator('.reader iframe')).toHaveCount(0);
+  await expect
+    .poll(async () => (await pev.shell<{ rowid: number | null }>('reader')).rowid)
+    .toBe(index.rows[1]!.anchorRowid);
+  await expect(pev.page.locator('.reader iframe.rp-frame')).toHaveCount(1);
   // Done loading: no loading bar.
   await expect(pev.page.locator('.side-foot')).toHaveCount(0);
 });
@@ -330,6 +333,11 @@ test('a selected conversation that is merged away stays selected through its mes
     'aria-selected',
     'true',
   );
+  // The reader opens B1.
+  const opened = () => pev.shell<{ rowid: number | null; view: { url: string } | null }>('reader');
+  await expect.poll(async () => (await opened()).view?.url ?? null).not.toBeNull();
+  const shownB1 = await opened();
+  expect(shownB1.rowid).toBe(b.anchorRowid);
 
   // C1 arrives and merges B into A: B's conversation ID is gone.
   await pev.main('releaseWrites', null);
@@ -348,6 +356,9 @@ test('a selected conversation that is merged away stays selected through its mes
   expect((await ask<number>(pev, { op: 'resolve', rowid: b.anchorRowid }))!.answer).toBe(
     a.threadId,
   );
+  // The reader still shows B1, with the same view: the merge didn't close or reopen it.
+  expect(await opened()).toMatchObject({ rowid: b.anchorRowid, view: { url: shownB1.view!.url } });
+  expect((await pev.main<{ status: number }>('fetchIn', 1, shownB1.view!.url)).status).toBe(200);
 });
 
 test('the index channel checks its arguments and the generation', async ({ pev }) => {

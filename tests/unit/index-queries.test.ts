@@ -56,8 +56,36 @@ describe('conversation list pages', () => {
       db.stmt("SELECT rowid FROM messages WHERE proton_id = 'in'").get()?.rowid,
     );
     expect(inbox[1]!.anchorRowid).toBe(inRowid);
+    // Its newest message of all is the sent reply, outside the inbox.
+    const sentRowid = asNumber(
+      db.stmt("SELECT rowid FROM messages WHERE proton_id = 'sent'").get()?.rowid,
+    );
+    expect(inbox[1]!.newestRowid).toBe(sentRowid);
+    expect(inbox[0]!.newestRowid).toBe(inbox[0]!.anchorRowid);
     const sent = listPage(db, '7', null).rows;
     expect(sent.map((r) => r.time)).toEqual([50]);
+    expect(sent[0]!.newestRowid).toBe(sentRowid);
+    db.close();
+  });
+
+  it('takes the later rowid as the newest message of two at the same time', () => {
+    const { db, writer } = fresh();
+    ingest(
+      writer,
+      [
+        message('first', ['t1'], { time: 30, labelIds: ['0', '5'] }),
+        message('tied', ['t2', 't1'], { time: 30, labelIds: ['7', '5'] }),
+      ],
+      1,
+    );
+    const rowid = (id: string) =>
+      asNumber(db.stmt('SELECT rowid FROM messages WHERE proton_id = ?').get(id)?.rowid);
+    expect(rowid('tied')).toBeGreaterThan(rowid('first'));
+    const [inbox] = listPage(db, '0', null).rows;
+    expect(inbox!.anchorRowid).toBe(rowid('first'));
+    // Same time: the later rowid is the newest, as in a list sorted by (time, rowid).
+    expect(inbox!.newestRowid).toBe(rowid('tied'));
+    expect(listPage(db, '7', null).rows[0]!.newestRowid).toBe(rowid('tied'));
     db.close();
   });
 
