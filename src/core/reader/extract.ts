@@ -8,7 +8,7 @@
 // MAX_MIME_PARTS parts, or a header block over MAX_HEAD_BYTES) is read up to
 // there; any other read error fails the read.
 
-import { Readable, Writable } from 'node:stream';
+import { Readable, Writable, type Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { Splitter, type MimeNode } from '@zone-eu/mailsplit';
 import FlowedDecoder from '@zone-eu/mailsplit/lib/flowed-decoder.js';
@@ -153,7 +153,24 @@ export async function extractMessage(
     collected[part.kind].parts.push(await decodePart(part.node, part.chunks));
   };
 
-  const read = pipeline(input, splitter, async (source: AsyncIterable<SplitChunk>) => {
+  // Only the splitter's own limit error ends the read early. The input's
+  // errors and the reader's own reach the splitter too, as the pipeline
+  // passes them on, so each is told apart by where it was raised first.
+  const raisedElsewhere = new WeakSet<object>();
+  const noteElsewhere = (err: unknown) => {
+    if (typeof err === 'object' && err !== null) raisedElsewhere.add(err);
+  };
+  input.on('error', noteElsewhere);
+  let splitterLimit: unknown = null;
+  // The splitter's types name only its data events; it is a Transform stream.
+  (splitter as Transform).on('error', (err: unknown) => {
+    const code = (err as { code?: unknown } | null)?.code;
+    if (splitterLimit === null && code === 'EMAXLEN' && !raisedElsewhere.has(err as object)) {
+      splitterLimit = err;
+    }
+  });
+
+  async function consume(source: AsyncIterable<SplitChunk>): Promise<void> {
     for await (const chunk of source) {
       if (chunk.type === 'node') {
         await finish();
@@ -179,13 +196,21 @@ export async function extractMessage(
       into.cut = true;
     }
     await finish();
+  }
+
+  const read = pipeline(input, splitter, async (source: AsyncIterable<SplitChunk>) => {
+    try {
+      await consume(source);
+    } catch (err) {
+      noteElsewhere(err);
+      throw err;
+    }
   });
   let stopped = false;
   try {
     await read;
   } catch (err) {
-    // Only the parser's own limits end the read early; anything else fails it.
-    if ((err as { code?: unknown }).code !== 'EMAXLEN') throw err;
+    if (splitterLimit === null || err !== splitterLimit) throw err;
     stopped = true;
     await finish();
   }

@@ -208,4 +208,12 @@ describe('the part limit', () => {
     }
     await expect(extractMessage(Readable.from(broken()))).rejects.toThrow('read failed');
   });
+
+  it('fails on an input error that carries the limit code, as only the splitter ends a read early', async () => {
+    async function* broken() {
+      yield Buffer.from('Subject: Broken\r\nContent-Type: text/plain\r\n\r\nSome text');
+      throw Object.assign(new Error('input limit'), { code: 'EMAXLEN' });
+    }
+    await expect(extractMessage(Readable.from(broken()))).rejects.toThrow('input limit');
+  });
 });
