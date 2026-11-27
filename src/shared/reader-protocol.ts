@@ -93,6 +93,8 @@ export interface WorkerRender {
   mode: OpenMode;
   /** `mail-asset://v/<token>` of the view being opened. */
   assetBase: string;
+  /** Test builds only: serve the HTML body without the sanitizer and the CSS filter. */
+  unsanitized?: true;
 }
 
 /**

@@ -67,6 +67,7 @@ const testState = {
   held: [] as Array<OpenRequest | ReadRequest>,
   /** Message files opened for the reader. */
   fileOpens: 0,
+  unsanitized: false,
 };
 /** Test builds can hold phase 1's writes. */
 let writeGate: import('../testhooks/core').WriteGate | null = null;
@@ -169,6 +170,7 @@ async function readOpen(request: ReadRequest, stale: () => boolean, fail: ReadFa
         input: opened.input,
         mode: request.mode,
         assetBase: `${ASSET_SCHEME}://${VIEW_HOST}/${request.token}`,
+        ...(__PEV_TEST_HOOKS__ && testState.unsanitized ? { unsanitized: true as const } : {}),
       },
       { key: request.lane, order: request.openId },
     );
