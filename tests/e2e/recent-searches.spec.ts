@@ -260,8 +260,12 @@ test('held in core: a recording then Off, a recording made while off, and a reco
     await openIndexSettings(second.page);
     await expect(keepSwitch(second.page)).not.toBeChecked();
     await backToMail(second.page);
+    // The relaunch shares the first launch's logs: count from here.
+    const offDrops = logCount(second, 'recent.dropped', { reason: 'off' });
     await commit(second, 'zeta');
-    await expect.poll(() => logCount(second, 'recent.dropped', { reason: 'off' })).toBe(1);
+    await expect
+      .poll(() => logCount(second, 'recent.dropped', { reason: 'off' }))
+      .toBe(offDrops + 1);
   } finally {
     await second.close();
   }
@@ -460,10 +464,11 @@ test('two exports keep their own switch and entries; Off then On held, a switch 
   const b = chipExport(root, 96, 'mail_20250101_100000');
   const stampA = await openExport(pev, a);
   const file = await pev.main<string>('registryFile');
-  const runs = (await pev.main<SourcesView>('sourcesView')).active!.runs;
-  const runOf = (name: string) => runs.find((r) => r.runName === name)!.runId;
+  // Each activation gives the runs new IDs, so they are read before every switch.
   const switchTo = async (runName: string, pairs: number) => {
-    await pev.shell('switchRun', [runOf(runName)]);
+    const runs = (await pev.main<SourcesView>('sourcesView')).active!.runs;
+    const runId = runs.find((r) => r.runName === runName)!.runId;
+    expect(await pev.shell('switchRun', [runId])).toMatchObject({ ok: true });
     await expect
       .poll(async () => (await pev.main<SourcesView>('sourcesView')).active?.runName)
       .toBe(runName);
@@ -632,6 +637,8 @@ test('a stale export or generation is refused and changes nothing; Forget then a
   // Forget, then the export added again: a new record, with the switch on.
   await openIndexSettings(pev.page);
   await setKeep(pev.page, false);
+  // Settings stays open across a Forget and an open; back to the mail first.
+  await backToMail(pev.page);
   const key = (await pev.main<Stamp>('sourceStamp')).sourceKey;
   expect(await pev.shell('forgetExport', [key])).toMatchObject({ ok: true, outcome: 'forgotten' });
   expect(sourceRecord(file, key)).toBeUndefined();
