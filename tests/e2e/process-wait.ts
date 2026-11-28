@@ -47,12 +47,10 @@ function psState(pid: number): string | null {
  * its exit status waits to be collected.
  */
 export function processState(pid: number): ProcessState {
-  try {
-    process.kill(pid, 0);
-  } catch (err) {
-    // EPERM: it exists, but belongs to someone else.
-    return (err as NodeJS.ErrnoException).code === 'ESRCH' ? 'gone' : 'running';
-  }
+  const first = probe(pid);
+  if (first === 'ESRCH') return 'gone';
+  // EPERM: it exists, but belongs to someone else.
+  if (first !== null) return 'running';
   if (process.platform === 'linux') {
     let stat: string;
     try {
@@ -62,8 +60,27 @@ export function processState(pid: number): ProcessState {
     }
     return statState(stat) === 'Z' ? 'zombie' : 'running';
   }
-  // The process existed a moment ago: unless ps says it's a zombie, it runs.
-  return psState(pid)?.startsWith('Z') ? 'zombie' : 'running';
+  return stateFromPs(psState(pid), () => probe(pid));
+}
+
+/**
+ * The state of a process that existed a moment ago, from the state `ps` gives
+ * for it. No output means it went in between, but only if probing it again
+ * says there is no such process (ESRCH); otherwise it still runs.
+ */
+export function stateFromPs(stat: string | null, probeAgain: () => string | null): ProcessState {
+  if (stat === null) return probeAgain() === 'ESRCH' ? 'gone' : 'running';
+  return stat.startsWith('Z') ? 'zombie' : 'running';
+}
+
+/** The error `kill(pid, 0)` gives, such as ESRCH or EPERM, or null when there is none. */
+function probe(pid: number): string | null {
+  try {
+    process.kill(pid, 0);
+    return null;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code ?? 'unknown';
+  }
 }
 
 /** Whether `pid` has exited: gone, or a zombie. */

@@ -13,6 +13,7 @@ import {
   killIfSame,
   processState,
   startTimeOf,
+  stateFromPs,
   statStartTime,
   statState,
   waitGone,
@@ -134,5 +135,24 @@ describe('process-wait', () => {
     expect(statStartTime(stat)).toBe('22');
     expect(statState('no name here')).toBeNull();
     expect(statStartTime('1 (short) S 1')).toBeNull();
+  });
+
+  it('takes no ps output for a process gone in between, only if probing it again says ESRCH', () => {
+    let probes = 0;
+    const probe = (code: string | null) => () => {
+      probes += 1;
+      return code;
+    };
+    // The first probe found it, and it went before ps looked.
+    expect(stateFromPs(null, probe('ESRCH'))).toBe('gone');
+    // Still there, or there but someone else's.
+    expect(stateFromPs(null, probe(null))).toBe('running');
+    expect(stateFromPs(null, probe('EPERM'))).toBe('running');
+    expect(probes).toBe(3);
+    expect(stateFromPs('Z+', probe('ESRCH'))).toBe('zombie');
+    expect(stateFromPs('T', probe('ESRCH'))).toBe('running');
+    expect(stateFromPs('Ss', probe('ESRCH'))).toBe('running');
+    // Only missing output probes again.
+    expect(probes).toBe(3);
   });
 });

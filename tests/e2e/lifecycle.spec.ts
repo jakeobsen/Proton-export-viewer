@@ -358,8 +358,12 @@ test('close returns only once core has exited, and the index is free', async () 
     startTime = startTimeOf(pid);
     expect(startTime).not.toBeNull();
 
-    // A stopped process can't exit, so core outlives main for sure. It is
-    // let go only once main has exited, and a while after.
+    // A stopped process can't exit by itself. On Linux, main leaves core to
+    // exit on its own, so a stopped core outlives main for sure: it is let go
+    // only once main has exited, and a while after. That is where the close
+    // wait is proven. On macOS, Electron ends its utility process at quit,
+    // before main exits, even a stopped one. That is the platform's behaviour,
+    // checked as such, so a change to it fails here rather than passing.
     const mainExited = new Promise<void>((resolve) =>
       pev.app.process().once('exit', () => resolve()),
     );
@@ -370,15 +374,23 @@ test('close returns only once core has exited, and the index is free', async () 
       closedAt = Date.now();
     });
     await mainExited;
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    expect(isGone(pid)).toBe(false);
-    const contAt = Date.now();
-    process.kill(pid, 'SIGCONT');
-    stopped = false;
-    await closing;
+    if (process.platform === 'darwin') {
+      expect(isGone(pid)).toBe(true);
+      stopped = false;
+      await closing;
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      expect(isGone(pid)).toBe(false);
+      const contAt = Date.now();
+      process.kill(pid, 'SIGCONT');
+      stopped = false;
+      await closing;
+      // close came back after core was let go.
+      expect(closedAt).toBeGreaterThanOrEqual(contAt);
+    }
 
-    // close came back after core was let go, and core is gone.
-    expect(closedAt).toBeGreaterThanOrEqual(contAt);
+    // The close waited for core, which is gone.
+    expect(['gone', 'zombie']).toContain(pev.closeWait?.state);
     expect(isGone(pid)).toBe(true);
     // Nothing holds the index: it opens with no busy timeout, checkpoints and takes a write lock.
     const db = openDb(join(indexDir, `${stamp.sourceKey}.sqlite`));

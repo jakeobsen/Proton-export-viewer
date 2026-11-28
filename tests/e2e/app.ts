@@ -47,6 +47,8 @@ export interface LogLine {
 export class PevApp {
   readonly consoleMessages: Array<{ type: string; text: string }> = [];
   private closing: Promise<void> | null = null;
+  /** How the close's wait for core ended, once the close has finished. */
+  closeWait: { state: string; ms?: number } | null = null;
 
   constructor(
     readonly app: ElectronApplication,
@@ -161,11 +163,16 @@ export class PevApp {
     const startTime = typeof pid === 'number' ? startTimeOf(pid) : null;
     await this.app.close().catch(() => undefined);
     if (typeof pid !== 'number') {
-      recordCloseWait({ state: pid === null ? 'no_answer' : 'no_core' });
+      this.waited({ state: pid === null ? 'no_answer' : 'no_core' });
       return;
     }
     const waited = await waitGone(pid, { timeoutMs: CORE_EXIT_MS, startTime });
-    recordCloseWait(waited);
+    this.waited(waited);
+  }
+
+  private waited(entry: { state: string; ms?: number }): void {
+    this.closeWait = entry;
+    recordCloseWait(entry);
   }
 }
 
