@@ -976,7 +976,7 @@ describe("the reader's open of a message file", () => {
     const e = exportAt('lc-reader-search', 6, 24);
     const c = core({ root: e.run, indexDir: e.indexDir });
     expect(await c.openIndex(null)).toMatchObject({ ok: true });
-    await c.session.index!.settled();
+    await c.session.settled();
     const generation = c.stamp.generation;
     const file = (await eml(c, 1))!;
     const path = join(e.run, file.rel!);
