@@ -112,7 +112,12 @@ function seccompMode(pid: number): string | null {
   }
 }
 
+let themeUpdates = 0;
+
 export async function install(ctx: AppContext): Promise<boolean> {
+  nativeTheme.on('updated', () => {
+    themeUpdates += 1;
+  });
   // Only the folder-proof build uses the real folder picker; it is kept
   // before the stubs replace it.
   const realOpenDialog = dialog.showOpenDialog.bind(dialog) as OpenDialog;
@@ -509,6 +514,16 @@ export async function install(ctx: AppContext): Promise<boolean> {
     resetApp: () => ctx.sources.reset(null),
     /** The theme Electron gives every frame: `system`, `light` or `dark`. */
     themeSource: () => nativeTheme.themeSource,
+    /** The theme as main sees it, and how many times Electron said it changed. */
+    themeState: () => ({
+      themeSource: nativeTheme.themeSource,
+      dark: nativeTheme.shouldUseDarkColors,
+      updated: themeUpdates,
+    }),
+    /** Applies a web preference again in every app window, so each page's preferences are recomputed. */
+    refreshWebPrefs: () => {
+      for (const { win } of ctx.windows.values()) win.webContents.setImageAnimationPolicy('animate');
+    },
     /**
      * Sends the first app window a key as main does for one typed in the body
      * frame, whatever has the focus: the shell's own handling is tested apart
