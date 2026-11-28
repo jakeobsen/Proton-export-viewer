@@ -17,7 +17,7 @@ import {
   useMailbox,
   useSearch,
 } from './mailbox-state';
-import { Chips } from './Mailbox';
+import { Chips } from './Chips';
 import {
   RESULT_ROW_HEIGHT,
   conversationsText,

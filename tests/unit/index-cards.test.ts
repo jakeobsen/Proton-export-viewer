@@ -3,7 +3,7 @@
 // oldest first, around an anchor, read from one snapshot.
 
 import { describe, expect, it } from 'vitest';
-import { cardsWindow } from '../../src/core/index/queries';
+import { cardsWindow, rowDetails } from '../../src/core/index/queries';
 import { asNumber, type Db } from '../../src/core/index/sql';
 import {
   CARDS_AFTER,
@@ -130,6 +130,7 @@ describe('cards windows', () => {
       followed: null,
       subject: '',
       total: 0,
+      labelIds: [],
       start: 0,
       cards: [],
       anchor: null,
@@ -148,6 +149,23 @@ describe('cards windows', () => {
     expect(w.anchorFound).toBe(true);
     expect(w.cards[0]!.rowid).toBe(other);
     expect(w.cards.map((c) => c.rowid)).toEqual(expect.arrayContaining(ids));
+    db.close();
+  });
+
+  it('gives the conversation’s folder and label IDs, the same as its list row’s, also after a merge', () => {
+    const { db, writer, ids } = thread();
+    const threadId = threadOf(db, 't0');
+    const w = cards(db, [ids[4]!], { rowid: ids[4]!, index: 0 });
+    expect(w.labelIds).toEqual(['0', '2', '3', '4', '5', '7']);
+    expect(w.labelIds).toEqual(rowDetails(db, [threadId])[0]!.labelIds);
+    // Merged with a conversation that has a label of its own.
+    ingest(writer, [message('tagged', ['tagged'], { time: 60, labelIds: ['0', '5', 'lab1'] })], 1);
+    ingest(writer, [message('link', ['link', 't0', 'tagged'], { time: 200 })], 1);
+    const tagged = rowidOf(db, 'tagged');
+    const merged = cards(db, [tagged], { rowid: tagged, index: 0 });
+    expect(merged.threadId).toBe(threadOf(db, 'tagged'));
+    expect(merged.labelIds).toContain('lab1');
+    expect(merged.labelIds).toEqual(rowDetails(db, [merged.threadId!])[0]!.labelIds);
     db.close();
   });
 
