@@ -109,10 +109,10 @@ export function useReaderState(): ReaderState {
   );
 }
 
-/** Opens a message in the reader pane; HTML unless another mode is asked for. */
+/** Opens a message in the reader pane, in the default view unless another mode is asked for. */
 export async function openInReader(
   rowid: number,
-  mode: OpenMode = 'html',
+  mode: OpenMode = getShellState().settings.messageView,
 ): Promise<MessageOpenResult> {
   latest += 1;
   const mine = latest;

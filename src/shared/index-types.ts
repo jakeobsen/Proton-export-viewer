@@ -411,6 +411,8 @@ export interface IndexReport {
   timeouts: number;
   /** Messages with a list cut to its limit, by list. */
   capped: Partial<Record<CappedListName, number>>;
+  /** Messages with at least one list cut to its limit, each counted once. */
+  cappedMessages: number;
   /** Label IDs on messages that labels.json doesn't name; they aren't shown. */
   hiddenLabelIds: number;
   /**

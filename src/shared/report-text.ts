@@ -89,6 +89,24 @@ export function attentionText(n: number): string {
 const sum = (counts: Partial<Record<string, number>>): number =>
   Object.values(counts).reduce<number>((a, b) => a + (b ?? 0), 0);
 
+/**
+ * The files that need attention, by what became of them: skipped files
+ * aren't listed, and a truncated message has a list cut to its limit. A
+ * listed message whose message file is missing is neither.
+ */
+export function fileCounts(report: IndexReport): { skipped: number; truncated: number } {
+  return {
+    skipped: sum(report.rejected) + report.metaMissing + sum(report.failed) + report.timeouts,
+    truncated: report.cappedMessages,
+  };
+}
+
+/** "2 skipped, 1 truncated". */
+export function filesText(report: IndexReport): string {
+  const { skipped, truncated } = fileCounts(report);
+  return `${count(skipped)} skipped, ${count(truncated)} truncated`;
+}
+
 /** "2 (fifo 1, symlink 1)", codes in name order; or "0". */
 function byCode<K extends string>(counts: Partial<Record<K, number>>): string {
   const parts = (Object.entries(counts) as Array<[K, number]>)
