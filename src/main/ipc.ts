@@ -15,6 +15,7 @@ import {
   type DoneResult,
   type ErrorKind,
   type IndexResult,
+  type LeadsResult,
   type LinkActionResult,
   type MessageOpenResult,
   type ReaderActionResult,
@@ -37,11 +38,14 @@ import {
   CARDS_AFTER,
   CARDS_BEFORE,
   CARDS_FOLLOW,
+  MAX_LEAD_ROWIDS,
   MAX_QUERY_LENGTH,
   MAX_SNIPPET_THREADS,
   WINDOW_AFTER,
   WINDOW_BEFORE,
+  type IndexQuery,
   type IndexReport,
+  type LeadsAnswer,
   type SearchPage,
   type SearchSnippets,
 } from '../shared/index-types';
@@ -217,6 +221,15 @@ const ShellQuery = z.discriminatedUnion('op', [
         .strict(),
       before: z.number().int().min(0).max(CARDS_BEFORE),
       after: z.number().int().min(1).max(CARDS_AFTER),
+      // The search the conversation was opened from, by its query ID only:
+      // main puts in the text that search was made with.
+      search: z
+        .object({
+          queryId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+          countRev: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+        })
+        .strict()
+        .optional(),
     })
     .strict(),
 ]);
@@ -258,6 +271,19 @@ const SnippetsArgs = z.tuple([
     .object({
       queryId: QueryId,
       threadIds: z.array(SearchThreadId).min(1).max(MAX_SNIPPET_THREADS),
+      generation: Generation,
+    })
+    .strict(),
+]);
+
+// Lead lines for messages on screen: who asks, the messages, and the search
+// the cards were opened from, by its query ID.
+const LeadsArgs = z.tuple([
+  z
+    .object({
+      requester: z.enum(['list', 'cards']),
+      rowids: z.array(Rowid).min(1).max(MAX_LEAD_ROWIDS),
+      queryId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
       generation: Generation,
     })
     .strict(),
@@ -805,13 +831,20 @@ export function registerIpc(ctx: AppContext): void {
   /**
    * A read from the open export's index. Before its index is open there is
    * nothing to read; that answer isn't logged, as the shell asks again when
-   * the index reports.
+   * the index reports. Cards that name an older or unknown search are read
+   * without it.
    */
   guarded<IndexResult<unknown>>(IPC.index, async (appWin, raw) => {
     const args = IndexArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
-    const [{ query, generation }] = args.data;
+    const [{ query: asked, generation }] = args.data;
     if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    let query: IndexQuery = asked;
+    if (asked.op === 'cards' && asked.search) {
+      const { search, ...plain } = asked;
+      const text = searchTextOf(appWin, search.queryId, generation);
+      query = text === null ? plain : { ...plain, search: { ...search, text } };
+    }
     const result = await ctx.sources.queryIndex(query);
     if (!result) return { ok: false, code: 'no_source' };
     if (generation !== ctx.generation) return reject('stale_generation', appWin);
@@ -874,6 +907,37 @@ export function registerIpc(ctx: AppContext): void {
     const answer = outcome.answer as SearchSnippets | null;
     if (answer?.queryId !== queryId) return reject('invalid', appWin);
     return { ok: true, generation, queryId, snippets: answer.snippets };
+  });
+
+  /**
+   * Lead lines for messages on screen, asked for by the list or the cards.
+   * Per window, one request runs in core, and each requester has one waiting:
+   * a newer request from the same requester answers its waiting one as
+   * superseded, and the list and the cards never take each other's place.
+   * Cards opened from a result name that search by its query ID; an older or
+   * unknown one gives plain lead lines.
+   */
+  const leadLanes = new SearchLanes<AppWindow>();
+  guarded<LeadsResult>(IPC.leads, async (appWin, raw) => {
+    const args = LeadsArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ requester, rowids, queryId, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    const text = queryId === undefined ? null : searchTextOf(appWin, queryId, generation);
+    const outcome = await leadLanes.run(
+      appWin,
+      async () =>
+        generation === ctx.generation
+          ? ctx.sources.queryIndex({ op: 'leads', rowids, ...(text === null ? {} : { text }) })
+          : null,
+      requester,
+    );
+    if (outcome === SUPERSEDED) return { ok: false, code: 'superseded' };
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    if (!outcome) return { ok: false, code: 'no_source' };
+    const answer = outcome.answer as LeadsAnswer | null;
+    if (!answer) return reject('invalid', appWin);
+    return { ok: true, generation, leads: answer.leads };
   });
 
   /**

@@ -10,6 +10,10 @@
 // If the expanded message is gone, the nearest card (the next newer one
 // first) opens in its place; with no card left, the reader closes and its
 // view is revoked.
+// A conversation opened from a result names that search in its reads: the
+// header then shows how many of its messages match. That count and the
+// message count are shown as a pair from one snapshot of the index, never
+// from an older snapshot than the pair shown.
 
 import {
   CARDS_AFTER,
@@ -29,6 +33,15 @@ export const CARD_MARGIN = 10;
 /** A position past any conversation's end: the index places it at the last card. */
 const PAST_END = 2 ** 31;
 
+/** The header's counts: the messages and, from a search, those that match, from one snapshot. */
+export interface CountPair {
+  total: number;
+  /** Null when the conversation isn't shown from a search. */
+  matching: number | null;
+  /** The revision of the snapshot the pair is from. */
+  rev: number;
+}
+
 export interface CardsSnapshot {
   /** A conversation is shown. */
   shown: boolean;
@@ -36,6 +49,10 @@ export interface CardsSnapshot {
   subject: string;
   /** Messages in the conversation. */
   total: number;
+  /** The header's counts; null until the first read. */
+  count: CountPair | null;
+  /** The search the conversation was opened from, by its query ID; null if none. */
+  queryId: number | null;
   /** Its folder and label IDs, as its list row has them. */
   labelIds: string[];
   /** The position of the first card held. */
@@ -69,6 +86,8 @@ const EMPTY: CardsSnapshot = {
   threadId: null,
   subject: '',
   total: 0,
+  count: null,
+  queryId: null,
   labelIds: [],
   start: 0,
   cards: [],
@@ -143,10 +162,11 @@ export class CardsModel {
   /**
    * Shows the conversation that holds message `rowid`, with that message
    * expanded and opened in the reader. `rowid` is the conversation's newest
-   * message, as the list opens it: if it is gone before the first read finds
-   * its place, the newest card left takes its place.
+   * message, as the list opens it, or its newest matching one, as a result
+   * opens it with its search's `queryId`: if it is gone before the first
+   * read finds its place, the newest card left takes its place.
    */
-  show(rowid: number, threadId: number | null): void {
+  show(rowid: number, threadId: number | null, queryId: number | null = null): void {
     this.epoch += 1;
     this.first = 0;
     this.last = 0;
@@ -159,6 +179,7 @@ export class CardsModel {
       ...EMPTY,
       shown: true,
       threadId,
+      queryId,
       expanded: rowid,
       scrollId: this.snap.scrollId + 1,
       shiftId: this.snap.shiftId,
@@ -177,6 +198,43 @@ export class CardsModel {
     this.moveTarget = null;
     this.snap = { ...EMPTY, scrollId: this.snap.scrollId, shiftId: this.snap.shiftId };
     this.onChange();
+  }
+
+  /**
+   * The conversation shown is now owned by a result of the search `queryId`:
+   * its header counts the messages that match, from the next read on.
+   */
+  setSearch(queryId: number | null): void {
+    if (!this.snap.shown || queryId === this.snap.queryId) return;
+    this.set({ queryId, count: this.snap.count && { ...this.snap.count, matching: null } });
+    this.refresh();
+  }
+
+  /** The messages of the cards on screen, oldest first. */
+  visibleRowids(): number[] {
+    const rowids: number[] = [];
+    for (let i = this.first; i <= this.last; i += 1) {
+      const card = this.cardAt(i);
+      if (card) rowids.push(card.rowid);
+    }
+    return rowids;
+  }
+
+  /**
+   * The header's counts after an answer read for the search `sentFor`. An
+   * answer from an older snapshot than the pair shown changes nothing. One
+   * with a matching count replaces both, unless it was read for a search left
+   * behind since; one without (core counts whenever the snapshot moved on, so
+   * it is from the same snapshot) replaces the message count only.
+   */
+  private nextCount(answer: CardsWindow, sentFor: number | null): CountPair {
+    const shown = this.snap.count;
+    if (shown !== null && answer.rev < shown.rev) return shown;
+    if (!answer.searched) return { total: answer.total, matching: null, rev: answer.rev };
+    if (answer.matching !== undefined && sentFor === this.snap.queryId) {
+      return { total: answer.total, matching: answer.matching, rev: answer.rev };
+    }
+    return { total: answer.total, matching: shown?.matching ?? null, rev: answer.rev };
   }
 
   /**
@@ -334,6 +392,7 @@ export class CardsModel {
     const expanded = this.snap.expanded;
     const follow = [...new Set([expanded, this.selected].filter((r): r is number => r !== null))];
     const screen = this.last - this.first + 1;
+    const { queryId, count } = this.snap;
     const answer = await this.read({
       op: 'cards',
       follow,
@@ -341,6 +400,15 @@ export class CardsModel {
       anchor,
       before: CARDS_ABOVE,
       after: Math.min(CARDS_AFTER, screen + 2 * CARD_MARGIN + CARDS_ABOVE),
+      // The count is asked for whenever the one shown isn't from this snapshot.
+      ...(queryId === null
+        ? {}
+        : {
+            search: {
+              queryId,
+              countRev: count !== null && count.matching !== null ? count.rev : null,
+            },
+          }),
     });
     if (!answer) return false;
     if (epoch !== this.epoch) return true;
@@ -359,6 +427,7 @@ export class CardsModel {
         threadId: null,
         subject: '',
         total: 0,
+        count: null,
         labelIds: [],
         start: 0,
         cards: [],
@@ -402,6 +471,7 @@ export class CardsModel {
       threadId: answer.threadId,
       subject: answer.subject,
       total: answer.total,
+      count: this.nextCount(answer, queryId),
       labelIds: answer.labelIds,
       start: answer.start,
       cards: answer.cards,

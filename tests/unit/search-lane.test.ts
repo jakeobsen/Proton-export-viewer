@@ -75,4 +75,53 @@ describe('search lanes', () => {
     b.open();
     expect(await rb).toBe('b');
   });
+
+  it('keeps one waiting request per requester: neither pushes the other out', async () => {
+    const lanes = new SearchLanes<object>();
+    const win = {};
+    const running = gate('running');
+    const list = gate('list');
+    const cards = gate('cards');
+    const rRunning = lanes.run(win, running.task, 'list');
+    // The list and the cards ask at the same moment, while another request runs.
+    const rList = lanes.run(win, list.task, 'list');
+    const rCards = lanes.run(win, cards.task, 'cards');
+    running.open();
+    expect(await rRunning).toBe('running');
+    await tick();
+    expect(list.started()).toBe(true);
+    expect(cards.started()).toBe(false);
+    list.open();
+    expect(await rList).toBe('list');
+    await tick();
+    expect(cards.started()).toBe(true);
+    cards.open();
+    expect(await rCards).toBe('cards');
+  });
+
+  it("lets a newer request replace only its own requester's waiting one, which keeps its place", async () => {
+    const lanes = new SearchLanes<object>();
+    const win = {};
+    const running = gate('running');
+    const oldList = gate('old list');
+    const cards = gate('cards');
+    const newList = gate('new list');
+    const rRunning = lanes.run(win, running.task, 'cards');
+    const rOld = lanes.run(win, oldList.task, 'list');
+    const rCards = lanes.run(win, cards.task, 'cards');
+    const rNew = lanes.run(win, newList.task, 'list');
+    expect(await rOld).toBe(SUPERSEDED);
+    running.open();
+    await rRunning;
+    await tick();
+    // The list's place came first, so its newer request runs first.
+    expect(newList.started()).toBe(true);
+    expect(cards.started()).toBe(false);
+    newList.open();
+    expect(await rNew).toBe('new list');
+    await tick();
+    cards.open();
+    expect(await rCards).toBe('cards');
+    expect(oldList.started()).toBe(false);
+  });
 });

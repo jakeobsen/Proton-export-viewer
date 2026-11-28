@@ -43,10 +43,26 @@ export function headerText(raw: string): string {
 }
 
 /**
- * A subject or a name as a row or a header shows it: as headerText, with each
- * run of white space, line breaks and tabs included, shown as one space.
+ * A part of a line of mail text, such as one marked or unmarked run of a
+ * snippet: invisible and bidi characters removed, each run of white space,
+ * line breaks and tabs included, shown as one space, and controls as symbols.
  * Invisible characters go first, so one between two spaces leaves one space.
+ * The ends stay as they are, so the parts of a line still join with their
+ * spaces.
+ */
+export function partText(raw: string): string {
+  return raw.replace(INVISIBLE_RE, '').replace(SPACES_RE, ' ').replace(CONTROLS_RE, picture);
+}
+
+/** A line of mail text, such as a message's first words under its name: partText, trimmed. */
+export function lineText(raw: string): string {
+  return partText(raw).trim();
+}
+
+/**
+ * A subject or a name as a row or a header shows it: lineText, cut as
+ * headerText cuts a value.
  */
 export function displayText(raw: string): string {
-  return headerText(raw.replace(INVISIBLE_RE, '').replace(SPACES_RE, ' '));
+  return headerText(lineText(raw));
 }

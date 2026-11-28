@@ -5,7 +5,7 @@
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useCallback, useEffect, useLayoutEffect, useRef, type KeyboardEvent } from 'react';
 import { displayText } from '../shared/header-text';
-import { MAX_QUERY_LENGTH, type MarkedSnippet, type SearchSort } from '../shared/index-types';
+import { MAX_QUERY_LENGTH, type SearchSort } from '../shared/index-types';
 import type { SidebarModel } from './folders';
 import { formatCount, fullDate, listDate, participantsText } from './format';
 import {
@@ -18,13 +18,8 @@ import {
   useSearch,
 } from './mailbox-state';
 import { Chips } from './Chips';
-import {
-  RESULT_ROW_HEIGHT,
-  conversationsText,
-  partialText,
-  snippetParts,
-  type ResultRow,
-} from './search';
+import { Snippet } from './Lead';
+import { RESULT_ROW_HEIGHT, conversationsText, partialText, type ResultRow } from './search';
 
 export function SearchBox() {
   const { text } = useSearch();
@@ -43,16 +38,6 @@ export function SearchBox() {
         if (e.key === 'Escape') clearSearch();
       }}
     />
-  );
-}
-
-function Snippet({ snippet }: { snippet: MarkedSnippet }) {
-  return (
-    <>
-      {snippetParts(snippet).map((part, i) =>
-        part.mark ? <mark key={i}>{part.text}</mark> : <span key={i}>{part.text}</span>,
-      )}
-    </>
   );
 }
 

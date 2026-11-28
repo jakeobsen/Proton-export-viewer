@@ -45,6 +45,8 @@ import type {
   IndexOpened,
   IndexProgress,
   IndexQuery,
+  CardsWindow,
+  LeadsAnswer,
   SearchPage,
   SearchSnippets,
 } from '../../shared/index-types';
@@ -286,6 +288,11 @@ export class IndexService {
   private writerEntry: number | null = null;
   private queryEntry: number | null = null;
   private queryReady: Promise<void> | null = null;
+  /**
+   * The newest snapshot revision a cards answer carried. A query thread that
+   * replaces a failed one starts above it, so revisions never go back.
+   */
+  private revSeen = 0;
   private pool: Pool | null = null;
   private opened: WriterOpened | null = null;
   private running: Promise<void> | null = null;
@@ -504,7 +511,12 @@ export class IndexService {
     const query = this.query;
     const uuid = this.opened?.uuid;
     if (!query || !uuid || this.closed) return Promise.reject(new ThreadError('NOT_OPEN'));
-    const args = { dbPath: this.dbPath, expectedUuid: uuid, ...this.busyArg() };
+    const args = {
+      dbPath: this.dbPath,
+      expectedUuid: uuid,
+      revFloor: this.revSeen,
+      ...this.busyArg(),
+    };
     this.queryReady ??= query.call('open', args).then(
       () => {
         this.queryEntry = this.connections.add({ role: 'query', dbPath: this.dbPath });
@@ -559,13 +571,21 @@ export class IndexService {
     try {
       await this.openQuery();
       const answer = await this.query!.call<IndexAnswer>('query', { call });
-      if (call.op === 'search' || call.op === 'snippets' || call.op === 'eml') {
+      if (
+        call.op === 'search' ||
+        call.op === 'snippets' ||
+        call.op === 'leads' ||
+        call.op === 'eml'
+      ) {
         // Snippets and match columns whose ranges failed the check are given without marks.
         const dropped =
           call.op === 'eml'
             ? ((answer as EmlFile | null)?.match?.dropped ?? 0)
-            : ((answer as SearchPage | SearchSnippets | null)?.dropped ?? 0);
+            : ((answer as SearchPage | SearchSnippets | LeadsAnswer | null)?.dropped ?? 0);
         if (dropped > 0) this.deps.log.warn('search.ranges_dropped', { count: dropped }, this.src);
+      }
+      if (call.op === 'cards') {
+        this.revSeen = Math.max(this.revSeen, (answer as CardsWindow).rev);
       }
       return answer;
     } catch (err) {
