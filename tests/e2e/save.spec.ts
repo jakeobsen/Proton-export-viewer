@@ -196,7 +196,7 @@ test('a message file saves byte for byte under its subject, and twice as " (2)"'
     .poll(() => pev.main<Array<{ method: string; args: string[] }>>('externalCalls'))
     .toEqual([
       {
-        method: 'showItemInFolder',
+        method: 'shell.showItemInFolder',
         args: [join(realpathSync(dir), name.replace(/\.eml$/, ' (2).eml'))],
       },
     ]);
@@ -405,9 +405,12 @@ test('downloads a page starts are cancelled, and a page that requests a save’s
     img.src = src;
     document.body.append(img);
   }, url);
-  await expect.poll(() => pev.hasLog('save.failed', { reason: 'foreign' })).toBe(true);
+  // The page's request reached the asset without main's nonce, and used it up.
+  await expect.poll(() => pev.main<string | null>('saveLastProof')).toBe('missing');
+  // The held save ends once it goes on: main's own download never starts.
   await pev.main('saveReleaseDownload');
   expect(await saving).toEqual({ ok: false, code: 'save_failed' });
+  expect(pev.hasLog('save.failed', { reason: 'foreign' })).toBe(true);
   expect(listed(await downloads(pev))).toEqual([]);
 });
 
