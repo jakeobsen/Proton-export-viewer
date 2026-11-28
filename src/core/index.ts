@@ -9,6 +9,7 @@ import type {
   CoreInit,
   CoreRequest,
   CoreResult,
+  IndexQueryRequest,
   OpenRequest,
   ProofFileRead,
   WorkerMessage,
@@ -68,6 +69,11 @@ const testState = {
   /** Message files opened for the reader. */
   fileOpens: 0,
   unsanitized: false,
+  /** Searches that reached core. */
+  searches: 0,
+  /** Searches and snippet requests are held, to answer them late. */
+  holdingSearches: false,
+  heldSearches: [] as IndexQueryRequest[],
   /** Holds reads once their message file is open, before the parse. */
   holdingOpened: false,
   heldOpened: [] as Array<() => void>,
@@ -233,6 +239,10 @@ function handle(request: CoreRequest): void {
             readerSource: () => readerSource,
             session,
             writeGate,
+            runSearch: (held) => {
+              if (session) session.handle(held);
+              else reply({ type: 'result', reqId: held.reqId, ok: false, code: 'no_source' });
+            },
           }),
         );
         return;
@@ -255,6 +265,14 @@ function handle(request: CoreRequest): void {
     case 'scan':
     case 'index':
     case 'index-query':
+      if (__PEV_TEST_HOOKS__ && request.type === 'index-query') {
+        const { op } = request.query;
+        if (op === 'search') testState.searches += 1;
+        if ((op === 'search' || op === 'snippets') && testState.holdingSearches) {
+          testState.heldSearches.push(request);
+          return;
+        }
+      }
       if (!session) {
         reply({ type: 'result', reqId: request.reqId, ok: false, code: 'no_source' });
         return;

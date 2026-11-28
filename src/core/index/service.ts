@@ -41,6 +41,7 @@ import type {
   IndexProgress,
   IndexQuery,
   SearchPage,
+  SearchSnippets,
 } from '../../shared/index-types';
 import type { Logger } from '../../shared/log/writer';
 import type { Stamp } from '../../shared/sources';
@@ -518,9 +519,9 @@ export class IndexService {
     try {
       await this.openQuery();
       const answer = await this.query!.call<IndexAnswer>('query', { call });
-      if (call.op === 'search') {
+      if (call.op === 'search' || call.op === 'snippets') {
         // A snippet whose match ranges failed the check is given as plain text.
-        const dropped = (answer as SearchPage | null)?.dropped ?? 0;
+        const dropped = (answer as SearchPage | SearchSnippets | null)?.dropped ?? 0;
         if (dropped > 0) this.deps.log.warn('search.ranges_dropped', { count: dropped }, this.src);
       }
       return answer;

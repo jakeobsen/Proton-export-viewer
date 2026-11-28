@@ -870,6 +870,7 @@ describe('phase 2', () => {
     expect(await found(h.service, 'filename:"budget plan.pdf"')).toEqual([first]);
     expect((await search(h.service, 'zeppelin')).coverage).toEqual({
       indexed: files,
+      pending: 0,
       total: files,
     });
     // A word of a generated message's body.
