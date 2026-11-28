@@ -350,6 +350,17 @@
   overflow: hidden;
 }
 
+/* A virtual row with the risk warning is a line taller (ATT_RISKY_ROW, less the gap). */
+.rp-att-virtual .rp-att-risky {
+  height: 66px;
+}
+
+.rp-att-virtual .rp-att-warn span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .rp-att-risky {
   border-color: var(--rp-danger-border);
   background: var(--rp-danger-soft);

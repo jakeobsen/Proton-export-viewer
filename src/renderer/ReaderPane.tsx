@@ -3,12 +3,15 @@
 // plain text and HTML switch, the actions on the message, the body frame, the
 // lines for blocked images, size limits and the fallback, and the attachments.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { AttachmentItem, RejectCode } from '../shared/api';
 import { BODY_IFRAME_REFERRER, BODY_IFRAME_SANDBOX } from '../shared/constants';
 import type { MessageDetails, MessageHeaders } from '../shared/reader-protocol';
 import {
+  ATT_ROW,
   attachmentCount,
+  attachmentRowAt,
+  attachmentRowTops,
   avatarColor,
   blockedImages,
   fileSize,
@@ -198,8 +201,7 @@ function Lines({ rowid, view }: { rowid: number; view: ReaderView }) {
   );
 }
 
-/** Row height of the attachment list, and how many rows it shows at once once virtual. */
-const ATT_ROW = 56;
+/** How many plain rows high the attachment list is once virtual. */
 const ATT_SHOWN = 6;
 /** Past this many attachments, only the rows in view and a few around them are made. */
 const ATT_VIRTUAL_AFTER = 50;
@@ -228,11 +230,16 @@ function AttachmentRow({ item, top }: { item: AttachmentItem; top: number | null
 
 function Attachments({ items }: { items: AttachmentItem[] }) {
   const [top, setTop] = useState(0);
-  if (items.length === 0) return null;
   const virtual = items.length > ATT_VIRTUAL_AFTER;
-  const first = virtual ? Math.max(0, Math.floor(top / ATT_ROW) - ATT_OVERSCAN) : 0;
+  const tops = useMemo(
+    () => (virtual ? attachmentRowTops(items.map((item) => item.risky)) : []),
+    [items, virtual],
+  );
+  if (items.length === 0) return null;
+  const height = ATT_SHOWN * ATT_ROW;
+  const first = virtual ? Math.max(0, attachmentRowAt(tops, top) - ATT_OVERSCAN) : 0;
   const end = virtual
-    ? Math.min(items.length, Math.ceil(top / ATT_ROW) + ATT_SHOWN + ATT_OVERSCAN)
+    ? Math.min(items.length, attachmentRowAt(tops, top + height) + 1 + ATT_OVERSCAN)
     : items.length;
   return (
     <section className="rp-atts" aria-label="Attachments">
@@ -240,16 +247,12 @@ function Attachments({ items }: { items: AttachmentItem[] }) {
       <div
         className={virtual ? 'rp-att-list rp-att-virtual' : 'rp-att-list'}
         role="list"
-        style={virtual ? { height: ATT_SHOWN * ATT_ROW } : undefined}
+        style={virtual ? { height } : undefined}
         onScroll={virtual ? (e) => setTop(e.currentTarget.scrollTop) : undefined}
       >
-        <div style={virtual ? { position: 'relative', height: items.length * ATT_ROW } : undefined}>
+        <div style={virtual ? { position: 'relative', height: tops[items.length] } : undefined}>
           {items.slice(first, end).map((item) => (
-            <AttachmentRow
-              key={item.index}
-              item={item}
-              top={virtual ? item.index * ATT_ROW : null}
-            />
+            <AttachmentRow key={item.index} item={item} top={virtual ? tops[item.index]! : null} />
           ))}
         </div>
       </div>

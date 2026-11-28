@@ -84,11 +84,15 @@ const MIXED = crlf([
   '',
 ]);
 
-/** A plain message with `count` small attachments and no Message-ID. */
-function many(count: number, digits = 3): string {
+/**
+ * A plain message with `count` small attachments and no Message-ID; every
+ * `riskyEvery`th one, from the first, is a program file.
+ */
+function many(count: number, digits = 3, riskyEvery = 0): string {
+  const ext = (i: number) => (riskyEvery > 0 && i % riskyEvery === 0 ? 'exe' : 'txt');
   const parts = Array.from({ length: count }, (_, i) => [
     '--m',
-    `Content-Type: text/plain; name="a-${String(i).padStart(digits, '0')}.txt"`,
+    `Content-Type: text/plain; name="a-${String(i).padStart(digits, '0')}.${ext(i)}"`,
     'Content-Disposition: attachment',
     '',
     `part ${i}`,
@@ -115,11 +119,13 @@ async function source(pev: PevApp, name: string): Promise<string> {
   writeFileSync(join(root, 'fifty.eml'), many(50));
   writeFileSync(join(root, 'many.eml'), many(120));
   writeFileSync(join(root, 'most.eml'), many(MAX_MIME_PARTS + 10, 5));
+  writeFileSync(join(root, 'risky.eml'), many(90, 3, 3));
   const result = await pev.main<{ ok: boolean }>('readerSource', root, [
     [1, { file: 'mixed.eml' }],
     [2, { file: 'fifty.eml' }],
     [3, { file: 'many.eml' }],
     [4, { file: 'most.eml' }],
+    [5, { file: 'risky.eml' }],
   ]);
   expect(result.ok).toBe(true);
   return root;
@@ -262,6 +268,48 @@ test('past 50 attachments only the rows in view are made', async ({ pev }) => {
     `a-${String(n - 1).padStart(5, '0')}.txt`,
   );
   expect(await list.locator('.rp-att').count()).toBeLessThan(20);
+});
+
+/** The rows made, top to bottom, with whether any of their content is cut off. */
+function rowBoxes(pev: PevApp) {
+  return pane(pev)
+    .locator('.rp-att')
+    .evaluateAll((rows) =>
+      rows
+        .map((row) => {
+          const box = row.getBoundingClientRect();
+          const warn = row.querySelector<HTMLElement>('.rp-att-warn span');
+          return {
+            top: box.top,
+            bottom: box.bottom,
+            risky: row.classList.contains('rp-att-risky'),
+            clipped: row.scrollHeight > row.clientHeight,
+            warnCut: warn !== null && warn.scrollWidth > warn.clientWidth,
+          };
+        })
+        .sort((a, b) => a.top - b.top),
+    );
+}
+
+test('in a long list, a program file row shows its whole warning, and rows never overlap', async ({
+  pev,
+}) => {
+  await source(pev, 'att-risky');
+  await openInReader(pev, 5);
+  await shown(pev);
+  const list = pane(pev).locator('.rp-atts');
+  await expect(list.locator('.rp-att-title')).toHaveText('90 attachments');
+  for (const at of [0, 30 * 60, 90 * 72]) {
+    await scrollAttachments(pev.page, at);
+    await expect.poll(async () => (await rowBoxes(pev)).some((b) => b.risky)).toBe(true);
+    const boxes = await rowBoxes(pev);
+    expect(boxes.length).toBeLessThan(20);
+    expect(boxes.filter((b) => b.clipped || b.warnCut)).toEqual([]);
+    for (let i = 1; i < boxes.length; i += 1) {
+      expect(boxes[i]!.top).toBeGreaterThanOrEqual(boxes[i - 1]!.bottom);
+    }
+  }
+  await expect(list.locator('.rp-att-name').last()).toHaveText('a-089.txt');
 });
 
 test('Details adds the Message-ID, the References and the format, cleaned for display', async ({
