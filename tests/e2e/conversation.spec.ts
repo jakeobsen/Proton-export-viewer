@@ -758,26 +758,21 @@ test('n and p typed in the body frame move the expanded card; in a field, a menu
   const shellKeys = () =>
     pev.page.evaluate(() => (window as unknown as { __seen: { keys: number } }).__seen.keys);
 
-  // The body frame has the focus: main passes the key on.
+  // The body frame has the focus: main passes the key on. Keys the test
+  // driver sends never reach main's input handler (the browser skips
+  // pre-handling them), so the test runs that handler as for a typed key.
   await pev.page.locator('.card.expanded .rp-frame').focus();
-  await pev.page.keyboard.press('p');
-  try {
-    await expanded(pev, ids[1]!);
-  } catch (err) {
-    const active = await pev.page.evaluate(() => document.activeElement?.tagName ?? null);
-    console.log(
-      'key inputs main saw',
-      JSON.stringify(await pev.main('keyInputs')),
-      'active',
-      active,
-    );
-    throw err;
-  }
+  expect(await pev.main('keyInFocusedFrame', 'p')).toBe('child:mail-body');
+  await expanded(pev, ids[1]!);
   expect(await shellKeys()).toBe(0);
   await pev.page.locator('.card.expanded .rp-frame').focus();
-  await pev.page.keyboard.press('n');
+  expect(await pev.main('keyInFocusedFrame', 'n')).toBe('child:mail-body');
   const view = await expanded(pev, ids[2]!);
   expect(await shellKeys()).toBe(0);
+  // With the shell's own document focused, main passes nothing on.
+  await pev.page.locator('.card.expanded .card-h').focus();
+  expect(await pev.main('keyInFocusedFrame', 'p')).toBe('main');
+  await stays(pev, ids[2]!);
 
   // A text field, a menu and editable text keep the keys.
   await pev.page.evaluate(() => {
