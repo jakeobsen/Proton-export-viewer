@@ -245,9 +245,10 @@ test('from search, the plain view marks the matches and the HTML view counts the
   await expect(pev.page.locator('.link-dialog')).toHaveCount(0);
 
   // A card in the same conversation that didn't match: no line and no marks.
-  const other = Number(
-    await pev.page.locator('.card', { hasText: 'Thanks' }).first().getAttribute('data-rowid'),
+  const shownCards = await pev.shell<{ cards: Array<{ rowid: number }>; expanded: number }>(
+    'cards',
   );
+  const other = shownCards.cards.map((c) => c.rowid).find((r) => r !== shownCards.expanded)!;
   await press(pev.page.locator(`.card[data-rowid="${other}"] .card-h`));
   const unmatched = await settledReader(pev, other);
   expect(unmatched.match).toBeNull();

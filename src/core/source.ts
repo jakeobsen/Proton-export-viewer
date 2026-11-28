@@ -90,7 +90,7 @@ export type ReaderFile =
   | {
       ok: false;
       code: 'no_source' | 'superseded' | 'unavailable' | 'not_found' | 'eml_missing' | 'refused';
-      /** For `eml_missing` from search: how the message matched. */
+      /** For `eml_missing` or `refused` from search: how the message matched. */
       match?: IndexMatch | null;
     };
 
@@ -553,9 +553,7 @@ export class SourceSession {
       this.log.info('open.file_refused', {
         reason: opened.gone ? 'eml_missing' : opened.rejection.kind,
       });
-      return opened.gone
-        ? { ok: false, code: 'eml_missing', ...withMatch }
-        : { ok: false, code: 'refused' };
+      return { ok: false, code: opened.gone ? 'eml_missing' : 'refused', ...withMatch };
     }
     const fd = opened.fd;
     const changed = match && !isIndexedFile(fd, indexed);

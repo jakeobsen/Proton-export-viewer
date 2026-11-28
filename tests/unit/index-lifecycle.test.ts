@@ -990,6 +990,16 @@ describe("the reader's open of a message file", () => {
     expect(replaced).toMatchObject({ ok: true, match: { changed: true, body: null } });
     if (replaced.ok) await replaced.opened.close();
 
+    // Refused (a link took the file's place): the fallback still says how the message matched.
+    rmSync(path);
+    symlinkSync(join(e.run, (await eml(c, 2))!.rel!), path);
+    const refused = await c.session.openForReader(1, generation, () => false, word);
+    expect(refused).toMatchObject({ ok: false, code: 'refused', match: { changed: false } });
+    expect(await c.session.openForReader(1, generation, () => false)).toEqual({
+      ok: false,
+      code: 'refused',
+    });
+
     // Removed after indexing: the refusal still says how the message matched.
     rmSync(path);
     const gone = await c.session.openForReader(1, generation, () => false, word);
