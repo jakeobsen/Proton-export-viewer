@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { LogWriter } from '../../src/shared/log/writer';
@@ -20,6 +20,22 @@ describe('LogWriter', () => {
     expect(statSync(dir).mode & 0o777).toBe(0o700);
     expect(statSync(join(dir, 'main.jsonl')).mode & 0o777).toBe(0o600);
     expect(findMarkers(readFileSync(join(dir, 'main.jsonl'), 'utf8'))).toEqual([]);
+  });
+
+  it('writes nothing once stopped, and starts a new file when resumed', () => {
+    const dir = join(testDir('log-resume'), 'logs');
+    const log = new LogWriter(dir, 'main', 'main');
+    log.info('app.start');
+    log.stop();
+    rmSync(dir, { recursive: true });
+    log.info('app.ready');
+    expect(existsSync(dir)).toBe(false);
+    log.resume();
+    log.info('app.ready');
+    const lines = readFileSync(join(dir, 'main.jsonl'), 'utf8').trim().split('\n');
+    expect(lines.map((l) => (JSON.parse(l) as { code: string }).code)).toEqual(['app.ready']);
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+    expect(statSync(join(dir, 'main.jsonl')).mode & 0o777).toBe(0o600);
   });
 
   it('rotates through a fixed number of files', () => {

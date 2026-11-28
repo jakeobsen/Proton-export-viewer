@@ -39,6 +39,12 @@ async function openExport(pev: PevApp, name: string): Promise<number> {
       timeout: 20_000,
     })
     .toMatchObject({ phase: 'done', loaded: written.pairs, total: written.pairs });
+  // Then phase 2: the text of every message file.
+  await expect
+    .poll(async () => (await ask<IndexTotals>(pev, { op: 'totals' }))?.progress, {
+      timeout: 20_000,
+    })
+    .toMatchObject({ bodyPhase: 'done', bodiesDone: written.pairs, bodiesTotal: written.pairs });
   const state = await pev.page.evaluate(() => window.pev.state());
   if (!state.ok) throw new Error('no generation');
   return state.generation;
@@ -48,7 +54,11 @@ test('the search channel takes the text, the sort and its keyset, for the curren
   pev,
 }) => {
   const invalid = { ok: false, code: 'invalid' };
-  const ok = { text: 'x', sort: 'date', after: null, generation: 1 };
+  const ok = { text: 'x', chips: [], sort: 'date', after: null, generation: 1 };
+  expect(await invoke(pev, { text: 'x', sort: 'date', after: null, generation: 1 })).toEqual(
+    invalid,
+  );
+  expect(await invoke(pev, { ...ok, chips: [{ k: 'unread', extra: 1 }] })).toEqual(invalid);
   expect(await invoke(pev, { ...ok, text: 'x'.repeat(1001) })).toEqual(invalid);
   expect(await invoke(pev, { ...ok, extra: 1 })).toEqual(invalid);
   expect(await invoke(pev, { ...ok, sort: 'size' })).toEqual(invalid);
@@ -93,7 +103,11 @@ test('a search gives a page of the open export, by date and by relevance', async
   expect(byDate.page.sort).toBe('date');
   expect(byDate.page.queryId).toBe(byDate.queryId);
   expect(byDate.page.rows.map((r) => r.threadId)).toContain(newest.threadId);
-  expect(byDate.page.coverage).toEqual({ indexed: 0, total: 30 });
+  expect(byDate.page.coverage).toEqual({ indexed: 30, pending: 0, total: 30 });
+  expect(byDate.page.total).toBe(byDate.page.rows.length);
+  expect(byDate.page.details.map((d) => d.threadId)).toEqual(
+    byDate.page.rows.map((r) => r.threadId),
+  );
   expect(byDate.progress.phase).toBe('done');
   const row = byDate.page.rows.find((r) => r.threadId === newest.threadId)!;
   expect(row.matching).toBeGreaterThan(0);

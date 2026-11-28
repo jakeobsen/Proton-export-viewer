@@ -22,6 +22,8 @@ const PROMPT: LinkPrompt = {
   host: { start: 8, end: 20 },
   mismatch: false,
   lookalike: false,
+  mail: false,
+  unclear: false,
 };
 
 beforeEach(async () => {
@@ -81,6 +83,31 @@ describe('openInReader', () => {
       pending: false,
       view: { openId: 2, url: `mail-body://v/${'b'.repeat(32)}` },
     });
+  });
+
+  it("keeps the fallback's refused file for that open only", async () => {
+    const fallback = (openId: number, fileRefused: boolean) => ({
+      ok: true,
+      openId,
+      outcome: 'fallback',
+      match: null,
+      fileRefused,
+    });
+    pev.open.mockResolvedValueOnce(fallback(1, true));
+    await reader.openInReader(4);
+    expect(reader.getReaderState()).toMatchObject({ fallback: true, fileRefused: true });
+
+    let answer: (value: unknown) => void = () => {};
+    pev.open.mockReturnValueOnce(new Promise((resolve) => (answer = resolve)));
+    const next = reader.openInReader(4, 'plain');
+    expect(reader.getReaderState()).toMatchObject({ pending: true, fileRefused: false });
+    answer({ ok: true, openId: 2, outcome: 'view', url: `mail-body://v/${'c'.repeat(32)}` });
+    await next;
+    expect(reader.getReaderState()).toMatchObject({ fallback: false, fileRefused: false });
+
+    pev.open.mockResolvedValueOnce(fallback(3, false));
+    await reader.openInReader(4, 'html-anyway');
+    expect(reader.getReaderState()).toMatchObject({ fallback: true, fileRefused: false });
   });
 });
 

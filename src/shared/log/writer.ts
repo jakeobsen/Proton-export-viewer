@@ -83,6 +83,12 @@ export class LogWriter implements Logger {
     this.stopped = true;
   }
 
+  /** Writes again after a stop, starting a new file if the old one is gone. */
+  resume(): void {
+    this.stopped = false;
+    this.size = -1;
+  }
+
   write(input: LogInput): void {
     if (this.stopped) return;
     if (LEVEL_RANK[input.level] > LEVEL_RANK[this.minLevel]) return;

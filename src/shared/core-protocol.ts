@@ -4,12 +4,21 @@
 import type { IndexAnswer, IndexOpened, IndexProgress, IndexQuery } from './index-types';
 import type {
   BodyLink,
+  FileIdentity,
+  LocateRequest,
   ReadRequest,
   ReaderFailure,
+  ReaderMatch,
   RenderedMessage,
+  SourceHeaders,
+  SourcePart,
+  SourceRequest,
   WorkerRender,
   WorkerRendered,
+  WorkerSource,
+  WorkerSourced,
 } from './reader-protocol';
+import type { RecentAnswer, RecentJob } from './recent-search';
 import type { RunIdentity, ScanSummary, Stamp } from './sources';
 
 /** The export run core serves. `root` is null while the run is unavailable. */
@@ -34,14 +43,24 @@ export interface CoreInit {
   test?: CoreTestInit;
 }
 
-/** Builds with test hooks only: settings for phase 1 in tests. */
+/** Builds with test hooks only: settings for indexing in tests. */
 export interface CoreTestInit {
   /** Pairs per write transaction. */
   batchPairs?: number;
-  /** Phase 1 writes wait until a test lets them through. */
+  /** Bytes of text one phase 2 transaction writes, at most. */
+  txnBytes?: number;
+  /** Writes, phase 1's and phase 2's, wait until a test lets them through. */
   holdWrites?: boolean;
+  /** Scans wait before they list the run's folder, and once they have, until a test lets them on. */
+  holdScans?: boolean;
+  /** Index opens wait before they start, until a test lets them on. */
+  holdIndexOpens?: boolean;
   /** New metadata files are read in name order, and their batches written in that order. */
   readByName?: boolean;
+  /** Each indexing job's time limit, in ms. */
+  jobMs?: number;
+  /** This message's body job never ends, so it runs past its time limit. */
+  stallBodyOf?: string;
 }
 
 export interface StubAssetMessage {
@@ -209,6 +228,14 @@ export interface IndexQueryRequest {
   query: IndexQuery;
 }
 
+/** A job on the open source's recent searches. Core runs them in the order they come. */
+export interface RecentRequest {
+  type: 'recent';
+  reqId: number;
+  stamp: Stamp;
+  job: RecentJob;
+}
+
 export type CoreRequest =
   | OpenRequest
   | PingRequest
@@ -217,8 +244,11 @@ export type CoreRequest =
   | IdentifyRequest
   | ScanRequest
   | ReadRequest
+  | LocateRequest
+  | SourceRequest
   | IndexRequest
   | IndexQueryRequest
+  | RecentRequest
   | ForgetRequest
   | ResetRequest;
 
@@ -238,9 +268,21 @@ export type CoreResult =
       scan?: ScanSummary;
       /** The rendered message of a `read`. */
       read?: RenderedMessage;
+      /** For a `read` from search: how the message matched. */
+      match?: ReaderMatch;
+      /** The identity of the file a `read` came from; null for a test input. */
+      file?: FileIdentity | null;
+      /** The path a `locate` found. */
+      path?: string;
+      /** A header block for the source view; null for a part the message doesn't have. */
+      headers?: SourceHeaders | null;
+      /** The message's parts for the source view. */
+      parts?: SourcePart[];
       index?: IndexOpened;
       answer?: IndexAnswer;
       progress?: IndexProgress;
+      /** What a `recent` job did. */
+      recent?: RecentAnswer;
     }
   | {
       type: 'result';
@@ -256,6 +298,7 @@ export type CoreResult =
         | 'not_found'
         | 'eml_missing'
         | 'superseded'
+        | 'changed'
         | 'reader_failed'
         | 'no_index'
         | 'damaged'
@@ -263,6 +306,8 @@ export type CoreResult =
         | 'busy';
       /** Why the reader gave no body, for `reader_failed`. */
       reason?: ReaderFailure;
+      /** For a `read` from search that failed as `reader_failed` or `eml_missing`: how the message matched. */
+      match?: ReaderMatch;
       /** Test builds only: why a test action failed. */
       detail?: string;
       stamp?: Stamp;
@@ -288,10 +333,12 @@ export interface WorkerProofRead {
   paths: string[];
 }
 
-export type WorkerRequest = WorkerBuild | WorkerTest | WorkerProofRead | WorkerRender;
+export type WorkerRequest =
+  WorkerBuild | WorkerTest | WorkerProofRead | WorkerRender | WorkerSource;
 
 export type WorkerMessage =
   | WorkerRendered
+  | WorkerSourced
   | { type: 'result'; reqId: number; ok: true; body: StubBodyMessage }
   | { type: 'proof-read'; reqId: number; reads: ProofFileRead[] }
   | { type: 'result'; reqId: number; ok: false; code: 'unknown_stub' }

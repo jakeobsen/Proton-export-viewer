@@ -559,7 +559,13 @@ test('a message file that is missing, deleted or swapped shows a state and holds
     await pressRow(pev.page, row);
     await expect
       .poll(async () => (await reader(pev)) as Reader)
-      .toMatchObject({ rowid: row.newestRowid, pending: false, fallback: true, view: null });
+      .toMatchObject({
+        rowid: row.newestRowid,
+        pending: false,
+        fallback: true,
+        fileRefused: true,
+        view: null,
+      });
     await expect(pev.page.locator('.rp-fallback b')).toHaveText("Couldn't render this message");
   }
   expect(count(pev, 'open.fallback', { reason: 'file' })).toBe(2);

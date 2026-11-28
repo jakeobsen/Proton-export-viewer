@@ -2,14 +2,28 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { appHandler, assetHandler, bodyHandler, hasRasterMagic } from '../../src/main/protocols';
+import { appHandler, assetHandler, bodyHandler } from '../../src/main/protocols';
 import { ViewRegistry } from '../../src/main/views';
 import { samplePng } from '../../src/core/png';
 import { BODY_CSP, SHELL_CSP } from '../../src/shared/constants';
 import type { Logger } from '../../src/shared/log/writer';
 import { testDir } from '../paths';
+import { dimensionBombPng, gifImage } from '../../tools/gen-export/images.mjs';
 
 const quiet: Logger = { log() {}, error() {}, warn() {}, info() {} };
+
+/** A logger that keeps each event's code and data. */
+function recording(): Logger & { events: Array<{ code: string; data: unknown }> } {
+  const events: Array<{ code: string; data: unknown }> = [];
+  const keep = (code: string, data?: unknown) => events.push({ code, data });
+  return {
+    events,
+    log: (_level, code, data) => keep(code, data),
+    error: keep,
+    warn: keep,
+    info: keep,
+  };
+}
 
 function fixture() {
   const root = testDir('app-protocol');
@@ -61,10 +75,16 @@ describe('mail-body: and mail-asset: handlers', () => {
     assets: [
       { id: 'c1', contentType: 'image/png', bytes: samplePng() },
       { id: 'c2', contentType: 'image/png', bytes: new TextEncoder().encode('not an image') },
+      // Registered with a type the bytes don't have: the bytes decide.
+      { id: 'c3', contentType: 'text/html', bytes: gifImage(2, 2, 1) },
+      { id: 'c4', contentType: 'image/png', bytes: dimensionBombPng(30000, 30000) },
+      // Only c<n> is checked: a remote placeholder id is served as registered.
+      { id: 'r1', contentType: 'image/png', bytes: samplePng() },
     ],
   });
   const body = bodyHandler({ views, log: quiet, windowId: 1 });
-  const asset = assetHandler({ views, log: quiet, windowId: 1 });
+  const log = recording();
+  const asset = assetHandler({ views, log, windowId: 1 });
 
   it('serves a live body with the exact headers', async () => {
     const res = await body({ url: `mail-body://v/${open.token}` });
@@ -93,13 +113,24 @@ describe('mail-body: and mail-asset: handlers', () => {
     expect((await body({ url })).status).toBe(404);
   });
 
+  it('serves an inline image with the type of the format the check found', async () => {
+    const res = await asset({ url: `mail-asset://v/${open.token}/c3` });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('image/gif');
+  });
+
   it.each([
-    ['unknown asset', `mail-asset://v/${open.token}/c9`],
-    ['bad magic bytes', `mail-asset://v/${open.token}/c2`],
-    ['unknown token', `mail-asset://v/${'0'.repeat(32)}/c1`],
-    ['traversal', `mail-asset://v/${open.token}/..%2fc1`],
-  ])('returns 404 for an asset with %s', async (_name, url) => {
+    ['unknown asset', `mail-asset://v/${open.token}/c9`, 'unknown_asset'],
+    ['no image signature', `mail-asset://v/${open.token}/c2`, 'format'],
+    ['a canvas over the limit', `mail-asset://v/${open.token}/c4`, 'canvas'],
+    ['unknown token', `mail-asset://v/${'0'.repeat(32)}/c1`, 'unknown_token'],
+    ['traversal', `mail-asset://v/${open.token}/..%2fc1`, 'unknown_asset'],
+  ])('returns 404 for an asset with %s, and logs why', async (_name, url, reason) => {
+    log.events.length = 0;
     expect((await asset({ url })).status).toBe(404);
+    expect(log.events).toEqual([
+      { code: 'protocol.not_found', data: { scheme: 'mail-asset', reason, windowId: 1 } },
+    ]);
   });
 
   it('returns 404 once the view is revoked', async () => {
@@ -109,14 +140,53 @@ describe('mail-body: and mail-asset: handlers', () => {
   });
 });
 
-describe('hasRasterMagic', () => {
-  it('recognizes PNG, JPEG, GIF and WebP signatures only', () => {
-    expect(hasRasterMagic(samplePng())).toBe(true);
-    expect(hasRasterMagic(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]))).toBe(true);
-    expect(hasRasterMagic(new TextEncoder().encode('GIF89a....'))).toBe(true);
-    expect(hasRasterMagic(new TextEncoder().encode('RIFF\0\0\0\0WEBPVP8 '))).toBe(true);
-    expect(
-      hasRasterMagic(new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg"/>')),
-    ).toBe(false);
+describe('mail-body: source documents', () => {
+  it('serves only the current source document of a view, with the body headers', async () => {
+    const views = new ViewRegistry();
+    const open = views.accept();
+    views.install(open.openId, open.token, 1, 1, {
+      html: '<p>body</p>',
+      assets: [],
+      message: { rowid: 17, file: null, messageId: '', attachments: [] },
+    });
+    const body = bodyHandler({ views, log: quiet, windowId: 1 });
+    const view = views.beginSource(open.openId)!;
+    // None before the first block shows.
+    expect((await body({ url: `mail-body://v/${open.token}/source/0` })).status).toBe(404);
+    expect((await body({ url: `mail-body://v/${open.token}/source/1` })).status).toBe(404);
+    const session = view.source!.session;
+    views.showSource(view, session, views.select(view)!, '<pre>one</pre>', 'one');
+    const first = await body({ url: `mail-body://v/${open.token}/source/1` });
+    expect(first.status).toBe(200);
+    expect(await first.text()).toBe('<pre>one</pre>');
+    expect(Object.fromEntries(first.headers.entries())).toEqual({
+      'content-security-policy': BODY_CSP,
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+      'referrer-policy': 'no-referrer',
+      'content-type': 'text/html; charset=utf-8',
+    });
+    views.showSource(view, session, views.select(view)!, '<pre>two</pre>', 'two');
+    expect((await body({ url: `mail-body://v/${open.token}/source/1` })).status).toBe(404);
+    expect(await (await body({ url: `mail-body://v/${open.token}/source/2` })).text()).toBe(
+      '<pre>two</pre>',
+    );
+    // The body itself is still the view's.
+    expect((await body({ url: `mail-body://v/${open.token}` })).status).toBe(200);
+    // After Back, no source document is served.
+    views.leaveSource(view);
+    expect((await body({ url: `mail-body://v/${open.token}/source/2` })).status).toBe(404);
+  });
+
+  it("serves a source-only view's document, and never a body for it", async () => {
+    const views = new ViewRegistry();
+    const open = views.accept();
+    views.markFallback(open.openId, 1, 17);
+    const body = bodyHandler({ views, log: quiet, windowId: 1 });
+    const view = views.beginSource(open.openId)!;
+    expect(view.sourceOnly).toBe(true);
+    views.showSource(view, view.source!.session, views.select(view)!, '<pre>h</pre>', 'h');
+    expect((await body({ url: `mail-body://v/${open.token}/source/1` })).status).toBe(200);
+    expect((await body({ url: `mail-body://v/${open.token}` })).status).toBe(404);
   });
 });
