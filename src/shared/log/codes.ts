@@ -155,6 +155,7 @@ export const REASONS = [
   'memory-eviction',
   'window_closed',
   'replaced',
+  'closed',
   'quit',
   'symlink',
   'directory',

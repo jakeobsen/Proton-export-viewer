@@ -2,7 +2,8 @@
 
 import { useEffect } from 'react';
 import type { IndexCondition } from '../shared/index-types';
-import { indexChanged, syncMailbox } from './mailbox-state';
+import { Conversation } from './Conversation';
+import { indexChanged, syncMailbox, useCards } from './mailbox-state';
 import { ConversationList, Sidebar } from './Mailbox';
 import { LinkDialog } from './LinkDialog';
 import { generationChanged, useReaderState } from './reader';
@@ -19,6 +20,7 @@ const INDEX_BANNERS: Partial<Record<IndexCondition, string>> = {
 export function App() {
   const state = useShellState();
   const reader = useReaderState();
+  const conversation = useCards();
 
   useEffect(() => window.pev.onLinkDialog(showLink), []);
   useEffect(() => window.pev.onSourcesChanged(() => void refreshSources()), []);
@@ -81,7 +83,7 @@ export function App() {
           {active && <Sidebar active={active} busy={state.busy} />}
           {active && <ConversationList />}
           <section className="reader" aria-label="Conversation">
-            <ReaderPane />
+            {conversation.shown ? <Conversation /> : <ReaderPane />}
           </section>
         </main>
       )}

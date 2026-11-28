@@ -3,6 +3,8 @@
 
 import type { LinkAction } from './constants';
 import type {
+  CardsQuery,
+  CardsWindow,
   IndexProgress,
   ListWindow,
   SearchDateKey,
@@ -19,6 +21,7 @@ export const IPC = {
   ping: 'pev:ping',
   openStub: 'pev:open-stub',
   open: 'pev:open',
+  closeView: 'pev:close-view',
   log: 'pev:log',
   report: 'pev:report',
   linkDialog: 'pev:link-dialog',
@@ -86,7 +89,7 @@ export type MessageOpenResult =
   | Rejected;
 
 /** What the shell reads from the open export's index. */
-export type ShellIndexQuery = { op: 'sidebar' } | WindowQuery;
+export type ShellIndexQuery = { op: 'sidebar' } | WindowQuery | CardsQuery;
 
 export type IndexResult<T> =
   { ok: true; generation: number; answer: T; progress: IndexProgress } | Rejected;
@@ -128,6 +131,8 @@ export type SearchResult =
   | { ok: true; generation: number; queryId: number; page: SearchPage; progress: IndexProgress }
   | Rejected;
 
+export type CloseViewResult = { ok: true } | Rejected;
+
 export type ErrorKind = 'uncaught' | 'rejection' | 'error';
 
 export interface ErrorReport {
@@ -142,6 +147,8 @@ export interface PevApi {
   ping(generation: number): Promise<PingResult>;
   openStub(id: string, generation: number): Promise<OpenResult>;
   open(rowid: number, mode: OpenMode, generation: number): Promise<MessageOpenResult>;
+  /** Closes the reader: its view and any open still under way are revoked. */
+  closeView(generation: number): Promise<CloseViewResult>;
   log(
     level: 'error' | 'warn' | 'info',
     code: string,
@@ -166,6 +173,8 @@ export interface PevApi {
   sidebar(generation: number): Promise<IndexResult<Sidebar>>;
   /** A stretch of a folder's or label's conversations. */
   listWindow(query: WindowQuery, generation: number): Promise<IndexResult<ListWindow>>;
+  /** A stretch of one conversation's cards. */
+  cards(query: CardsQuery, generation: number): Promise<IndexResult<CardsWindow>>;
   /** Called as indexing moves on or the index's state changes. */
   onIndexChanged(listener: (update: IndexUpdate) => void): () => void;
   /**
