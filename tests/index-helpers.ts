@@ -248,7 +248,8 @@ export function ingest(
 /**
  * A thread that runs the index's operations in this process. `hang` makes a
  * call never answer, so its time limit ends it; the thread is then replaced,
- * as a worker thread would be.
+ * as a worker thread would be. A call past its limit says, as `exited`, when
+ * the operation it started has ended: nothing of it runs after that.
  */
 export class InlineThread implements IndexThread {
   respawns = 0;
@@ -268,16 +269,21 @@ export class InlineThread implements IndexThread {
     return new Promise<T>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | null = null;
       let timedOut = false;
+      let ended: () => void = () => {};
+      const exited = new Promise<void>((done) => (ended = done));
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           timedOut = true;
           this.respawns += 1;
           this.handle = threadHandler(this.role);
           this.onRespawn?.();
-          reject(new ThreadError(TIMEOUT));
+          reject(new ThreadError(TIMEOUT, exited));
         }, timeoutMs);
       }
-      if (this.hang(op, args)) return;
+      if (this.hang(op, args)) {
+        ended();
+        return;
+      }
       const handle = this.handle;
       setImmediate(() => {
         // An operation may answer with a promise, as in the worker thread.
@@ -289,6 +295,8 @@ export class InlineThread implements IndexThread {
             if (timer) clearTimeout(timer);
             if (!timedOut) reject(new ThreadError(codeOf(err)));
             return;
+          } finally {
+            ended();
           }
           if (timer) clearTimeout(timer);
           if (!timedOut) resolve(value as T);
