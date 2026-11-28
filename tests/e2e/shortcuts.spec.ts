@@ -592,7 +592,7 @@ test('Escape closes the overlay, then Settings, then the report, then clears the
 });
 
 test('the theme from Settings applies to the shell at once and after a restart', async () => {
-  const first = await launch('keys-theme');
+  const first = await launch('keys-theme', { appColorScheme: true });
   try {
     expect(await first.main('themeSource')).toBe('system');
     await chooseTheme(first.page, 'Dark');
@@ -606,7 +606,7 @@ test('the theme from Settings applies to the shell at once and after a restart',
   } finally {
     await first.close();
   }
-  const second = await launch('keys-theme', { userData: first.userData });
+  const second = await launch('keys-theme', { userData: first.userData, appColorScheme: true });
   try {
     expect(await second.main('themeSource')).toBe('dark');
     expect(await darkInShell(second.page)).toBe(true);
@@ -618,18 +618,23 @@ test('the theme from Settings applies to the shell at once and after a restart',
   }
 });
 
-test("a message's own dark-mode rules follow the theme setting in its frame", async ({ pev }) => {
-  const color = async () => {
-    const url = await shownView(pev, 'html');
-    const frame = await pev.bodyFrame(url);
-    return frame.locator('p').evaluate((p) => getComputedStyle(p).color);
-  };
-  await openSchemes(pev);
-  await chooseTheme(pev.page, 'Dark');
-  await expect.poll(color).toBe('rgb(1, 2, 3)');
-  await chooseTheme(pev.page, 'Light');
-  await expect.poll(color).toBe('rgb(4, 5, 6)');
-  await chooseTheme(pev.page, 'Dark');
-  await expect.poll(color).toBe('rgb(1, 2, 3)');
-  await checkHidden(pev);
+test("a message's own dark-mode rules follow the theme setting in its frame", async () => {
+  const pev = await launch('keys-schemes-theme', { appColorScheme: true });
+  try {
+    const color = async () => {
+      const url = await shownView(pev, 'html');
+      const frame = await pev.bodyFrame(url);
+      return frame.locator('p').evaluate((p) => getComputedStyle(p).color);
+    };
+    await openSchemes(pev);
+    await chooseTheme(pev.page, 'Dark');
+    await expect.poll(color).toBe('rgb(1, 2, 3)');
+    await chooseTheme(pev.page, 'Light');
+    await expect.poll(color).toBe('rgb(4, 5, 6)');
+    await chooseTheme(pev.page, 'Dark');
+    await expect.poll(color).toBe('rgb(1, 2, 3)');
+    await checkHidden(pev);
+  } finally {
+    await pev.close();
+  }
 });
