@@ -416,11 +416,16 @@ test('operators, both sorts, "N matching" and snippets as text, and a result ope
   await rowE.dispatchEvent('click');
   await expect(rowE).toHaveAttribute('aria-selected', 'true');
   const reader = () => pev.shell<{ rowid: number | null; view: { url: string } | null }>('reader');
+  const cards = () =>
+    pev.shell<{ shown: boolean; threadId: number | null; expanded: number | null }>('cards');
   await expect.poll(async () => (await reader()).view?.url ?? null).not.toBeNull();
   expect((await reader()).rowid).toBe(anchorE);
+  // It opens as its conversation's cards, with the matching message expanded.
+  expect(await cards()).toMatchObject({ shown: true, threadId: e, expanded: anchorE });
   // Clearing the box closes what a result opened; the list has nothing selected.
   await typeText(pev.page, '');
   await expect.poll(async () => (await reader()).rowid).toBeNull();
+  expect((await cards()).shown).toBe(false);
   expect(await pev.shell('listSelection')).toBeNull();
 });
 

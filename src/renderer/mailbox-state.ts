@@ -135,11 +135,19 @@ export function useSearch() {
   return useSyncExternalStore(subscribe, () => search.snapshot);
 }
 
+/**
+ * The showing of cards a selected result put on screen. A conversation's ID
+ * can change while it shows (a merge or split), so what a result opened is
+ * told by its showing, not by its conversation.
+ */
+let resultShowing: number | null = null;
+
 /** Results go away: the conversation a result opened goes with them. */
 function leaveSearch(drop: () => void): void {
-  const selected = search.snapshot.selected;
+  const owned = resultShowing;
+  resultShowing = null;
   drop();
-  if (selected !== null && cards.snapshot.threadId === selected.threadId) {
+  if (owned !== null && cards.showing === owned) {
     cards.hide();
     closeReaderAndView();
   }
@@ -176,9 +184,12 @@ export function selectResult(row: ResultRow): void {
     reader.rowid === row.anchorRowid &&
     reader.refused === null
   ) {
+    // Shown already; with the list's selection gone, the result owns it.
+    resultShowing = cards.showing;
     return;
   }
   cards.show(row.anchorRowid, row.threadId);
+  resultShowing = cards.showing;
 }
 
 /** The selected conversation's cards; the expanded one is open in the reader. */
