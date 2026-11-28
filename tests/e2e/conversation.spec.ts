@@ -761,7 +761,18 @@ test('n and p typed in the body frame move the expanded card; in a field, a menu
   // The body frame has the focus: main passes the key on.
   await pev.page.locator('.card.expanded .rp-frame').focus();
   await pev.page.keyboard.press('p');
-  await expanded(pev, ids[1]!);
+  try {
+    await expanded(pev, ids[1]!);
+  } catch (err) {
+    const active = await pev.page.evaluate(() => document.activeElement?.tagName ?? null);
+    console.log(
+      'key inputs main saw',
+      JSON.stringify(await pev.main('keyInputs')),
+      'active',
+      active,
+    );
+    throw err;
+  }
   expect(await shellKeys()).toBe(0);
   await pev.page.locator('.card.expanded .rp-frame').focus();
   await pev.page.keyboard.press('n');

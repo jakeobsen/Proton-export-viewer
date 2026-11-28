@@ -176,6 +176,32 @@ export async function install(ctx: AppContext): Promise<boolean> {
   // Every frame's console messages and every preconnect request, per window.
   // Windows are created after this; each has a session of its own.
   const sessionsSeen = new WeakSet<Electron.Session>();
+  // The n and p key events main sees for each window, and which frame had the focus.
+  const keyInputs: Array<{ event: string; key: string; type: string; focused: string }> = [];
+  const focusedKind = (contents: Electron.WebContents) => {
+    const frame = contents.focusedFrame;
+    if (!frame) return 'none';
+    if (frame === contents.mainFrame) return 'main';
+    return frame.parent === contents.mainFrame ? `child:${frame.url.split(':')[0]}` : 'nested';
+  };
+  app.on('web-contents-created', (_event, contents) => {
+    contents.on('before-input-event', (_e, input) => {
+      if (input.key === 'n' || input.key === 'p') {
+        keyInputs.push({
+          event: 'before-input',
+          key: input.key,
+          type: input.type,
+          focused: focusedKind(contents),
+        });
+      }
+    });
+    contents.on('input-event', (_e, input) => {
+      const key = (input as { key?: string }).key;
+      if (key === 'n' || key === 'p') {
+        keyInputs.push({ event: 'input', key, type: input.type, focused: focusedKind(contents) });
+      }
+    });
+  });
   app.on('web-contents-created', (_event, contents) => {
     if (!sessionsSeen.has(contents.session)) {
       sessionsSeen.add(contents.session);
@@ -448,6 +474,8 @@ export async function install(ctx: AppContext): Promise<boolean> {
     indexDir: () => join(app.getPath('userData'), 'index'),
     /** Resets the app's data, as Settings will. */
     resetApp: () => ctx.sources.reset(),
+    /** The n and p key events main saw, with the focused frame of each. */
+    keyInputs: () => keyInputs.map((k) => ({ ...k })),
   };
   (globalThis as { __pevTest?: typeof api }).__pevTest = api;
 

@@ -34,10 +34,20 @@ interface FakeFrame {
 const BODY = 'mail-body://v/0123456789abcdef0123456789abcdef';
 
 function fakeContents() {
-  const main: FakeFrame = { processId: 1, frameToken: 'main', parent: null, url: 'app://shell/index.html' };
+  const main: FakeFrame = {
+    processId: 1,
+    frameToken: 'main',
+    parent: null,
+    url: 'app://shell/index.html',
+  };
   const body: FakeFrame = { processId: 2, frameToken: 'body', parent: main, url: BODY };
   const nested: FakeFrame = { processId: 2, frameToken: 'nested', parent: body, url: BODY };
-  const sibling: FakeFrame = { processId: 3, frameToken: 'sibling', parent: main, url: 'about:blank' };
+  const sibling: FakeFrame = {
+    processId: 3,
+    frameToken: 'sibling',
+    parent: main,
+    url: 'about:blank',
+  };
   const sent: unknown[][] = [];
   let authorized: string | null = BODY;
   const contents = Object.assign(new EventEmitter(), {
