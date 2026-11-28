@@ -13,10 +13,13 @@
 //
 // Phase 2 then reads the text of every message file still waiting for it,
 // newest message first: one file per pool job, with the same time limit, so a
-// file past it fails alone. The text is written in transactions of at most
-// 500 bodies and 4 MiB of text, counted after reading. A message whose file
-// changed since the scan waits for the next reconcile; one interrupted by a
-// close waits for the next open.
+// file past it fails alone. Core opens each file itself, without blocking and
+// under the same limit, lends the descriptor to the job and closes it whatever
+// becomes of the job (see body-files.ts); a teardown waits no longer than the
+// job limit for a thread stuck in a read. The text is written in transactions
+// of at most 500 bodies and 4 MiB of text, counted after reading. A message
+// whose file changed since the scan waits for the next reconcile; one
+// interrupted by a close waits for the next open.
 //
 // On reopen, phase 1 reconciles: the folder's files are compared with the
 // stored pairs, what needs nothing read (a file gone, a message file changed)
@@ -29,8 +32,9 @@
 // pages are read as usual. A failed check, or SQLite reporting the file as
 // corrupt at any time, is reported once, for the source's lifecycle to act on.
 // Closing is the index's part of the teardown: queued jobs are cancelled, the
-// write in flight rolls back, the check is ended and joined, and every
-// connection is closed.
+// write in flight rolls back, the check is ended and joined, every file phase
+// 2 opened is closed once no thread can read it (waiting no longer than the
+// job limit for a thread stuck in a read), and every connection is closed.
 
 import { mkdirSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
@@ -45,10 +49,12 @@ import type {
 } from '../../shared/index-types';
 import type { Logger } from '../../shared/log/writer';
 import type { Stamp } from '../../shared/sources';
-import type { FileRef, RunScan } from '../containment';
+import { ContainmentError, openContainedAsync, type FileRef, type RunScan } from '../containment';
+import { BodyFiles } from './body-files';
 import { TXN_INPUT_BYTES, WRITE_BATCH_PAIRS } from './limits';
 import {
   BODY_CHANGED,
+  rejectCode,
   type ApplyResult,
   type BatchResult,
   type BodyJobItem,
@@ -98,6 +104,11 @@ export const PROGRESS_MS = 250;
 export const BODY_BATCH = 500;
 /** Phase 2 jobs waiting per pool thread, so a thread never waits for the next file. */
 const BODY_LANES = 2;
+/**
+ * Descriptors phase 2 holds per lane, at most: the lane's own, and as many
+ * again left by timeouts, still opening or still lent to an ended thread.
+ */
+const BODY_FILES_PER_LANE = 2;
 
 /** One registered connection: which thread holds it, on which database. */
 export interface Connection {
@@ -170,6 +181,8 @@ export interface IndexServiceDeps {
   log: Logger;
   /** Starts a thread of the given role. */
   thread: (role: ThreadRole) => IndexThread;
+  /** Opens a message file for a body job; openContainedAsync by default. */
+  openFile?: (root: string, ref: FileRef) => Promise<number>;
   /** False once the source's generation has moved on. */
   isCurrent: () => boolean;
   options?: IndexOptions;
@@ -284,6 +297,8 @@ export class IndexService {
     bodiesTotal: 0,
     bodiesFailed: 0,
   };
+  /** How long phase 1 took when it last ran to the end, in ms. */
+  took: number | null = null;
   private readonly poolSize: number;
   private readonly jobMs: number;
   private readonly metaJob: number;
@@ -300,6 +315,10 @@ export class IndexService {
   });
   /** Bytes of text one phase 2 transaction writes, at most. */
   private readonly textBudget: number;
+  /** The descriptors phase 2 has open, opening, or lent to a thread. */
+  private readonly bodyFiles: BodyFiles;
+  /** The monotonic time until which a close waits for the pool's threads and their files. */
+  private closeBy: number | null = null;
 
   constructor(private readonly deps: IndexServiceDeps) {
     this.dbPath = join(deps.indexDir, `${deps.stamp.sourceKey}.sqlite`);
@@ -316,6 +335,7 @@ export class IndexService {
       textBudget = Math.max(1, Math.min(TXN_INPUT_BYTES, o.txnBytes));
     }
     this.textBudget = textBudget;
+    this.bodyFiles = new BodyFiles(this.poolSize * BODY_LANES * BODY_FILES_PER_LANE);
   }
 
   private get src() {
@@ -547,7 +567,14 @@ export class IndexService {
     try {
       if (await this.runPhase1(scan)) await this.runPhase2(scan);
     } finally {
-      await this.stopPool();
+      // The threads and the files they read get one job limit, from here or
+      // from the start of a close, whichever comes first.
+      const until = Math.min(this.closeBy ?? Infinity, performance.now() + this.jobMs);
+      await this.stopPool(until);
+      // A file a thread still reads after that is left to it: it is closed
+      // when the thread exits, or by the system when core does.
+      const held = await this.bodyFiles.drain(until - performance.now());
+      if (held > 0) this.deps.log.warn('index.files_held', { count: held }, this.src);
       this.touch();
     }
   }
@@ -589,10 +616,26 @@ export class IndexService {
     return this.pool;
   }
 
-  private async stopPool(): Promise<void> {
+  /**
+   * Ends the pool's threads, waiting for them until `until` (the monotonic
+   * clock) at most: a thread stuck in a read on a dead disk exits whenever
+   * that read ends.
+   */
+  private async stopPool(until: number): Promise<void> {
     const pool = this.pool;
     this.pool = null;
-    await pool?.stop();
+    if (!pool) return;
+    // Left running past the deadline: a later failure there has nothing to stop.
+    const stopped = pool.stop().catch(() => undefined);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, Math.max(0, until - performance.now()));
+    });
+    try {
+      await Promise.race([stopped, late]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /** Phase 1; resolves true if it ended with every pair handled. */
@@ -661,12 +704,13 @@ export class IndexService {
       await this.readAndWrite(pool, writer, toRead, scan.metadata);
       if (!this.current()) throw new ThreadError('STALE');
       await writer.call('finish', { stamp });
+      this.took = Math.round(performance.now() - started);
       this.progress.phase = 'done';
       if (this.progress.condition === 'rebuilding') this.progress.condition = 'ok';
       this.report(true);
       this.deps.log.info(
         'index.phase1_done',
-        { count: this.progress.loaded, ms: Math.round(performance.now() - started) },
+        { count: this.progress.loaded, ms: this.took },
         this.src,
       );
       return true;
@@ -831,7 +875,10 @@ export class IndexService {
 
   /**
    * Reads one message file on the pool. Null leaves the message waiting: its
-   * file isn't the one the scan found, or changed since.
+   * file isn't the one the scan found, or changed since. Core opens the file
+   * and lends it to the job; it is closed at once when the job has a reply or
+   * no thread took it, and once the thread has exited when a thread took the
+   * job and was ended with it.
    */
   private async bodyItem(
     pool: Pool,
@@ -859,11 +906,30 @@ export class IndexService {
       attachmentsCapped: false,
       error,
     });
+    let opened;
+    try {
+      const openFile = this.deps.openFile ?? openContainedAsync;
+      opened = await this.bodyFiles.open(() => openFile(this.deps.root, ref), this.jobMs);
+    } catch (err) {
+      if (!(err instanceof ContainmentError)) return failed('BODY_FAILED');
+      const code = rejectCode(err.kind === 'root_unavailable' ? 'unreadable' : err.kind);
+      return code === BODY_CHANGED ? null : failed(code);
+    }
+    // The index is closing: indexing stops here.
+    if (opened === 'stopped') throw new ThreadError(THREAD_STOPPED);
+    if (opened === 'timeout') {
+      this.progress.timeouts += 1;
+      return failed('BODY_TIMEOUT');
+    }
+    const { fd } = opened;
+    let exited: Promise<void> | undefined;
     let result: BodyJobResult;
     try {
       const item: BodyJobItem = { protonId: todo.protonId, rev: todo.rev, ref };
-      result = await pool.run<BodyJobResult>('body', { root: this.deps.root, item }, this.jobMs);
+      result = await pool.run<BodyJobResult>('body', { fd, item }, this.jobMs);
     } catch (err) {
+      // A thread that took the job and was ended may still be reading the file.
+      if (err instanceof ThreadError) exited = err.exited;
       const code = err instanceof ThreadError ? err.code : 'FAILED';
       // The pool ended: indexing stops here.
       if (code === THREAD_STOPPED) throw err;
@@ -872,6 +938,8 @@ export class IndexService {
         return failed('BODY_TIMEOUT');
       }
       return failed('BODY_FAILED');
+    } finally {
+      this.bodyFiles.close(fd, exited);
     }
     if (!result.ok) return result.error === BODY_CHANGED ? null : failed(result.error);
     return {
@@ -1127,8 +1195,10 @@ export class IndexService {
   /**
    * The index's part of a teardown: no new work starts, queued jobs are
    * cancelled, the write in flight stops and rolls back, the check is ended
-   * and joined, and every connection is closed. Resolves once all of that has
-   * happened.
+   * and joined, every file phase 2 opened is closed once the thread it was
+   * lent to has exited (waiting no longer than the job limit for a thread
+   * stuck in a read), and every connection is closed. Resolves once all of
+   * that has happened.
    */
   async close(): Promise<void> {
     this.closed = true;
@@ -1138,7 +1208,10 @@ export class IndexService {
     Atomics.store(new Int32Array(this.cancel), 0, 1);
     if (this.idleTimer) clearInterval(this.idleTimer);
     this.idleTimer = null;
-    await this.stopPool();
+    this.bodyFiles.stop();
+    this.closeBy = performance.now() + this.jobMs;
+    await this.stopPool(this.closeBy);
+    // A run ends once every file it opened is closed, or the wait for them is over.
     await this.running;
     await this.verifier?.stop();
     await this.checking;

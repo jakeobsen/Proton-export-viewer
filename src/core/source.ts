@@ -27,7 +27,8 @@ import type {
   ResetRequest,
   ScanRequest,
 } from '../shared/core-protocol';
-import type { EmlFile, IndexOpened } from '../shared/index-types';
+import type { EmlFile, IndexOpened, IndexReport } from '../shared/index-types';
+import type { FileIdentity } from '../shared/reader-protocol';
 import type { Logger } from '../shared/log/writer';
 import type { ScanSummary } from '../shared/sources';
 import {
@@ -35,6 +36,7 @@ import {
   addEntry,
   countRejections,
   emptyScan,
+  openContained,
   openWithRescan,
   pairCounts,
   resolveRoot,
@@ -47,9 +49,10 @@ import { FamilyInUse, deleteFamily } from './index/family';
 import type { CheckResult } from './index/ops';
 import { ThreadError, type IndexThread, type ThreadRole } from './index/pool';
 import { BODY_STATE, mismatchOf, probeIdentity } from './index/schema';
-import type { OpenedMessage } from './reader/source';
+import type { LocatedFile, OpenedMessage } from './reader/source';
 import { overlaps } from '../shared/overlap';
 import { ConnectionRegistry, IndexService, type IndexOptions } from './index/service';
+import { withScan } from './index/report';
 
 /** Entries scanned between yields, so core keeps answering during a long scan. */
 const SCAN_SLICE = 2000;
@@ -463,6 +466,10 @@ export class SourceSession {
     let answer: Awaited<ReturnType<IndexService['ask']>>;
     try {
       answer = await service.ask(request.query);
+      // The report adds what the last scan refused, which only the source holds.
+      if (request.query.op === 'report' && answer !== null && typeof answer === 'object') {
+        answer = withScan(answer as IndexReport, this.records.rejected, service.took);
+      }
     } catch (err) {
       if (service.isDamaged) return damaged();
       throw err;
@@ -525,12 +532,57 @@ export class SourceSession {
       ok: true,
       opened: {
         input: { kind: 'fd', fd },
+        file: { dev: opened.ref.dev.toString(), ino: opened.ref.ino.toString() },
         close: () => {
           closeSync(fd);
           return Promise.resolve();
         },
       },
     };
+  }
+
+  /**
+   * The path of a message's file for Show in folder, only while the file at
+   * the pair's path is still the one a view was read from: a contained open
+   * (no links, a regular file) whose `(dev, ino)` is that identity. A replaced
+   * file is never shown in place of the one that was read.
+   */
+  async locateForReader(
+    rowid: number,
+    generation: number,
+    want: FileIdentity,
+  ): Promise<LocatedFile> {
+    const current = this.gate.current;
+    if (!current) return { ok: false, code: 'no_source' };
+    if (current.generation !== generation) return { ok: false, code: 'superseded' };
+    const root = this.root;
+    if (root === null) return { ok: false, code: 'unavailable' };
+    const service = this.index;
+    if (!service || service.isDamaged) return { ok: false, code: 'not_found' };
+    const file = (await service.ask({ op: 'eml', rowid })) as EmlFile | null;
+    if (!this.gate.isCurrent(current) || this.index !== service || service.isDamaged) {
+      return { ok: false, code: 'superseded' };
+    }
+    if (!file) return { ok: false, code: 'not_found' };
+    if (file.rel === null || file.bodyState === BODY_STATE.emlMissing) {
+      return { ok: false, code: 'eml_missing' };
+    }
+    let fd: number;
+    try {
+      fd = openContained(root, {
+        rel: file.rel,
+        kind: 'eml',
+        dev: BigInt(want.dev),
+        ino: BigInt(want.ino),
+        size: file.size,
+        mtimeNs: BigInt(file.mtimeNs),
+      });
+    } catch (err) {
+      if (!(err instanceof ContainmentError)) throw err;
+      return { ok: false, code: err.errno === 'ENOENT' ? 'eml_missing' : 'changed' };
+    }
+    closeSync(fd);
+    return { ok: true, path: join(root, file.rel) };
   }
 
   /** Scans the run for the index when no scan was accepted yet. */

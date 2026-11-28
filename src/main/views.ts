@@ -4,6 +4,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { BODY_SCHEME, VIEW_HOST } from '../shared/constants';
+import type { FileIdentity } from '../shared/reader-protocol';
 
 export interface ViewAsset {
   contentType: string;
@@ -16,6 +17,30 @@ export interface ViewLink {
   text: string;
 }
 
+/** What main keeps about one listed attachment; the shell knows it only by its index. */
+export interface ViewAttachment {
+  /** The part's dotted path in the message. */
+  path: string;
+  /** The cleaned file name. */
+  name: string;
+  /** The declared content type, lower-cased. */
+  contentType: string;
+  /** The decoded size, in bytes. */
+  size: number;
+}
+
+/** What main keeps about the message a view shows, for the actions on it. */
+export interface ViewMessage {
+  /** The reader's rowid of the message. */
+  rowid: number;
+  /** The identity of the file the view was read from; null for a test input. */
+  file: FileIdentity | null;
+  /** The Message-ID as Details shows it, or '' when the message has none. */
+  messageId: string;
+  /** Each listed attachment, by its index in the list the shell shows. */
+  attachments: ViewAttachment[];
+}
+
 export interface View {
   token: string;
   openId: number;
@@ -24,12 +49,15 @@ export interface View {
   assets: Map<string, ViewAsset>;
   /** Kept apart from the assets: a link id is never served. */
   links: Map<string, ViewLink>;
+  /** The message a reader view shows; none for the test hooks' fixed bodies. */
+  message: ViewMessage | null;
 }
 
 export interface ViewBody {
   html: string;
   assets: Array<{ id: string; contentType: string; bytes: Uint8Array }>;
   links?: Array<{ id: string; url: string; text: string }>;
+  message?: ViewMessage;
 }
 
 export type InstallOutcome =
@@ -80,6 +108,7 @@ export class ViewRegistry {
         body.assets.map((a) => [a.id, { contentType: a.contentType, bytes: a.bytes }]),
       ),
       links: new Map((body.links ?? []).map((l) => [l.id, { url: l.url, text: l.text }])),
+      message: body.message ?? null,
     };
     this.live.set(token, view);
     this.pendingToken = null;
@@ -113,6 +142,12 @@ export class ViewRegistry {
 
   lookup(token: string): View | undefined {
     return TOKEN_RE.test(token) ? this.live.get(token) : undefined;
+  }
+
+  /** The live view, if it is the one the open `openId` installed. */
+  byOpenId(openId: number): View | undefined {
+    for (const view of this.live.values()) if (view.openId === openId) return view;
+    return undefined;
   }
 
   /** The only body URL the body frame may navigate to. */

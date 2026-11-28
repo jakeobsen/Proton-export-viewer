@@ -3,9 +3,13 @@
 // one of them expanded in the reader. Like the list, only a window of cards
 // around what is on screen is held, read again when the index moves on or the
 // view leaves it. Each read follows the expanded message, so a merge or split
-// keeps the expansion. If the expanded message is gone, the nearest card
-// (the next newer one first) opens in its place; with no card left, the
-// reader closes and its view is revoked.
+// keeps the expansion, and a move steps it to the next newer or older card.
+// Moves made before the cards they need are held add up: the cards around the
+// expanded one are read, then those around where the moves end, and only the
+// card there opens.
+// If the expanded message is gone, the nearest card (the next newer one
+// first) opens in its place; with no card left, the reader closes and its
+// view is revoked.
 
 import {
   CARDS_AFTER,
@@ -88,6 +92,13 @@ export class CardsModel {
   private again = false;
   /** The next read anchors at the expanded card's place, wherever the screen is. */
   private seekExpanded = false;
+  /** Cards to move the expansion by once the expanded card's neighbours are read. */
+  private pendingMove = 0;
+  /**
+   * Where waiting moves end, once that is known and its card isn't held: the
+   * next read anchors there.
+   */
+  private moveTarget: number | null = null;
   /** Conversation changes since the start; a read for an older one is dropped. */
   private epoch = 0;
 
@@ -142,6 +153,8 @@ export class CardsModel {
     this.selected = rowid;
     this.expandedKey = null;
     this.seekExpanded = false;
+    this.pendingMove = 0;
+    this.moveTarget = null;
     this.snap = {
       ...EMPTY,
       shown: true,
@@ -160,6 +173,8 @@ export class CardsModel {
     this.epoch += 1;
     this.selected = null;
     this.expandedKey = null;
+    this.pendingMove = 0;
+    this.moveTarget = null;
     this.snap = { ...EMPTY, scrollId: this.snap.scrollId, shiftId: this.snap.shiftId };
     this.onChange();
   }
@@ -170,10 +185,64 @@ export class CardsModel {
    */
   expand(card: CardRow): boolean {
     if (!this.snap.shown || card.rowid === this.snap.expanded) return false;
+    // A card expanded by hand replaces any move still waiting for a read.
+    this.pendingMove = 0;
+    this.moveTarget = null;
     this.expandedKey = { time: card.time, rowid: card.rowid };
     this.set({ expanded: card.rowid, scrollId: this.snap.scrollId + 1 });
     this.actions.open(card.rowid);
     return true;
+  }
+
+  /**
+   * Expands the card `step` places from the expanded one: 1 is the next newer,
+   * -1 the next older. Nothing happens past either end. If that card isn't
+   * held, the cards around the expanded one are read first. Returns false if
+   * there is no card to move to.
+   */
+  move(step: 1 | -1): boolean {
+    const { shown, ready, expanded, total } = this.snap;
+    if (!shown || !ready || expanded === null) return false;
+    if (this.moveTarget !== null) {
+      // The cards where the waiting moves end are being read: this one adds to them.
+      const to = Math.max(0, Math.min(total - 1, this.moveTarget + step));
+      if (to === this.moveTarget) return false;
+      this.moveTarget = to;
+      this.refresh();
+      return true;
+    }
+    const at = this.expandedIndex();
+    if (at !== null && this.pendingMove === 0) {
+      const to = at + step;
+      if (to < 0 || to >= total) return false;
+      const card = this.cardAt(to);
+      if (card) return this.expand(card);
+    }
+    // The expanded card or its neighbour isn't held: read at its place, then move.
+    this.pendingMove += step;
+    this.seekExpanded = true;
+    this.refresh();
+    return true;
+  }
+
+  /**
+   * Moves the expansion by the moves that waited for a read of the expanded
+   * card's place, within the conversation. If the card where they end isn't
+   * held, the cards there are read first, and it opens then.
+   */
+  private applyMove(): void {
+    const step = this.pendingMove;
+    this.pendingMove = 0;
+    const at = this.expandedIndex();
+    if (at === null) return;
+    const to = Math.max(0, Math.min(this.snap.total - 1, at + step));
+    const card = this.cardAt(to);
+    if (card) {
+      this.expand(card);
+      return;
+    }
+    this.moveTarget = to;
+    this.again = true;
   }
 
   /** The positions on screen, first and last; reads more cards if they aren't held. */
@@ -213,10 +282,20 @@ export class CardsModel {
   }
 
   /**
-   * The anchor: the expanded card if it is on screen (or a read must find
-   * its place), else the top card on screen.
+   * The anchor: where waiting moves end, while those cards are read; else
+   * the expanded card if it is on screen (or a read must find its place);
+   * else the top card on screen.
    */
-  private anchor(): { anchor: CardsAnchor; index: number; atExpanded: boolean } {
+  private anchor(): {
+    anchor: CardsAnchor;
+    index: number;
+    atExpanded: boolean;
+    atTarget: boolean;
+  } {
+    if (this.moveTarget !== null) {
+      const index = this.moveTarget;
+      return { anchor: { index }, index, atExpanded: false, atTarget: true };
+    }
     const { expanded } = this.snap;
     const at = this.expandedIndex();
     const onScreen = at !== null && at >= this.first && at <= this.last;
@@ -230,6 +309,7 @@ export class CardsModel {
         },
         index,
         atExpanded: true,
+        atTarget: false,
       };
     }
     const top = this.cardAt(this.first);
@@ -242,14 +322,15 @@ export class CardsModel {
           },
           index: this.first,
           atExpanded: false,
+          atTarget: false,
         }
-      : { anchor: { index: this.first }, index: this.first, atExpanded: false };
+      : { anchor: { index: this.first }, index: this.first, atExpanded: false, atTarget: false };
   }
 
   /** Reads the cards once; false if no answer came. */
   private async readOnce(): Promise<boolean> {
     const epoch = this.epoch;
-    const { anchor, index, atExpanded } = this.anchor();
+    const { anchor, index, atExpanded, atTarget } = this.anchor();
     const expanded = this.snap.expanded;
     const follow = [...new Set([expanded, this.selected].filter((r): r is number => r !== null))];
     const screen = this.last - this.first + 1;
@@ -271,6 +352,8 @@ export class CardsModel {
     if (answer.threadId === null) {
       // Nothing of the conversation is left.
       this.seekExpanded = false;
+      this.pendingMove = 0;
+      this.moveTarget = null;
       const hadExpanded = expanded !== null;
       this.set({
         threadId: null,
@@ -290,13 +373,17 @@ export class CardsModel {
     if (removed && !atExpanded) {
       // This window may not hold the place of the card that went: read there.
       // Its view and any open of it are revoked now, not once that read is back.
+      // Moves waiting for it are dropped with it.
       this.seekExpanded = true;
+      this.moveTarget = null;
       this.again = true;
       this.set({ threadId: answer.threadId });
       this.actions.close();
       return true;
     }
-    this.seekExpanded = false;
+    // Only a read at the expanded card's place finds it: a read at the screen
+    // or at a move's end leaves a waiting search for it as it is.
+    if (atExpanded) this.seekExpanded = false;
     const moved = answer.anchorFound && answer.anchor !== null ? answer.anchor - index : 0;
     // Cards on screen stay in place by a shift; on a first read or a new
     // expansion the expanded card's header scrolls to the top instead.
@@ -327,8 +414,29 @@ export class CardsModel {
     this.first = Math.max(0, this.first + moved);
     this.last = Math.max(this.first, this.last + moved);
     if (removed) {
+      // The nearest card opens in the removed one's place; a waiting move is dropped.
+      this.pendingMove = 0;
+      this.moveTarget = null;
       if (next !== null) this.actions.open(next);
       else this.actions.close();
+    } else if (atTarget && this.moveTarget !== null) {
+      // The cards where the moves end: open that card, or read there again if
+      // more moves took them past this window meanwhile.
+      const card = this.cardAt(Math.max(0, Math.min(this.moveTarget, answer.total - 1)));
+      if (card) {
+        this.moveTarget = null;
+        this.expand(card);
+      } else {
+        this.again = true;
+      }
+    } else if (this.pendingMove !== 0) {
+      // Moves made while the screen's cards were read wait for the expanded card's.
+      if (atExpanded) {
+        this.applyMove();
+      } else {
+        this.seekExpanded = true;
+        this.again = true;
+      }
     }
     return true;
   }

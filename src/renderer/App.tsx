@@ -3,12 +3,21 @@
 import { useEffect } from 'react';
 import type { IndexCondition } from '../shared/index-types';
 import { Conversation } from './Conversation';
-import { indexChanged, syncMailbox, useCards, useSearch } from './mailbox-state';
+import { typedCardKey } from './card-keys';
+import {
+  indexChanged,
+  moveCard,
+  syncMailbox,
+  useCards,
+  useMailbox,
+  useSearch,
+} from './mailbox-state';
 import { ConversationList, Sidebar } from './Mailbox';
 import { SearchBox, SearchResults } from './SearchResults';
 import { LinkDialog } from './LinkDialog';
 import { generationChanged, useReaderState } from './reader';
 import { ReaderPane } from './ReaderPane';
+import { ReportView } from './Report';
 import { locateExport, openExport, refreshSources, showLink, useShellState } from './shell';
 import { Welcome } from './Welcome';
 
@@ -23,10 +32,21 @@ export function App() {
   const reader = useReaderState();
   const results = useSearch().active;
   const conversation = useCards();
+  const { reportOpen } = useMailbox();
 
   useEffect(() => window.pev.onLinkDialog(showLink), []);
   useEffect(() => window.pev.onSourcesChanged(() => void refreshSources()), []);
   useEffect(() => window.pev.onIndexChanged(indexChanged), []);
+  // `n`/`p`: typed in the shell, or in the body frame and passed on by main.
+  useEffect(() => window.pev.onCardKey(moveCard), []);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const key = typedCardKey(event);
+      if (key !== null) moveCard(key);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
   useEffect(() => {
     void refreshSources();
   }, []);
@@ -41,6 +61,7 @@ export function App() {
   const welcome =
     state.sources !== null && !state.sources.restoring && active === null && reader.rowid === null;
   const banner = active?.index ? INDEX_BANNERS[active.index] : undefined;
+  const showReport = active !== null && reportOpen;
 
   return (
     <div className="shell">
@@ -82,13 +103,18 @@ export function App() {
       {welcome ? (
         <Welcome recent={state.sources?.recent ?? []} busy={state.busy} notice={state.notice} />
       ) : (
-        <main className="content">
-          {active && <Sidebar active={active} busy={state.busy} />}
-          {active && (results ? <SearchResults /> : <ConversationList />)}
-          <section className="reader" aria-label="Conversation">
-            {conversation.shown ? <Conversation /> : <ReaderPane />}
-          </section>
-        </main>
+        <div className="stage">
+          {showReport && <ReportView active={active} />}
+          {/* Under the report the mail stays as it was, with its open message:
+              still laid out, but unseen and inert. */}
+          <main className="content" hidden={showReport} inert={showReport}>
+            {active && <Sidebar active={active} busy={state.busy} />}
+            {active && (results ? <SearchResults /> : <ConversationList />)}
+            <section className="reader" aria-label="Conversation">
+              {conversation.shown ? <Conversation /> : <ReaderPane />}
+            </section>
+          </main>
+        </div>
       )}
       {state.link !== null && <LinkDialog key={state.link.dialogId} prompt={state.link} />}
     </div>

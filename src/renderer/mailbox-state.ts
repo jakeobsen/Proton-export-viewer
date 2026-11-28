@@ -5,10 +5,17 @@
 // main reports that the index moved on, and results are not.
 
 import { useSyncExternalStore } from 'react';
-import type { IndexResult, IndexUpdate, SearchRequest, SnippetsRequest } from '../shared/api';
+import type {
+  CardKeyName,
+  IndexResult,
+  IndexUpdate,
+  SearchRequest,
+  SnippetsRequest,
+} from '../shared/api';
 import type {
   CardRow,
   IndexProgress,
+  IndexReport,
   SearchSort,
   Sidebar,
   ThreadSnippet,
@@ -26,9 +33,20 @@ export interface MailboxState {
   sidebar: SidebarModel | null;
   folder: string;
   progress: IndexProgress | null;
+  /** The index report, read while it is on screen and once phase 1 is done. */
+  report: IndexReport | null;
+  /** The index report is on screen instead of the list. */
+  reportOpen: boolean;
 }
 
-let state: MailboxState = { key: null, sidebar: null, folder: INBOX, progress: null };
+let state: MailboxState = {
+  key: null,
+  sidebar: null,
+  folder: INBOX,
+  progress: null,
+  report: null,
+  reportOpen: false,
+};
 const listeners = new Set<() => void>();
 
 function update(patch: Partial<MailboxState>): void {
@@ -246,6 +264,7 @@ export function syncMailbox(): void {
       void readSidebar();
       list.refresh();
       cards.refresh();
+      refreshReport();
     }
     return;
   }
@@ -253,7 +272,8 @@ export function syncMailbox(): void {
   const folder = sameExport ? state.folder : INBOX;
   // Results belong to the generation that answered them.
   search.clear();
-  update({ key, sidebar: null, progress: null, folder });
+  update({ key, sidebar: null, progress: null, folder, report: null, reportOpen: false });
+  reportStamp = '';
   list.reset(key === null ? null : folder);
   // A new export or generation: main revoked the reader's view, and nothing is selected.
   cards.hide();
@@ -267,6 +287,89 @@ export function indexChanged(update_: IndexUpdate): void {
   void readSidebar();
   list.refresh();
   cards.refresh();
+  refreshReport();
+}
+
+/** The report is read at most this often. */
+export const REPORT_MS = 1000;
+let readingReport = false;
+let reportAgain = false;
+let lastReport = -Infinity;
+let reportTimer: ReturnType<typeof setTimeout> | null = null;
+/** The counts the last report read started from (see stampOf). */
+let reportStamp = '';
+
+/**
+ * What the list header's count can move with, as index updates carry it:
+ * the phase (a new scan, or reconcile), metadata that couldn't be used,
+ * timeouts, lists cut to their limit (phase 2 cuts attachment lists) and
+ * message files whose text couldn't be read.
+ */
+function stampOf(progress: IndexProgress | null): string {
+  if (progress === null) return '';
+  const { phase, failed, timeouts, capped, bodiesFailed } = progress;
+  return `${phase}:${failed}:${timeouts}:${capped}:${bodiesFailed}`;
+}
+
+async function readReport(): Promise<void> {
+  if (readingReport) {
+    reportAgain = true;
+    return;
+  }
+  readingReport = true;
+  lastReport = performance.now();
+  reportStamp = stampOf(state.progress);
+  const key = state.key;
+  try {
+    const answer = await ask((generation) => window.pev.indexReport(generation));
+    if (answer && state.key === key) update({ report: answer });
+  } finally {
+    readingReport = false;
+    if (reportAgain) {
+      reportAgain = false;
+      refreshReport();
+    }
+  }
+}
+
+/**
+ * Reads the report again, at most once per REPORT_MS: on every index update
+ * while it is on screen, and once phase 1 is done (the list header names the
+ * files that need attention) only when an update moved the counts it
+ * depends on.
+ */
+function refreshReport(): void {
+  if (state.key === null) return;
+  if (!state.reportOpen) {
+    if (state.progress?.phase !== 'done') {
+      // A new scan or reconcile: the next 'done' is read whatever its counts.
+      reportStamp = '';
+      return;
+    }
+    if (stampOf(state.progress) === reportStamp) return;
+  }
+  if (reportTimer) return;
+  // The monotonic clock: a wall clock set back can't hold the next read.
+  const wait = lastReport + REPORT_MS - performance.now();
+  if (wait > 0) {
+    reportTimer = setTimeout(() => {
+      reportTimer = null;
+      refreshReport();
+    }, wait);
+    return;
+  }
+  void readReport();
+}
+
+export function openReport(): void {
+  if (state.key === null || state.reportOpen) return;
+  update({ reportOpen: true });
+  lastReport = -Infinity;
+  refreshReport();
+}
+
+export function closeReport(): void {
+  if (state.reportOpen) update({ reportOpen: false });
 }
 
 export function showFolder(id: string): void {
@@ -306,4 +409,15 @@ export function expandCard(card: CardRow): void {
   // The card already expanded: open it again only if its open was refused.
   const reader = getReaderState();
   if (reader.rowid === card.rowid && reader.refused !== null) void openInReader(card.rowid);
+}
+
+/**
+ * `n` expands the next newer card, `p` the next older one, stopping at either
+ * end; the list selection stays. Nothing moves while the link dialog is open
+ * or the index report shows, whether the key was typed in the shell or
+ * passed on by main from the body frame.
+ */
+export function moveCard(key: CardKeyName): void {
+  if (getShellState().link !== null || state.reportOpen) return;
+  cards.move(key === 'n' ? 1 : -1);
 }

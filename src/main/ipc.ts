@@ -5,15 +5,17 @@
 // rejected. The one exception is `state`, the bootstrap call: it takes no
 // arguments and returns the current generation.
 
-import { ipcMain, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
+import { clipboard, ipcMain, shell, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
 import { z } from 'zod';
 import {
   IPC,
   type CloseViewResult,
+  type CopyResult,
   type ErrorKind,
   type IndexResult,
   type LinkActionResult,
   type MessageOpenResult,
+  type ReaderActionResult,
   type OpenResult,
   type PingResult,
   type Rejected,
@@ -32,9 +34,11 @@ import {
   MAX_SNIPPET_THREADS,
   WINDOW_AFTER,
   WINDOW_BEFORE,
+  type IndexReport,
   type SearchPage,
   type SearchSnippets,
 } from '../shared/index-types';
+import { reportText } from '../shared/report-text';
 import type { SourceOutcome } from '../shared/sources';
 import { STALE, type Stale } from './sources/manager';
 import { APP_ORIGIN, LINK_ACTIONS } from '../shared/constants';
@@ -65,6 +69,15 @@ const MessageOpenArgs = z.tuple([
     .object({
       rowid: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
       mode: z.enum(OPEN_MODES),
+      generation: Generation,
+    })
+    .strict(),
+]);
+// An action on the open message names its view by the open that installed it.
+const ViewActionArgs = z.tuple([
+  z
+    .object({
+      openId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
       generation: Generation,
     })
     .strict(),
@@ -109,6 +122,7 @@ const ListKey = z
   .strict();
 const ShellQuery = z.discriminatedUnion('op', [
   z.object({ op: z.literal('sidebar') }).strict(),
+  z.object({ op: z.literal('report') }).strict(),
   z
     .object({
       op: z.literal('window'),
@@ -408,6 +422,17 @@ export function registerIpc(ctx: AppContext): void {
       html: message.html,
       assets: viewAssets(message),
       links: message.links,
+      message: {
+        rowid,
+        file: result.file ?? null,
+        messageId: message.details.messageId,
+        attachments: message.attachments.map((a) => ({
+          path: a.path,
+          name: a.name,
+          contentType: a.contentType,
+          size: a.size,
+        })),
+      },
     });
     if (!outcome.ok) {
       ctx.log.info('open.stale', { reason: outcome.reason, openId, windowId: appWin.id });
@@ -425,7 +450,74 @@ export function registerIpc(ctx: AppContext): void {
       htmlTooLarge: message.htmlTooLarge,
       cut: message.cut,
       headers: message.headers,
+      // The shell names an attachment by its index in this list, never by its part.
+      attachments: message.attachments.map((a, index) => ({
+        index,
+        name: a.name,
+        label: a.label,
+        size: a.size,
+        risky: a.risky,
+        imageFormat: a.imageFormat,
+      })),
+      details: message.details,
     };
+  });
+
+  /** The live view an action names, by the open that installed it, or why there is none. */
+  const actionView = (appWin: AppWindow, raw: unknown[]) => {
+    const args = ViewActionArgs.safeParse(raw);
+    if (!args.success) return 'invalid' as const;
+    const [{ openId, generation }] = args.data;
+    if (generation !== ctx.generation) return 'stale_generation' as const;
+    const view = appWin.views.byOpenId(openId);
+    if (!view?.message || view.generation !== ctx.generation) return 'superseded' as const;
+    return { view, message: view.message };
+  };
+
+  guarded<ReaderActionResult>(IPC.showInFolder, async (appWin, raw) => {
+    const live = actionView(appWin, raw);
+    if (typeof live === 'string') return reject(live, appWin);
+    const { view, message } = live;
+    if (ctx.sources.isOffline()) return reject('offline', appWin);
+    if (!message.file) return reject('not_found', appWin);
+    let result;
+    try {
+      result = await ctx.core.requestRunning(
+        { type: 'locate', generation: ctx.generation, rowid: message.rowid, file: message.file },
+        ctx.sources.stamp(),
+      );
+    } catch (err) {
+      if (!(err instanceof CoreUnavailableError)) throw err;
+      return reject('core_unavailable', appWin);
+    }
+    // The answer counts only while the view it was asked for is still live:
+    // after a switch or a newer open, nothing is revealed.
+    if (
+      appWin.win.isDestroyed() ||
+      view.generation !== ctx.generation ||
+      appWin.views.byOpenId(view.openId) !== view
+    ) {
+      return reject('superseded', appWin);
+    }
+    if (!result.ok) {
+      const known = ['changed', 'eml_missing', 'no_source', 'not_found', 'superseded'] as const;
+      const code = known.find((c) => c === result.code);
+      return reject(result.code === 'unavailable' ? 'offline' : (code ?? 'invalid'), appWin);
+    }
+    if (!result.path) return reject('superseded', appWin);
+    shell.showItemInFolder(result.path);
+    ctx.log.info('reader.show_in_folder', { windowId: appWin.id });
+    return { ok: true };
+  });
+
+  guarded<ReaderActionResult>(IPC.copyMessageId, (appWin, raw) => {
+    const live = actionView(appWin, raw);
+    if (typeof live === 'string') return reject(live, appWin);
+    const { message } = live;
+    if (message.messageId === '') return reject('not_found', appWin);
+    clipboard.writeText(message.messageId);
+    ctx.log.info('reader.copy_message_id', { windowId: appWin.id });
+    return { ok: true };
   });
 
   guarded<LinkActionResult>(IPC.linkAction, async (appWin, raw) => {
@@ -529,6 +621,24 @@ export function registerIpc(ctx: AppContext): void {
     const answer = outcome.answer as SearchSnippets | null;
     if (answer?.queryId !== queryId) return reject('invalid', appWin);
     return { ok: true, generation, queryId, snippets: answer.snippets };
+  });
+
+  /**
+   * Copies the open export's index report as plain text. Main reads the
+   * report itself; the shell sends nothing but the generation.
+   */
+  guarded<CopyResult>(IPC.copyReport, async (appWin, raw) => {
+    const args = GenerationArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    const result = await ctx.sources.queryIndex({ op: 'report' });
+    if (!result) return { ok: false, code: 'no_source' };
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    const report = result.answer as IndexReport;
+    clipboard.writeText(reportText(report));
+    ctx.log.info('report.copied', { count: report.attention, windowId: appWin.id });
+    return { ok: true, generation };
   });
 
   /**

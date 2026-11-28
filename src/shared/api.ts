@@ -6,6 +6,7 @@ import type {
   CardsQuery,
   CardsWindow,
   IndexProgress,
+  IndexReport,
   ListWindow,
   SearchDateKey,
   SearchPage,
@@ -14,7 +15,8 @@ import type {
   ThreadSnippet,
   WindowQuery,
 } from './index-types';
-import type { MessageHeaders, OpenMode } from './reader-protocol';
+import type { RasterFormat } from './attachment-types';
+import type { MessageDetails, MessageHeaders, OpenMode } from './reader-protocol';
 import type { SourceOutcome, SourcesView } from './sources';
 
 export const IPC = {
@@ -27,6 +29,7 @@ export const IPC = {
   report: 'pev:report',
   linkDialog: 'pev:link-dialog',
   linkAction: 'pev:link-action',
+  cardKey: 'pev:card-key',
   sources: 'pev:sources',
   chooseFolder: 'pev:choose-folder',
   openExport: 'pev:open-export',
@@ -38,6 +41,9 @@ export const IPC = {
   indexChanged: 'pev:index-changed',
   search: 'pev:search',
   searchSnippets: 'pev:search-snippets',
+  showInFolder: 'pev:show-in-folder',
+  copyMessageId: 'pev:copy-message-id',
+  copyReport: 'pev:copy-report',
 } as const;
 
 export type RejectCode =
@@ -55,17 +61,32 @@ export type RejectCode =
   | 'not_found'
   | 'eml_missing'
   | 'offline'
+  | 'changed'
   | 'unknown_dialog';
 
 export type Rejected = { ok: false; code: RejectCode };
 
 export type StateResult = { ok: true; generation: number } | Rejected;
 export type PingResult = { ok: true; generation: number } | Rejected;
+export type CopyResult = { ok: true; generation: number } | Rejected;
 export type OpenResult = { ok: true; openId: number; url: string } | Rejected;
 export type SourcesResult = { ok: true; generation: number; sources: SourcesView } | Rejected;
 /** The outcome of an open, a switch, a Locate or a Forget, and the generation it left. */
 export type SourceActionResult =
   { ok: true; outcome: SourceOutcome; generation: number } | Rejected;
+
+/** An attachment as the shell lists it. Actions on it name its `index` in the view's list. */
+export interface AttachmentItem {
+  index: number;
+  name: string;
+  label: string;
+  size: number;
+  risky: boolean;
+  imageFormat: RasterFormat | null;
+}
+
+/** The outcome of an action on the open message, such as Show in folder. */
+export type ReaderActionResult = { ok: true } | Rejected;
 
 /**
  * The outcome of opening a message: its body view, or the fallback when the
@@ -86,12 +107,15 @@ export type MessageOpenResult =
       /** Why only part of the body is shown: its size, or its number of parts; null if whole. */
       cut: 'size' | 'parts' | null;
       headers: MessageHeaders;
+      /** The attachments, by their index in this view's list; never their place in the message. */
+      attachments: AttachmentItem[];
+      details: MessageDetails;
     }
   | { ok: true; openId: number; outcome: 'fallback' }
   | Rejected;
 
 /** What the shell reads from the open export's index. */
-export type ShellIndexQuery = { op: 'sidebar' } | WindowQuery | CardsQuery;
+export type ShellIndexQuery = { op: 'sidebar' } | { op: 'report' } | WindowQuery | CardsQuery;
 
 export type IndexResult<T> =
   { ok: true; generation: number; answer: T; progress: IndexProgress } | Rejected;
@@ -133,6 +157,9 @@ export type SearchResult =
   | { ok: true; generation: number; queryId: number; page: SearchPage; progress: IndexProgress }
   | Rejected;
 
+/** The keys that move the expanded card: `n` to the next newer, `p` to the next older. */
+export type CardKeyName = 'n' | 'p';
+
 /** Snippets for rows of one of this window's searches, named by its query ID. */
 export interface SnippetsRequest {
   queryId: number;
@@ -160,6 +187,10 @@ export interface PevApi {
   open(rowid: number, mode: OpenMode, generation: number): Promise<MessageOpenResult>;
   /** Closes the reader: its view and any open still under way are revoked. */
   closeView(generation: number): Promise<CloseViewResult>;
+  /** Shows the open message's file in Finder. */
+  showInFolder(openId: number, generation: number): Promise<ReaderActionResult>;
+  /** Copies the open message's Message-ID. */
+  copyMessageId(openId: number, generation: number): Promise<ReaderActionResult>;
   log(
     level: 'error' | 'warn' | 'info',
     code: string,
@@ -171,6 +202,8 @@ export interface PevApi {
   onLinkDialog(listener: (prompt: LinkPrompt) => void): () => void;
   /** The user's choice in the link dialog. Only the dialog's id goes to main. */
   linkAction(dialogId: string, action: LinkAction, generation: number): Promise<LinkActionResult>;
+  /** Called with `n` or `p` typed while the body frame has the focus. */
+  onCardKey(listener: (key: CardKeyName) => void): () => void;
   sources(generation: number): Promise<SourcesResult>;
   chooseFolder(generation: number): Promise<SourceActionResult>;
   openExport(sourceKey: string, generation: number): Promise<SourceActionResult>;
@@ -186,6 +219,10 @@ export interface PevApi {
   listWindow(query: WindowQuery, generation: number): Promise<IndexResult<ListWindow>>;
   /** A stretch of one conversation's cards. */
   cards(query: CardsQuery, generation: number): Promise<IndexResult<CardsWindow>>;
+  /** The open export's index report. */
+  indexReport(generation: number): Promise<IndexResult<IndexReport>>;
+  /** Copies the open export's index report as plain text. */
+  copyReport(generation: number): Promise<CopyResult>;
   /** Called as indexing moves on or the index's state changes. */
   onIndexChanged(listener: (update: IndexUpdate) => void): () => void;
   /**
