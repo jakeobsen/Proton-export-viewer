@@ -18,7 +18,7 @@ import {
   extractBody,
   type BodyText,
 } from '../../src/core/index/body';
-import { openContained, scanRun, type FileRef } from '../../src/core/containment';
+import { examine, openContained, type FileRef } from '../../src/core/containment';
 import { BODY_CHANGED, bodyJob, type BodyJobItem } from '../../src/core/index/ops';
 import { MAX_MIME_PARTS } from '../../src/core/mime-limits';
 import { largeMessage } from '../../tools/gen-export/stream.mjs';
@@ -464,6 +464,13 @@ describe('the body job', () => {
     }
   }
 
+  /** The identity phase 1 records for a run's message file. */
+  function recorded(dir: string, rel: string): FileRef {
+    const found = examine(dir, rel);
+    if (!found || !('ref' in found)) throw new Error(`no regular file ${rel}`);
+    return found.ref;
+  }
+
   const message = (body: string) =>
     ['Subject: s', 'Content-Type: text/plain; charset=utf-8', '', body, ''].join('\r\n');
 
@@ -471,8 +478,7 @@ describe('the body job', () => {
     const dir = testDir(name);
     writeFileSync(join(dir, 'a.metadata.json'), '{}');
     writeFileSync(join(dir, 'a.eml'), message(body));
-    const ref = scanRun(dir).eml.get('a')!;
-    return { dir, ref, file: join(dir, 'a.eml') };
+    return { dir, ref: recorded(dir, 'a.eml'), file: join(dir, 'a.eml') };
   }
 
   it('reads the file the scan found', async () => {
@@ -512,7 +518,7 @@ describe('the body job', () => {
     writeFileSync(join(dir, 'a.metadata.json'), '{}');
     const parts = Array.from({ length: MAX_MIME_PARTS + 10 }, (_, i) => named(`p${i}`));
     writeFileSync(join(dir, 'a.eml'), mixed(parts));
-    const ref = scanRun(dir).eml.get('a')!;
+    const ref = recorded(dir, 'a.eml');
     expect(await job(dir, { protonId: 'a', rev: 1, ref })).toMatchObject({
       protonId: 'a',
       rev: 1,
