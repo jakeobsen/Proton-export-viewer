@@ -6,6 +6,7 @@
 // the settings file.
 
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   readFileSync,
@@ -499,6 +500,37 @@ test('Reset from Settings: Cancel and Esc change nothing; confirmed, every windo
   expect(again.sourceKey).not.toBe(stamp.sourceKey);
   expect(familyOf(indexDir, again.sourceKey)).not.toEqual([]);
   expect(digest(written.root)).toBe(before);
+  await checkHidden(pev);
+});
+
+test('a Reset that leaves a file of the app’s says so on the welcome screen', async ({ pev }) => {
+  test.skip(process.getuid?.() === 0, 'file modes do not bind root');
+  const root = realpathSync(testDir('settings-reset-left'));
+  const written = writeExport(root, { seed: 45, messages: 4 });
+  await openExport(pev, written);
+  const registry = await pev.main<string>('registryFile');
+  await openSettings(pev.page);
+  await showTab(pev.page, 'Index');
+  const dialog = pev.page.getByRole('dialog', { name: 'Reset app?' });
+  // The data folder can't be changed, so the registry in it stays.
+  chmodSync(pev.userData, 0o555);
+  try {
+    await pressButton(pev.page, 'Reset app…');
+    await dialog.getByRole('button', { name: 'Reset app' }).dispatchEvent('click');
+    await expect(welcome(pev.page)).toBeVisible();
+    await expect(pev.page.locator('p.notice')).toHaveText("Some app files couldn't be deleted.");
+    expect(existsSync(registry)).toBe(true);
+  } finally {
+    chmodSync(pev.userData, 0o755);
+  }
+  await expect
+    .poll(() =>
+      pev
+        .logs()
+        .filter((l) => l.code === 'app.reset_failed')
+        .map((l) => l.data),
+    )
+    .toEqual([{ count: 1 }]);
   await checkHidden(pev);
 });
 

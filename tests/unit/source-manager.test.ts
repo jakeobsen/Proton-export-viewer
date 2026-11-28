@@ -1797,6 +1797,15 @@ describe('Reset', () => {
     expect(t.core.started).toHaveLength(starts);
   });
 
+  it('admits opens again after a Reset made for a generation that moved on', async () => {
+    const t = setup('mgr-reset-stale');
+    const root = tool('mgr-reset-stale-tool');
+    t.picks.push({ path: root, bookmark: 'bm1' });
+    expect(await t.manager.reset(t.generation() - 1)).toBe(STALE);
+    expect(t.lines.some((l) => l.includes('"app.reset"'))).toBe(false);
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('opened');
+  });
+
   it('runs one of two Resets made for one generation while the queue is held: the other is stale', async () => {
     const t = setup('mgr-reset-twice');
     const root = tool('mgr-reset-twice-tool');
@@ -1823,7 +1832,7 @@ describe('Reset', () => {
     expect(await t.manager.chooseFolder(null, t.generation())).toBe('opened');
   });
 
-  it('fails, with its own answer and log code, when a file of the app's stays', async () => {
+  it('fails, with its own answer and log code, when a file of the app’s stays', async () => {
     const t = setup('mgr-reset-left');
     writeFileSync(join(t.userData, 'sources.json'), '{}');
     // A folder that can't be changed: its files can't be deleted.

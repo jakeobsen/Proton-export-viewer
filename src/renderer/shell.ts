@@ -177,7 +177,11 @@ export async function resetApp(at: number): Promise<DoneResult> {
     update({ busy: false });
   }
   if (result.ok) update({ generation: result.generation, screen: 'mail' });
-  else if (result.code === 'stale_generation') await refreshGeneration();
+  else if (result.code === 'not_deleted') {
+    // The reset went ahead and every window is back at the start; this one says what stayed.
+    update({ screen: 'mail', notice: "Some app files couldn't be deleted." });
+    await refreshGeneration();
+  } else if (result.code === 'stale_generation') await refreshGeneration();
   await refreshSources();
   return result;
 }
