@@ -152,6 +152,9 @@ describe('match info for the reader', () => {
     // Bound as a plain number, the rowid can be ignored next to the match: b would match then.
     expect(matchInfo(db, rowidOf(db, 'b'), 'invoice')).toBeNull();
     expect(matchInfo(db, rowidOf(db, 'c'), 'invoice')).not.toBeNull();
+    // The marks come from this message's own row, not the first one that matches.
+    expect(matchInfo(db, rowidOf(db, 'c'), 'invoice')!.body!.text).toBe('second invoice');
+    expect(matchInfo(db, rowidOf(db, 'a'), 'invoice')!.body!.text).toBe('invoice attached');
     // Every term must match this message, not only one of them.
     expect(matchInfo(db, rowidOf(db, 'a'), 'invoice second')).toBeNull();
     expect(matchInfo(db, rowidOf(db, 'c'), 'invoice second')).not.toBeNull();

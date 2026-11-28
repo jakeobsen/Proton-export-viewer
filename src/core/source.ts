@@ -13,7 +13,7 @@
 // later, such as the outcome of a check, are looked at again under the lock
 // and dropped if their index is no longer the current one.
 
-import { closeSync } from 'node:fs';
+import { closeSync, fstatSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import type {
@@ -57,9 +57,19 @@ const SCAN_SLICE = 2000;
 
 const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
-/** The two refs name the same file as it was when each was taken. */
-function sameIdentity(a: FileRef, b: FileRef): boolean {
-  return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs;
+/**
+ * The open file is the one the index read: same device, inode, size and
+ * modification time. A file rewritten in place keeps its inode, so the size
+ * and time are what tell it apart.
+ */
+function isIndexedFile(fd: number, indexed: FileRef): boolean {
+  const st = fstatSync(fd, { bigint: true });
+  return (
+    st.dev === indexed.dev &&
+    st.ino === indexed.ino &&
+    Number(st.size) === indexed.size &&
+    st.mtimeNs === indexed.mtimeNs
+  );
 }
 
 /**
@@ -548,7 +558,7 @@ export class SourceSession {
         : { ok: false, code: 'refused' };
     }
     const fd = opened.fd;
-    const changed = match && !sameIdentity(opened.ref, indexed);
+    const changed = match && !isIndexedFile(fd, indexed);
     return {
       ok: true,
       ...(changed ? { match: unindexedBody(match) } : withMatch),

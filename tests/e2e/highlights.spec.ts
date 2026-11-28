@@ -290,6 +290,27 @@ test('from search, the plain view marks the matches and the HTML view counts the
     .toBe(true);
   expect((await pev.main<{ ok: boolean }>('readerBreakMarks', false)).ok).toBe(true);
 
+  // Main takes the search's ID only: a malformed one is refused, and an
+  // unknown or older one opens the message without its matches.
+  const generation = (await pev.shell<{ generation: number }>('state')).generation;
+  const queryId = (await reader(pev)).queryId!;
+  const openRaw = (args: Record<string, unknown>) =>
+    pev.page.evaluate(
+      (a) =>
+        (
+          window as unknown as {
+            __pevTestIpc: { invoke(c: string, ...x: unknown[]): Promise<unknown> };
+          }
+        ).__pevTestIpc.invoke('pev:open', a),
+      { rowid: alpha.rowid, mode: 'plain', generation, ...args },
+    ) as Promise<{ ok: boolean; code?: string; match?: ReaderMatch | null }>;
+  for (const bad of ['7', 0, -1, 1.5, null, { text: 'invoice' }]) {
+    expect(await openRaw({ queryId: bad })).toEqual({ ok: false, code: 'invalid' });
+  }
+  expect(await openRaw({ text: 'invoice' })).toEqual({ ok: false, code: 'invalid' });
+  expect(await openRaw({ queryId: queryId + 1000 })).toMatchObject({ ok: true, match: null });
+  expect(await openRaw({ queryId })).toMatchObject({ ok: true, match: { bodyMatches: 2 } });
+
   // Outside search, the same message opens without marks.
   await typeText(pev.page, '');
   await expect.poll(async () => (await reader(pev)).rowid).toBeNull();

@@ -224,6 +224,33 @@ describe('cards a search result opened', () => {
     expect(mailbox.cards.snapshot.shown).toBe(false);
     expect(reader.getReaderState().rowid).toBeNull();
   });
+
+  it("opens in a result's conversation name its search; outside search they don't", async () => {
+    setup();
+    page = { ...resultFor('b2'), queryId: 7 };
+    await searchFor('big');
+    expect(mailbox.search.currentQueryId).toBe(7);
+    mailbox.selectResult(mailbox.search.snapshot.rows[0]!);
+    await flush();
+    expect(pev.open).toHaveBeenLastCalledWith(rowidOf('b2'), 'html', GENERATION, 7);
+    expect(reader.getReaderState().queryId).toBe(7);
+    // Another card, and the body switch, keep it.
+    const older = mailbox.cards.snapshot.cards.find((c) => c.rowid === rowidOf('b1'))!;
+    mailbox.expandCard(older);
+    await flush();
+    expect(pev.open).toHaveBeenLastCalledWith(rowidOf('b1'), 'html', GENERATION, 7);
+    await reader.openInReader(rowidOf('b1'), 'plain');
+    expect(pev.open).toHaveBeenLastCalledWith(rowidOf('b1'), 'plain', GENERATION, 7);
+
+    // Leaving search drops it: any later open goes without it, a row of the folder's list too.
+    mailbox.clearSearch();
+    await reader.openInReader(rowidOf('b0'));
+    expect(pev.open).toHaveBeenLastCalledWith(rowidOf('b0'), 'html', GENERATION);
+    mailbox.selectRow({ threadId: threadOf('s0'), newestRowid: rowidOf('s0') } as Row);
+    await flush();
+    expect(pev.open).toHaveBeenLastCalledWith(rowidOf('s0'), 'html', GENERATION);
+    expect(reader.getReaderState().queryId).toBeNull();
+  });
 });
 
 describe('cards no result opened', () => {
