@@ -383,7 +383,8 @@ test('close returns only once core has exited, and the index is free', async () 
     // Nothing holds the index: it opens with no busy timeout, checkpoints and takes a write lock.
     const db = openDb(join(indexDir, `${stamp.sourceKey}.sqlite`));
     try {
-      db.stmt('PRAGMA wal_checkpoint(TRUNCATE)').get();
+      // A reader still there would leave the checkpoint busy, without an error.
+      expect(db.stmt('PRAGMA wal_checkpoint(TRUNCATE)').get()).toMatchObject({ busy: 0 });
       db.exec('BEGIN IMMEDIATE');
       db.exec('ROLLBACK');
     } finally {

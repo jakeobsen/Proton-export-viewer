@@ -97,16 +97,17 @@ describe('process-wait', () => {
     expect(signal).toBe('SIGKILL');
   });
 
-  it('never kills a process that started at another time', async () => {
+  it('never kills a process that started at another time, and counts it as a new one', async () => {
     const child = node("process.stdout.write('ready\\n'); setInterval(() => {}, 1000);");
     expect(await firstLine(child)).toBe('ready');
     const pid = child.pid!;
     expect(startTimeOf(pid)).not.toBeNull();
     expect(killIfSame(pid, 'another start time')).toBe(false);
     expect(killIfSame(pid, null)).toBe(false);
-    await expect(waitGone(pid, { timeoutMs: 50, startTime: 'another start time' })).rejects.toThrow(
-      /^core_alive_after_close/,
-    );
+    // The number now names another process: the one waited for is gone.
+    const waited = await waitGone(pid, { timeoutMs: 5000, startTime: 'another start time' });
+    expect(waited.state).toBe('reused');
+    expect(waited.ms).toBeLessThan(1000);
     expect(processState(pid)).toBe('running');
   });
 

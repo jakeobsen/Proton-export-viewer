@@ -109,20 +109,28 @@ export interface WaitGoneOptions {
   pollMs?: number;
 }
 
+/** How a process waited for was found gone: exited, a zombie, or its number given to a new process. */
+export type GoneState = Exclude<ProcessState, 'running'> | 'reused';
+
 /**
- * Resolves once `pid` has exited, with how long that took. Past `timeoutMs`
- * it kills the process, if it is still the same one, so nothing outlives the
- * run, and rejects with `core_alive_after_close: <ms>`.
+ * Resolves once `pid` has exited, with how long that took. A process with
+ * that number but another start time is a new one: the one waited for has
+ * gone. Past `timeoutMs` it kills the process, if it is still the same one,
+ * so nothing outlives the run, and rejects with `core_alive_after_close: <ms>`.
  */
 export async function waitGone(
   pid: number,
   options: WaitGoneOptions,
-): Promise<{ ms: number; state: Exclude<ProcessState, 'running'> }> {
+): Promise<{ ms: number; state: GoneState }> {
   const started = Date.now();
   for (;;) {
     const state = processState(pid);
     const ms = Date.now() - started;
     if (state !== 'running') return { ms, state };
+    if (options.startTime !== null) {
+      const now = startTimeOf(pid);
+      if (now !== null && now !== options.startTime) return { ms, state: 'reused' };
+    }
     if (ms >= options.timeoutMs) {
       killIfSame(pid, options.startTime);
       throw new Error(`core_alive_after_close: ${ms}`);

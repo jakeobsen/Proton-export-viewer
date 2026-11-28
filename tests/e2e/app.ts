@@ -46,7 +46,7 @@ export interface LogLine {
 
 export class PevApp {
   readonly consoleMessages: Array<{ type: string; text: string }> = [];
-  private closed = false;
+  private closing: Promise<void> | null = null;
 
   constructor(
     readonly app: ElectronApplication,
@@ -142,11 +142,15 @@ export class PevApp {
   /**
    * Closes the app, and returns once its core process has exited too: core
    * can outlive main for a moment, with the index still open. A core still
-   * there after CORE_EXIT_MS is killed, and the close fails.
+   * there after CORE_EXIT_MS is killed, and the close fails. Every caller
+   * waits for the same close.
    */
-  async close(): Promise<void> {
-    if (this.closed) return;
-    this.closed = true;
+  close(): Promise<void> {
+    this.closing ??= this.closeAndWait();
+    return this.closing;
+  }
+
+  private async closeAndWait(): Promise<void> {
     let pid: number | undefined | null;
     try {
       pid = await this.main<number | undefined>('corePid');
