@@ -100,12 +100,11 @@ export function changedAt(time: number, now: Date = new Date()): string {
 }
 
 /**
- * The index's Status in Settings: "Complete" once the text of every message
- * file is indexed, else "Full text N%" of this run's files, rounded down.
+ * The index's Status in Settings: "Complete" once phase 2 is done, else
+ * "Full text N%", the share of the whole export's message files it has
+ * handled, as the sidebar shows it.
  */
 export function fullTextStatus(progress: IndexProgress): string {
   if (progress.bodyPhase === 'done') return 'Complete';
-  const { bodiesDone, bodiesTotal } = progress;
-  const percent = bodiesTotal > 0 ? Math.floor((bodiesDone / bodiesTotal) * 100) : 0;
-  return `Full text ${percent}%`;
+  return `Full text ${fullTextShare(progress) ?? 0}%`;
 }

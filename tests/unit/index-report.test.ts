@@ -291,6 +291,9 @@ describe('the index report', () => {
     ]);
     expect(report.attention).toBe(5);
     expect(report.more).toBe(0);
+    // Settings' Files: the metadata file and the two texts not read; the text over the limit.
+    expect(fileCounts(report)).toEqual({ skipped: 3, truncated: 1 });
+    expect(filesText(report)).toBe('3 skipped, 1 truncated');
     expect(report.rows.map(reasonText)).toEqual(
       expect.arrayContaining(['Timed out', "Couldn't read text", 'Over the 1 MB search limit']),
     );

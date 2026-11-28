@@ -93,14 +93,21 @@ const sum = (counts: Partial<Record<string, number>>): number =>
   Object.values(counts).reduce<number>((a, b) => a + (b ?? 0), 0);
 
 /**
- * The files that need attention, by what became of them: skipped files
- * aren't listed, and a truncated message has a list cut to its limit. A
- * listed message whose message file is missing is neither.
+ * The files that need attention, by what became of them: a skipped metadata
+ * file isn't listed, and a skipped message file's text isn't searchable; a
+ * truncated message has a list cut to its limit, and a truncated message
+ * file has only its first part searchable. A listed message whose message
+ * file is missing is neither.
  */
 export function fileCounts(report: IndexReport): { skipped: number; truncated: number } {
   return {
-    skipped: sum(report.rejected) + report.metaMissing + sum(report.failed) + report.timeouts,
-    truncated: report.cappedMessages,
+    skipped:
+      sum(report.rejected) +
+      report.metaMissing +
+      sum(report.failed) +
+      report.timeouts +
+      report.fullText.skipped,
+    truncated: report.cappedMessages + report.fullText.truncated,
   };
 }
 
