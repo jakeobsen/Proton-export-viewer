@@ -4,10 +4,12 @@
 // down and deleted under the source's lock; Forget and Reset; and the races
 // between them. The export is never changed.
 
+import { once } from 'node:events';
 import {
   closeSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -41,7 +43,7 @@ import { sanitizeEvent } from '../../src/shared/log/schema';
 import type { Stamp } from '../../src/shared/sources';
 import { digest } from '../../tools/gen-export/tree.mjs';
 import { writeExport } from '../exports';
-import { InlineThread, damageTablePage } from '../index-helpers';
+import { InlineThread, damageTablePage, holdIndexLock } from '../index-helpers';
 import { testDir } from '../paths';
 
 const KEY = '00000000-0000-4000-8000-0000000000a1';
@@ -111,7 +113,8 @@ interface CoreOptions {
   generation?: number;
   sourceKey?: string;
   check?: HeldCheck;
-  query?: CorruptingQuery;
+  query?: IndexThread;
+  writer?: IndexThread;
   options?: IndexOptions;
   /** Other exports the app knows. */
   exports?: string[];
@@ -143,6 +146,7 @@ function core(o: CoreOptions) {
   const thread = (role: ThreadRole): IndexThread => {
     if (role === 'verify' && o.check) return o.check;
     if (role === 'query' && o.query) return o.query;
+    if (role === 'writer' && o.writer) return o.writer;
     if (role === 'writer' && o.atWriter) {
       const at = o.atWriter;
       return new InlineThread(role, (op) => (at(op), false));
@@ -514,6 +518,98 @@ describe('an index found damaged by the check', () => {
     if (c.session.index) await c.session.close();
     expect(digest(root)).toBe(before);
   });
+});
+
+/** A query thread whose open answers INDEX_DAMAGED. */
+class DamagedQuery extends InlineThread {
+  constructor() {
+    super('query');
+  }
+
+  override call<T>(op: string, args: unknown = {}, timeoutMs = 0): Promise<T> {
+    if (op === 'open') return Promise.reject(new ThreadError('INDEX_DAMAGED'));
+    return super.call<T>(op, args, timeoutMs);
+  }
+}
+
+/** A writer thread that opens the index without touching its file. */
+class OpenedWriter extends InlineThread {
+  constructor(private readonly uuid: string) {
+    super('writer');
+  }
+
+  override call<T>(op: string): Promise<T> {
+    const opened = { uuid: this.uuid, created: false, replaced: false, mismatch: null, phase1Done: true };
+    return Promise.resolve((op === 'open' ? opened : null) as T);
+  }
+}
+
+describe('an index another connection holds', () => {
+  /** Each file of the index folder with its inode. */
+  const inodes = (indexDir: string) =>
+    Object.fromEntries(
+      family(indexDir).map((n) => [n, String(lstatSync(join(indexDir, n), { bigint: true }).ino)]),
+    );
+
+  /** Checks that the open was refused as busy, and that nothing was deleted, made or reported as damage. */
+  function refusedAsBusy(c: ReturnType<typeof core>, reply: CoreResult): void {
+    expect(reply).toMatchObject({ ok: false, code: 'unavailable' });
+    expect(c.logs.filter((l) => l.code === 'index.open_refused').map((l) => l.data)).toEqual([
+      { reason: 'busy' },
+    ]);
+    const codes = c.logs.map((l) => l.code);
+    for (const code of ['index.damaged', 'index.deleted', 'index.created', 'index.schema_pending']) {
+      expect(codes).not.toContain(code);
+    }
+    expect(c.events.some((e) => e.damaged || e.progress.condition === 'damaged')).toBe(false);
+  }
+
+  for (const online of [true, false]) {
+    const where = online ? 'online' : 'while the export is unavailable';
+    it(`past the busy timeout is refused, kept as it is, and opens once free (${where})`, async () => {
+      const { run, indexDir } = exportAt(`lc-busy-${online}`);
+      const uuid = await built(run, indexDir);
+      const before = inodes(indexDir);
+      const lock = await holdIndexLock(join(indexDir, `${KEY}.sqlite`), 4000);
+      try {
+        const c = core({ root: online ? run : null, indexDir, generation: 2, options: { busyMs: 200 } });
+        refusedAsBusy(c, await c.openIndex(uuid));
+        await c.session.close();
+        // The holder's -wal and -shm files are its own; the index file is the same.
+        expect(inodes(indexDir)[`${KEY}.sqlite`]).toBe(before[`${KEY}.sqlite`]);
+      } finally {
+        lock.child.kill('SIGKILL');
+      }
+      await once(lock.child, 'exit').catch(() => undefined);
+      const again = core({ root: online ? run : null, indexDir, generation: 3 });
+      expect(await again.openIndex(uuid)).toMatchObject({
+        ok: true,
+        index: { dbUuid: uuid, created: false, replaced: false },
+      });
+      await again.session.close();
+    });
+
+    it(`found damaged by a thread, but busy when looked at again, is refused and kept (${where})`, async () => {
+      const { run, indexDir } = exportAt(`lc-busy-damaged-${online}`);
+      const uuid = await built(run, indexDir);
+      const lock = await holdIndexLock(join(indexDir, `${KEY}.sqlite`), 4000);
+      try {
+        const before = inodes(indexDir);
+        const c = core({
+          root: online ? run : null,
+          indexDir,
+          generation: 2,
+          query: new DamagedQuery(),
+          writer: new OpenedWriter(uuid),
+        });
+        refusedAsBusy(c, await c.openIndex(uuid));
+        await c.session.close();
+        expect(inodes(indexDir)).toEqual(before);
+      } finally {
+        lock.child.kill('SIGKILL');
+      }
+    });
+  }
 });
 
 describe('the lifecycle lock', () => {
