@@ -32,6 +32,7 @@ import {
   useListLeads,
   useMailbox,
 } from './mailbox-state';
+import { setListStep } from './shortcut-actions';
 import { openReportFrom } from './Report';
 import { attentionText } from '../shared/report-text';
 import { switchRun } from './shell';
@@ -365,18 +366,29 @@ export function ConversationList() {
     return () => setListShown(false);
   }, []);
 
+  // The next or previous row, from the selected one, or with none selected
+  // from the first row on screen: the arrow keys, and `j`/`k` anywhere.
+  const step = useCallback(
+    (delta: 1 | -1) => {
+      const at =
+        list.selectedIndex() ?? Math.floor((scrollRef.current?.scrollTop ?? 0) / ROW_HEIGHT);
+      const next = Math.max(0, Math.min(list.snapshot.total - 1, at + delta));
+      const row = list.rowAt(next);
+      if (!row) return;
+      selectRow(row);
+      virtualizer.scrollToIndex(next);
+      scrollRef.current
+        ?.querySelector<HTMLElement>(`[data-thread="${row.threadId}"]`)
+        ?.focus({ preventScroll: true });
+    },
+    [virtualizer],
+  );
+  useEffect(() => setListStep(step), [step]);
+
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
     e.preventDefault();
-    const at = list.selectedIndex() ?? Math.floor((scrollRef.current?.scrollTop ?? 0) / ROW_HEIGHT);
-    const next = Math.max(0, Math.min(snap.total - 1, at + (e.key === 'ArrowDown' ? 1 : -1)));
-    const row = list.rowAt(next);
-    if (!row) return;
-    selectRow(row);
-    virtualizer.scrollToIndex(next);
-    scrollRef.current
-      ?.querySelector<HTMLElement>(`[data-thread="${row.threadId}"]`)
-      ?.focus({ preventScroll: true });
+    step(e.key === 'ArrowDown' ? 1 : -1);
   };
 
   const name = sidebar?.byId.get(folder)?.name ?? '';
