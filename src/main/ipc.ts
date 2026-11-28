@@ -39,15 +39,15 @@ import type { SourceOutcome } from '../shared/sources';
 import { STALE, type Stale } from './sources/manager';
 import { APP_ORIGIN, LINK_ACTIONS } from '../shared/constants';
 import { isRendererLogCode } from '../shared/log/codes';
-import { OPEN_MODES } from '../shared/reader-protocol';
+import { OPEN_MODES, type RenderedMessage } from '../shared/reader-protocol';
 import { CoreUnavailableError } from './core-host';
 import type { AppContext, AppWindow } from './context';
 import { DIALOG_ID_RE } from './link-dialog';
 import { sameFrame } from './navigation';
 import { OPEN_GAP_MS, OpenPacer } from './open-pacer';
-import { PLACEHOLDER } from './placeholder';
+import { PLACEHOLDER } from '../shared/placeholder';
 import { SUPERSEDED, SearchLanes } from './search-lane';
-import { bodyUrl } from './views';
+import { bodyUrl, type ViewBody } from './views';
 
 const Generation = z
   .number()
@@ -228,6 +228,27 @@ export function checkSender(ctx: AppContext, event: Event): AppWindow | RejectCo
   return appWin;
 }
 
+/**
+ * The assets a rendered body's view serves: every remote image as the same
+ * neutral placeholder, and each inline image (`c<n>`) as its checked bytes,
+ * or the placeholder when it has none.
+ */
+function viewAssets(message: RenderedMessage): ViewBody['assets'] {
+  const remote = Array.from({ length: message.remote }, (_, i) => ({
+    id: `r${i + 1}`,
+    ...PLACEHOLDER,
+  }));
+  const images = new Map(message.images.map((image) => [image.id, image]));
+  const inline = Array.from({ length: message.cids }, (_, i) => {
+    const id = `c${i + 1}`;
+    const image = images.get(id);
+    return image
+      ? { id, contentType: image.contentType, bytes: image.bytes }
+      : { id, ...PLACEHOLDER };
+  });
+  return [...remote, ...inline];
+}
+
 export function registerIpc(ctx: AppContext): void {
   const reject = (code: RejectCode, appWin?: AppWindow): Rejected => {
     ctx.log.warn('ipc.rejected', appWin ? { reason: code, windowId: appWin.id } : { reason: code });
@@ -385,11 +406,7 @@ export function registerIpc(ctx: AppContext): void {
 
     const outcome = appWin.views.install(openId, token, generation, ctx.generation, {
       html: message.html,
-      // Every remote image shows as the same neutral placeholder.
-      assets: Array.from({ length: message.remote }, (_, i) => ({
-        id: `r${i + 1}`,
-        ...PLACEHOLDER,
-      })),
+      assets: viewAssets(message),
       links: message.links,
     });
     if (!outcome.ok) {

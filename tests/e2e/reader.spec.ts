@@ -11,6 +11,7 @@ import type { MessageOpenResult } from '../../src/shared/api';
 import { BODY_CSP } from '../../src/shared/constants';
 import type { OpenMode, TestInput } from '../../src/shared/reader-protocol';
 import { hostileMessages } from '../../tools/gen-export/hostile.mjs';
+import { solidPng } from '../../tools/gen-export/images.mjs';
 import { testDir } from '../paths';
 import { expect, test, tokenOf, type PevApp } from './app';
 
@@ -183,6 +184,9 @@ test('a message opens as plain text, served by mail-body: with its body headers'
   expect(frame.url()).toBe(secondUrl);
 });
 
+/** The HTML message's cid: part: a PNG that isn't the placeholder. */
+const INLINE_PNG = solidPng(2, 2, [10, 20, 30]);
+
 const HTML = [
   'Subject: HTML body',
   'From: "Sender" <sender@example.org>',
@@ -205,7 +209,7 @@ const HTML = [
   'Content-ID: <part1@example.org>',
   'Content-Transfer-Encoding: base64',
   '',
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNgAAIAAAUAAen63NgAAAAASUVORK5CYII=',
+  INLINE_PNG.toString('base64'),
   '--rel--',
   '',
 ].join('\r\n');
@@ -273,7 +277,8 @@ test('an HTML message opens sanitized, with placeholders, and requests nothing r
     )
     .toBe(true);
 
-  // The placeholder serves; a cid and a link id serve nothing for now.
+  // The placeholder serves, and so does the cid part, as the PNG it is; a
+  // link id serves nothing.
   const asset = (id: string) =>
     pev.main<{ status: number; headers: Record<string, string>; length: number }>(
       'fetchIn',
@@ -282,7 +287,8 @@ test('an HTML message opens sanitized, with placeholders, and requests nothing r
     );
   expect(await asset('r1')).toMatchObject({ status: 200, length: 68 });
   expect((await asset('r1')).headers['content-type']).toBe('image/png');
-  expect((await asset('c1')).status).toBe(404);
+  expect(await asset('c1')).toMatchObject({ status: 200, length: INLINE_PNG.length });
+  expect((await asset('c1')).headers['content-type']).toBe('image/png');
   expect((await asset('l1')).status).toBe(404);
 
   // Nothing but this view's own URLs was requested, nothing was cancelled,

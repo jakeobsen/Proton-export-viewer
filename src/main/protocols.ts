@@ -5,6 +5,7 @@
 import { readFile } from 'node:fs/promises';
 import { extname, resolve, sep } from 'node:path';
 import { APP_HOST, BODY_CSP, VIEW_HOST } from '../shared/constants';
+import { checkRaster } from '../core/reader/raster';
 import type { Logger } from '../shared/log/writer';
 import type { ViewRegistry } from './views';
 
@@ -45,18 +46,6 @@ function parse(url: string): URL | null {
   } catch {
     return null;
   }
-}
-
-/** True when the bytes start with a PNG, JPEG, GIF or WebP signature. */
-export function hasRasterMagic(bytes: Uint8Array): boolean {
-  const b = bytes;
-  const png = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-  if (b.length >= 8 && png.every((v, i) => b[i] === v)) return true;
-  if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return true;
-  const ascii = (from: number, to: number) => String.fromCharCode(...b.subarray(from, to));
-  if (b.length >= 6 && (ascii(0, 6) === 'GIF87a' || ascii(0, 6) === 'GIF89a')) return true;
-  if (b.length >= 12 && ascii(0, 4) === 'RIFF' && ascii(8, 12) === 'WEBP') return true;
-  return false;
 }
 
 export interface AppHandlerOptions {
@@ -149,7 +138,11 @@ export function bodyHandler(options: ViewHandlerOptions): Handler {
   };
 }
 
-/** Serves `mail-asset://v/<token>/<id>` for assets registered with a live view of this window. */
+/**
+ * Serves `mail-asset://v/<token>/<id>` for assets registered with a live view
+ * of this window. An inline image (`c<n>`) passes the raster check again here,
+ * and is served with the type of the format it found.
+ */
 export function assetHandler(options: ViewHandlerOptions): Handler {
   const reject = (reason: string): Response => {
     options.log.info('protocol.not_found', {
@@ -169,11 +162,16 @@ export function assetHandler(options: ViewHandlerOptions): Handler {
     const id = match[2];
     const asset = ASSET_ID_RE.test(id) ? view.assets.get(id) : undefined;
     if (!asset) return reject('unknown_asset');
-    if (CID_RE.test(id) && !hasRasterMagic(asset.bytes)) return reject('bad_magic');
+    let contentType = asset.contentType;
+    if (CID_RE.test(id)) {
+      const check = checkRaster(asset.bytes);
+      if (!check.ok) return reject(check.reason);
+      contentType = check.image.contentType;
+    }
     return new Response(new Uint8Array(asset.bytes), {
       status: 200,
       headers: {
-        'Content-Type': asset.contentType,
+        'Content-Type': contentType,
         'Cache-Control': 'no-store',
         'X-Content-Type-Options': 'nosniff',
       },
