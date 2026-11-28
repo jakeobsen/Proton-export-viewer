@@ -4,7 +4,7 @@
 // and cards the result didn't open stay.
 
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { cardsWindow } from '../../src/core/index/queries';
+import { cardsAnswer } from '../../src/core/index/search';
 import { asNumber, type Db } from '../../src/core/index/sql';
 import type { IndexWriter } from '../../src/core/index/writer';
 import type { CardsQuery, IndexProgress, SearchPage } from '../../src/shared/index-types';
@@ -38,7 +38,7 @@ const pev = {
   cards: vi.fn(async (query: CardsQuery) => ({
     ok: true,
     generation: GENERATION,
-    answer: cardsWindow(db, query),
+    answer: cardsAnswer(db, query, 1),
     progress: PROGRESS,
   })),
   search: vi.fn(async () =>
@@ -47,6 +47,7 @@ const pev = {
       : { ok: false, code: 'core_unavailable' },
   ),
   searchSnippets: vi.fn(async () => ({ ok: true, generation: GENERATION, snippets: [] })),
+  leads: vi.fn(async () => ({ ok: false, code: 'core_unavailable' })),
   open: vi.fn(async () => ({ ok: true, outcome: 'view', url: 'about:blank' })),
   closeView: vi.fn(async () => ({ ok: true })),
 };

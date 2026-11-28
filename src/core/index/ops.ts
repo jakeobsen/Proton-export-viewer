@@ -25,17 +25,10 @@ import {
 } from './limits';
 import { MetadataError, parseMetadata, type MessageRow } from './metadata';
 import type { IndexAnswer, IndexQuery } from '../../shared/index-types';
-import {
-  cardsWindow,
-  emlFile,
-  listPage,
-  listWindow,
-  rowDetails,
-  sidebar,
-  threadOfMessage,
-} from './queries';
+import { emlFile, listPage, listWindow, rowDetails, sidebar, threadOfMessage } from './queries';
+import { leads } from './leads';
 import { indexReport } from './report';
-import { searchPage, searchSnippets } from './search';
+import { cardsAnswer, searchPage, searchSnippets } from './search';
 import {
   META,
   createSchema,
@@ -381,8 +374,24 @@ export const SYSTEM_IDS: readonly string[] = Object.values(SYSTEM_LABELS).filter
   (id) => id !== SYSTEM_LABELS.allMailCopy,
 );
 
+/**
+ * The first statement of a query's read transaction: BEGIN is deferred, so
+ * the snapshot every later statement of the query sees is fixed here.
+ */
+const PIN_SNAPSHOT = 'SELECT 1 FROM messages LIMIT 1';
+
 export class QueryState {
   db: Db | null = null;
+  /**
+   * The revision of the snapshot the last query read. It rises when a query
+   * sees changes another connection committed since the one before, and on
+   * every open of the connection, so it never goes back while this state
+   * lives; a replacement query thread starts from the floor its opener
+   * gives it.
+   */
+  private rev = 0;
+  /** `PRAGMA data_version` as the last query read it; null before the first since an open. */
+  private version: number | null = null;
 
   /**
    * Opens a read-only connection, only to a database with this schema version
@@ -390,7 +399,7 @@ export class QueryState {
    * disk; once it matches, SQLite may create the shared-memory and WAL files
    * beside the database, as for any reader of a WAL database.
    */
-  open(dbPath: string, expectedUuid: string): void {
+  open(dbPath: string, expectedUuid: string, revFloor = 0): void {
     this.close();
     // No file: there is no index. A file that isn't this index: a damaged one.
     if (!isFile(dbPath)) throw new Error('NO_INDEX');
@@ -408,6 +417,9 @@ export class QueryState {
       throw new Error('INDEX_DAMAGED');
     }
     this.db = db;
+    // A new connection may see any change: its first snapshot gets a new revision.
+    this.rev = Math.max(this.rev, revFloor) + 1;
+    this.version = null;
   }
 
   /** Answers a query from one read snapshot, however many statements it takes. */
@@ -416,13 +428,27 @@ export class QueryState {
     if (!db) throw new Error('NOT_OPEN');
     db.exec('BEGIN');
     try {
-      return this.answer(db, call);
+      db.stmt(PIN_SNAPSHOT).get();
+      return this.answer(db, call, this.revision(db));
     } finally {
       db.exec('COMMIT');
     }
   }
 
-  private answer(db: Db, call: IndexQuery): IndexAnswer {
+  /**
+   * The revision of the snapshot the open read transaction holds. Inside it,
+   * `PRAGMA data_version` gives the value of that snapshot, whatever commits
+   * since; it differs from the last query's when other connections committed
+   * in between.
+   */
+  private revision(db: Db): number {
+    const version = scalar(db, 'PRAGMA data_version');
+    if (this.version !== null && version !== this.version) this.rev += 1;
+    this.version = version;
+    return this.rev;
+  }
+
+  private answer(db: Db, call: IndexQuery, rev: number): IndexAnswer {
     switch (call.op) {
       case 'sidebar':
         return sidebar(db, SYSTEM_IDS);
@@ -441,7 +467,9 @@ export class QueryState {
       case 'window':
         return listWindow(db, call);
       case 'cards':
-        return cardsWindow(db, call);
+        return cardsAnswer(db, call, rev);
+      case 'leads':
+        return leads(db, call);
       case 'eml':
         return emlFile(db, call.rowid);
       case 'search':
@@ -677,8 +705,8 @@ export function threadHandler(role: ThreadRole): (op: string, args: unknown) => 
     return (op, args) => {
       switch (op) {
         case 'open': {
-          const a = args as { dbPath: string; expectedUuid: string };
-          query.open(a.dbPath, a.expectedUuid);
+          const a = args as { dbPath: string; expectedUuid: string; revFloor?: number };
+          query.open(a.dbPath, a.expectedUuid, a.revFloor ?? 0);
           return null;
         }
         case 'query':

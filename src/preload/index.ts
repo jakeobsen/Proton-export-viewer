@@ -105,6 +105,13 @@ const api: PevApi = {
       threadIds: request.threadIds,
       generation,
     }),
+  leads: (request, generation) =>
+    ipcRenderer.invoke(IPC.leads, {
+      requester: request.requester,
+      rowids: request.rowids,
+      ...(request.queryId === undefined ? {} : { queryId: request.queryId }),
+      generation,
+    }),
 };
 
 contextBridge.exposeInMainWorld('pev', api);

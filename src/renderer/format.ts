@@ -54,3 +54,9 @@ export function participantsText(participants: readonly Participant[]): string {
 export function loadingText(loaded: number, total: number): string {
   return `Loading ${formatCount(loaded)} of ${formatCount(total)}…`;
 }
+
+/** A conversation's header count: "4 messages", or from a result "4 messages · 2 matching". */
+export function countText(total: number, matching: number | null): string {
+  const messages = `${formatCount(total)} ${total === 1 ? 'message' : 'messages'}`;
+  return matching === null ? messages : `${messages} · ${formatCount(matching)} matching`;
+}

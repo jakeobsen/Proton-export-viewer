@@ -327,11 +327,11 @@ function cardsThread(
  * `anchor.index`. Cards are found by their (date, rowid) key on the
  * conversation's index; only the last case seeks by position.
  */
-export function cardsWindow(db: Db, query: Omit<CardsQuery, 'op'>): CardsWindow {
+export function cardsWindow(db: Db, query: Omit<CardsQuery, 'op'>): CardsStretch {
   const before = clampCount(query.before, CARDS_BEFORE);
   const after = Math.max(1, clampCount(query.after, CARDS_AFTER));
   const named = cardsThread(db, query.follow, query.threadId);
-  const empty: CardsWindow = {
+  const empty: CardsStretch = {
     threadId: null,
     followed: null,
     subject: '',
@@ -430,6 +430,9 @@ export function cardsWindow(db: Db, query: Omit<CardsQuery, 'op'>): CardsWindow 
     anchorFound: found,
   };
 }
+
+/** A cards window as the index holds it, before the query thread adds what it reads it from. */
+export type CardsStretch = Omit<CardsWindow, 'rev' | 'searched' | 'matching'>;
 
 /** The conversation a message is in now, or null if the message is gone. */
 export function threadOfMessage(db: Db, rowid: number): number | null {

@@ -9,6 +9,7 @@ import type {
   CardKeyName,
   IndexResult,
   IndexUpdate,
+  LeadsRequest,
   SearchRequest,
   SnippetsRequest,
 } from '../shared/api';
@@ -16,12 +17,14 @@ import type {
   CardRow,
   IndexProgress,
   IndexReport,
+  Lead,
   SearchSort,
   Sidebar,
   ThreadSnippet,
 } from '../shared/index-types';
 import { INBOX, sidebarModel, type SidebarModel } from './folders';
 import { CardsModel } from './cards';
+import { LeadsModel } from './leads';
 import { ListModel, type Row } from './list';
 import { closeReaderAndView, getReaderState, openInReader } from './reader';
 import { SearchModel, type ResultRow } from './search';
@@ -106,15 +109,48 @@ function setProgress(next: IndexProgress): void {
   update({ progress: next });
 }
 
+function notify(): void {
+  for (const listener of listeners) listener();
+}
+
+/** Lead lines; null if the answer isn't for the current export. */
+async function askLeads(request: LeadsRequest): Promise<Lead[] | null> {
+  try {
+    const generation = getShellState().generation;
+    if (generation === null) return null;
+    const result = await window.pev.leads(request, generation);
+    if (!result.ok || state.key === null || keyOf(result.generation) !== state.key) return null;
+    return result.leads;
+  } catch {
+    return null;
+  }
+}
+
+/** The lead lines of the list's rows. */
+export const listLeads = new LeadsModel('list', askLeads, notify);
+/** The lead lines of the cards, or a result's snippets on the cards that match its search. */
+export const cardLeads = new LeadsModel('cards', askLeads, notify);
+
 export const list = new ListModel(
   (query) => ask((generation) => window.pev.listWindow(query, generation)),
   () => {
-    for (const listener of listeners) listener();
+    notify();
+    listLeads.show(list.visibleRowids());
   },
 );
 
 export function useList() {
   return useSyncExternalStore(subscribe, () => list.snapshot);
+}
+
+export function useListLeads() {
+  return useSyncExternalStore(subscribe, () => listLeads.snapshot);
+}
+
+/** The rows on screen changed: more rows may be read, and their lead lines asked for. */
+export function setListViewport(first: number, last: number): void {
+  list.setViewport(first, last);
+  listLeads.show(list.visibleRowids());
 }
 
 /** Snippets for rows of the shown search; null if the answer isn't for the current export. */
@@ -203,10 +239,11 @@ export function selectResult(row: ResultRow): void {
     reader.refused === null
   ) {
     // Shown already; with the list's selection gone, the result owns it.
+    cards.setSearch(search.currentQueryId());
     resultShowing = cards.showing;
     return;
   }
-  cards.show(row.anchorRowid, row.threadId);
+  cards.show(row.anchorRowid, row.threadId, search.currentQueryId());
   resultShowing = cards.showing;
 }
 
@@ -214,7 +251,8 @@ export function selectResult(row: ResultRow): void {
 export const cards = new CardsModel(
   (query) => ask((generation) => window.pev.cards(query, generation)),
   () => {
-    for (const listener of listeners) listener();
+    notify();
+    cardLeads.show(cards.visibleRowids(), cards.snapshot.queryId);
   },
   {
     open: (rowid) => void openInReader(rowid),
@@ -224,6 +262,16 @@ export const cards = new CardsModel(
 
 export function useCards() {
   return useSyncExternalStore(subscribe, () => cards.snapshot);
+}
+
+export function useCardLeads() {
+  return useSyncExternalStore(subscribe, () => cardLeads.snapshot);
+}
+
+/** The cards on screen changed: more cards may be read, and their lead lines asked for. */
+export function setCardsViewport(first: number, last: number): void {
+  cards.setViewport(first, last);
+  cardLeads.show(cards.visibleRowids(), cards.snapshot.queryId);
 }
 
 const keyOf = (generation: number | null): string | null => {
@@ -264,6 +312,8 @@ export function syncMailbox(): void {
       void readSidebar();
       list.refresh();
       cards.refresh();
+      listLeads.changed();
+      cardLeads.changed();
       refreshReport();
     }
     return;
@@ -277,6 +327,8 @@ export function syncMailbox(): void {
   list.reset(key === null ? null : folder);
   // A new export or generation: main revoked the reader's view, and nothing is selected.
   cards.hide();
+  listLeads.reset();
+  cardLeads.reset();
   if (key !== null) void readSidebar();
 }
 
@@ -287,6 +339,8 @@ export function indexChanged(update_: IndexUpdate): void {
   void readSidebar();
   list.refresh();
   cards.refresh();
+  listLeads.changed();
+  cardLeads.changed();
   refreshReport();
 }
 
@@ -398,6 +452,8 @@ export function selectRow(row: Row): void {
     reader.rowid === row.newestRowid &&
     reader.refused === null
   ) {
+    // Picked from the list: no longer shown from a search.
+    cards.setSearch(null);
     return;
   }
   cards.show(row.newestRowid, row.threadId);

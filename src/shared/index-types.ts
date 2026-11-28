@@ -240,6 +240,8 @@ export interface CardRow {
   spam: boolean;
   /** The message is in Trash (label ID 3). */
   trash: boolean;
+  /** With a search: the message matches it. */
+  matched?: boolean;
 }
 
 /** Where a card stands in its conversation, oldest first: by date, then by rowid. */
@@ -265,6 +267,16 @@ export const CARDS_AFTER = 200;
 /** The most messages a cards query may name to follow. */
 export const CARDS_FOLLOW = 4;
 
+/** The search a conversation was opened from, for its cards. */
+export interface CardsSearch {
+  /** One of the window's searches, by its query ID. */
+  queryId: number;
+  /** The revision of the matching count the header shows; null while it shows none. */
+  countRev: number | null;
+  /** The search's text: main puts it in from the search the query ID names, never the shell. */
+  text?: string;
+}
+
 export interface CardsQuery {
   op: 'cards';
   /**
@@ -277,6 +289,8 @@ export interface CardsQuery {
   anchor: CardsAnchor;
   before: number;
   after: number;
+  /** The search the conversation was opened from: which cards match, and how many messages do. */
+  search?: CardsSearch;
 }
 
 /** A stretch of one conversation's cards, oldest first, read from one snapshot. */
@@ -298,6 +312,51 @@ export interface CardsWindow {
   anchor: number | null;
   /** The anchor card is message `anchor.rowid` itself. */
   anchorFound: boolean;
+  /**
+   * The revision of the snapshot the window was read from. It rises with
+   * every change the index's readers can see, and never goes back while the
+   * export stays open in this generation.
+   */
+  rev: number;
+  /** The query's search applied: each card says whether it matches. */
+  searched: boolean;
+  /**
+   * With a search whose count was behind this snapshot: the conversation's
+   * messages that match, counted in the same snapshot as the window.
+   */
+  matching?: number;
+}
+
+/** The most messages one lead-lines request covers. */
+export const MAX_LEAD_ROWIDS = 50;
+/** The longest lead line, in UTF-16 units. */
+export const LEAD_UNITS = 200;
+
+/** The lead lines of messages on screen, by rowid. */
+export interface LeadsQuery {
+  op: 'leads';
+  rowids: number[];
+  /**
+   * The text of the search the messages were opened from, put in by main: a
+   * message that matches it gets the search's snippet in place of its lead.
+   */
+  text?: string;
+}
+
+/** A message's lead line: the first words of its stored body, cleaned for one line. */
+export interface Lead {
+  rowid: number;
+  /** Null when the body isn't indexed, the message is gone, or nothing is left once cleaned. */
+  text: string | null;
+  /** With a search with words: the snippet of a message that matches it. */
+  snippet: MarkedSnippet | null;
+}
+
+export interface LeadsAnswer {
+  /** One per message asked for, in the order asked. */
+  leads: Lead[];
+  /** Snippets whose match ranges failed the check and were given without them. */
+  dropped: number;
 }
 
 export type IndexQuery =
@@ -311,7 +370,8 @@ export type IndexQuery =
   | WindowQuery
   | SearchQuery
   | SnippetsQuery
-  | CardsQuery;
+  | CardsQuery
+  | LeadsQuery;
 
 export type IndexAnswer =
   | Sidebar
@@ -325,6 +385,7 @@ export type IndexAnswer =
   | EmlFile
   | SearchPage
   | SearchSnippets
+  | LeadsAnswer
   | IndexReport;
 
 /**
