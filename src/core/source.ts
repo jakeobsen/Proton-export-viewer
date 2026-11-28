@@ -52,7 +52,6 @@ import type { CheckResult } from './index/ops';
 import { ThreadError, type IndexThread, type ThreadRole } from './index/pool';
 import { BODY_STATE, mismatchOf, probeIdentity } from './index/schema';
 import { IndexBusy } from './index/sql';
-
 import type { LocatedFile, OpenedMessage } from './reader/source';
 import { overlaps } from '../shared/overlap';
 import {

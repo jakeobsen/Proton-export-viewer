@@ -608,6 +608,9 @@ describe('an index another connection holds', () => {
           options: { busyMs: 200 },
         });
         refusedAsBusy(c, await c.openIndex(uuid));
+        // A refused open starts no scan, online or not.
+        await c.session.settled();
+        expect(c.logs.some((l) => l.code === 'scan.done')).toBe(false);
         await c.session.close();
         // The holder's -wal and -shm files are its own; the index file is the same.
         expect(inodes(indexDir)[`${KEY}.sqlite`]).toBe(before[`${KEY}.sqlite`]);
@@ -620,6 +623,9 @@ describe('an index another connection holds', () => {
         ok: true,
         index: { dbUuid: uuid, created: false, replaced: false },
       });
+      // Once it opens, the scan runs when the export is there.
+      await again.session.settled();
+      expect(again.logs.some((l) => l.code === 'scan.done')).toBe(online);
       await again.session.close();
     });
 
