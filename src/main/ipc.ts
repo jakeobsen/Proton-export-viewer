@@ -496,7 +496,7 @@ export function registerIpc(ctx: AppContext): void {
       return reject('superseded', appWin);
     }
     if (!result.ok) {
-      const known = ['changed', 'eml_missing', 'not_found', 'superseded'] as const;
+      const known = ['changed', 'eml_missing', 'no_source', 'not_found', 'superseded'] as const;
       const code = known.find((c) => c === result.code);
       return reject(result.code === 'unavailable' ? 'offline' : (code ?? 'invalid'), appWin);
     }

@@ -176,10 +176,11 @@ export function detailsOf(
     typeof contentType === 'object' && contentType !== null && 'value' in contentType
       ? String((contentType as { value: unknown }).value)
       : '';
-  const references = messageIds(headers?.get('references')).map(headerText);
+  const references = messageIds(headers?.get('references'));
   return {
     messageId: headerText(messageIds(headers?.get('message-id'))[0] ?? ''),
-    references: references.slice(0, MAX_REFERENCES),
+    // Only the references shown are cleaned.
+    references: references.slice(0, MAX_REFERENCES).map(headerText),
     moreReferences: Math.max(0, references.length - MAX_REFERENCES),
     format: formatLine(type.toLowerCase(), bodies, bodies.attachments),
   };

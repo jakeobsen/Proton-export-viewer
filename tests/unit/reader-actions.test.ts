@@ -268,7 +268,8 @@ describe('Show in folder', () => {
       ['not_found', 'not_found'],
       ['superseded', 'superseded'],
       ['unavailable', 'offline'],
-      ['no_source', 'invalid'],
+      ['no_source', 'no_source'],
+      ['reader_failed', 'invalid'],
     ];
     for (const [code, expected] of cases) {
       const t = make();

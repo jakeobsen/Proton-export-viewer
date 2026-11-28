@@ -164,8 +164,15 @@ describe('the attachment list', () => {
     for (const plan of plans) {
       const index = await extractBody(Readable.from([plan.emlData])).catch(() => null);
       const reader = await render(plan.emlData, 'plain').catch(() => null);
-      if (!index || !reader || index.attachmentsCapped) continue;
-      expect(reader.attachments.length, plan.key).toBe(index.attachments.length);
+      if (!index || !reader) continue;
+      // A capped index keeps its first rows; the reader's list starts with them.
+      if (index.attachmentsCapped) {
+        expect(reader.attachments.length, plan.key).toBeGreaterThanOrEqual(
+          index.attachments.length,
+        );
+      } else {
+        expect(reader.attachments.length, plan.key).toBe(index.attachments.length);
+      }
       for (const [i, row] of index.attachments.entries()) {
         // The index keeps NAME_UNITS of a name; compare the names it kept whole.
         if (row.name.length < NAME_UNITS) {

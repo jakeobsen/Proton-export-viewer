@@ -41,7 +41,6 @@ export interface InlineImage {
   bytes: Uint8Array;
 }
 
-/** A message rendered by the reader worker. */
 /** One attachment of a rendered message, in the order the message has its parts. */
 export interface AttachmentEntry {
   /** The part's dotted path in the message: `1.2` is the second part of the first. */
@@ -75,6 +74,7 @@ export interface MessageDetails {
   format: string;
 }
 
+/** A message rendered by the reader worker. */
 export interface RenderedMessage {
   headers: MessageHeaders;
   /** Its attachments, as listed in this view's mode. */
