@@ -438,7 +438,8 @@ describe('the index report', () => {
     const dir = testDir('report-second-run');
     const written = writeExport(join(dir, 'export'), { seed: 11, messages: 6 });
     const run = realpathSync(written.run);
-    const [late, slow] = emlIds(run) as [string, string];
+    const [late, slow, big] = emlIds(run) as [string, string, string];
+    bigEml(run, big, 1_100_000);
     const aside = join(dir, 'aside');
     mkdirSync(aside);
     for (const ext of ['.eml', '.metadata.json']) {
@@ -448,7 +449,12 @@ describe('the index report', () => {
     const s = service(run, join(dir, 'index'), { jobMs: 1000 }, hangBodies(slow));
     await s.open(null);
     await s.startIndexing(scanRun(run));
-    expect(s.progress).toMatchObject({ bodiesTotal: 5, bodiesDone: 5, bodiesFailed: 1 });
+    expect(s.progress).toMatchObject({
+      bodiesTotal: 5,
+      bodiesDone: 5,
+      bodiesFailed: 1,
+      bodiesTruncated: 1,
+    });
     for (const ext of ['.eml', '.metadata.json']) {
       writeFileSync(join(run, late + ext), readFileSync(join(aside, late + ext)));
     }
@@ -459,6 +465,7 @@ describe('the index report', () => {
       bodiesTotal: 1,
       bodiesDone: 1,
       bodiesFailed: 0,
+      bodiesTruncated: 0,
     });
     expect(fullTextShare(s.progress)).toBe(100);
     await s.close();
