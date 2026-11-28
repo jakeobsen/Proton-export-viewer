@@ -39,6 +39,19 @@ export async function phase1Done(pev: PevApp, total: number): Promise<void> {
     .toMatchObject({ phase: 'done', loaded: total, total });
 }
 
+/**
+ * Waits until the mail follows main's open export and generation. The shell
+ * takes a new generation first and the mail follows it a moment later,
+ * clearing the search box: text typed before that would be lost.
+ */
+export async function mailboxFollows(pev: PevApp): Promise<void> {
+  const stamp = await pev.main<Stamp | null>('sourceStamp');
+  if (!stamp) throw new Error('no open export');
+  await expect
+    .poll(() => pev.shell<string | null>('mailboxKey'))
+    .toBe(`${stamp.sourceKey}:${stamp.generation}`);
+}
+
 export async function openExport(
   pev: PevApp,
   written: WrittenExport,
@@ -47,6 +60,7 @@ export async function openExport(
   await pev.main('queuePick', written.root, bookmark);
   await pev.shell('chooseFolder', []);
   await phase1Done(pev, written.pairs);
+  await mailboxFollows(pev);
   return pev.main<Stamp>('sourceStamp');
 }
 

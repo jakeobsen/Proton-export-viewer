@@ -241,14 +241,45 @@ describe('phase 1', () => {
     const { run, indexDir } = exportAt('timeout', 40);
     const scan = scanRun(run);
     const slow = [...scan.metadata.keys()][7]!;
-    const h = harness(run, indexDir, { jobMs: 150, metaJob: 10 }, (role, op, args) => {
-      if (role !== 'parse' || op !== 'meta') return false;
-      return (args as { items: Array<{ protonId: string }> }).items.some(
+    const holdsSlow = (args: unknown) =>
+      ((args as { items?: Array<{ protonId: string }> }).items ?? []).some(
         (i) => i.protonId === slow,
       );
-    });
+    // Every parse job is sent with the limit. The in-process threads all run
+    // on this test's one event loop, so a busy machine could hold a healthy
+    // job past 150 ms; only the jobs with the hung file keep the limit here.
+    const limits: Array<[string, number | undefined]> = [];
+    const limitHungOnly = (role: ThreadRole, thread: IndexThread): IndexThread => {
+      if (role !== 'parse') return thread;
+      return {
+        call<T>(op: string, args?: unknown, timeoutMs?: number): Promise<T> {
+          limits.push([op, timeoutMs]);
+          return thread.call<T>(op, args, holdsSlow(args) ? timeoutMs : 0);
+        },
+        stop: () => thread.stop(),
+        get respawns() {
+          return thread.respawns;
+        },
+        get onRespawn() {
+          return thread.onRespawn;
+        },
+        set onRespawn(listener) {
+          thread.onRespawn = listener;
+        },
+      };
+    };
+    const h = harness(
+      run,
+      indexDir,
+      { jobMs: 150, metaJob: 10 },
+      (role, op, args) => role === 'parse' && op === 'meta' && holdsSlow(args),
+      limitHungOnly,
+    );
     await h.service.open(null);
     await h.service.startIndexing(scan);
+    const metaLimits = limits.filter(([op]) => op === 'meta').map(([, ms]) => ms);
+    expect(metaLimits.length).toBeGreaterThan(4);
+    expect(new Set(metaLimits)).toEqual(new Set([150]));
     expect(h.service.progress).toMatchObject({
       phase: 'done',
       loaded: 40,

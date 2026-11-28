@@ -2,7 +2,14 @@
 // Shell test hooks, reached by tests as window.__pevTest.
 
 import { reportError } from '../renderer/errors';
-import { cardLeads, cards, list, listLeads, search } from '../renderer/mailbox-state';
+import {
+  cardLeads,
+  cards,
+  getMailboxState,
+  list,
+  listLeads,
+  search,
+} from '../renderer/mailbox-state';
 import {
   chooseFolder,
   clearLink,
@@ -145,6 +152,8 @@ export function install(): void {
     openInReader: (rowid: number, mode?: OpenMode) => openInReader(rowid, mode),
     closeReader,
     reader: () => getReaderState(),
+    /** The export and generation the mail follows, `<sourceKey>:<generation>`; null with none. */
+    mailboxKey: () => getMailboxState().key,
     refreshSources,
     chooseFolder,
     openExport,

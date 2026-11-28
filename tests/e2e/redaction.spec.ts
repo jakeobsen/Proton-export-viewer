@@ -28,6 +28,7 @@ import {
   backToMail,
   clearButton,
   keyInBox,
+  mailboxFollows,
   openIndexSettings,
   phase1Done as recentPhase1,
   recentTexts,
@@ -325,6 +326,7 @@ test('no marker reaches a log file through the recent searches', async () => {
     await first.main('queuePick', root, 'bm1');
     await first.shell('chooseFolder', []);
     await recentPhase1(first, written.pairs);
+    await mailboxFollows(first);
     const stamp = await first.main<Stamp>('sourceStamp');
     dbPath = join(await first.main<string>('indexDir'), `${stamp.sourceKey}.sqlite`);
     // A marker query with a marker From chip, committed and listed.
@@ -344,6 +346,7 @@ test('no marker reaches a log file through the recent searches', async () => {
   const second = await launch('redaction-recent-2', { userData: first.userData });
   try {
     await recentPhase1(second, written.pairs);
+    await mailboxFollows(second);
     await expect.poll(() => recentTexts(second.page)).toEqual([MARKER_TEXT]);
     await expect
       .poll(() => second.hasLog('recent.invalid_rows', { proc: 'core', count: 1 }))
