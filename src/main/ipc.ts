@@ -5,12 +5,14 @@
 // rejected. The one exception is `state`, the bootstrap call: it takes no
 // arguments and returns the current generation.
 
+import { lstatSync, mkdirSync } from 'node:fs';
 import { clipboard, ipcMain, shell, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
 import { z } from 'zod';
 import {
   IPC,
   type CloseViewResult,
   type CopyResult,
+  type DoneResult,
   type ErrorKind,
   type IndexResult,
   type LinkActionResult,
@@ -25,6 +27,8 @@ import {
   type RejectCode,
   type SearchResult,
   type SnippetsResult,
+  type SetSettingResult,
+  type SettingsResult,
   type SourceActionResult,
   type SourcesResult,
   type StateResult,
@@ -42,8 +46,9 @@ import {
   type SearchSnippets,
 } from '../shared/index-types';
 import { reportText } from '../shared/report-text';
+import { SETTING_KEYS } from '../shared/settings';
 import type { SourceOutcome } from '../shared/sources';
-import { STALE, type Stale } from './sources/manager';
+import { RESET_FAILED, STALE, type Stale } from './sources/manager';
 import { APP_ORIGIN, LINK_ACTIONS } from '../shared/constants';
 import { isRendererLogCode } from '../shared/log/codes';
 import {
@@ -55,12 +60,13 @@ import {
   type SourceWhat,
 } from '../shared/reader-protocol';
 import { CoreUnavailableError } from './core-host';
-import type { AppContext, AppWindow } from './context';
+import { notifySettings, type AppContext, type AppWindow } from './context';
 import { DIALOG_ID_RE } from './link-dialog';
 import { sameFrame } from './navigation';
 import { OPEN_GAP_MS, OpenPacer } from './open-pacer';
 import { PLACEHOLDER } from '../shared/placeholder';
 import { SUPERSEDED, SearchLanes } from './search-lane';
+import { diagnosticsSummary, settingsView } from './settings-view';
 import { headerDocument } from './source-doc';
 import { sourceNodes } from './source-parts';
 import { bodyUrl, type View, type ViewBody } from './views';
@@ -262,6 +268,10 @@ const RunId = z.string().regex(/^[0-9a-f]{16}$/);
 const GenerationArgs = z.tuple([z.object({ generation: Generation }).strict()]);
 const SourceArgs = z.tuple([z.object({ sourceKey: SourceKey, generation: Generation }).strict()]);
 const RunArgs = z.tuple([z.object({ runId: RunId, generation: Generation }).strict()]);
+// Main checks the value against the setting's own rule.
+const SettingArgs = z.tuple([
+  z.object({ key: z.enum(SETTING_KEYS), value: z.unknown(), generation: Generation }).strict(),
+]);
 
 const REPORT_CODES: Record<ErrorKind, string> = {
   uncaught: 'renderer.uncaught',
@@ -923,6 +933,74 @@ export function registerIpc(ctx: AppContext): void {
     'unknown_source',
     (_appWin, { sourceKey, generation }) => ctx.sources.forget(sourceKey, generation),
   );
+
+  /**
+   * Settings: what it shows, the settings themselves, and its actions. Every
+   * action carries the generation Settings was read under; Rebuild and Forget
+   * also the export it showed.
+   */
+  guarded<SettingsResult>(IPC.settings, (appWin, raw) => {
+    const args = GenerationArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
+    return { ok: true, generation: ctx.generation, view: settingsView(ctx) };
+  });
+
+  guarded<SetSettingResult>(IPC.setSetting, (appWin, raw) => {
+    const args = SettingArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ key, value, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    if (!ctx.settings.set(key, value)) return reject('invalid', appWin);
+    notifySettings(ctx);
+    return { ok: true, settings: ctx.settings.get() };
+  });
+
+  sourceAction(
+    IPC.rebuildIndex,
+    SourceArgs,
+    'unknown_source',
+    (_appWin, { sourceKey, generation }) => ctx.sources.rebuildIndex(sourceKey, generation),
+  );
+
+  guarded<DoneResult>(IPC.resetApp, async (appWin, raw) => {
+    const args = GenerationArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
+    // Checked again when its turn comes: an operation queued before it may move the generation on.
+    const done = await ctx.sources.reset(args.data[0].generation);
+    if (done === STALE) return reject('stale_generation', appWin);
+    if (done === RESET_FAILED) return reject('not_deleted', appWin);
+    if (!done) return reject('refused', appWin);
+    return { ok: true, generation: ctx.generation };
+  });
+
+  guarded<DoneResult>(IPC.openLogs, async (appWin, raw) => {
+    const args = GenerationArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
+    // Only the app's own folder: never a link, or anything but a folder.
+    let folder = false;
+    try {
+      mkdirSync(ctx.dirs.logs, { recursive: true, mode: 0o700 });
+      folder = lstatSync(ctx.dirs.logs).isDirectory();
+    } catch {
+      // Refused below.
+    }
+    if (!folder || (await ctx.openPath(ctx.dirs.logs)) !== '') {
+      ctx.log.warn('logs.open_failed', { windowId: appWin.id });
+      return { ok: false, code: 'failed' };
+    }
+    return { ok: true, generation: ctx.generation };
+  });
+
+  guarded<DoneResult>(IPC.copyDiagnostics, (appWin, raw) => {
+    const args = GenerationArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
+    ctx.writeClipboard(diagnosticsSummary(ctx));
+    return { ok: true, generation: ctx.generation };
+  });
 
   /** Like `guarded`, for one-way sends; also drops a send made for a stale generation. */
   const guardedSend = <A extends { generation: number }>(
