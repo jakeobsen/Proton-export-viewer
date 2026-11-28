@@ -323,9 +323,11 @@ async function decodeParts(
 
   try {
     await pipeline(input, new Splitter(SPLITTER_OPTIONS), consume);
-  } catch (err) {
-    // Leaving the read early, once every wanted part is in, aborts it.
-    if (!state.done) throw err;
+  } catch {
+    // Leaving the read early, once every wanted part is in, aborts it. Any
+    // other early end (a read error, the splitter's part limit) keeps the
+    // parts read whole before it; the others can't be shown.
+    if (!state.done) for (const part of wanted) if (!out.has(part)) out.set(part, 'unreadable');
   }
   for (const part of wanted) if (!out.has(part)) out.set(part, 'changed');
   return out;

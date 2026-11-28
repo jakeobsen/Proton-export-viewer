@@ -32,6 +32,7 @@ import {
   type Reread,
 } from '../../src/core/reader/images';
 import { PartTree, cidUrlKey, contentIdKey } from '../../src/core/reader/parts';
+import { MAX_MIME_PARTS } from '../../src/core/mime-limits';
 import { MAX_TOTAL_PIXELS } from '../../src/core/reader/raster';
 import { renderMessage } from '../../src/core/reader/render';
 import { sanitizeHtml } from '../../src/core/reader/sanitize';
@@ -639,6 +640,39 @@ describe('the second read', () => {
     expect(shown('a')).toBe('placeholder');
     expect(shown('b')).toEqual(BLUE);
     expect(refused).toEqual({ changed: 1 });
+  });
+
+  it('keeps the parts read whole when the second read fails after them', async () => {
+    // The message up to the boundary after the first image's part, then,
+    // once that is read, a read error.
+    const cut = bytes.indexOf('Content-ID: <b@x>');
+    const failing = () =>
+      Readable.from(
+        (async function* () {
+          yield bytes.subarray(0, cut);
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          throw new Error('read error');
+        })(),
+      );
+    const { shown, refused } = await render(bytes, { open: () => Promise.resolve(failing()) });
+    expect(shown('a')).toEqual(RED);
+    expect(shown('b')).toBe('placeholder');
+    expect(refused).toEqual({ unreadable: 1 });
+  });
+
+  it('shows an image before the part limit in a message cut at it', async () => {
+    const fillers = Array.from({ length: MAX_MIME_PARTS + 10 }, (_, i) => ({
+      type: 'application/octet-stream',
+      headers: [`Content-Disposition: attachment; filename="f${i}.bin"`],
+      body: 'x',
+    }));
+    const cut = message(
+      mixed(related(html('<img alt="a" src="cid:a@x">'), image('a@x', RED)), ...fillers),
+    );
+    const { rendered, shown, refused } = await render(cut);
+    expect(rendered.cut).toBe('parts');
+    expect(shown('a')).toEqual(RED);
+    expect(refused).toEqual({});
   });
 
   it('stops after the last part it needs', async () => {
