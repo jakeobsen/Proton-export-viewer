@@ -110,12 +110,42 @@
   background: transparent;
 }
 
-.ch-l1 {
+/* The name line, and under it on a collapsed card the message's lead line. */
+.ch-main {
   display: flex;
   flex: 1;
+  flex-direction: column;
+  justify-content: center;
+  min-width: 0;
+}
+
+.ch-l1 {
+  display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
+}
+
+/*
+ * A lead line or a snippet is mail data: an isolated run of text. Its line
+ * is kept while empty, so a card's name line doesn't move when it arrives.
+ */
+.ch-snip {
+  height: 16px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  unicode-bidi: isolate;
+}
+
+.ch-snip mark {
+  border-radius: 2px;
+  background: var(--accent-soft);
+  color: var(--fg);
 }
 
 /* The sender's name is mail data: an isolated run of text. */

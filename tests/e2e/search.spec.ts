@@ -54,7 +54,11 @@ test('the search channel takes the text, the sort and its keyset, for the curren
   pev,
 }) => {
   const invalid = { ok: false, code: 'invalid' };
-  const ok = { text: 'x', sort: 'date', after: null, generation: 1 };
+  const ok = { text: 'x', chips: [], sort: 'date', after: null, generation: 1 };
+  expect(await invoke(pev, { text: 'x', sort: 'date', after: null, generation: 1 })).toEqual(
+    invalid,
+  );
+  expect(await invoke(pev, { ...ok, chips: [{ k: 'unread', extra: 1 }] })).toEqual(invalid);
   expect(await invoke(pev, { ...ok, text: 'x'.repeat(1001) })).toEqual(invalid);
   expect(await invoke(pev, { ...ok, extra: 1 })).toEqual(invalid);
   expect(await invoke(pev, { ...ok, sort: 'size' })).toEqual(invalid);

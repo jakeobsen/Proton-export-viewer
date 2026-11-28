@@ -23,6 +23,7 @@ import type {
   IdentifyRequest,
   IndexQueryRequest,
   IndexRequest,
+  RecentRequest,
   ResetRequest,
   ScanRequest,
 } from '../shared/core-protocol';
@@ -31,6 +32,7 @@ import { errorClassOf } from '../shared/log/schema';
 import type { FileIdentity } from '../shared/reader-protocol';
 import type { Logger } from '../shared/log/writer';
 import type { ScanSummary } from '../shared/sources';
+import type { SearchSpec } from '../shared/search-chips';
 import {
   ContainmentError,
   addEntry,
@@ -51,6 +53,7 @@ import { FamilyInUse, deleteFamily } from './index/family';
 import type { CheckResult } from './index/ops';
 import { ThreadError, type IndexThread, type ThreadRole } from './index/pool';
 import { BODY_STATE, mismatchOf, probeIdentity } from './index/schema';
+import { IndexBusy } from './index/sql';
 import type { LocatedFile, OpenedMessage } from './reader/source';
 import { overlaps } from '../shared/overlap';
 import {
@@ -65,6 +68,13 @@ import { withScan } from './index/report';
 const SCAN_SLICE = 2000;
 /** The shortest time between two reports of a scan's progress, in milliseconds. */
 const SCAN_REPORT_MS = 250;
+
+/**
+ * How long the look at a damaged index's file waits for another connection's
+ * lock. It runs on core's main thread, so it waits briefly: busy means the
+ * open is refused, never that the file is damaged.
+ */
+const DAMAGED_PROBE_BUSY_MS = 100;
 
 const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -202,7 +212,9 @@ export class SourceSession {
     return this.root !== null;
   }
 
-  handle(request: IdentifyRequest | ScanRequest | IndexRequest | IndexQueryRequest): void {
+  handle(
+    request: IdentifyRequest | ScanRequest | IndexRequest | IndexQueryRequest | RecentRequest,
+  ): void {
     const current = this.gate.current;
     if (!current) {
       this.send({ type: 'result', reqId: request.reqId, ok: false, code: 'no_source' });
@@ -214,8 +226,13 @@ export class SourceSession {
     }
     const root = this.root;
     const stamp: Stamp = { ...current };
-    // An unavailable run can still be browsed from its index.
-    if (root === null && request.type !== 'index' && request.type !== 'index-query') {
+    // An unavailable run can still be browsed from its index, and its recent searches kept.
+    if (
+      root === null &&
+      request.type !== 'index' &&
+      request.type !== 'index-query' &&
+      request.type !== 'recent'
+    ) {
       this.send({ type: 'result', reqId: request.reqId, ok: false, code: 'unavailable' });
       return;
     }
@@ -226,7 +243,9 @@ export class SourceSession {
           ? this.scan(request, root!, stamp)
           : request.type === 'index'
             ? this.openIndex(request, root, stamp)
-            : this.query(request, stamp);
+            : request.type === 'recent'
+              ? this.recent(request, stamp)
+              : this.query(request, stamp);
     work.catch((err: unknown) => {
       // Only the class and, for a thread's error, its reason: never a message.
       this.log.warn(
@@ -358,9 +377,22 @@ export class SourceSession {
             this.log.warn('index.open_refused', { reason: 'overlap' }, { src: stamp.sourceKey });
             return failed('closed');
           }
+          // Another connection held the index past the busy timeout: it may be
+          // fine, so it is neither deleted nor rebuilt. The next open tries again.
+          const busy = () => {
+            this.log.warn('index.open_refused', { reason: 'busy' }, { src: stamp.sourceKey });
+            return failed('unavailable');
+          };
+          if (err instanceof ThreadError && err.code === 'INDEX_BUSY') return busy();
           if (err instanceof ThreadError && err.code === 'INDEX_DAMAGED') {
             const dbPath = this.dbPathOf(stamp.sourceKey);
-            const found = dbPath ? probeIdentity(dbPath) : null;
+            let found: ReturnType<typeof probeIdentity>;
+            try {
+              found = dbPath ? probeIdentity(dbPath, DAMAGED_PROBE_BUSY_MS) : null;
+            } catch (probeErr) {
+              if (probeErr instanceof IndexBusy) return busy();
+              throw probeErr;
+            }
             const reason = (dbPath && mismatchOf(found, request.dbUuid)) || 'identity';
             if (reason === 'schema' && root === null) {
               // An index of another schema version is no damage: it stays as
@@ -583,6 +615,30 @@ export class SourceSession {
   }
 
   /**
+   * Runs a job on the recent searches, in the order the jobs came. Only
+   * counts are logged, never a search.
+   */
+  private async recent(request: RecentRequest, stamp: Stamp): Promise<void> {
+    const service = this.index;
+    if (!service) {
+      this.send({ type: 'result', reqId: request.reqId, ok: false, code: 'no_index', stamp });
+      return;
+    }
+    if (service.isDamaged) {
+      this.send({ type: 'result', reqId: request.reqId, ok: false, code: 'damaged', stamp });
+      return;
+    }
+    const answer = await service.recent(request.job);
+    const src = { src: stamp.sourceKey };
+    if (answer.op !== 'wipe' && answer.invalid > 0) {
+      this.log.warn('recent.invalid_rows', { count: answer.invalid }, src);
+    }
+    if (answer.op === 'record') this.log.info('recent.recorded', {}, src);
+    if (answer.op === 'wipe') this.log.info('recent.cleared', { count: answer.deleted }, src);
+    this.send({ type: 'result', reqId: request.reqId, ok: true, stamp, recent: answer });
+  }
+
+  /**
    * The reader's source: the message file of an indexed message, under the
    * current generation, opened only through the contained open. A file that
    * changed since the scan is examined again and opened once more with its new
@@ -595,7 +651,7 @@ export class SourceSession {
     rowid: number,
     generation: number,
     stale: () => boolean,
-    search?: string,
+    search?: SearchSpec,
   ): Promise<ReaderFile> {
     const current = this.gate.current;
     if (!current) return { ok: false, code: 'no_source' };
@@ -731,9 +787,11 @@ export class SourceSession {
           condition: this.index?.progress.condition ?? 'ok',
           // Phase 2 waits for phase 1, which waits for this scan.
           bodyPhase: 'waiting',
+          bodiesBefore: 0,
           bodiesDone: 0,
           bodiesTotal: 0,
           bodiesFailed: 0,
+          bodiesTruncated: 0,
         },
         false,
       );

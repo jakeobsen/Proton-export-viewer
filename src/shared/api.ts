@@ -7,6 +7,7 @@ import type {
   CardsWindow,
   IndexProgress,
   IndexReport,
+  Lead,
   ListWindow,
   SearchDateKey,
   SearchPage,
@@ -17,6 +18,8 @@ import type {
 } from './index-types';
 import type { RasterFormat } from './attachment-types';
 import type { MessageDetails, MessageHeaders, OpenMode, ReaderMatch } from './reader-protocol';
+import type { Chip, SearchSpec } from './search-chips';
+import type { AppSettings, SettingKey } from './settings';
 import type { SourceOutcome, SourcesView } from './sources';
 
 export const IPC = {
@@ -29,7 +32,7 @@ export const IPC = {
   report: 'pev:report',
   linkDialog: 'pev:link-dialog',
   linkAction: 'pev:link-action',
-  cardKey: 'pev:card-key',
+  frameKey: 'pev:frame-key',
   sources: 'pev:sources',
   chooseFolder: 'pev:choose-folder',
   openExport: 'pev:open-export',
@@ -41,9 +44,28 @@ export const IPC = {
   indexChanged: 'pev:index-changed',
   search: 'pev:search',
   searchSnippets: 'pev:search-snippets',
+  leads: 'pev:leads',
   showInFolder: 'pev:show-in-folder',
   copyMessageId: 'pev:copy-message-id',
   copyReport: 'pev:copy-report',
+  settings: 'pev:settings',
+  setSetting: 'pev:set-setting',
+  settingsChanged: 'pev:settings-changed',
+  showSettings: 'pev:show-settings',
+  appReset: 'pev:app-reset',
+  rebuildIndex: 'pev:rebuild-index',
+  resetApp: 'pev:reset-app',
+  openLogs: 'pev:open-logs',
+  copyDiagnostics: 'pev:copy-diagnostics',
+  viewSource: 'pev:source',
+  sourceTree: 'pev:source-tree',
+  sourcePart: 'pev:source-part',
+  copyHeaders: 'pev:copy-headers',
+  sourceBack: 'pev:source-back',
+  commitSearch: 'pev:commit-search',
+  recentSearches: 'pev:recent-searches',
+  keepRecent: 'pev:keep-recent',
+  clearRecent: 'pev:clear-recent',
 } as const;
 
 export type RejectCode =
@@ -62,7 +84,10 @@ export type RejectCode =
   | 'eml_missing'
   | 'offline'
   | 'changed'
-  | 'unknown_dialog';
+  | 'unknown_dialog'
+  | 'refused'
+  | 'not_deleted'
+  | 'failed';
 
 export type Rejected = { ok: false; code: RejectCode };
 
@@ -87,6 +112,32 @@ export interface AttachmentItem {
 
 /** The outcome of an action on the open message, such as Show in folder. */
 export type ReaderActionResult = { ok: true } | Rejected;
+
+/** One part of the open message in the source view's tree. Main has checked every field. */
+export interface SourceNode {
+  /** Dotted path: `1` is the message. A part is named to main only by it. */
+  path: string;
+  /** The parent's index in the list, or -1 for the message. */
+  parent: number;
+  /** A lower-case `type/subtype`, or "unknown type". */
+  type: string;
+  charset: string | null;
+  /** The cleaned file name, or ''. */
+  name: string;
+  inline: boolean;
+  /** Decoded bytes; a container's is the sum of its parts'. */
+  size: number;
+  /** The read stopped inside this part: `size` is only what was read. */
+  cut: boolean;
+  risky: boolean;
+}
+
+/** A header block shown in the body frame: the URL to load there. */
+export type SourceResult = { ok: true; url: string; truncated: boolean } | Rejected;
+/** The tree, or null when the message's structure couldn't be read within the limits. */
+export type SourceTreeResult = { ok: true; parts: SourceNode[] | null } | Rejected;
+/** Back to the message: its body URL, or null for a message the reader couldn't render. */
+export type SourceBackResult = { ok: true; url: string | null } | Rejected;
 
 /**
  * The outcome of opening a message: its body view, or the fallback when the
@@ -160,10 +211,13 @@ export interface LinkPrompt {
 
 export type LinkActionResult = { ok: true } | Rejected;
 
-/** A search of the open export: the text, the sort, and where the page continues. */
-export type SearchRequest =
-  | { text: string; sort: 'date'; after: SearchDateKey | null }
-  | { text: string; sort: 'relevance'; after: SearchRankKey | null };
+/**
+ * A search of the open export: the text, its chips (none if left out), the
+ * sort, and where the page continues.
+ */
+export type SearchRequest = { text: string; chips?: Chip[] } & (
+  { sort: 'date'; after: SearchDateKey | null } | { sort: 'relevance'; after: SearchRankKey | null }
+);
 
 /** One page of results; `queryId` names the request it answers. */
 export type SearchResult =
@@ -172,6 +226,14 @@ export type SearchResult =
 
 /** The keys that move the expanded card: `n` to the next newer, `p` to the next older. */
 export type CardKeyName = 'n' | 'p';
+
+/** The only keys main passes on to the shell when they are typed in the body frame. */
+export const FRAME_KEYS = ['j', 'k', 'n', 'p', 'u', 'Escape'] as const;
+export type FrameKeyName = (typeof FRAME_KEYS)[number];
+
+export function isFrameKey(key: unknown): key is FrameKeyName {
+  return typeof key === 'string' && (FRAME_KEYS as readonly string[]).includes(key);
+}
 
 /** Snippets for rows of one of this window's searches, named by its query ID. */
 export interface SnippetsRequest {
@@ -182,7 +244,51 @@ export interface SnippetsRequest {
 export type SnippetsResult =
   { ok: true; generation: number; queryId: number; snippets: ThreadSnippet[] } | Rejected;
 
+/**
+ * Lead lines for messages on screen, asked for by the list or by the cards.
+ * The cards of a conversation opened from a result name that search by its
+ * query ID, so the messages that match it get its snippet.
+ */
+export interface LeadsRequest {
+  requester: 'list' | 'cards';
+  rowids: number[];
+  queryId?: number;
+}
+
+export type LeadsResult = { ok: true; generation: number; leads: Lead[] } | Rejected;
+
 export type CloseViewResult = { ok: true } | Rejected;
+/** The open export's index, as Settings shows it. Paths have home as `~`. */
+export interface SettingsIndex {
+  sourceKey: string;
+  account: string | null;
+  runName: string;
+  /** The index database's full path. */
+  location: string;
+  /** The database and its sidecars. */
+  bytes: number;
+  /** When the index last changed, in ms since the epoch. */
+  updatedAt: number | null;
+  /** "Keep recent searches" for this export. */
+  keepRecentSearches: boolean;
+}
+
+/** What Settings shows. */
+export interface SettingsView {
+  settings: AppSettings;
+  /** Null when no export is open. */
+  index: SettingsIndex | null;
+  /** The logs folder. */
+  logsLocation: string;
+}
+
+export type SettingsResult = { ok: true; generation: number; view: SettingsView } | Rejected;
+export type SetSettingResult = { ok: true; settings: AppSettings } | Rejected;
+/** An action that leaves no outcome but the generation it left. */
+export type DoneResult = { ok: true; generation: number } | Rejected;
+/** The open export's recent searches, newest first. */
+export type RecentSearchesResult =
+  { ok: true; generation: number; entries: SearchSpec[] } | Rejected;
 
 export type ErrorKind = 'uncaught' | 'rejection' | 'error';
 
@@ -213,6 +319,19 @@ export interface PevApi {
   showInFolder(openId: number, generation: number): Promise<ReaderActionResult>;
   /** Copies the open message's Message-ID. */
   copyMessageId(openId: number, generation: number): Promise<ReaderActionResult>;
+  /**
+   * Shows the source of the open `openId`, or of its fallback: the message's
+   * raw headers in the body frame.
+   */
+  viewSource(openId: number, generation: number): Promise<SourceResult>;
+  /** The message's parts for the source view's tree. */
+  sourceTree(openId: number, generation: number): Promise<SourceTreeResult>;
+  /** Shows the raw headers of one part, by its path from the tree; null for the message's. */
+  sourcePart(openId: number, path: string | null, generation: number): Promise<SourceResult>;
+  /** Copies the header block the source view shows. */
+  copyHeaders(openId: number, generation: number): Promise<ReaderActionResult>;
+  /** Leaves the source view. */
+  sourceBack(openId: number, generation: number): Promise<SourceBackResult>;
   log(
     level: 'error' | 'warn' | 'info',
     code: string,
@@ -224,8 +343,8 @@ export interface PevApi {
   onLinkDialog(listener: (prompt: LinkPrompt) => void): () => void;
   /** The user's choice in the link dialog. Only the dialog's id goes to main. */
   linkAction(dialogId: string, action: LinkAction, generation: number): Promise<LinkActionResult>;
-  /** Called with `n` or `p` typed while the body frame has the focus. */
-  onCardKey(listener: (key: CardKeyName) => void): () => void;
+  /** Called with a shortcut key typed while the body frame has the focus (FRAME_KEYS only). */
+  onFrameKey(listener: (key: FrameKeyName) => void): () => void;
   sources(generation: number): Promise<SourcesResult>;
   chooseFolder(generation: number): Promise<SourceActionResult>;
   openExport(sourceKey: string, generation: number): Promise<SourceActionResult>;
@@ -258,4 +377,47 @@ export interface PevApi {
    * made; one of an older search is answered as 'superseded'.
    */
   searchSnippets(request: SnippetsRequest, generation: number): Promise<SnippetsResult>;
+  /**
+   * Lead lines for messages on screen. A request waits while this window's
+   * previous one runs, and a newer one from the same requester answers it as
+   * 'superseded'.
+   */
+  leads(request: LeadsRequest, generation: number): Promise<LeadsResult>;
+  /** What Settings shows, for the current generation. */
+  settings(generation: number): Promise<SettingsResult>;
+  /** Changes one setting; main checks the value. */
+  setSetting<K extends SettingKey>(
+    key: K,
+    value: AppSettings[K],
+    generation: number,
+  ): Promise<SetSettingResult>;
+  /** Called with the new settings when one changes, from any window. */
+  onSettingsChanged(listener: (settings: AppSettings) => void): () => void;
+  /** Called when the app menu's "Settings…" is chosen in this window. */
+  onShowSettings(listener: () => void): () => void;
+  /** Called when the app's data was deleted by a reset, in every window. */
+  onAppReset(listener: () => void): () => void;
+  /**
+   * Deletes the open export's index and builds it again. The key and
+   * generation are the ones Settings showed; a stale one changes nothing.
+   */
+  rebuildIndex(sourceKey: string, generation: number): Promise<SourceActionResult>;
+  /** Deletes all the app's data; the export files stay as they are. */
+  resetApp(generation: number): Promise<DoneResult>;
+  /** Shows the logs folder in the file manager. */
+  openLogs(generation: number): Promise<DoneResult>;
+  /** Copies the diagnostics summary; main builds it, and the shell never sees it. */
+  copyDiagnostics(generation: number): Promise<DoneResult>;
+  /**
+   * Records the search this window ran as `queryId` in the open export's
+   * recent searches. Main takes the search itself from its own record of it;
+   * an older search's ID is 'superseded'.
+   */
+  commitSearch(queryId: number, generation: number): Promise<DoneResult>;
+  /** The open export's recent searches, newest first. */
+  recentSearches(generation: number): Promise<RecentSearchesResult>;
+  /** "Keep recent searches" for the export Settings showed; off deletes them. */
+  setKeepRecent(sourceKey: string, keep: boolean, generation: number): Promise<DoneResult>;
+  /** Deletes the recent searches of the export Settings showed. */
+  clearRecent(sourceKey: string, generation: number): Promise<DoneResult>;
 }

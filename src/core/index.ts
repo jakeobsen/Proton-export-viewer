@@ -29,6 +29,7 @@ import { WorkerThread, type ThreadRole } from './index/pool';
 import type { IndexOptions } from './index/service';
 import { READER_RETIRE_MB, ReaderLane } from './reader/lane';
 import { OpenTracker } from './reader/opens';
+import { readSource } from './reader/source-read';
 import type { LocatedFile, ReaderSource } from './reader/source';
 import { SourceSession, type ReaderFile } from './source';
 
@@ -58,10 +59,11 @@ const lane = new ReaderLane<WorkerRequest, WorkerMessage>({
     log?.warn(breach === 'timeout' ? 'reader.timeout' : 'reader.limit', { ms }),
   // A large message can leave the worker holding hundreds of MB: a new worker gives it back.
   retire: (message) =>
-    message.type === 'rendered' && message.heldBytes > READER_RETIRE_MB * 1024 * 1024,
+    (message.type === 'rendered' || message.type === 'sourced') &&
+    message.heldBytes > READER_RETIRE_MB * 1024 * 1024,
   onRetire: (message) =>
     log?.info('reader.worker_retired', {
-      bytes: message.type === 'rendered' ? message.heldBytes : 0,
+      bytes: message.type === 'rendered' || message.type === 'sourced' ? message.heldBytes : 0,
     }),
   onOther: (message) => {
     if (message.type === 'log') workerLog?.log(message.level, message.code, message.data);
@@ -94,6 +96,7 @@ const testState = {
 let writeGate: import('../testhooks/core').WriteGate | null = null;
 let scanGate: import('../testhooks/core').WriteGate | null = null;
 let indexGate: import('../testhooks/core').WriteGate | null = null;
+let recentGate: import('../testhooks/core').RecentGate | null = null;
 
 process.on('uncaughtException', (err) => log?.error('core.uncaught', errorData(err, roots)));
 process.on('unhandledRejection', (reason) =>
@@ -142,7 +145,7 @@ const opens = new OpenTracker();
 
 /** The message to read: from the test source if a test set one, else from the open export. */
 async function openForRead(
-  request: ReadRequest,
+  request: Pick<ReadRequest, 'rowid' | 'generation' | 'search'>,
   stale: () => boolean,
 ): Promise<ReaderFile | { ok: false; code: 'no_source' }> {
   if (__PEV_TEST_HOOKS__ && readerSource) {
@@ -151,7 +154,7 @@ async function openForRead(
   }
   if (!session) return { ok: false, code: 'no_source' };
   return session
-    .openForReader(request.rowid, request.generation, stale, request.search?.text)
+    .openForReader(request.rowid, request.generation, stale, request.search)
     .catch((): ReaderFile => ({ ok: false, code: 'not_found' }));
 }
 
@@ -307,6 +310,7 @@ function handle(request: CoreRequest): void {
             writeGate,
             scanGate,
             indexGate,
+            recentGate,
             runSearch: (held) => {
               if (session) session.handle(held);
               else reply({ type: 'result', reqId: held.reqId, ok: false, code: 'no_source' });
@@ -332,10 +336,18 @@ function handle(request: CoreRequest): void {
     case 'locate':
       void locate(request);
       return;
+    case 'source':
+      void readSource(request, {
+        open: (r) => openForRead(r, () => false),
+        job: (message, slot) => lane.job(message, slot),
+        reply,
+      });
+      return;
     case 'identify':
     case 'scan':
     case 'index':
     case 'index-query':
+    case 'recent':
       if (__PEV_TEST_HOOKS__ && request.type === 'index-query') {
         const { op } = request.query;
         if (op === 'search') testState.searches += 1;
@@ -395,6 +407,11 @@ async function init(event: Electron.MessageEvent): Promise<void> {
       beforeScan: scanGate.beforeWrite,
       beforeIndexOpen: indexGate.beforeWrite,
     };
+  }
+  if (__PEV_TEST_HOOKS__) {
+    const hooks = await import('../testhooks/core');
+    recentGate = new hooks.RecentGate();
+    options = { ...options, recentHooks: recentGate.hooks };
   }
   session = new SourceSession(
     init.source,

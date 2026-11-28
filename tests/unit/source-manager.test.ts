@@ -5,6 +5,7 @@
 
 import { randomUUID } from 'node:crypto';
 import {
+  chmodSync,
   cpSync,
   existsSync,
   readdirSync,
@@ -24,12 +25,15 @@ import type { Logger } from '../../src/shared/log/writer';
 import type { IndexCondition, IndexProgress } from '../../src/shared/index-types';
 import type { ScanSummary, Stamp } from '../../src/shared/sources';
 import {
+  RESET_FAILED,
   STALE,
   SourceManager,
   type CoreControl,
   type OrderStep,
 } from '../../src/main/sources/manager';
+import { REGISTRY_FILE } from '../../src/main/sources/registry';
 import { ScopeError, type Picked, type Scopes } from '../../src/main/sources/scope';
+import { searchKey } from '../../src/shared/search-chips';
 import { digest } from '../../tools/gen-export/tree.mjs';
 import { testDir } from '../paths';
 
@@ -63,9 +67,11 @@ const PROGRESS: IndexProgress = {
   capped: 0,
   condition: 'ok',
   bodyPhase: 'waiting',
+  bodiesBefore: 0,
   bodiesDone: 0,
   bodiesTotal: 0,
   bodiesFailed: 0,
+  bodiesTruncated: 0,
 };
 
 class FakeCore implements CoreControl {
@@ -81,6 +87,11 @@ class FakeCore implements CoreControl {
   readonly heldQueries: Array<() => void> = [];
   /** Index opens, with what main asked for. */
   readonly indexCalls: Array<{ stamp: Stamp; dbUuid: string | null; rebuild: boolean }> = [];
+  /** The recent searches' jobs core got, with the stamp each was sent for. */
+  readonly recentJobs: Array<{ stamp: Stamp; op: string }> = [];
+  /** Recent jobs held until the test lets them go; a crashed core never answers them. */
+  holdRecent = false;
+  readonly heldRecent: Array<() => void> = [];
   readonly forgets: string[] = [];
   /** Sources whose index core can't delete yet. */
   readonly busy = new Set<string>();
@@ -175,6 +186,23 @@ class FakeCore implements CoreControl {
       this.resets += 1;
       this.onReset?.();
       return { type: 'result', reqId: 0, ok: true };
+    }
+    if (call.type === 'recent' && src) {
+      const job = call.job;
+      this.recentJobs.push({ stamp: call.stamp, op: job.op });
+      if (this.holdRecent) await new Promise<void>((go) => this.heldRecent.push(go));
+      return {
+        type: 'result',
+        reqId: 0,
+        ok: true,
+        stamp: call.stamp,
+        recent:
+          job.op === 'wipe'
+            ? { op: 'wipe', deleted: 0 }
+            : job.op === 'list'
+              ? { op: 'list', rows: [], invalid: 0 }
+              : { op: 'record', invalid: 0 },
+      };
     }
     if (!src?.root) return fail('unavailable');
     const stamp = { sourceKey: src.sourceKey, generation: src.generation };
@@ -974,7 +1002,7 @@ describe('core exiting on its own', () => {
     const forgetting = t.manager.forget(after.sourceKey, t.generation());
     t.manager.coreExited(after);
     await forgetting;
-    await t.manager.reset();
+    await t.manager.reset(null);
     t.manager.coreExited(after);
     await settle();
     expect(restarts(t)).toBe(0);
@@ -1161,7 +1189,7 @@ describe('a step of the open that fails', () => {
       ['unavailable', 'unavailable'],
       ['invalid', 'invalid'],
       ['closed', 'closed'],
-      ['busy', 'unknown'],
+      ['no_such_code', 'unknown'],
     ] as const) {
       const t = setup(`mgr-index-failed-${answer}`);
       t.picks.push({ path: tool(`mgr-index-failed-${answer}-tool`), bookmark: 'bm1' });
@@ -1482,6 +1510,167 @@ describe('Forget', () => {
   });
 });
 
+describe('Rebuild by hand', () => {
+  const opened = async (name: string) => {
+    const t = setup(name);
+    t.picks.push({ path: tool(`${name}-tool`), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    return t;
+  };
+  const codes = (t: ReturnType<typeof setup>) =>
+    t.lines.map((l) => JSON.parse(l) as { code: string; data: unknown; meta: unknown });
+
+  it('deletes the open index in core, then opens the source again with a fresh one', async () => {
+    const t = await opened('mgr-rebuild');
+    const before = t.manager.stamp()!;
+    const oldUuid = t.manager.registry.source(before.sourceKey)!.dbUuid;
+    expect(oldUuid).toEqual(expect.any(String));
+    t.order.length = 0;
+    const calls = t.core.indexCalls.length;
+
+    expect(await t.manager.rebuildIndex(before.sourceKey, t.generation())).toBe('opened');
+    const after = t.manager.stamp()!;
+    expect(after.sourceKey).toBe(before.sourceKey);
+    expect(after.generation).toBeGreaterThan(before.generation + 1);
+    expect(t.core.forgets).toEqual([before.sourceKey]);
+    // The folder stays granted; core starts afresh, since the old one retired the key.
+    expect(steps(t.order)).toEqual(['core.stop', 'scope.keep', 'core.spawn']);
+    expect([...t.live.values()]).toEqual(['bm1']);
+    await indexOpened(t, after.generation);
+    // A fresh index, not a recovery: no "damaged" state.
+    expect(t.core.indexCalls.slice(calls)).toEqual([
+      { stamp: after, dbUuid: null, rebuild: false },
+    ]);
+    const newUuid = t.manager.registry.source(before.sourceKey)!.dbUuid;
+    expect(newUuid).toEqual(expect.any(String));
+    expect(newUuid).not.toBe(oldUuid);
+    expect(t.manager.view().active!.index).toBe('ok');
+    expect(codes(t)).toContainEqual({
+      code: 'index.rebuild',
+      data: { generation: before.generation + 1, reason: 'manual' },
+      meta: { src: before.sourceKey },
+    });
+  });
+
+  it('changes nothing for a stale generation, another export, an unknown one or an offline one', async () => {
+    const t = await opened('mgr-rebuild-refused');
+    const first = t.manager.stamp()!;
+    expect(await t.manager.rebuildIndex(first.sourceKey, t.generation() - 1)).toBe(STALE);
+    expect(await t.manager.rebuildIndex(randomUUID(), t.generation())).toBeNull();
+    await t.manager.switchRun(t.manager.view().active!.runs[1]!.runId, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    const generation = t.generation();
+    expect(await t.manager.rebuildIndex(first.sourceKey, generation)).toBeNull();
+    expect(t.generation()).toBe(generation);
+    expect(t.core.forgets).toEqual([]);
+
+    // The open run goes away: it can't be read to build an index.
+    const open = t.manager.stamp()!;
+    const run = join(t.manager.exportRoots().at(-1)!);
+    renameSync(run, `${run}-gone`);
+    await t.manager.openRecent(open.sourceKey, t.generation());
+    expect(t.manager.view().active!.status).toBe('offline');
+    expect(await t.manager.rebuildIndex(open.sourceKey, t.generation())).toBe('offline');
+    expect(t.core.forgets).toEqual([]);
+    expect(t.manager.registry.source(open.sourceKey)!.dbUuid).toEqual(expect.any(String));
+  });
+
+  it('opens the source again with its index when core can not delete it, and says busy', async () => {
+    const t = await opened('mgr-rebuild-busy');
+    const stamp = t.manager.stamp()!;
+    const uuid = t.manager.registry.source(stamp.sourceKey)!.dbUuid;
+    t.core.busy.add(stamp.sourceKey);
+    const calls = t.core.indexCalls.length;
+    expect(await t.manager.rebuildIndex(stamp.sourceKey, t.generation())).toBe('busy');
+    // Asked again of a core started afresh, which holds nothing of it.
+    expect(t.core.forgets).toEqual([stamp.sourceKey, stamp.sourceKey]);
+    expect(t.manager.registry.source(stamp.sourceKey)!.dbUuid).toBe(uuid);
+    await indexOpened(t, t.manager.stamp()!.generation);
+    expect(t.core.indexCalls.slice(calls)).toEqual([
+      { stamp: t.manager.stamp(), dbUuid: uuid, rebuild: false },
+    ]);
+    expect(codes(t)).toContainEqual({
+      code: 'index.rebuild_refused',
+      data: { reason: 'in_use' },
+      meta: { src: stamp.sourceKey },
+    });
+  });
+
+  it('is refused behind a Forget queued before it, so no index is made for the forgotten export', async () => {
+    const t = await opened('mgr-rebuild-forget');
+    const stamp = t.manager.stamp()!;
+    const generation = t.generation();
+    const calls = t.core.indexCalls.length;
+    const forgetting = t.manager.forget(stamp.sourceKey, generation);
+    const rebuilding = t.manager.rebuildIndex(stamp.sourceKey, generation);
+    expect(await forgetting).toBe('forgotten');
+    expect(await rebuilding).toBe(STALE);
+    await settle();
+    expect(t.core.indexCalls).toHaveLength(calls);
+    expect(t.manager.registry.source(stamp.sourceKey)).toBeUndefined();
+  });
+
+  it('makes a switch queued behind it stale, and the rebuilt export stays open', async () => {
+    const t = await opened('mgr-rebuild-then-switch');
+    const stamp = t.manager.stamp()!;
+    const generation = t.generation();
+    const other = t.manager.view().active!.runs[1]!.runId;
+    const rebuilding = t.manager.rebuildIndex(stamp.sourceKey, generation);
+    const switching = t.manager.switchRun(other, generation);
+    expect(await rebuilding).toBe('opened');
+    expect(await switching).toBe(STALE);
+    expect(t.manager.stamp()!.sourceKey).toBe(stamp.sourceKey);
+    expect(t.manager.view().recent).toHaveLength(1);
+  });
+
+  it('is stale behind a switch queued before it, and the export switched to is untouched', async () => {
+    const t = await opened('mgr-switch-then-rebuild');
+    const first = t.manager.stamp()!;
+    const generation = t.generation();
+    const switching = t.manager.switchRun(t.manager.view().active!.runs[1]!.runId, generation);
+    const rebuilding = t.manager.rebuildIndex(first.sourceKey, generation);
+    expect(await switching).toBe('opened');
+    expect(await rebuilding).toBe(STALE);
+    await indexOpened(t, t.manager.stamp()!.generation);
+    const second = t.manager.stamp()!;
+    const calls = t.core.indexCalls.length;
+    await settle();
+    expect(t.core.forgets).toEqual([]);
+    expect(t.manager.stamp()).toEqual(second);
+    expect(t.core.indexCalls).toHaveLength(calls);
+    // The first export keeps its index identity: nothing was deleted.
+    expect(t.manager.registry.source(first.sourceKey)!.dbUuid).toEqual(expect.any(String));
+  });
+
+  it('is refused while a Reset runs', async () => {
+    const t = await opened('mgr-rebuild-reset');
+    const stamp = t.manager.stamp()!;
+    const generation = t.generation();
+    const resetting = t.manager.reset(null);
+    expect(await t.manager.rebuildIndex(stamp.sourceKey, generation)).toBe(STALE);
+    expect(await resetting).toBe(true);
+    expect(t.core.forgets).toEqual([]);
+  });
+
+  it('leaves nothing once a Reset queued behind it has run', async () => {
+    const t = await opened('mgr-rebuild-then-reset');
+    const stamp = t.manager.stamp()!;
+    const rebuilding = t.manager.rebuildIndex(stamp.sourceKey, t.generation());
+    const resetting = t.manager.reset(null);
+    // The Reset closed the app to opens first, so the rebuild doesn't reopen.
+    expect(await rebuilding).toBe('closed');
+    expect(await resetting).toBe(true);
+    // The rebuild never reached core: it was refused at its turn.
+    expect(t.core.forgets).toEqual([]);
+    const calls = t.core.indexCalls.length;
+    await settle();
+    expect(t.core.indexCalls).toHaveLength(calls);
+    expect(t.manager.view()).toEqual({ restoring: false, active: null, recent: [] });
+    expect(existsSync(join(t.userData, 'sources.json'))).toBe(false);
+  });
+});
+
 describe('an export overlapping the app’s data folder', () => {
   it('is refused when it lies inside it, and nothing changes', async () => {
     const t = setup('mgr-inside');
@@ -1549,7 +1738,7 @@ describe('an export overlapping the app’s data folder', () => {
     const manager = t.make();
     expect(manager.view().recent).toHaveLength(1);
     expect(manager.exportRoots()).toEqual([join(pickPath, 'acct', 'mail_20250630_120000')]);
-    await manager.reset();
+    await manager.reset(null);
     expect(t.lines.map((l) => JSON.parse(l) as { code: string; data: unknown })).toContainEqual({
       code: 'app.reset_refused',
       data: { reason: 'overlap' },
@@ -1557,13 +1746,14 @@ describe('an export overlapping the app’s data folder', () => {
     expect(existsSync(join(t.userData, 'sources.json'))).toBe(true);
     expect(existsSync(join(t.userData, 'index', `${key}.sqlite`))).toBe(true);
     expect(digest(pickPath)).toBe(before);
-    // And it stays closed.
-    expect(await manager.openRecent(key, t.generation())).toBe('closed');
+    // The app goes on as before: opens are admitted again, and this one is
+    // still refused for where it is.
+    expect(await manager.openRecent(key, t.generation())).toBe('app_data');
   });
 });
 
 describe('Reset', () => {
-  it('closes to opens queued before and after it, and deletes the data once core is down', async () => {
+  it('refuses opens queued before and during it, deletes the data once core is down, then admits opens again', async () => {
     const t = setup('mgr-reset');
     const root = tool('mgr-reset-tool');
     t.picks.push({ path: root, bookmark: 'bm1' });
@@ -1587,16 +1777,14 @@ describe('Reset', () => {
     // Its dialog is up.
     await vi.waitFor(() => expect(pick).toBeDefined(), WAIT);
     const queuedBefore = t.manager.openRecent(key, t.generation());
-    const reset = t.manager.reset();
+    const reset = t.manager.reset(null);
     const queuedAfter = t.manager.chooseFolder(null, t.generation());
     pick!({ path: root, bookmark: 'bm2' });
     expect(await inProgress).toBe('closed');
     expect(await queuedBefore).toBe('closed');
-    await reset;
+    expect(await reset).toBe(true);
     // Made for the generation before the reset: refused when its turn comes.
     expect(await queuedAfter).toBe(STALE);
-    expect(await t.manager.chooseFolder(null, t.generation())).toBe('closed');
-    expect(await t.manager.openRecent(key, t.generation())).toBe('closed');
 
     // Core was told to tear down and stopped while the data was still there.
     expect(seen).toEqual(['reset:true', 'stop:true']);
@@ -1607,6 +1795,105 @@ describe('Reset', () => {
     await settle();
     expect(existsSync(join(t.userData, 'sources.json'))).toBe(false);
     expect(existsSync(join(t.userData, 'index'))).toBe(false);
+    // Core is up again with no source, as at a launch with nothing to reopen.
+    expect(t.core.running).toBe(true);
+    expect(t.core.current).toBeNull();
+
+    // Then the app starts afresh: the old source is unknown, and a new open works.
+    expect(await t.manager.openRecent(key, t.generation())).toBeNull();
+    t.manager.setAccess({ picker: () => Promise.resolve({ path: root, bookmark: 'bm3' }) });
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('opened');
+    expect(t.manager.stamp()!.sourceKey).not.toBe(key);
+  });
+
+  it('stays closed when the app quits while it runs: no opens are admitted and core stays down', async () => {
+    const t = setup('mgr-reset-quit');
+    t.picks.push({ path: tool('mgr-reset-quit-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    const starts = t.core.started.length;
+    // The app quits while core tears the source down for the Reset.
+    t.core.onReset = () => t.manager.close();
+    expect(await t.manager.reset(null)).toBe(true);
+    await settle();
+    expect(t.core.running).toBe(false);
+    expect(t.core.started).toHaveLength(starts);
+    t.picks.push({ path: tool('mgr-reset-quit-tool-2'), bookmark: 'bm2' });
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('closed');
+    expect(t.core.started).toHaveLength(starts);
+  });
+
+  it('admits opens again after a Reset made for a generation that moved on', async () => {
+    const t = setup('mgr-reset-stale');
+    const root = tool('mgr-reset-stale-tool');
+    t.picks.push({ path: root, bookmark: 'bm1' });
+    expect(await t.manager.reset(t.generation() - 1)).toBe(STALE);
+    expect(t.lines.some((l) => l.includes('"app.reset"'))).toBe(false);
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('opened');
+  });
+
+  it('runs one of two Resets made for one generation while the queue is held: the other is stale', async () => {
+    const t = setup('mgr-reset-twice');
+    const root = tool('mgr-reset-twice-tool');
+    t.picks.push({ path: root, bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    // An open holds the queue (its dialog is up) while two windows ask for a Reset.
+    let pick: ((p: Picked | null) => void) | undefined;
+    t.manager.setAccess({ picker: () => new Promise((r) => (pick = r)) });
+    const inProgress = t.manager.chooseFolder(null, t.generation());
+    await vi.waitFor(() => expect(pick).toBeDefined(), WAIT);
+    const shown = t.generation();
+    const first = t.manager.reset(shown);
+    const second = t.manager.reset(shown);
+    pick!({ path: root, bookmark: 'bm2' });
+    expect(await inProgress).toBe('closed');
+    expect(await first).toBe(true);
+    // The first moved the generation on before the second's turn.
+    expect(await second).toBe(STALE);
+    expect(t.lines.filter((l) => l.includes('"app.reset"'))).toHaveLength(1);
+    expect(t.core.resets).toBe(1);
+    // Opens are admitted again after the stale one.
+    t.manager.setAccess({ picker: () => Promise.resolve({ path: root, bookmark: 'bm3' }) });
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('opened');
+  });
+
+  it('fails, with its own answer and log code, when a file of the app’s stays', async () => {
+    const t = setup('mgr-reset-left');
+    writeFileSync(join(t.userData, 'sources.json'), '{}');
+    // A folder that can't be changed: its files can't be deleted.
+    chmodSync(t.userData, 0o555);
+    try {
+      expect(await t.manager.reset(t.generation())).toBe(RESET_FAILED);
+    } finally {
+      chmodSync(t.userData, 0o755);
+    }
+    expect(existsSync(join(t.userData, 'sources.json'))).toBe(true);
+    const failed = t.lines.filter((l) => l.includes('"app.reset_failed"'));
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).not.toContain(t.userData);
+    // Opens are admitted again, and core is up.
+    expect(t.core.running).toBe(true);
+  });
+
+  it('starts the logs again and restores the default settings once the data is gone', async () => {
+    const t = setup('mgr-reset-after');
+    const seen: string[] = [];
+    const manager = new SourceManager({
+      userData: t.userData,
+      log: { log: () => {}, error: () => {}, warn: () => {}, info: () => {} },
+      core: t.core,
+      generation: () => 1,
+      bumpGeneration: () => 2,
+      notify: () => seen.push('notify'),
+      stopLogs: () => seen.push(`stop:${existsSync(join(t.userData, 'settings.json'))}`),
+      afterReset: () => seen.push(`after:${existsSync(join(t.userData, 'settings.json'))}`),
+      picker: () => Promise.resolve(null),
+      scopes: { start: () => ({ release: () => {} }) },
+    });
+    writeFileSync(join(t.userData, 'settings.json'), '{}');
+    expect(await manager.reset(null)).toBe(true);
+    expect(seen).toEqual(['stop:true', 'after:false', 'notify']);
   });
 
   it('refuses a recovery queued before it and an open of another source', async () => {
@@ -1622,12 +1909,162 @@ describe('Reset', () => {
     const calls = t.core.indexCalls.length;
     t.manager.handleCoreEvent(damaged(stamp));
     const other = t.manager.openRecent(first.sourceKey, t.generation());
-    await t.manager.reset();
+    await t.manager.reset(null);
     expect(await other).toBe('closed');
     await settle();
     expect(t.core.indexCalls).toHaveLength(calls);
-    expect(t.core.running).toBe(false);
+    // Core runs again, with no source.
+    expect(t.core.current).toBeNull();
     expect(existsSync(join(t.userData, 'sources.json'))).toBe(false);
     expect(existsSync(join(t.userData, 'index'))).toBe(false);
+  });
+});
+
+describe('recent searches', () => {
+  const ops = (t: ReturnType<typeof setup>, generation: number) =>
+    t.core.recentJobs.filter((j) => j.stamp.generation === generation).map((j) => j.op);
+  const open = async (name: string) => {
+    const t = setup(name);
+    t.picks.push({ path: tool(`${name}-tool`), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    return t;
+  };
+  const q = (text: string) => searchKey({ text, chips: [] });
+
+  it('turned off: saves the switch and the owed wipe in one save, then wipes', async () => {
+    const t = await open('mgr-recent-off');
+    const stamp = t.manager.stamp()!;
+    const file = join(t.userData, REGISTRY_FILE);
+    expect(t.manager.setKeepRecent(stamp.sourceKey, false, stamp.generation)).toBe(true);
+    // Saved before the wipe went anywhere.
+    const saved = JSON.parse(readFileSync(file, 'utf8')).sources[0];
+    expect(saved).toMatchObject({ keepRecentSearches: false, recentWipePending: true });
+    await vi.waitFor(() => expect(ops(t, stamp.generation)).toEqual(['wipe']), WAIT);
+    // The wipe committed and was the last one: nothing is owed any more.
+    await vi.waitFor(
+      () => expect(t.manager.registry.source(stamp.sourceKey)!.recentWipePending).toBe(false),
+      WAIT,
+    );
+    expect(t.manager.registry.source(stamp.sourceKey)!.keepRecentSearches).toBe(false);
+    // A recording while off never reaches core.
+    t.manager.recordSearch(q('x'), 1);
+    expect(await t.manager.recentSearches()).toEqual([]);
+    await settle();
+    expect(ops(t, stamp.generation)).toEqual(['wipe']);
+  });
+
+  it('turned on: saves only the switch, and a wipe still owed stays owed', async () => {
+    const t = await open('mgr-recent-on');
+    const stamp = t.manager.stamp()!;
+    t.manager.registry.updateSource(stamp.sourceKey, {
+      keepRecentSearches: false,
+      recentWipePending: true,
+    });
+    expect(t.manager.setKeepRecent(stamp.sourceKey, true, stamp.generation)).toBe(true);
+    const source = t.manager.registry.source(stamp.sourceKey)!;
+    expect(source.keepRecentSearches).toBe(true);
+    expect(source.recentWipePending).toBe(true);
+  });
+
+  it('refuses a stale export or generation from Settings, and changes nothing', async () => {
+    const t = await open('mgr-recent-stale');
+    const stamp = t.manager.stamp()!;
+    const other = '00000000-0000-4000-8000-0000000000cc';
+    expect(t.manager.setKeepRecent(stamp.sourceKey, false, stamp.generation - 1)).toBe(STALE);
+    expect(t.manager.setKeepRecent(other, false, stamp.generation)).toBe(STALE);
+    expect(await t.manager.clearRecent(stamp.sourceKey, stamp.generation - 1)).toBe(STALE);
+    expect(await t.manager.clearRecent(other, stamp.generation)).toBe(STALE);
+    expect(t.manager.registry.source(stamp.sourceKey)!.keepRecentSearches).toBeUndefined();
+    await settle();
+    expect(t.core.recentJobs).toEqual([]);
+    expect(await t.manager.clearRecent(stamp.sourceKey, stamp.generation)).toBe('ok');
+    expect(ops(t, stamp.generation)).toEqual(['wipe']);
+  });
+
+  it('wipes first at every activation while off or owed: a restart, a rebuild and a relaunch', async () => {
+    const t = await open('mgr-recent-activations');
+    const key = t.manager.stamp()!.sourceKey;
+    t.manager.registry.updateSource(key, { keepRecentSearches: true, recentWipePending: true });
+    // The restart path after a crash.
+    const next = t.manager.stamp()!.generation + 1;
+    t.manager.coreExited(t.core.crash());
+    await indexOpened(t, next);
+    await vi.waitFor(() => expect(ops(t, next)).toEqual(['wipe']), WAIT);
+    await vi.waitFor(
+      () => expect(t.manager.registry.source(key)!.recentWipePending).toBe(false),
+      WAIT,
+    );
+    // Off: every later activation wipes too, and the switch survives damage recovery.
+    t.manager.registry.updateSource(key, { keepRecentSearches: false });
+    t.manager.registry.save();
+    const stamp = t.manager.stamp()!;
+    t.manager.handleCoreEvent(damaged(stamp));
+    await indexOpened(t, stamp.generation + 1);
+    await vi.waitFor(() => expect(ops(t, stamp.generation + 1)).toEqual(['wipe']), WAIT);
+    expect(t.manager.registry.source(key)!.keepRecentSearches).toBe(false);
+    // On: no wipe at the next activation.
+    t.manager.registry.updateSource(key, { keepRecentSearches: true });
+    t.manager.registry.save();
+    const manager = await t.relaunch(t.manager);
+    await manager.restore();
+    const launched = manager.stamp()!;
+    await indexOpened(t, launched.generation);
+    expect(manager.keepsRecent(key)).toBe(true);
+    manager.recordSearch(q('kept'), 5);
+    await vi.waitFor(() => expect(ops(t, launched.generation)).toEqual(['record']), WAIT);
+  });
+
+  it('answers a Clear held in core when core exits as stale, and pays an Off held there at the restart', async () => {
+    const t = await open('mgr-recent-exit');
+    const stamp = t.manager.stamp()!;
+    t.core.holdRecent = true;
+    const clear = t.manager.clearRecent(stamp.sourceKey, stamp.generation);
+    await vi.waitFor(() => expect(t.core.heldRecent).toHaveLength(1), WAIT);
+    t.core.holdRecent = false;
+    t.manager.coreExited(t.core.crash());
+    expect(await clear).toBe(STALE);
+    await indexOpened(t, stamp.generation + 1);
+
+    // Off, its wipe held, then core exits: still owed, and the restart wipes first.
+    const now = t.manager.stamp()!;
+    t.core.holdRecent = true;
+    expect(t.manager.setKeepRecent(now.sourceKey, false, now.generation)).toBe(true);
+    await vi.waitFor(() => expect(t.core.heldRecent).toHaveLength(2), WAIT);
+    expect(t.manager.setKeepRecent(now.sourceKey, true, now.generation)).toBe(true);
+    t.core.holdRecent = false;
+    t.manager.coreExited(t.core.crash());
+    await indexOpened(t, now.generation + 1);
+    await vi.waitFor(() => expect(ops(t, now.generation + 1)).toEqual(['wipe']), WAIT);
+    await vi.waitFor(
+      () => expect(t.manager.registry.source(now.sourceKey)!.recentWipePending).toBe(false),
+      WAIT,
+    );
+    expect(t.manager.keepsRecent(now.sourceKey)).toBe(true);
+  });
+
+  it("settles a Clear held in core at the restart limit's bump: nothing waits for a core that won't come back", async () => {
+    const t = await open('mgr-recent-gave-up');
+    for (let i = 0; i < 3; i += 1) {
+      const next = t.manager.stamp()!.generation + 1;
+      t.manager.coreExited(t.core.crash());
+      await indexOpened(t, next);
+    }
+    const stamp = t.manager.stamp()!;
+    t.core.holdRecent = true;
+    const clear = t.manager.clearRecent(stamp.sourceKey, stamp.generation);
+    await vi.waitFor(() => expect(t.core.heldRecent).toHaveLength(1), WAIT);
+    t.manager.coreExited(t.core.crash());
+    const hung = new Promise((r) => setTimeout(() => r('still waiting'), 2000));
+    expect(await Promise.race([clear, hung])).toBe(STALE);
+    expect(t.manager.recent.size).toBe(0);
+  });
+
+  it('keeps the switch off across a relaunch', async () => {
+    const t = await open('mgr-recent-relaunch');
+    const stamp = t.manager.stamp()!;
+    t.manager.setKeepRecent(stamp.sourceKey, false, stamp.generation);
+    const manager = await t.relaunch(t.manager);
+    expect(manager.keepsRecent(stamp.sourceKey)).toBe(false);
   });
 });

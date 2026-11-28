@@ -33,17 +33,12 @@ import {
 } from './limits';
 import { MetadataError, parseMetadata, type MessageRow } from './metadata';
 import type { IndexAnswer, IndexQuery } from '../../shared/index-types';
-import {
-  cardsWindow,
-  emlFile,
-  listPage,
-  listWindow,
-  rowDetails,
-  sidebar,
-  threadOfMessage,
-} from './queries';
+import { emlFile, listPage, listWindow, rowDetails, sidebar, threadOfMessage } from './queries';
+import { leads } from './leads';
+import type { RecentJob } from '../../shared/recent-search';
+import { RecentOnlyState, recentJob } from './recent';
 import { indexReport } from './report';
-import { matchInfo, searchPage, searchSnippets } from './search';
+import { cardsAnswer, matchInfo, searchPage, searchSnippets } from './search';
 import {
   META,
   createSchema,
@@ -56,12 +51,16 @@ import {
   type Mismatch,
 } from './schema';
 import {
+  INDEX_BUSY_MS,
+  IndexBusy,
   SQLITE_CORRUPT,
   SQLITE_FULL,
   SQLITE_NOTADB,
   configure,
+  isBusy,
   openDb,
   scalar,
+  setBusyTimeout,
   sqliteCode,
   type Db,
 } from './sql';
@@ -71,6 +70,7 @@ import {
   StaleBatch,
   type ApplyItem,
   type ApplyStats,
+  type BodyOrder,
   type BodyTodo,
   type PairFile,
   type Phase1Item,
@@ -102,6 +102,7 @@ export function codeOf(err: unknown): string {
   if (err instanceof StaleBatch) return 'STALE';
   if (err instanceof Cancelled) return 'CANCELLED';
   if (err instanceof FamilyInUse) return 'FAMILY_IN_USE';
+  if (err instanceof IndexBusy) return 'INDEX_BUSY';
   const sqlite = sqliteCode(err);
   if (sqlite === SQLITE_FULL) return 'INDEX_FULL';
   if (sqlite === SQLITE_CORRUPT || sqlite === SQLITE_NOTADB) return 'INDEX_CORRUPT';
@@ -129,6 +130,8 @@ export interface WriterOpen {
    * next unit of work and rolls back.
    */
   cancel?: SharedArrayBuffer;
+  /** How long the open waits for another connection's lock; the default unless a test sets it. */
+  busyMs?: number;
 }
 
 export interface WriterOpened {
@@ -180,7 +183,8 @@ export class WriterState {
     const exists = isFile(args.dbPath);
     let mismatch: Mismatch | null = null;
     if (exists) {
-      mismatch = probeMismatch(args.dbPath, args.expectedUuid);
+      // Busy past the timeout throws IndexBusy: nothing is deleted or made.
+      mismatch = probeMismatch(args.dbPath, args.expectedUuid, args.busyMs);
       if (mismatch === null && args.expectedUuid !== null) {
         refuseOverlap(args);
         const kept = this.openExisting(args, args.expectedUuid);
@@ -208,20 +212,22 @@ export class WriterState {
   /**
    * Opens the database there, which the probe found to have this schema
    * version and identity. If the open connection finds otherwise, or the
-   * open fails, it is closed again, and the answer is why.
+   * open fails, it is closed again, and the answer is why. Another
+   * connection's lock held past the timeout throws IndexBusy instead.
    */
   private openExisting(args: WriterOpen, expectedUuid: string): WriterOpened | Mismatch {
     let db: Db | null = null;
     try {
       chmodSync(args.dbPath, 0o600);
       db = openDb(args.dbPath);
-      configure(db, 'writer');
+      configure(db, 'writer', args.busyMs);
       const mismatch = mismatchOf(identityOf(db), expectedUuid);
       if (mismatch) return mismatch;
       const opened = this.ready(db, args, expectedUuid, false, false, null);
       db = null;
       return opened;
-    } catch {
+    } catch (err) {
+      if (err instanceof IndexBusy || isBusy(err)) throw new IndexBusy();
       return 'corrupt';
     } finally {
       if (db) this.drop(db);
@@ -363,8 +369,10 @@ export class WriterState {
     this.truncateWal();
   }
 
-  bodyOrder(): number[] {
-    return this.need().writer.bodyOrder();
+  /** The messages phase 2 still has to read, and the files it handled before, in one call. */
+  bodyOrder(): BodyOrder {
+    const writer = this.need().writer;
+    return { order: writer.bodyOrder(), before: writer.bodyBefore() };
   }
 
   bodyTodo(rowids: number[]): BodyTodo[] {
@@ -393,26 +401,48 @@ export const SYSTEM_IDS: readonly string[] = Object.values(SYSTEM_LABELS).filter
   (id) => id !== SYSTEM_LABELS.allMailCopy,
 );
 
+/**
+ * The first statement of a query's read transaction: BEGIN is deferred, so
+ * the snapshot every later statement of the query sees is fixed here.
+ */
+const PIN_SNAPSHOT = 'SELECT 1 FROM messages LIMIT 1';
+
 export class QueryState {
   db: Db | null = null;
+  /**
+   * The revision of the snapshot the last query read. It rises when a query
+   * sees changes another connection committed since the one before, and on
+   * every open of the connection, so it never goes back while this state
+   * lives; a replacement query thread starts from the floor its opener
+   * gives it.
+   */
+  private rev = 0;
+  /** `PRAGMA data_version` as the last query read it; null before the first since an open. */
+  private version: number | null = null;
 
   /**
    * Opens a read-only connection, only to a database with this schema version
    * and identity. The identity is checked first without changing anything on
    * disk; once it matches, SQLite may create the shared-memory and WAL files
-   * beside the database, as for any reader of a WAL database.
+   * beside the database, as for any reader of a WAL database. Another
+   * connection's lock held past the timeout throws IndexBusy, never damage.
    */
-  open(dbPath: string, expectedUuid: string): void {
+  open(dbPath: string, expectedUuid: string, busyMs?: number, revFloor = 0): void {
     this.close();
     // No file: there is no index. A file that isn't this index: a damaged one.
     if (!isFile(dbPath)) throw new Error('NO_INDEX');
-    if (!probeSame(dbPath, expectedUuid)) throw new Error('INDEX_DAMAGED');
+    if (!probeSame(dbPath, expectedUuid, busyMs)) throw new Error('INDEX_DAMAGED');
     const db = openDb(dbPath, true);
     let usable: boolean;
     try {
+      // Settings first: the identity read waits for a lock as any read does.
+      configure(db, 'reader', busyMs);
       usable = sameIdentity(db, expectedUuid);
-      if (usable) configure(db, 'reader');
-    } catch {
+    } catch (err) {
+      if (err instanceof IndexBusy || isBusy(err)) {
+        db.close();
+        throw new IndexBusy();
+      }
       usable = false;
     }
     if (!usable) {
@@ -420,6 +450,9 @@ export class QueryState {
       throw new Error('INDEX_DAMAGED');
     }
     this.db = db;
+    // A new connection may see any change: its first snapshot gets a new revision.
+    this.rev = Math.max(this.rev, revFloor) + 1;
+    this.version = null;
   }
 
   /** Answers a query from one read snapshot, however many statements it takes. */
@@ -428,13 +461,27 @@ export class QueryState {
     if (!db) throw new Error('NOT_OPEN');
     db.exec('BEGIN');
     try {
-      return this.answer(db, call);
+      db.stmt(PIN_SNAPSHOT).get();
+      return this.answer(db, call, this.revision(db));
     } finally {
       db.exec('COMMIT');
     }
   }
 
-  private answer(db: Db, call: IndexQuery): IndexAnswer {
+  /**
+   * The revision of the snapshot the open read transaction holds. Inside it,
+   * `PRAGMA data_version` gives the value of that snapshot, whatever commits
+   * since; it differs from the last query's when other connections committed
+   * in between.
+   */
+  private revision(db: Db): number {
+    const version = scalar(db, 'PRAGMA data_version');
+    if (this.version !== null && version !== this.version) this.rev += 1;
+    this.version = version;
+    return this.rev;
+  }
+
+  private answer(db: Db, call: IndexQuery, rev: number): IndexAnswer {
     switch (call.op) {
       case 'sidebar':
         return sidebar(db, SYSTEM_IDS);
@@ -453,7 +500,9 @@ export class QueryState {
       case 'window':
         return listWindow(db, call);
       case 'cards':
-        return cardsWindow(db, call);
+        return cardsAnswer(db, call, rev);
+      case 'leads':
+        return leads(db, call);
       case 'eml': {
         // With a search, the match comes from the same snapshot as the file.
         const file = emlFile(db, call.rowid);
@@ -491,14 +540,19 @@ export interface CheckResult {
 
 /**
  * Runs SQLite's quick check on its own read-only connection, after the same
- * identity check every connection makes, and closes it again.
+ * identity check every connection makes, and closes it again. A lock held
+ * past the busy timeout leaves it unchecked (`ok: null`), never damaged.
  */
-export function quickCheck(dbPath: string, expectedUuid: string): CheckResult {
+export function quickCheck(
+  dbPath: string,
+  expectedUuid: string,
+  busyMs: number = INDEX_BUSY_MS,
+): CheckResult {
   if (!isFile(dbPath)) return { ok: null, reason: null };
   let db: Db | null = null;
   try {
     db = openDb(dbPath, true);
-    db.exec('PRAGMA busy_timeout = 5000');
+    setBusyTimeout(db, busyMs);
     const mismatch = mismatchOf(identityOf(db), expectedUuid);
     if (mismatch) return { ok: false, reason: mismatch };
     const rows = db.stmt('PRAGMA quick_check').all();
@@ -756,11 +810,29 @@ export function threadHandler(role: ThreadRole): (op: string, args: unknown) => 
           return writer.bodyTodo(a.rowids as number[]);
         case 'phase2':
           return writer.phase2(a.stamp as Stamp, a.items as Phase2Item[], a.budget as number);
+        case 'recent':
+          return recentJob(writer.db, a.job as RecentJob);
         case 'shrink':
           writer.shrink();
           return null;
         case 'close':
           writer.close();
+          return null;
+      }
+      throw new Error('UNKNOWN_OP');
+    };
+  }
+  if (role === 'recent') {
+    const recent = new RecentOnlyState();
+    return (op, args) => {
+      switch (op) {
+        case 'open':
+          recent.open(args as { dbPath: string; expectedUuid: string; exportRoots?: string[] });
+          return null;
+        case 'recent':
+          return recent.run((args as { job: RecentJob }).job);
+        case 'close':
+          recent.close();
           return null;
       }
       throw new Error('UNKNOWN_OP');
@@ -778,8 +850,13 @@ export function threadHandler(role: ThreadRole): (op: string, args: unknown) => 
     return (op, args) => {
       switch (op) {
         case 'open': {
-          const a = args as { dbPath: string; expectedUuid: string };
-          query.open(a.dbPath, a.expectedUuid);
+          const a = args as {
+            dbPath: string;
+            expectedUuid: string;
+            busyMs?: number;
+            revFloor?: number;
+          };
+          query.open(a.dbPath, a.expectedUuid, a.busyMs, a.revFloor ?? 0);
           return null;
         }
         case 'query':

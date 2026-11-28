@@ -11,14 +11,28 @@ import type { SidebarEntry, SidebarModel } from './folders';
 import {
   formatCount,
   fullDate,
+  fullTextLine,
+  fullTextShare,
   listDate,
   loadingText,
   participantsText,
   readingText,
 } from './format';
 import { exportLabel } from './labels';
+import { LeadText } from './Lead';
+import type { LeadLine } from './leads';
 import { ROW_HEIGHT, type Row } from './list';
-import { list, selectRow, showFolder, useList, useMailbox } from './mailbox-state';
+import {
+  list,
+  selectRow,
+  setListShown,
+  setListViewport,
+  showFolder,
+  useList,
+  useListLeads,
+  useMailbox,
+} from './mailbox-state';
+import { setListStep } from './shortcut-actions';
 import { openReportFrom } from './Report';
 import { attentionText } from '../shared/report-text';
 import { switchRun } from './shell';
@@ -171,6 +185,34 @@ function IndexStatus({ active }: { active: ActiveExport }) {
       </div>
     );
   }
+  // Phase 2 over the whole export; nothing once it has ended.
+  const share =
+    progress?.phase === 'done' && progress.bodyPhase === 'indexing'
+      ? fullTextShare(progress)
+      : null;
+  if (share !== null) {
+    return (
+      <div className="side-foot" role="status">
+        <button
+          type="button"
+          className="link full-text"
+          onClick={(e) => openReportFrom(e.currentTarget)}
+        >
+          {fullTextLine(share)}
+        </button>
+        <div
+          className="bar-track"
+          role="progressbar"
+          aria-label="Full text"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={share}
+        >
+          <span style={{ width: `${share}%` }} />
+        </div>
+      </div>
+    );
+  }
   return null;
 }
 
@@ -201,12 +243,14 @@ function ConversationRow({
   total,
   selected,
   sidebar,
+  line,
 }: {
   row: Row;
   index: number;
   total: number;
   selected: boolean;
   sidebar: SidebarModel | null;
+  line: LeadLine | undefined;
 }) {
   const unread = row.unreadHere > 0;
   const who = participantsText(row.details?.participants ?? []);
@@ -245,6 +289,9 @@ function ConversationRow({
           <span className="clip" title="Has attachments" aria-label="Has attachments" />
         )}
       </div>
+      <div className="snip">
+        <LeadText line={line} />
+      </div>
       <Chips labelIds={row.details?.labelIds} sidebar={sidebar} />
     </div>
   );
@@ -253,6 +300,7 @@ function ConversationRow({
 export function ConversationList() {
   const { sidebar, folder, progress, report } = useMailbox();
   const snap = useList();
+  const leads = useListLeads();
   const scrollRef = useRef<HTMLDivElement>(null);
   // Where the virtualizer learns the scroll offset. A scroll the list makes
   // itself is passed on at once, before the paint, rather than waiting for
@@ -278,7 +326,7 @@ export function ConversationList() {
     const last = Math.floor(
       (el.scrollTop + Math.max(el.clientHeight, ROW_HEIGHT) - 1) / ROW_HEIGHT,
     );
-    list.setViewport(first, last);
+    setListViewport(first, last);
   }, []);
 
   const scrollTo = useCallback(
@@ -312,18 +360,35 @@ export function ConversationList() {
     return () => observer.disconnect();
   }, [reportViewport]);
 
+  // Out of sight (results show in its place), no row's line is asked for.
+  useEffect(() => {
+    setListShown(true);
+    return () => setListShown(false);
+  }, []);
+
+  // The next or previous row, from the selected one, or with none selected
+  // from the first row on screen: the arrow keys, and `j`/`k` anywhere.
+  const step = useCallback(
+    (delta: 1 | -1) => {
+      const at =
+        list.selectedIndex() ?? Math.floor((scrollRef.current?.scrollTop ?? 0) / ROW_HEIGHT);
+      const next = Math.max(0, Math.min(list.snapshot.total - 1, at + delta));
+      const row = list.rowAt(next);
+      if (!row) return;
+      selectRow(row);
+      virtualizer.scrollToIndex(next);
+      scrollRef.current
+        ?.querySelector<HTMLElement>(`[data-thread="${row.threadId}"]`)
+        ?.focus({ preventScroll: true });
+    },
+    [virtualizer],
+  );
+  useEffect(() => setListStep(step), [step]);
+
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
     e.preventDefault();
-    const at = list.selectedIndex() ?? Math.floor((scrollRef.current?.scrollTop ?? 0) / ROW_HEIGHT);
-    const next = Math.max(0, Math.min(snap.total - 1, at + (e.key === 'ArrowDown' ? 1 : -1)));
-    const row = list.rowAt(next);
-    if (!row) return;
-    selectRow(row);
-    virtualizer.scrollToIndex(next);
-    scrollRef.current
-      ?.querySelector<HTMLElement>(`[data-thread="${row.threadId}"]`)
-      ?.focus({ preventScroll: true });
+    step(e.key === 'ArrowDown' ? 1 : -1);
   };
 
   const name = sidebar?.byId.get(folder)?.name ?? '';
@@ -380,6 +445,7 @@ export function ConversationList() {
                     total={snap.total}
                     selected={row.threadId === selectedThread}
                     sidebar={sidebar}
+                    line={leads.get(row.anchorRowid)}
                   />
                 ) : (
                   <div className="conv placeholder" aria-hidden="true" />

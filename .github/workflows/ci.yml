@@ -35,3 +35,13 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: npm run ci:linux
         run: xvfb-run --auto-servernum npm run ci:linux
+      # A failed run keeps one thing: how each test's close waited for the
+      # app's core process (fixed words and numbers only).
+      - name: Keep the close-wait record of a failed run
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: close-waits
+          path: test-output/close-waits.jsonl
+          if-no-files-found: ignore
+          retention-days: 7

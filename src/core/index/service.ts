@@ -45,10 +45,13 @@ import type {
   IndexOpened,
   IndexProgress,
   IndexQuery,
+  CardsWindow,
+  LeadsAnswer,
   SearchPage,
   SearchSnippets,
 } from '../../shared/index-types';
 import type { Logger } from '../../shared/log/writer';
+import type { RecentAnswer, RecentJob } from '../../shared/recent-search';
 import type { Stamp } from '../../shared/sources';
 import {
   ContainmentError,
@@ -84,12 +87,14 @@ import {
   type IndexThread,
   type ThreadRole,
 } from './pool';
+import { reasonOf } from './report';
 import { BODY_STATE, CAPPED, CAPPED_LISTS } from './schema';
 import {
   BODY_TOO_LARGE,
   labelsStatOf,
   textBytes,
   type ApplyItem,
+  type BodyOrder,
   type BodyTodo,
   type FileStat,
   type PairFile,
@@ -126,7 +131,7 @@ const BODY_FILES_PER_LANE = 2;
 
 /** One registered connection: which thread holds it, on which database. */
 export interface Connection {
-  role: 'writer' | 'query' | 'verifier';
+  role: 'writer' | 'query' | 'verifier' | 'recent';
   dbPath: string;
 }
 
@@ -190,8 +195,25 @@ export interface IndexOptions {
    * writes, at most; TXN_INPUT_BYTES otherwise.
    */
   txnBytes?: number;
+  /**
+   * Builds with test hooks only: how long an open waits for another
+   * connection's lock; INDEX_BUSY_MS otherwise.
+   */
+  busyMs?: number;
   /** Builds with test hooks only: this message's body job never ends, so it runs past its limit. */
   stallBodyOf?: string;
+  /** Builds with test hooks only: hooks on the recent searches' jobs. */
+  recentHooks?: RecentHooks;
+}
+
+/** Builds with test hooks only: what tests see and hold of the recent searches' jobs. */
+export interface RecentHooks {
+  /** Called as each job reaches the index, before it waits for the ones ahead of it. */
+  received(job: RecentJob): void;
+  /** Awaited by the job at the head of the queue before it runs; it never reorders. */
+  before(job: RecentJob): Promise<void>;
+  /** True once after a test asks: the next wipe then fails without deleting. */
+  failWipe(): boolean;
 }
 
 export interface IndexServiceDeps {
@@ -279,26 +301,6 @@ function chunk<T>(list: T[], size: number): T[][] {
   return out;
 }
 
-/** The log reason for a pair's code. */
-export function reasonOf(code: string): string {
-  if (code.startsWith('FILE_')) return code.slice('FILE_'.length).toLowerCase();
-  switch (code) {
-    case 'META_JSON':
-      return 'meta_json';
-    case 'META_SHAPE':
-      return 'meta_shape';
-    case 'META_ID':
-      return 'meta_id';
-    case 'META_TIMEOUT':
-    case 'BODY_TIMEOUT':
-      return 'timeout';
-    case BODY_TOO_LARGE:
-      return 'too_large';
-    default:
-      return 'worker_failed';
-  }
-}
-
 /** A whole number as stored in a row's text, or null. */
 function wholeOf(value: string | null): bigint | null {
   return value !== null && /^-?\d+$/.test(value) ? BigInt(value) : null;
@@ -324,10 +326,21 @@ export class IndexService {
   private writer: IndexThread | null = null;
   private query: IndexThread | null = null;
   private verifier: IndexThread | null = null;
+  /** While the run is unavailable: the recent-only connection's thread, opened on demand. */
+  private recentOnly: IndexThread | null = null;
+  private recentEntry: number | null = null;
+  private recentReady: Promise<void> | null = null;
+  /** Recent jobs run one at a time, in the order they came. */
+  private recentTail: Promise<unknown> = Promise.resolve();
   private checking: Promise<void> | null = null;
   private writerEntry: number | null = null;
   private queryEntry: number | null = null;
   private queryReady: Promise<void> | null = null;
+  /**
+   * The newest snapshot revision a cards answer carried. A query thread that
+   * replaces a failed one starts above it, so revisions never go back.
+   */
+  private revSeen = 0;
   private pool: Pool | null = null;
   private opened: WriterOpened | null = null;
   private running: Promise<void> | null = null;
@@ -347,9 +360,11 @@ export class IndexService {
     capped: 0,
     condition: 'ok',
     bodyPhase: 'waiting',
+    bodiesBefore: 0,
     bodiesDone: 0,
     bodiesTotal: 0,
     bodiesFailed: 0,
+    bodiesTruncated: 0,
   };
   /** How long phase 1 took when it last ran to the end, in ms. */
   took: number | null = null;
@@ -486,6 +501,7 @@ export class IndexService {
       capBytes: this.capBytes,
       exportRoots: this.deps.exportRoots ?? [],
       cancel: this.cancel,
+      ...this.busyArg(),
     });
     this.writerEntry = this.connections.add({ role: 'writer', dbPath: this.dbPath });
     this.opened = opened;
@@ -539,11 +555,23 @@ export class IndexService {
     };
   }
 
+  /** A test's busy timeout for the opens, if it set one. */
+  private busyArg(): { busyMs?: number } {
+    const busyMs = __PEV_TEST_HOOKS__ ? this.deps.options?.busyMs : undefined;
+    return busyMs === undefined ? {} : { busyMs };
+  }
+
   private openQuery(): Promise<void> {
     const query = this.query;
     const uuid = this.opened?.uuid;
     if (!query || !uuid || this.closed) return Promise.reject(new ThreadError('NOT_OPEN'));
-    this.queryReady ??= query.call('open', { dbPath: this.dbPath, expectedUuid: uuid }).then(
+    const args = {
+      dbPath: this.dbPath,
+      expectedUuid: uuid,
+      revFloor: this.revSeen,
+      ...this.busyArg(),
+    };
+    this.queryReady ??= query.call('open', args).then(
       () => {
         this.queryEntry = this.connections.add({ role: 'query', dbPath: this.dbPath });
       },
@@ -597,19 +625,86 @@ export class IndexService {
     try {
       await this.openQuery();
       const answer = await this.query!.call<IndexAnswer>('query', { call });
-      if (call.op === 'search' || call.op === 'snippets' || call.op === 'eml') {
+      if (
+        call.op === 'search' ||
+        call.op === 'snippets' ||
+        call.op === 'leads' ||
+        call.op === 'eml'
+      ) {
         // Snippets and match columns whose ranges failed the check are given without marks.
         const dropped =
           call.op === 'eml'
             ? ((answer as EmlFile | null)?.match?.dropped ?? 0)
-            : ((answer as SearchPage | SearchSnippets | null)?.dropped ?? 0);
+            : ((answer as SearchPage | SearchSnippets | LeadsAnswer | null)?.dropped ?? 0);
         if (dropped > 0) this.deps.log.warn('search.ranges_dropped', { count: dropped }, this.src);
+      }
+      if (call.op === 'cards') {
+        this.revSeen = Math.max(this.revSeen, (answer as CardsWindow).rev);
       }
       return answer;
     } catch (err) {
       this.watch(err);
       throw err;
     }
+  }
+
+  /**
+   * Runs one job on the recent searches once the ones before it have ended:
+   * on the writer, or, while the run is unavailable, on the recent-only
+   * connection, which never creates, replaces or migrates the index.
+   */
+  recent(job: RecentJob): Promise<RecentAnswer> {
+    const hooks = __PEV_TEST_HOOKS__ ? this.deps.options?.recentHooks : undefined;
+    hooks?.received(job);
+    const run = async (): Promise<RecentAnswer> => {
+      if (hooks) await Promise.race([hooks.before(job), this.closing]);
+      if (this.closed) throw new ThreadError('NOT_OPEN');
+      this.touch();
+      if (hooks && job.op === 'wipe' && hooks.failWipe()) throw new ThreadError('RECENT_FAILED');
+      try {
+        const thread = this.writer ?? (await this.openRecentOnly());
+        return await thread.call<RecentAnswer>('recent', { job });
+      } catch (err) {
+        this.watch(err);
+        throw err;
+      }
+    };
+    const next = this.recentTail.then(run, run);
+    this.recentTail = next.catch(() => undefined);
+    return next;
+  }
+
+  /** The recent-only connection: only to an index with the expected identity and schema version. */
+  private async openRecentOnly(): Promise<IndexThread> {
+    const uuid = this.opened?.uuid;
+    if (!uuid || this.closed) throw new ThreadError('NOT_OPEN');
+    if (!this.recentOnly) {
+      const thread = this.deps.thread('recent');
+      this.recentOnly = thread;
+      thread.onRespawn = () => {
+        this.connections.remove(this.recentEntry);
+        this.recentEntry = null;
+        this.recentReady = null;
+      };
+    }
+    const thread = this.recentOnly;
+    this.recentReady ??= thread
+      .call('open', {
+        dbPath: this.dbPath,
+        expectedUuid: uuid,
+        exportRoots: this.deps.exportRoots ?? [],
+      })
+      .then(
+        () => {
+          this.recentEntry = this.connections.add({ role: 'recent', dbPath: this.dbPath });
+        },
+        (err: unknown) => {
+          this.recentReady = null;
+          throw err;
+        },
+      );
+    await this.recentReady;
+    return thread;
   }
 
   /**
@@ -803,9 +898,14 @@ export class IndexService {
       if (!writer) throw new ThreadError('NOT_OPEN');
       const pool = this.startPool();
       if (!this.current()) throw new ThreadError('STALE');
-      const order = await writer.call<number[]>('bodyOrder');
+      const { order, before } = await writer.call<BodyOrder>('bodyOrder');
+      // Counts start again with each run; what earlier runs handled is in `before`.
       this.progress.bodyPhase = 'indexing';
+      this.progress.bodiesBefore = before;
       this.progress.bodiesTotal = order.length;
+      this.progress.bodiesDone = 0;
+      this.progress.bodiesFailed = 0;
+      this.progress.bodiesTruncated = 0;
       this.report(true);
       await this.readBodies(pool, writer, order, scan.eml);
       if (!this.current()) throw new ThreadError('STALE');
@@ -1025,6 +1125,7 @@ export class IndexService {
     this.touch();
     this.progress.bodiesDone += handled;
     this.progress.bodiesFailed += stats.failed.length;
+    this.progress.bodiesTruncated += stats.truncated;
     this.progress.capped += stats.cappedNew;
     this.report();
     for (const fileId of stats.capped) {
@@ -1449,18 +1550,29 @@ export class IndexService {
     await this.running;
     await this.verifier?.stop();
     await this.checking;
-    for (const role of ['query', 'writer'] as const) {
-      const thread = role === 'query' ? this.query : this.writer;
+    // The recent job in flight, if any, ends before its connection closes.
+    await this.recentTail;
+    for (const role of ['query', 'writer', 'recent'] as const) {
+      const thread =
+        role === 'query' ? this.query : role === 'writer' ? this.writer : this.recentOnly;
       if (!thread) continue;
       await thread.call('close').catch(() => undefined);
       await thread.stop();
-      if (role === 'query') this.connections.remove(this.queryEntry);
-      else this.connections.remove(this.writerEntry);
+      this.connections.remove(
+        role === 'query'
+          ? this.queryEntry
+          : role === 'writer'
+            ? this.writerEntry
+            : this.recentEntry,
+      );
     }
     this.queryEntry = null;
     this.writerEntry = null;
+    this.recentEntry = null;
     this.query = null;
     this.writer = null;
+    this.recentOnly = null;
+    this.recentReady = null;
   }
 }
 

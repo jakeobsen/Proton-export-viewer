@@ -4,10 +4,12 @@
 // down and deleted under the source's lock; Forget and Reset; and the races
 // between them. The export is never changed.
 
+import { once } from 'node:events';
 import {
   closeSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -42,7 +44,7 @@ import { sanitizeEvent } from '../../src/shared/log/schema';
 import type { Stamp } from '../../src/shared/sources';
 import { digest } from '../../tools/gen-export/tree.mjs';
 import { writeExport } from '../exports';
-import { InlineThread, damageTablePage } from '../index-helpers';
+import { InlineThread, damageTablePage, holdIndexLock } from '../index-helpers';
 import { testDir } from '../paths';
 
 const KEY = '00000000-0000-4000-8000-0000000000a1';
@@ -112,7 +114,8 @@ interface CoreOptions {
   generation?: number;
   sourceKey?: string;
   check?: HeldCheck;
-  query?: CorruptingQuery;
+  query?: IndexThread;
+  writer?: IndexThread;
   options?: IndexOptions;
   /** Other exports the app knows. */
   exports?: string[];
@@ -144,6 +147,7 @@ function core(o: CoreOptions) {
   const thread = (role: ThreadRole): IndexThread => {
     if (role === 'verify' && o.check) return o.check;
     if (role === 'query' && o.query) return o.query;
+    if (role === 'writer' && o.writer) return o.writer;
     if (role === 'writer' && o.atWriter) {
       const at = o.atWriter;
       return new InlineThread(role, (op) => (at(op), false));
@@ -539,6 +543,114 @@ describe('an index found damaged by the check', () => {
     if (c.session.index) await c.session.close();
     expect(digest(root)).toBe(before);
   });
+});
+
+/** A query thread whose open answers INDEX_DAMAGED. */
+class DamagedQuery extends InlineThread {
+  constructor() {
+    super('query');
+  }
+
+  override call<T>(op: string, args: unknown = {}, timeoutMs = 0): Promise<T> {
+    if (op === 'open') return Promise.reject(new ThreadError('INDEX_DAMAGED'));
+    return super.call<T>(op, args, timeoutMs);
+  }
+}
+
+/** A writer thread that opens the index without touching its file. */
+class OpenedWriter extends InlineThread {
+  constructor(private readonly uuid: string) {
+    super('writer');
+  }
+
+  override call<T>(op: string): Promise<T> {
+    const opened = {
+      uuid: this.uuid,
+      created: false,
+      replaced: false,
+      mismatch: null,
+      phase1Done: true,
+    };
+    return Promise.resolve((op === 'open' ? opened : null) as T);
+  }
+}
+
+describe('an index another connection holds', () => {
+  /** Each file of the index folder with its inode. */
+  const inodes = (indexDir: string) =>
+    Object.fromEntries(
+      family(indexDir).map((n) => [n, String(lstatSync(join(indexDir, n), { bigint: true }).ino)]),
+    );
+
+  /** Checks that the open was refused as busy, and that nothing was deleted, made or reported as damage. */
+  function refusedAsBusy(c: ReturnType<typeof core>, reply: CoreResult): void {
+    expect(reply).toMatchObject({ ok: false, code: 'unavailable' });
+    expect(c.logs.filter((l) => l.code === 'index.open_refused').map((l) => l.data)).toEqual([
+      { reason: 'busy' },
+    ]);
+    const codes = c.logs.map((l) => l.code);
+    const never = ['index.damaged', 'index.deleted', 'index.created', 'index.schema_pending'];
+    for (const code of never) expect(codes).not.toContain(code);
+    expect(c.events.some((e) => e.damaged || e.progress.condition === 'damaged')).toBe(false);
+  }
+
+  for (const online of [true, false]) {
+    const where = online ? 'online' : 'while the export is unavailable';
+    it(`past the busy timeout is refused, kept as it is, and opens once free (${where})`, async () => {
+      const { run, indexDir } = exportAt(`lc-busy-${online}`);
+      const uuid = await built(run, indexDir);
+      const before = inodes(indexDir);
+      const lock = await holdIndexLock(join(indexDir, `${KEY}.sqlite`), 4000);
+      try {
+        const c = core({
+          root: online ? run : null,
+          indexDir,
+          generation: 2,
+          options: { busyMs: 200 },
+        });
+        refusedAsBusy(c, await c.openIndex(uuid));
+        // A refused open starts no scan, online or not.
+        await c.session.settled();
+        expect(c.logs.some((l) => l.code === 'scan.done')).toBe(false);
+        await c.session.close();
+        // The holder's -wal and -shm files are its own; the index file is the same.
+        expect(inodes(indexDir)[`${KEY}.sqlite`]).toBe(before[`${KEY}.sqlite`]);
+      } finally {
+        lock.child.kill('SIGKILL');
+      }
+      await once(lock.child, 'exit').catch(() => undefined);
+      const again = core({ root: online ? run : null, indexDir, generation: 3 });
+      expect(await again.openIndex(uuid)).toMatchObject({
+        ok: true,
+        index: { dbUuid: uuid, created: false, replaced: false },
+      });
+      // Once it opens, the scan runs when the export is there.
+      await again.session.settled();
+      expect(again.logs.some((l) => l.code === 'scan.done')).toBe(online);
+      await again.session.close();
+    });
+
+    it(`found damaged by a thread, but busy when looked at again, is refused and kept (${where})`, async () => {
+      const { run, indexDir } = exportAt(`lc-busy-damaged-${online}`);
+      const uuid = await built(run, indexDir);
+      const lock = await holdIndexLock(join(indexDir, `${KEY}.sqlite`), 4000);
+      try {
+        const before = inodes(indexDir);
+        const c = core({
+          root: online ? run : null,
+          indexDir,
+          generation: 2,
+          query: new DamagedQuery(),
+          writer: new OpenedWriter(uuid),
+        });
+        refusedAsBusy(c, await c.openIndex(uuid));
+        await c.session.close();
+        expect(inodes(indexDir)).toEqual(before);
+      } finally {
+        lock.child.kill('SIGKILL');
+      }
+    });
+  }
 });
 
 describe('the lifecycle lock', () => {
@@ -977,7 +1089,7 @@ describe("the reader's open of a message file", () => {
     const e = exportAt('lc-reader-search', 6, 24);
     const c = core({ root: e.run, indexDir: e.indexDir });
     expect(await c.openIndex(null)).toMatchObject({ ok: true });
-    await c.session.index!.settled();
+    await c.session.settled();
     const generation = c.stamp.generation;
     const file = (await eml(c, 1))!;
     const path = join(e.run, file.rel!);
@@ -990,7 +1102,10 @@ describe("the reader's open of a message file", () => {
     expect(plain.ok && 'match' in plain).toBe(false);
     if (plain.ok) await plain.opened.close();
 
-    const found = await c.session.openForReader(1, generation, () => false, word);
+    const found = await c.session.openForReader(1, generation, () => false, {
+      text: word,
+      chips: [],
+    });
     expect(found).toMatchObject({ ok: true, match: { changed: false } });
     if (found.ok) {
       expect(found.match!.columns).toContain('subject');
@@ -1000,7 +1115,10 @@ describe("the reader's open of a message file", () => {
     // The file is rewritten in place after the scan (same inode): it opens without the stored body.
     const original = readFileSync(path);
     writeFileSync(path, Buffer.concat([original, Buffer.from('\r\nmore text\r\n')]));
-    const changed = await c.session.openForReader(1, generation, () => false, word);
+    const changed = await c.session.openForReader(1, generation, () => false, {
+      text: word,
+      chips: [],
+    });
     expect(changed).toMatchObject({
       ok: true,
       match: { changed: true, bodyMatches: 0, body: null },
@@ -1012,14 +1130,20 @@ describe("the reader's open of a message file", () => {
     // Replaced by another file (a new inode): examined again, and opened the same way.
     rmSync(path);
     writeFileSync(path, original);
-    const replaced = await c.session.openForReader(1, generation, () => false, word);
+    const replaced = await c.session.openForReader(1, generation, () => false, {
+      text: word,
+      chips: [],
+    });
     expect(replaced).toMatchObject({ ok: true, match: { changed: true, body: null } });
     if (replaced.ok) await replaced.opened.close();
 
     // Refused (a link took the file's place): the fallback still says how the message matched.
     rmSync(path);
     symlinkSync(join(e.run, (await eml(c, 2))!.rel!), path);
-    const refused = await c.session.openForReader(1, generation, () => false, word);
+    const refused = await c.session.openForReader(1, generation, () => false, {
+      text: word,
+      chips: [],
+    });
     expect(refused).toMatchObject({ ok: false, code: 'refused', match: { changed: false } });
     expect(await c.session.openForReader(1, generation, () => false)).toEqual({
       ok: false,
@@ -1028,7 +1152,10 @@ describe("the reader's open of a message file", () => {
 
     // Removed after indexing: the refusal still says how the message matched.
     rmSync(path);
-    const gone = await c.session.openForReader(1, generation, () => false, word);
+    const gone = await c.session.openForReader(1, generation, () => false, {
+      text: word,
+      chips: [],
+    });
     expect(gone).toMatchObject({
       ok: false,
       code: 'eml_missing',

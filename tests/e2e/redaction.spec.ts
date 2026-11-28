@@ -22,6 +22,19 @@ import { writeExport } from '../exports';
 import { MARKERS, MARKER_TEXT, findMarkers } from '../markers';
 import { testDir } from '../paths';
 import { expect, launch, test, type PevApp } from './app';
+import {
+  addChip,
+  addIndexRows,
+  backToMail,
+  clearButton,
+  keyInBox,
+  openIndexSettings,
+  phase1Done as recentPhase1,
+  recentTexts,
+  setKeep,
+  settled,
+  typeText,
+} from './search-ui';
 
 test('no marker reaches a log file through any path', async ({ pev }) => {
   const M = MARKER_TEXT;
@@ -298,6 +311,70 @@ test('no marker reaches a log file through the index text and its schema checks,
 
   // No marker, in any form, and no home-folder path in any log file.
   const dir = third.logsDir();
+  for (const file of readdirSync(dir)) {
+    expect(findMarkers(readFileSync(join(dir, file), 'utf8')), file).toEqual([]);
+  }
+});
+
+test('no marker reaches a log file through the recent searches', async () => {
+  const root = realpathSync(testDir(`${MARKERS[0]}-recent`));
+  const written = writeExport(root, { seed: 36, messages: 4 });
+  const first = await launch('redaction-recent-1');
+  let dbPath: string;
+  try {
+    await first.main('queuePick', root, 'bm1');
+    await first.shell('chooseFolder', []);
+    await recentPhase1(first, written.pairs);
+    const stamp = await first.main<Stamp>('sourceStamp');
+    dbPath = join(await first.main<string>('indexDir'), `${stamp.sourceKey}.sqlite`);
+    // A marker query with a marker From chip, committed and listed.
+    await typeText(first.page, MARKER_TEXT);
+    await settled(first, MARKER_TEXT, 0);
+    await addChip(first.page, { k: 'from', v: MARKERS[0] });
+    await settled(first, MARKER_TEXT, 1);
+    await keyInBox(first.page, 'Enter');
+    await expect.poll(() => recentTexts(first.page)).toEqual([MARKER_TEXT]);
+    await expect.poll(() => first.hasLog('recent.recorded', { proc: 'core' })).toBe(true);
+  } finally {
+    await first.close();
+  }
+  // A row that fails the check, holding the markers.
+  addIndexRows(dbPath, [{ q: `{"v":1,"text":${JSON.stringify(MARKER_TEXT)}`, at: Date.now() }]);
+
+  const second = await launch('redaction-recent-2', { userData: first.userData });
+  try {
+    await recentPhase1(second, written.pairs);
+    await expect.poll(() => recentTexts(second.page)).toEqual([MARKER_TEXT]);
+    await expect
+      .poll(() => second.hasLog('recent.invalid_rows', { proc: 'core', count: 1 }))
+      .toBe(true);
+    // Committed again, cleared, committed, then the switch turned off.
+    await typeText(second.page, MARKERS[1]);
+    await settled(second, MARKERS[1]);
+    await keyInBox(second.page, 'Enter');
+    await expect.poll(() => recentTexts(second.page)).toEqual([MARKERS[1], MARKER_TEXT]);
+    await openIndexSettings(second.page);
+    await clearButton(second.page).dispatchEvent('click');
+    await expect.poll(() => second.hasLog('recent.cleared', { proc: 'core', count: 2 })).toBe(true);
+    await backToMail(second.page);
+    await typeText(second.page, MARKERS[3]);
+    await settled(second, MARKERS[3]);
+    await keyInBox(second.page, 'Enter');
+    await expect.poll(() => recentTexts(second.page)).toEqual([MARKERS[3]]);
+    await openIndexSettings(second.page);
+    await setKeep(second.page, false);
+    await expect.poll(() => second.hasLog('recent.cleared', { proc: 'core', count: 1 })).toBe(true);
+    await backToMail(second.page);
+    await typeText(second.page, MARKERS[5]);
+    await settled(second, MARKERS[5]);
+    await keyInBox(second.page, 'Enter');
+    await expect.poll(() => second.hasLog('recent.dropped', { reason: 'off' })).toBe(true);
+  } finally {
+    await second.close();
+  }
+
+  // No marker, in any form, and no home-folder path in any log file.
+  const dir = second.logsDir();
   for (const file of readdirSync(dir)) {
     expect(findMarkers(readFileSync(join(dir, file), 'utf8')), file).toEqual([]);
   }

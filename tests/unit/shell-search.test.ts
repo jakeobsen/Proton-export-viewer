@@ -15,10 +15,12 @@ import {
   RESULTS_MARGIN,
   SearchModel,
   TYPING_PAUSE_MS,
+  cleanParts,
   conversationsText,
   partialText,
   snippetParts,
 } from '../../src/renderer/search';
+import { countText } from '../../src/renderer/format';
 
 interface Call {
   request: SearchRequest;
@@ -134,7 +136,7 @@ describe('typing', () => {
     expect(model.snapshot.active).toBe(false);
     vi.advanceTimersByTime(1);
     expect(runner.calls.map((c) => c.request)).toEqual([
-      { text: 'zeb', sort: 'date', after: null },
+      { text: 'zeb', chips: [], sort: 'date', after: null },
     ]);
     expect(model.snapshot).toMatchObject({ text: 'zeb', active: true, searching: true });
   });
@@ -164,7 +166,7 @@ describe('typing', () => {
     model.setText('zebra');
     model.setSort('date');
     expect(runner.calls.map((c) => c.request)).toEqual([
-      { text: 'zebra', sort: 'date', after: null },
+      { text: 'zebra', chips: [], sort: 'date', after: null },
     ]);
     // The pause that was running doesn't search a second time.
     vi.advanceTimersByTime(TYPING_PAUSE_MS);
@@ -239,7 +241,7 @@ describe('while typing pauses', () => {
     expect(runner.calls).toHaveLength(2);
     vi.advanceTimersByTime(1);
     expect(runner.calls).toHaveLength(3);
-    expect(runner.last.request).toEqual({ text: 'yak', sort: 'date', after: null });
+    expect(runner.last.request).toEqual({ text: 'yak', chips: [], sort: 'date', after: null });
     await answer(runner.last, page([5], { total: 1 }));
     expect(model.snapshot).toMatchObject({ resultsFor: 'yak', total: 1 });
     expect(model.snapshot.rows.map((r) => r.threadId)).toEqual([5]);
@@ -259,7 +261,7 @@ describe('while typing pauses', () => {
     expect(runner.calls).toHaveLength(2);
     vi.advanceTimersByTime(TYPING_PAUSE_MS);
     expect(runner.calls).toHaveLength(3);
-    expect(runner.last.request).toEqual({ text: 'zebras', sort: 'date', after: null });
+    expect(runner.last.request).toEqual({ text: 'zebras', chips: [], sort: 'date', after: null });
   });
 
   it('a scroll during the pause asks for no page or snippet of the shown search', async () => {
@@ -277,7 +279,12 @@ describe('while typing pauses', () => {
     expect(runner.calls).toHaveLength(2);
     await answer(runner.last, page(range(301, 200), { next: dateKey(500) }));
     model.setViewport(199, 199);
-    expect(runner.last.request).toEqual({ text: 'zebras', sort: 'date', after: dateKey(500) });
+    expect(runner.last.request).toEqual({
+      text: 'zebras',
+      chips: [],
+      sort: 'date',
+      after: dateKey(500),
+    });
   });
 
   it('snippets that answer during the pause install nothing, and a scroll then asks for none', async () => {
@@ -323,7 +330,12 @@ describe('pages', () => {
     model.setViewport(200 - RESULTS_MARGIN - 1, 200 - RESULTS_MARGIN - 1);
     expect(runner.calls).toHaveLength(1);
     model.setViewport(200 - RESULTS_MARGIN, 200 - RESULTS_MARGIN);
-    expect(runner.last.request).toEqual({ text: 'zebra', sort: 'date', after: dateKey(200) });
+    expect(runner.last.request).toEqual({
+      text: 'zebra',
+      chips: [],
+      sort: 'date',
+      after: dateKey(200),
+    });
     // One page at a time.
     model.setViewport(199, 199);
     expect(runner.calls).toHaveLength(2);
@@ -348,7 +360,7 @@ describe('pages', () => {
       expect(model.snapshot.rows.map((r) => r.threadId)).toEqual([...range(1, 202)]);
       expect(model.snapshot.skipped).toBe(1);
       model.setViewport(201, 201);
-      expect(runner.last.request).toEqual({ text: 'zebra', sort, after: key(5) });
+      expect(runner.last.request).toEqual({ text: 'zebra', chips: [], sort, after: key(5) });
     });
   }
 
@@ -361,7 +373,12 @@ describe('pages', () => {
     expect(model.snapshot.skipped).toBe(200);
     // Nothing new to show, so the next page is read straight away, after the last row returned.
     expect(runner.calls).toHaveLength(3);
-    expect(runner.last.request).toEqual({ text: 'zebra', sort: 'date', after: dateKey(400) });
+    expect(runner.last.request).toEqual({
+      text: 'zebra',
+      chips: [],
+      sort: 'date',
+      after: dateKey(400),
+    });
     await answer(runner.last, page([401]));
     expect(model.snapshot.rows.at(-1)!.threadId).toBe(401);
   });
@@ -376,7 +393,12 @@ describe('pages', () => {
     );
     expect(model.snapshot.ranked).toBe(false);
     model.setViewport(199, 199);
-    expect(runner.last.request).toEqual({ text: 'is:unread', sort: 'date', after: dateKey(200) });
+    expect(runner.last.request).toEqual({
+      text: 'is:unread',
+      chips: [],
+      sort: 'date',
+      after: dateKey(200),
+    });
   });
 
   it('a later page without an answer is read again on the next scroll', async () => {
@@ -401,7 +423,12 @@ describe('pages', () => {
     await answer(late, page([201]));
     expect(model.snapshot.rows.map((r) => r.threadId)).not.toContain(201);
     model.setViewport(199, 199);
-    expect(runner.last.request).toEqual({ text: 'zebras', sort: 'date', after: dateKey(500) });
+    expect(runner.last.request).toEqual({
+      text: 'zebras',
+      chips: [],
+      sort: 'date',
+      after: dateKey(500),
+    });
   });
 
   it('keeps the coverage of the latest page', async () => {
@@ -532,6 +559,32 @@ describe('texts', () => {
     expect(snippetParts({ text: '', ranges: [[0, 1]] })).toEqual([]);
   });
 
+  it('cleans a marked snippet part by part, so each mark stays on its own text', () => {
+    // An override and a zero-width space before the mark, a line break and a
+    // control inside the text after it, and white space at both ends.
+    const text = ' \u202eSee\u200b the\r\n invoice\u0007 for\tMay ';
+    const start = text.indexOf('invoice');
+    const parts = cleanParts(snippetParts({ text, ranges: [[start, start + 7]] }));
+    expect(parts).toEqual([
+      { text: 'See the ', mark: false },
+      { text: 'invoice', mark: true },
+      { text: '\u2407 for May', mark: false },
+    ]);
+    // A part left empty goes, and the marked text stays marked.
+    expect(
+      cleanParts([
+        { text: '\u200b\u202e', mark: false },
+        { text: 'zebra', mark: true },
+      ]),
+    ).toEqual([{ text: 'zebra', mark: true }]);
+  });
+
+  it('gives the header count, with the matching messages from a result', () => {
+    expect(countText(1, null)).toBe('1 message');
+    expect(countText(1200, null)).toBe('1,200 messages');
+    expect(countText(4, 2)).toBe('4 messages \u00b7 2 matching');
+  });
+
   it('counts conversations, and shows the partial line only while bodies wait', () => {
     expect(conversationsText(1)).toBe('1 conversation');
     expect(conversationsText(1200)).toBe('1,200 conversations');
@@ -542,5 +595,113 @@ describe('texts', () => {
     expect(partialText({ indexed: 61_000, pending: 91_000, total: 152_000 })).toBe(
       'Partial results: 61,000 of 152,000 bodies indexed.',
     );
+  });
+});
+
+describe('chips', () => {
+  it('run the search at once, with the text as it is, and removing one leaves the text', async () => {
+    typeAndPause('budget');
+    await answer(runner.last, page([1], { queryId: 1 }));
+    model.setChips([{ k: 'unread' }]);
+    expect(runner.calls).toHaveLength(2);
+    expect(runner.last.request).toEqual({
+      text: 'budget',
+      chips: [{ k: 'unread' }],
+      sort: 'date',
+      after: null,
+    });
+    await answer(runner.last, page([2], { queryId: 2, next: { time: 5, threadId: 2 } }));
+    // Later pages carry the shown search's chips.
+    model.setViewport(0, 1);
+    expect(runner.last.request).toEqual({
+      text: 'budget',
+      chips: [{ k: 'unread' }],
+      sort: 'date',
+      after: { time: 5, threadId: 2 },
+    });
+    model.setChips([]);
+    expect(model.snapshot.text).toBe('budget');
+    expect(runner.last.request).toMatchObject({ text: 'budget', chips: [] });
+  });
+
+  it('keep the search active with no text, by date; Esc clears both', async () => {
+    model.setChips([{ k: 'attachment' }]);
+    expect(model.snapshot).toMatchObject({ active: true, searching: true, text: '' });
+    expect(runner.last.request).toMatchObject({ text: '', chips: [{ k: 'attachment' }] });
+    // Emptying the box keeps a chips-only search.
+    model.setText('x');
+    model.setText('');
+    vi.advanceTimersByTime(TYPING_PAUSE_MS);
+    expect(model.snapshot.active).toBe(true);
+    model.clear();
+    expect(model.snapshot).toMatchObject({ active: false, text: '', chips: [] });
+  });
+
+  it('a whole search picked from the recent ones runs at once', () => {
+    model.setSearch('invoice', [{ k: 'from', v: 'alice' }]);
+    expect(runner.calls).toHaveLength(1);
+    expect(runner.last.request).toMatchObject({
+      text: 'invoice',
+      chips: [{ k: 'from', v: 'alice' }],
+    });
+  });
+});
+
+describe('Enter', () => {
+  it('within the typing pause runs the box text at once and gives that search its ID', async () => {
+    typeAndPause('invoic');
+    await answer(runner.last, page([1], { queryId: 1 }));
+    model.setText('invoice');
+    const committed = model.enterQueryId();
+    // No waiting for the pause: the full text runs now, once.
+    expect(runner.calls).toHaveLength(2);
+    expect(runner.last.request).toMatchObject({ text: 'invoice' });
+    vi.advanceTimersByTime(TYPING_PAUSE_MS);
+    expect(runner.calls).toHaveLength(2);
+    await answer(runner.last, page([2], { queryId: 2 }));
+    expect(await committed).toBe(2);
+  });
+
+  it('gives the shown search its ID without running it again', async () => {
+    typeAndPause('invoice');
+    await answer(runner.last, page([1], { queryId: 7 }));
+    expect(await model.enterQueryId()).toBe(7);
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  it('waits for the search already running for the box', async () => {
+    typeAndPause('invoice');
+    const committed = model.enterQueryId();
+    expect(runner.calls).toHaveLength(1);
+    await answer(runner.last, page([1], { queryId: 4 }));
+    expect(await committed).toBe(4);
+  });
+
+  it('waits for the search a chip started, not the one shown before it', async () => {
+    typeAndPause('invoice');
+    await answer(runner.last, page([1], { queryId: 5 }));
+    model.setChips([{ k: 'unread' }]);
+    expect(runner.calls).toHaveLength(2);
+    const committed = model.enterQueryId();
+    // That search is already running: it isn't run again.
+    expect(runner.calls).toHaveLength(2);
+    await answer(runner.last, page([2], { queryId: 6 }));
+    expect(await committed).toBe(6);
+  });
+
+  it('gives nothing when a newer search takes its place before it answers', async () => {
+    typeAndPause('invoice');
+    const committed = model.enterQueryId();
+    model.setText('invoices');
+    await answer(runner.calls[0]!, page([1], { queryId: 4 }));
+    expect(await committed).toBeNull();
+  });
+
+  it('gives nothing for an empty box with no chips, or a search with no answer', async () => {
+    expect(await model.enterQueryId()).toBeNull();
+    typeAndPause('x');
+    const committed = model.enterQueryId();
+    await answer(runner.last, null);
+    expect(await committed).toBeNull();
   });
 });

@@ -10,9 +10,15 @@ import type {
   ReaderFailure,
   ReaderMatch,
   RenderedMessage,
+  SourceHeaders,
+  SourcePart,
+  SourceRequest,
   WorkerRender,
   WorkerRendered,
+  WorkerSource,
+  WorkerSourced,
 } from './reader-protocol';
+import type { RecentAnswer, RecentJob } from './recent-search';
 import type { RunIdentity, ScanSummary, Stamp } from './sources';
 
 /** The export run core serves. `root` is null while the run is unavailable. */
@@ -222,6 +228,14 @@ export interface IndexQueryRequest {
   query: IndexQuery;
 }
 
+/** A job on the open source's recent searches. Core runs them in the order they come. */
+export interface RecentRequest {
+  type: 'recent';
+  reqId: number;
+  stamp: Stamp;
+  job: RecentJob;
+}
+
 export type CoreRequest =
   | OpenRequest
   | PingRequest
@@ -231,8 +245,10 @@ export type CoreRequest =
   | ScanRequest
   | ReadRequest
   | LocateRequest
+  | SourceRequest
   | IndexRequest
   | IndexQueryRequest
+  | RecentRequest
   | ForgetRequest
   | ResetRequest;
 
@@ -258,9 +274,15 @@ export type CoreResult =
       file?: FileIdentity | null;
       /** The path a `locate` found. */
       path?: string;
+      /** A header block for the source view; null for a part the message doesn't have. */
+      headers?: SourceHeaders | null;
+      /** The message's parts for the source view. */
+      parts?: SourcePart[];
       index?: IndexOpened;
       answer?: IndexAnswer;
       progress?: IndexProgress;
+      /** What a `recent` job did. */
+      recent?: RecentAnswer;
     }
   | {
       type: 'result';
@@ -311,10 +333,12 @@ export interface WorkerProofRead {
   paths: string[];
 }
 
-export type WorkerRequest = WorkerBuild | WorkerTest | WorkerProofRead | WorkerRender;
+export type WorkerRequest =
+  WorkerBuild | WorkerTest | WorkerProofRead | WorkerRender | WorkerSource;
 
 export type WorkerMessage =
   | WorkerRendered
+  | WorkerSourced
   | { type: 'result'; reqId: number; ok: true; body: StubBodyMessage }
   | { type: 'proof-read'; reqId: number; reads: ProofFileRead[] }
   | { type: 'result'; reqId: number; ok: false; code: 'unknown_stub' }

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The index's lifecycle in the app: a damaged index is found by its check
 // after a reopen and rebuilt; while the export is gone it is deleted and
-// rebuilt once the export is located; Forget leaves no file of the index; and
-// Reset deletes the app's own data once the open export is torn down. The
-// exports are never changed, not even one put inside the app's data folder.
+// rebuilt once the export is located; Forget leaves no file of the index;
+// Reset deletes the app's own data once the open export is torn down, after
+// which the app starts afresh; and a close returns only once core has exited
+// and left the index free. The exports are never changed, not even one put
+// inside the app's data folder.
 
 import {
   existsSync,
@@ -14,6 +16,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { openDb } from '../../src/core/index/sql';
 import type { SourceActionResult } from '../../src/shared/api';
 import type { IndexProgress, IndexTotals } from '../../src/shared/index-types';
 import type { SourcesView, Stamp } from '../../src/shared/sources';
@@ -21,7 +24,8 @@ import { digest } from '../../tools/gen-export/tree.mjs';
 import { writeExport } from '../exports';
 import { damageTablePage } from '../index-helpers';
 import { testDir } from '../paths';
-import { expect, launch, test, type PevApp } from './app';
+import { CORE_EXIT_MS, expect, launch, test, type PevApp } from './app';
+import { isGone, startTimeOf, waitGone } from './process-wait';
 
 type Answer<T> = { answer: T; progress: IndexProgress } | null;
 
@@ -196,7 +200,7 @@ test('Forget leaves no file of the index, and late work recreates none', async (
   expect([digest(rootA), digest(rootB)]).toEqual(digests);
 });
 
-test('Reset deletes the app data once the open export is torn down, and nothing else', async ({
+test('Reset deletes the app data once the open export is torn down, and nothing else; then the app starts afresh', async ({
   pev,
 }) => {
   const root = realpathSync(testDir('life-reset'));
@@ -223,32 +227,41 @@ test('Reset deletes the app data once the open export is torn down, and nothing 
   await pev.shell('chooseFolder', []);
   await phase1Done(pev, written.pairs);
   const registry = await pev.main<string>('registryFile');
-  const logsDir = pev.logsDir();
   const settings = join(pev.userData, 'settings.json');
   writeFileSync(settings, '{}');
   expect(existsSync(registry)).toBe(true);
-  expect(readdirSync(logsDir).length).toBeGreaterThan(0);
+  // Main, core and the shell have each logged before the reset.
+  await pev.shell('log', ['before-reset']);
+  await expect.poll(() => pev.logs().some((l) => l.code === 'test.log')).toBe(true);
+  const earlier = ['source.opened', 'index.created', 'test.log'];
+  for (const code of earlier) expect(pev.hasLog(code)).toBe(true);
 
   await pev.main('resetApp');
   // The index folder keeps only what the app didn't make there.
   expect(readdirSync(indexDir)).toEqual(['nested']);
   expect(existsSync(registry)).toBe(false);
   expect(existsSync(settings)).toBe(false);
-  expect(existsSync(logsDir)).toBe(false);
+  // Every log from before is gone. Main and core log again at once, so new
+  // files may already be there, with nothing in them from before.
+  expect(pev.logs().filter((l) => [...earlier, 'app.reset'].includes(l.code))).toEqual([]);
   expect(await view(pev)).toEqual({ restoring: false, active: null, recent: [] });
   expect(await pev.main('liveScopes')).toEqual([]);
-  // Nothing opens afterwards, and nothing comes back: not the index, the
-  // registry or the logs, though main and the shell keep logging.
-  await pev.main('queuePick', root, 'bm2');
-  expect(await pev.shell<SourceActionResult>('chooseFolder', [])).toMatchObject({
-    ok: true,
-    outcome: 'closed',
-  });
-  await pev.shell('log', ['after-reset']);
+  // Nothing comes back on its own: not the index or the registry. The logs
+  // start again in a new folder, with nothing from before the reset.
   await new Promise((r) => setTimeout(r, 1000));
   expect(readdirSync(indexDir)).toEqual(['nested']);
   expect(existsSync(registry)).toBe(false);
-  expect(existsSync(logsDir)).toBe(false);
+  await pev.shell('log', ['after-reset']);
+  await expect.poll(() => pev.logs().filter((l) => l.code === 'test.log').length).toBe(1);
+  expect(pev.logs().filter((l) => ['app.reset', 'source.opened'].includes(l.code))).toEqual([]);
+  // Then the app starts afresh: an export opens as a new one.
+  await pev.main('queuePick', root, 'bm2');
+  expect(await pev.shell<SourceActionResult>('chooseFolder', [])).toMatchObject({
+    ok: true,
+    outcome: 'opened',
+  });
+  await phase1Done(pev, written.pairs);
+  expect(existsSync(registry)).toBe(true);
   expect(digest(root)).toBe(before);
   expect(digest(nestedRoot)).toBe(nestedBefore);
 });
@@ -334,4 +347,83 @@ test('after 3 restarts within a minute the export is closed, and Reopen opens it
   await phase1Done(pev, written.pairs);
   expect((await view(pev)).active).toMatchObject({ status: 'online', closed: false });
   await checkHidden(pev);
+});
+
+test('close returns only once core has exited, and the index is free', async () => {
+  const root = realpathSync(testDir('life-close-wait'));
+  const written = writeExport(root, { seed: 28, messages: 8 });
+  const pev = await launch('life-close-wait');
+  let pid: number | undefined;
+  let startTime: string | null = null;
+  let stopped = false;
+  try {
+    await pev.main('queuePick', root, 'bm1');
+    await pev.shell('chooseFolder', []);
+    await phase1Done(pev, written.pairs);
+    const stamp = await pev.main<Stamp>('sourceStamp');
+    const indexDir = await pev.main<string>('indexDir');
+    await checkHidden(pev);
+    pid = await pev.main<number>('corePid');
+    expect(pid).toBeGreaterThan(0);
+    startTime = startTimeOf(pid);
+    expect(startTime).not.toBeNull();
+
+    // A stopped process can't exit by itself. On Linux, main leaves core to
+    // exit on its own, so a stopped core outlives main for sure: it is let go
+    // only once main has exited, and a while after. That is where the close
+    // wait is proven. On macOS, Electron ends its utility process at quit,
+    // before main exits, even a stopped one. That is the platform's behaviour,
+    // checked as such, so a change to it fails here rather than passing.
+    const mainExited = new Promise<void>((resolve) =>
+      pev.app.process().once('exit', () => resolve()),
+    );
+    process.kill(pid, 'SIGSTOP');
+    stopped = true;
+    let closedAt = 0;
+    const closing = pev.close().then(() => {
+      closedAt = Date.now();
+    });
+    await mainExited;
+    if (process.platform === 'darwin') {
+      expect(isGone(pid)).toBe(true);
+      stopped = false;
+      await closing;
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      expect(isGone(pid)).toBe(false);
+      const contAt = Date.now();
+      process.kill(pid, 'SIGCONT');
+      stopped = false;
+      await closing;
+      // close came back after core was let go.
+      expect(closedAt).toBeGreaterThanOrEqual(contAt);
+    }
+
+    // The close waited for core, which is gone.
+    expect(['gone', 'zombie']).toContain(pev.closeWait?.state);
+    expect(isGone(pid)).toBe(true);
+    // Nothing holds the index: it opens with no busy timeout, checkpoints and takes a write lock.
+    const db = openDb(join(indexDir, `${stamp.sourceKey}.sqlite`));
+    try {
+      // A reader still there would leave the checkpoint busy, without an error.
+      expect(db.stmt('PRAGMA wal_checkpoint(TRUNCATE)').get()).toMatchObject({ busy: 0 });
+      db.exec('BEGIN IMMEDIATE');
+      db.exec('ROLLBACK');
+    } finally {
+      db.close();
+    }
+  } finally {
+    // Whatever failed, no stopped core is left behind.
+    if (pid !== undefined && stopped) {
+      try {
+        process.kill(pid, 'SIGCONT');
+      } catch {
+        // Already gone.
+      }
+    }
+    await pev.close().catch(() => undefined);
+    if (pid !== undefined) {
+      await waitGone(pid, { timeoutMs: CORE_EXIT_MS, startTime }).catch(() => undefined);
+    }
+  }
 });

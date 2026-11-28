@@ -3,13 +3,24 @@
 // a query. Snippets are text with marked spans; nothing in them is markup.
 
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { useCallback, useEffect, useLayoutEffect, useRef, type KeyboardEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from 'react';
 import { displayText } from '../shared/header-text';
-import { MAX_QUERY_LENGTH, type MarkedSnippet, type SearchSort } from '../shared/index-types';
+import { MAX_QUERY_LENGTH, type SearchSort } from '../shared/index-types';
 import type { SidebarModel } from './folders';
 import { formatCount, fullDate, listDate, participantsText } from './format';
+import type { SearchSpec } from '../shared/search-chips';
 import {
   clearSearch,
+  commitSearch,
+  recentSearches,
+  runRecentSearch,
   search,
   selectResult,
   setSearchSort,
@@ -17,42 +28,124 @@ import {
   useMailbox,
   useSearch,
 } from './mailbox-state';
+import { ChipRow } from './SearchChips';
+import { recentParts } from './search-chips';
 import { Chips } from './Chips';
-import {
-  RESULT_ROW_HEIGHT,
-  conversationsText,
-  partialText,
-  snippetParts,
-  type ResultRow,
-} from './search';
+import { Snippet } from './Lead';
+import { RESULT_ROW_HEIGHT, conversationsText, partialText, type ResultRow } from './search';
+import { setListStep } from './shortcut-actions';
 
-export function SearchBox() {
-  const { text } = useSearch();
-  return (
-    <input
-      className="search-box"
-      type="text"
-      placeholder="Search mail"
-      aria-label="Search mail"
-      spellCheck={false}
-      autoComplete="off"
-      maxLength={MAX_QUERY_LENGTH}
-      value={text}
-      onChange={(e) => setSearchText(e.target.value)}
-      onKeyDown={(e) => {
-        if (e.key === 'Escape') clearSearch();
-      }}
-    />
-  );
+interface RecentMenu {
+  entries: Array<{ spec: SearchSpec; parts: string[] }>;
+  /** The highlighted entry; -1 for none. */
+  at: number;
 }
 
-function Snippet({ snippet }: { snippet: MarkedSnippet }) {
+/**
+ * The search box. Enter runs the box's search at once and records it; Esc
+ * clears the text and the chips. Focused, empty and with no chips, it shows
+ * the export's recent searches: arrows move, Enter picks, Esc closes.
+ */
+export function SearchBox() {
+  const { text, chips } = useSearch();
+  const { sidebar } = useMailbox();
+  const [menu, setMenu] = useState<RecentMenu | null>(null);
+  const box = useRef<HTMLInputElement | null>(null);
+  const openMenu = async () => {
+    if (text !== '' || chips.length > 0) return;
+    const specs = await recentSearches();
+    const snap = search.snapshot;
+    // Only while the box is still focused, empty and without chips.
+    if (document.activeElement !== box.current || snap.text !== '' || snap.chips.length > 0) {
+      return;
+    }
+    const entries = specs.flatMap((spec) => {
+      const parts = recentParts(spec, sidebar);
+      return parts === null ? [] : [{ spec, parts }];
+    });
+    setMenu(entries.length > 0 ? { entries, at: -1 } : null);
+  };
+  const pick = (spec: SearchSpec) => {
+    setMenu(null);
+    runRecentSearch(spec);
+  };
+  const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (menu) {
+      const n = menu.entries.length;
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const at = e.key === 'ArrowDown' ? (menu.at + 1) % n : menu.at <= 0 ? n - 1 : menu.at - 1;
+        setMenu({ ...menu, at });
+        return;
+      }
+      if (e.key === 'Enter' && menu.at >= 0) {
+        e.preventDefault();
+        pick(menu.entries[menu.at]!.spec);
+        return;
+      }
+      if (e.key === 'Escape') {
+        setMenu(null);
+        return;
+      }
+    }
+    if (e.key === 'ArrowDown' && !menu) void openMenu();
+    if (e.key === 'Escape') clearSearch();
+    if (e.key === 'Enter') void commitSearch();
+  };
   return (
-    <>
-      {snippetParts(snippet).map((part, i) =>
-        part.mark ? <mark key={i}>{part.text}</mark> : <span key={i}>{part.text}</span>,
+    <div className="search-wrap">
+      <input
+        ref={box}
+        className="search-box"
+        type="text"
+        placeholder="Search mail"
+        aria-label="Search mail"
+        role="combobox"
+        aria-expanded={menu !== null}
+        aria-controls="recent-searches"
+        aria-autocomplete="list"
+        spellCheck={false}
+        autoComplete="off"
+        maxLength={MAX_QUERY_LENGTH}
+        value={text}
+        onFocus={() => void openMenu()}
+        onBlur={() => setMenu(null)}
+        onChange={(e) => {
+          setMenu(null);
+          setSearchText(e.target.value);
+        }}
+        onKeyDown={onKeyDown}
+      />
+      {menu && (
+        <div
+          className="recent-menu"
+          id="recent-searches"
+          role="listbox"
+          aria-label="Recent searches"
+        >
+          <div className="recent-head" aria-hidden="true">
+            Recent searches
+          </div>
+          {menu.entries.map((entry, i) => (
+            <div
+              key={i}
+              className={`recent-entry${i === menu.at ? ' active' : ''}`}
+              role="option"
+              aria-selected={i === menu.at}
+              // Keeps the box focused, so the menu isn't closed before the pick.
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => pick(entry.spec)}
+            >
+              {entry.parts.map((part, j) => (
+                <span key={j} className="recent-part" dir="auto">
+                  {part}
+                </span>
+              ))}
+            </div>
+          ))}
+        </div>
       )}
-    </>
+    </div>
   );
 }
 
@@ -153,19 +246,30 @@ export function SearchResults() {
     return () => observer.disconnect();
   }, [reportViewport]);
 
+  // The next or previous result, from the selected one, or with none
+  // selected from the first row on screen: the arrow keys, and `j`/`k` anywhere.
+  const step = useCallback(
+    (delta: 1 | -1) => {
+      const at =
+        search.selectedIndex() ??
+        Math.floor((scrollRef.current?.scrollTop ?? 0) / RESULT_ROW_HEIGHT);
+      const next = Math.max(0, Math.min(search.snapshot.rows.length - 1, at + delta));
+      const row = search.rowAt(next);
+      if (!row) return;
+      selectResult(row);
+      virtualizer.scrollToIndex(next);
+      scrollRef.current
+        ?.querySelector<HTMLElement>(`[data-thread="${row.threadId}"]`)
+        ?.focus({ preventScroll: true });
+    },
+    [virtualizer],
+  );
+  useEffect(() => setListStep(step), [step]);
+
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
     e.preventDefault();
-    const at =
-      search.selectedIndex() ?? Math.floor((scrollRef.current?.scrollTop ?? 0) / RESULT_ROW_HEIGHT);
-    const next = Math.max(0, Math.min(snap.rows.length - 1, at + (e.key === 'ArrowDown' ? 1 : -1)));
-    const row = search.rowAt(next);
-    if (!row) return;
-    selectResult(row);
-    virtualizer.scrollToIndex(next);
-    scrollRef.current
-      ?.querySelector<HTMLElement>(`[data-thread="${row.threadId}"]`)
-      ?.focus({ preventScroll: true });
+    step(e.key === 'ArrowDown' ? 1 : -1);
   };
 
   const selectedThread = snap.selected?.threadId ?? null;
@@ -194,6 +298,7 @@ export function SearchResults() {
             {snap.ranked && <option value="relevance">Relevance</option>}
           </select>
         </div>
+        <ChipRow sidebar={sidebar} />
         {partial !== null && (
           <div className="partial" role="status">
             {partial}

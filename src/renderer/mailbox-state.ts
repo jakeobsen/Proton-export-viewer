@@ -9,6 +9,7 @@ import type {
   CardKeyName,
   IndexResult,
   IndexUpdate,
+  LeadsRequest,
   SearchRequest,
   SnippetsRequest,
 } from '../shared/api';
@@ -16,15 +17,19 @@ import type {
   CardRow,
   IndexProgress,
   IndexReport,
+  Lead,
   SearchSort,
   Sidebar,
   ThreadSnippet,
 } from '../shared/index-types';
 import { INBOX, sidebarModel, type SidebarModel } from './folders';
 import { CardsModel } from './cards';
+import { LeadsModel } from './leads';
 import { ListModel, type Row } from './list';
 import { closeReaderAndView, getReaderState, openInReader, setReaderSearch } from './reader';
+import type { Chip, SearchSpec } from '../shared/search-chips';
 import { SearchModel, type ResultRow } from './search';
+import { withChip, withoutChip } from './search-chips';
 import { getShellState, refreshGeneration } from './shell';
 
 export interface MailboxState {
@@ -106,15 +111,62 @@ function setProgress(next: IndexProgress): void {
   update({ progress: next });
 }
 
+function notify(): void {
+  for (const listener of listeners) listener();
+}
+
+/** Lead lines; null if the answer isn't for the current export. */
+async function askLeads(request: LeadsRequest): Promise<Lead[] | null> {
+  try {
+    const generation = getShellState().generation;
+    if (generation === null) return null;
+    const result = await window.pev.leads(request, generation);
+    if (!result.ok || state.key === null || keyOf(result.generation) !== state.key) return null;
+    return result.leads;
+  } catch {
+    return null;
+  }
+}
+
+/** The lead lines of the list's rows. */
+export const listLeads = new LeadsModel('list', askLeads, notify);
+/** The lead lines of the cards, or a result's snippets on the cards that match its search. */
+export const cardLeads = new LeadsModel('cards', askLeads, notify);
+
+/** Whether the list is on screen: a search's results show in its place. */
+let listShown = false;
+
+/** Asks for the lead lines of the list's rows on screen, if the list is. */
+function showListLeads(): void {
+  listLeads.show(listShown ? list.visibleRowids() : []);
+}
+
 export const list = new ListModel(
   (query) => ask((generation) => window.pev.listWindow(query, generation)),
   () => {
-    for (const listener of listeners) listener();
+    notify();
+    showListLeads();
   },
 );
 
 export function useList() {
   return useSyncExternalStore(subscribe, () => list.snapshot);
+}
+
+export function useListLeads() {
+  return useSyncExternalStore(subscribe, () => listLeads.snapshot);
+}
+
+/** The rows on screen changed: more rows may be read, and their lead lines asked for. */
+export function setListViewport(first: number, last: number): void {
+  list.setViewport(first, last);
+  showListLeads();
+}
+
+/** The list came on screen, or left it: out of sight, no row's line is asked for. */
+export function setListShown(shown: boolean): void {
+  listShown = shown;
+  showListLeads();
 }
 
 /** Snippets for rows of the shown search; null if the answer isn't for the current export. */
@@ -174,8 +226,62 @@ function leaveSearch(drop: () => void): void {
 
 /** The search box's text changed. */
 export function setSearchText(text: string): void {
-  if (text.trim() === '') leaveSearch(() => search.setText(text));
-  else search.setText(text);
+  if (text.trim() === '' && search.snapshot.chips.length === 0) {
+    leaveSearch(() => search.setText(text));
+  } else search.setText(text);
+}
+
+/** The search's chips changed: it runs again at once, with the box's text as it is. */
+function setSearchChips(chips: Chip[]): void {
+  if (search.snapshot.text.trim() === '' && chips.length === 0) {
+    leaveSearch(() => search.setChips(chips));
+  } else search.setChips(chips);
+}
+
+export function addSearchChip(chip: Chip): void {
+  setSearchChips(withChip(search.snapshot.chips, chip));
+}
+
+/** Removes exactly that chip; the typed text stays as it is. */
+export function removeSearchChip(index: number): void {
+  setSearchChips(withoutChip(search.snapshot.chips, index));
+}
+
+/** Runs a recent search at once. It is recorded again only when it is committed. */
+export function runRecentSearch(spec: SearchSpec): void {
+  search.setSearch(spec.text, spec.chips);
+}
+
+/** Records a search of this window in the open export's recent searches, by its query ID. */
+async function commitQueryId(queryId: number | null): Promise<void> {
+  const generation = getShellState().generation;
+  if (queryId === null || generation === null) return;
+  try {
+    await window.pev.commitSearch(queryId, generation);
+  } catch {
+    // Not recorded; nothing else depends on it.
+  }
+}
+
+/**
+ * Enter in the search box: the search for the box's text and chips as they
+ * are now runs at once, unless it is the one shown, and is recorded once it
+ * answers. A newer search that takes its place first is not recorded.
+ */
+export async function commitSearch(): Promise<void> {
+  await commitQueryId(await search.enterQueryId());
+}
+
+/** The open export's recent searches, newest first; none if there is no answer. */
+export async function recentSearches(): Promise<SearchSpec[]> {
+  const generation = getShellState().generation;
+  if (generation === null) return [];
+  try {
+    const result = await window.pev.recentSearches(generation);
+    return result.ok && result.generation === getShellState().generation ? result.entries : [];
+  } catch {
+    return [];
+  }
 }
 
 export function setSearchSort(sort: SearchSort): void {
@@ -195,6 +301,8 @@ export function clearSearch(): void {
  */
 export function selectResult(row: ResultRow): void {
   search.select(row);
+  // Opening a result commits the search it belongs to.
+  void commitQueryId(search.currentQueryId);
   list.clearSelection();
   setReaderSearch(search.currentQueryId);
   const reader = getReaderState();
@@ -206,14 +314,16 @@ export function selectResult(row: ResultRow): void {
     reader.refused === null
   ) {
     // Shown already; with the list's selection gone, the result owns it. Its
-    // next open, by a card, a key or the body switch, is made from the search.
+    // next open, by a card, a key or the body switch, is made from the search,
+    // and its header counts the messages that match.
+    cards.setSearch(search.currentQueryId);
     resultShowing = cards.showing;
     // Opened from the folder or for another search, it opens again for this
     // one, so the reader shows how it matched.
     if (reader.queryId !== search.currentQueryId) void openInReader(row.anchorRowid);
     return;
   }
-  cards.show(row.anchorRowid, row.threadId);
+  cards.show(row.anchorRowid, row.threadId, search.currentQueryId);
   resultShowing = cards.showing;
 }
 
@@ -221,7 +331,8 @@ export function selectResult(row: ResultRow): void {
 export const cards = new CardsModel(
   (query) => ask((generation) => window.pev.cards(query, generation)),
   () => {
-    for (const listener of listeners) listener();
+    notify();
+    cardLeads.show(cards.visibleRowids(), cards.snapshot.queryId);
   },
   {
     open: (rowid) => void openInReader(rowid),
@@ -231,6 +342,16 @@ export const cards = new CardsModel(
 
 export function useCards() {
   return useSyncExternalStore(subscribe, () => cards.snapshot);
+}
+
+export function useCardLeads() {
+  return useSyncExternalStore(subscribe, () => cardLeads.snapshot);
+}
+
+/** The cards on screen changed: more cards may be read, and their lead lines asked for. */
+export function setCardsViewport(first: number, last: number): void {
+  cards.setViewport(first, last);
+  cardLeads.show(cards.visibleRowids(), cards.snapshot.queryId);
 }
 
 const keyOf = (generation: number | null): string | null => {
@@ -271,6 +392,8 @@ export function syncMailbox(): void {
       void readSidebar();
       list.refresh();
       cards.refresh();
+      listLeads.changed();
+      cardLeads.changed();
       refreshReport();
     }
     return;
@@ -285,6 +408,8 @@ export function syncMailbox(): void {
   // A new export or generation: main revoked the reader's view, and nothing is selected.
   setReaderSearch(null);
   cards.hide();
+  listLeads.reset();
+  cardLeads.reset();
   if (key !== null) void readSidebar();
 }
 
@@ -297,6 +422,8 @@ export function indexChanged(update_: IndexUpdate): void {
   void readSidebar();
   list.refresh();
   cards.refresh();
+  listLeads.changed();
+  cardLeads.changed();
   refreshReport();
 }
 
@@ -312,13 +439,13 @@ let reportStamp = '';
 /**
  * What the list header's count can move with, as index updates carry it:
  * the phase (a new scan, or reconcile), metadata that couldn't be used,
- * timeouts, lists cut to their limit (phase 2 cuts attachment lists) and
- * message files whose text couldn't be read.
+ * timeouts, lists cut to their limit (phase 2 cuts attachment lists), and
+ * message files whose text couldn't be read or was cut to the search limit.
  */
 function stampOf(progress: IndexProgress | null): string {
   if (progress === null) return '';
-  const { phase, failed, timeouts, capped, bodiesFailed } = progress;
-  return `${phase}:${failed}:${timeouts}:${capped}:${bodiesFailed}`;
+  const { phase, failed, timeouts, capped, bodiesFailed, bodiesTruncated } = progress;
+  return `${phase}:${failed}:${timeouts}:${capped}:${bodiesFailed}:${bodiesTruncated}`;
 }
 
 async function readReport(): Promise<void> {
@@ -410,6 +537,8 @@ export function selectRow(row: Row): void {
     reader.rowid === row.newestRowid &&
     reader.refused === null
   ) {
+    // Picked from the list: no longer shown from a search.
+    cards.setSearch(null);
     return;
   }
   cards.show(row.newestRowid, row.threadId);
@@ -426,10 +555,11 @@ export function expandCard(card: CardRow): void {
 /**
  * `n` expands the next newer card, `p` the next older one, stopping at either
  * end; the list selection stays. Nothing moves while the link dialog is open
- * or the index report shows, whether the key was typed in the shell or
- * passed on by main from the body frame.
+ * or the index report or Settings shows, whether the key was typed in the
+ * shell or passed on by main from the body frame.
  */
 export function moveCard(key: CardKeyName): void {
-  if (getShellState().link !== null || state.reportOpen) return;
+  const shell = getShellState();
+  if (shell.link !== null || state.reportOpen || shell.screen === 'settings') return;
   cards.move(key === 'n' ? 1 : -1);
 }
