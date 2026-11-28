@@ -7,6 +7,8 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { MessageOpenResult } from '../../src/shared/api';
 import type { OpenMode, TestInput } from '../../src/shared/reader-protocol';
+import { MAX_MIME_PARTS } from '../../src/core/mime-limits';
+import { bodiesAfter, bodiesAround } from '../mime-parts';
 import { testDir } from '../paths';
 import { expect, test, tokenOf, type PevApp } from './app';
 
@@ -111,7 +113,13 @@ test('a message opens in the pane as HTML first, with its header fields', async 
 
   // Details: the full fields, and back.
   await pane(pev).locator('.rp-linkish').click();
-  await expect(pane(pev).locator('.rp-details dt')).toHaveText(['From', 'To', 'Cc', 'Date']);
+  await expect(pane(pev).locator('.rp-details dt')).toHaveText([
+    'From',
+    'To',
+    'Cc',
+    'Date',
+    'Format',
+  ]);
   await expect(pane(pev).locator('.rp-details dd').first()).toHaveText(
     '"Ana Lee" <ana@example.org>',
   );
@@ -123,6 +131,9 @@ test('a message opens in the pane as HTML first, with its header fields', async 
   expect(await pane(pev).locator('button').allTextContents()).toEqual([
     'Plain text',
     'HTML',
+    'Source',
+    'Show in folder',
+    'Message-ID',
     'Details',
   ]);
   expect(await pane(pev).locator('.rp-line').allTextContents()).toEqual([
@@ -205,16 +216,61 @@ test('over 20 MB the pane says only the first 1 MB is shown', async ({ pev }) =>
   await expect(pane(pev).locator('.rp-too-large')).toHaveCount(0);
 });
 
+test('many parts: bodies after 1,000 show whole; past the part limit only part shows', async ({
+  pev,
+}) => {
+  const root = testDir('pane-parts');
+  writeFileSync(join(root, 'after.eml'), bodiesAfter(1001));
+  writeFileSync(join(root, 'around.eml'), bodiesAround(MAX_MIME_PARTS + 10));
+  const result = await pev.main<{ ok: boolean }>('readerSource', root, [
+    [1, { file: 'after.eml' }],
+    [2, { file: 'around.eml' }],
+  ]);
+  expect(result.ok).toBe(true);
+
+  // The bodies after the 1,000th part, whole, in both views.
+  await openInReader(pev, 1, 'html');
+  let frame = await pev.bodyFrame(await shownUrl(pev));
+  expect(await frame.locator('#p').textContent()).toBe('HTML after the parts.');
+  await expect(pane(pev).locator('.rp-truncated')).toHaveCount(0);
+  await openInReader(pev, 1, 'plain');
+  frame = await pev.bodyFrame(await shownUrl(pev));
+  expect(await frame.locator('pre').textContent()).toContain('Text after the parts.');
+  await expect(pane(pev).locator('.rp-truncated')).toHaveCount(0);
+
+  // Past the part limit: what came before it, with the line, in both views.
+  await openInReader(pev, 2, 'html');
+  frame = await pev.bodyFrame(await shownUrl(pev));
+  expect(await frame.locator('#p').textContent()).toBe('HTML before the parts.');
+  expect(await frame.locator('body').textContent()).not.toContain('after the parts');
+  await expect(pane(pev).locator('.rp-truncated')).toHaveText('Only part of this message shown');
+  await openInReader(pev, 2, 'plain');
+  frame = await pev.bodyFrame(await shownUrl(pev));
+  const text = await frame.locator('pre').textContent();
+  expect(text).toContain('Text before the parts.');
+  expect(text).not.toContain('after the parts');
+  await expect(pane(pev).locator('.rp-truncated')).toHaveText('Only part of this message shown');
+  // Each read that stopped at the limit left core's file open for core to close, once.
+  expect(pev.hasLog('core.rejection')).toBe(false);
+  expect(pev.hasLog('core.uncaught')).toBe(false);
+});
+
 test('the fallback offers the message as plain text', async ({ pev }) => {
   await source(pev, [[3, generated('html', 6 * MB)]]);
   // Rendering this HTML needs well over this heap; its plain text needs less.
   await pev.main('readerLimits', { heapMb: 64 });
   await openInReader(pev, 3, 'html-anyway');
   await expect(pane(pev).locator('.rp-fallback')).toContainText("Couldn't render this message");
-  await expect(pane(pev).locator('.rp-fallback button')).toHaveText('View as plain text');
+  await expect(pane(pev).locator('.rp-fallback button')).toHaveText([
+    'View as plain text',
+    'View source',
+  ]);
   await expect(pane(pev).locator('.rp-frame')).toHaveCount(0);
 
-  await pane(pev).locator('.rp-fallback button').click();
+  await pane(pev)
+    .locator('.rp-fallback')
+    .getByRole('button', { name: 'View as plain text' })
+    .click();
   await shownUrl(pev);
   await expect(pane(pev).locator('.rp-fallback')).toHaveCount(0);
   await expect(pane(pev).locator('.rp-plain')).toHaveAttribute('aria-pressed', 'true');

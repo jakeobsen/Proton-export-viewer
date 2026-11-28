@@ -56,7 +56,16 @@ const FORBIDDEN_CONTENT = [
   'pev-no-resolver-rule',
   'sessionPreconnects',
   'readByName',
+  'txnBytes',
   'openGapMs',
+  // Core's test holds for scans, index opens and searches, and the shell's
+  // test render fault.
+  'beforeScan',
+  'holdScans',
+  'beforeIndexOpen',
+  'holdIndexOpens',
+  'hold-searches',
+  '__pevTestRenderFault',
   // The self-test's smoke drives the body frame through the DevTools protocol.
   ...SELFTEST_ONLY,
   ...STUB_ONLY,

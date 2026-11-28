@@ -1,21 +1,40 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The reader pane: one message with its sender, date and recipients, the
-// plain text and HTML switch, the body frame, and the lines for blocked
-// images, size limits and the fallback.
+// plain text and HTML switch, the actions on the message, the body frame, the
+// lines for search matches, blocked images, size limits and the fallback, and
+// the attachments. The source view of the message takes the pane's place
+// while it shows.
 
-import { useState } from 'react';
-import type { RejectCode } from '../shared/api';
+import { useEffect, useMemo, useState } from 'react';
+import type { AttachmentItem, RejectCode } from '../shared/api';
 import { BODY_IFRAME_REFERRER, BODY_IFRAME_SANDBOX } from '../shared/constants';
-import type { MessageHeaders } from '../shared/reader-protocol';
+import { displayText, headerText } from '../shared/header-text';
+import type { MessageDetails, MessageHeaders } from '../shared/reader-protocol';
 import {
+  ATT_ROW,
+  attachmentCount,
+  attachmentRowAt,
+  attachmentRowTops,
   avatarColor,
   blockedImages,
+  fileSize,
   fullDate,
   initialsOf,
   senderOf,
   shortDate,
 } from './reader-format';
-import { openInReader, useReaderState, type ReaderView } from './reader';
+import { indexedPartText, matchLine, type MatchLine } from './match-line';
+import {
+  copyMessageId,
+  openInReader,
+  openSource,
+  showInFolder,
+  useReaderState,
+  viewChoices,
+  type ReaderView,
+} from './reader';
+import { useShellState } from './shell';
+import { SourceView } from './SourceView';
 import './reader-pane.css';
 
 const ICON = {
@@ -61,6 +80,15 @@ function ImageOffIcon() {
   );
 }
 
+function SourceIcon() {
+  return (
+    <svg className="rp-icon" {...ICON}>
+      <polyline points="16 18 22 12 16 6" />
+      <polyline points="8 6 2 12 8 18" />
+    </svg>
+  );
+}
+
 function WarnIcon() {
   return (
     <svg className="rp-icon" {...ICON} width={16} height={16}>
@@ -73,11 +101,14 @@ function WarnIcon() {
 
 function Header({ headers }: { headers: MessageHeaders }) {
   const sender = senderOf(headers.from);
+  const subject = displayText(headers.subject);
+  // A name that cleans to nothing gives way to the address, as on the cards.
+  const name = displayText(sender.name) || displayText(sender.address);
   return (
     <>
-      {headers.subject !== '' && (
+      {subject !== '' && (
         <div className="rp-head">
-          <h1 className="rp-subject">{headers.subject}</h1>
+          <h1 className="rp-subject">{subject}</h1>
         </div>
       )}
       <div className="rp-sender">
@@ -86,24 +117,24 @@ function Header({ headers }: { headers: MessageHeaders }) {
           style={{ background: avatarColor(sender.address || sender.name) }}
           aria-hidden="true"
         >
-          {initialsOf(sender.name)}
+          {initialsOf(name)}
         </span>
-        <span className="rp-name">{sender.name}</span>
+        <span className="rp-name">{name}</span>
         <span className="rp-date">{shortDate(headers.date)}</span>
       </div>
     </>
   );
 }
 
-function Who({ headers }: { headers: MessageHeaders }) {
+function Who({ headers, details: more }: { headers: MessageHeaders; details: MessageDetails }) {
   const [details, setDetails] = useState(false);
   const sender = senderOf(headers.from);
-  const recipients = [headers.to, headers.cc].filter((r) => r !== '').join(', ');
+  const address = displayText(sender.address);
+  const name = displayText(sender.name) || address;
+  const recipients = displayText([headers.to, headers.cc].filter((r) => r !== '').join(', '));
   return (
     <div className="rp-who">
-      {sender.address !== '' && sender.address !== sender.name && (
-        <span className="rp-addr">&lt;{sender.address}&gt;</span>
-      )}
+      {address !== '' && address !== name && <span className="rp-addr">&lt;{address}&gt;</span>}
       {recipients !== '' && <span className="rp-to">to {recipients}</span>}
       <button
         type="button"
@@ -116,17 +147,17 @@ function Who({ headers }: { headers: MessageHeaders }) {
       {details && (
         <dl className="rp-details">
           <dt>From</dt>
-          <dd>{headers.from}</dd>
+          <dd>{headerText(headers.from)}</dd>
           {headers.to !== '' && (
             <>
               <dt>To</dt>
-              <dd>{headers.to}</dd>
+              <dd>{headerText(headers.to)}</dd>
             </>
           )}
           {headers.cc !== '' && (
             <>
               <dt>Cc</dt>
-              <dd>{headers.cc}</dd>
+              <dd>{headerText(headers.cc)}</dd>
             </>
           )}
           {headers.date !== null && (
@@ -135,13 +166,62 @@ function Who({ headers }: { headers: MessageHeaders }) {
               <dd>{fullDate(headers.date)}</dd>
             </>
           )}
+          {more.messageId !== '' && (
+            <>
+              <dt>Message-ID</dt>
+              <dd className="rp-mono">{more.messageId}</dd>
+            </>
+          )}
+          {more.references.length > 0 && (
+            <>
+              <dt>References</dt>
+              <dd className="rp-mono">
+                {more.references.map((id, i) => (
+                  <div key={i}>{id}</div>
+                ))}
+                {more.moreReferences > 0 && <div>and {more.moreReferences} more</div>}
+              </dd>
+            </>
+          )}
+          <dt>Format</dt>
+          <dd>{more.format}</dd>
         </dl>
       )}
     </div>
   );
 }
 
-function Lines({ rowid, view }: { rowid: number; view: ReaderView }) {
+/** The match line of an open from search; the plain view it offers carries the same search. */
+function MatchBar({ rowid, line }: { rowid: number; line: MatchLine }) {
+  if (line.kind === 'none') return null;
+  return (
+    <div className="rp-line rp-matches" role="status">
+      <b>{line.text}</b>
+      {line.kind === 'matches' && (
+        <>
+          <span aria-hidden="true">·</span>
+          <button
+            type="button"
+            className="rp-btn"
+            onClick={() => void openInReader(rowid, 'plain')}
+          >
+            Show highlights in plain text
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+function Lines({
+  rowid,
+  view,
+  indexedPart,
+}: {
+  rowid: number;
+  view: ReaderView;
+  indexedPart: string | null;
+}) {
   return (
     <>
       {view.format === 'html' && view.remote > 0 && (
@@ -161,12 +241,122 @@ function Lines({ rowid, view }: { rowid: number; view: ReaderView }) {
           </button>
         </div>
       )}
-      {view.truncated && (
+      {view.cut && (
         <div className="rp-line rp-truncated">
-          <b>First 1 MB shown</b>
+          <b>{view.cut === 'size' ? 'First 1 MB shown' : 'Only part of this message shown'}</b>
+        </div>
+      )}
+      {indexedPart !== null && (
+        <div className="rp-line rp-truncated">
+          <b>{indexedPart}</b>
         </div>
       )}
     </>
+  );
+}
+
+/** How many plain rows high the attachment list is once virtual. */
+const ATT_SHOWN = 6;
+/** Past this many attachments, only the rows in view and a few around them are made. */
+const ATT_VIRTUAL_AFTER = 50;
+const ATT_OVERSCAN = 4;
+
+function AttachmentRow({ item, top }: { item: AttachmentItem; top: number | null }) {
+  return (
+    <div
+      className={item.risky ? 'rp-att rp-att-risky' : 'rp-att'}
+      role="listitem"
+      style={top === null ? undefined : { position: 'absolute', top, left: 0, right: 0 }}
+    >
+      <div className="rp-att-name">{item.name}</div>
+      <div className="rp-att-meta">
+        {item.label} · {fileSize(item.size)}
+      </div>
+      {item.risky && (
+        <div className="rp-att-warn">
+          <WarnIcon />
+          <span>Program file. It can harm your computer.</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Attachments({ items }: { items: AttachmentItem[] }) {
+  const [top, setTop] = useState(0);
+  const virtual = items.length > ATT_VIRTUAL_AFTER;
+  const tops = useMemo(
+    () => (virtual ? attachmentRowTops(items.map((item) => item.risky)) : []),
+    [items, virtual],
+  );
+  if (items.length === 0) return null;
+  const height = ATT_SHOWN * ATT_ROW;
+  const first = virtual ? Math.max(0, attachmentRowAt(tops, top) - ATT_OVERSCAN) : 0;
+  const end = virtual
+    ? Math.min(items.length, attachmentRowAt(tops, top + height) + 1 + ATT_OVERSCAN)
+    : items.length;
+  return (
+    <section className="rp-atts" aria-label="Attachments">
+      <div className="rp-att-title">{attachmentCount(items.length)}</div>
+      <div
+        className={virtual ? 'rp-att-list rp-att-virtual' : 'rp-att-list'}
+        role="list"
+        style={virtual ? { height } : undefined}
+        onScroll={virtual ? (e) => setTop(e.currentTarget.scrollTop) : undefined}
+      >
+        <div style={virtual ? { position: 'relative', height: tops[items.length] } : undefined}>
+          {items.slice(first, end).map((item) => (
+            <AttachmentRow key={item.index} item={item} top={virtual ? tops[item.index]! : null} />
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/** How long "Message-ID copied." stays. */
+const NOTE_MS = 2500;
+
+/** Show in folder and Copy Message-ID, for the message the pane shows. */
+function MessageActions({ view }: { view: ReaderView }) {
+  const { sources } = useShellState();
+  const offline = sources?.active?.status === 'offline';
+  const [note, setNote] = useState<string | null>(null);
+  useEffect(() => {
+    if (note === null) return;
+    const timer = setTimeout(() => setNote(null), NOTE_MS);
+    return () => clearTimeout(timer);
+  }, [note]);
+  return (
+    <div className="rp-acts" role="group" aria-label="Message">
+      <button
+        type="button"
+        className="rp-act rp-show"
+        disabled={offline}
+        title="Show in folder"
+        onClick={() => void showInFolder()}
+      >
+        Show in folder
+      </button>
+      <button
+        type="button"
+        className="rp-act rp-copy-id"
+        disabled={view.details.messageId === ''}
+        title="Copy Message-ID"
+        onClick={() =>
+          void copyMessageId().then((r) => {
+            if (r.ok) setNote('Message-ID copied.');
+          })
+        }
+      >
+        Message-ID
+      </button>
+      {note !== null && (
+        <span className="rp-note" role="status">
+          {note}
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -196,18 +386,42 @@ export function MessageBody() {
   const reader = useReaderState();
   const { rowid, view, pending } = reader;
   if (rowid === null) return null;
+  const line = pending
+    ? ({ kind: 'none' } as const)
+    : matchLine({
+        match: reader.match,
+        refused: reader.refused,
+        fallback: reader.fallback,
+        mode: reader.mode,
+        fileRefused: reader.fileRefused,
+        view: view && { format: view.format, highlighted: view.highlighted },
+      });
   if (reader.refused !== null) {
-    const text = refusedText(reader.refused);
+    // A missing file's match line says it is missing, so the pane doesn't say it twice.
+    const text = line.kind === 'none' ? refusedText(reader.refused) : line.text;
     return text === null ? null : (
-      <div className="rp-line rp-state" role="status">
+      <div
+        className={line.kind === 'none' ? 'rp-line rp-state' : 'rp-line rp-state rp-matches'}
+        role="status"
+      >
         <b>{text}</b>
       </div>
     );
   }
+  if (reader.source !== null) {
+    const refused = reader.source.refused;
+    return (
+      <SourceView
+        source={reader.source}
+        headers={view?.headers ?? null}
+        refused={refused === null ? null : refusedText(refused)}
+      />
+    );
+  }
   const shown = view?.format ?? null;
-  // HTML was asked for and plain text came back: this open can't show the HTML
-  // ("Show HTML anyway" is offered when its size alone kept it back).
-  const htmlKeptBack = view?.format === 'plain' && reader.mode !== 'plain';
+  // HTML was asked for and plain text came back: the switch can't offer the
+  // HTML ("Show HTML anyway" is offered when its size alone kept it back).
+  const choices = viewChoices(reader);
   return (
     <>
       <div className="rp-actbar" role="toolbar" aria-label="Message actions">
@@ -216,7 +430,7 @@ export function MessageBody() {
             type="button"
             className="rp-plain"
             aria-pressed={shown === 'plain'}
-            disabled={pending || shown === 'plain'}
+            disabled={!choices.plain}
             onClick={() => void openInReader(rowid, 'plain')}
           >
             <PlainIcon />
@@ -226,7 +440,7 @@ export function MessageBody() {
             type="button"
             className="rp-html"
             aria-pressed={shown === 'html'}
-            disabled={pending || shown === 'html' || !view?.hasHtml || htmlKeptBack}
+            disabled={!choices.html}
             title={view && !view.hasHtml ? 'No HTML version' : undefined}
             onClick={() => void openInReader(rowid, 'html')}
           >
@@ -234,9 +448,28 @@ export function MessageBody() {
             HTML
           </button>
         </div>
+        {view && (
+          <button
+            type="button"
+            className="rp-act rp-source"
+            title="View source"
+            onClick={() => void openSource()}
+          >
+            <SourceIcon />
+            Source
+          </button>
+        )}
+        {view && <MessageActions key={view.url} view={view} />}
       </div>
-      {view && <Who headers={view.headers} />}
-      {view && <Lines rowid={rowid} view={view} />}
+      {view && <Who headers={view.headers} details={view.details} />}
+      <MatchBar rowid={rowid} line={line} />
+      {view && (
+        <Lines
+          rowid={rowid}
+          view={view}
+          indexedPart={indexedPartText(reader.match, view.highlighted)}
+        />
+      )}
       {reader.fallback && (
         <div className="rp-line rp-fallback" role="alert">
           <WarnIcon />
@@ -248,6 +481,10 @@ export function MessageBody() {
             onClick={() => void openInReader(rowid, 'plain')}
           >
             View as plain text
+          </button>
+          <span aria-hidden="true">·</span>
+          <button type="button" className="rp-btn rp-view-source" onClick={() => void openSource()}>
+            View source
           </button>
         </div>
       )}
@@ -263,6 +500,7 @@ export function MessageBody() {
           />
         )}
       </div>
+      {view && <Attachments key={view.url} items={view.attachments} />}
     </>
   );
 }

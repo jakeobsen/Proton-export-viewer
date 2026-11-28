@@ -32,6 +32,9 @@ const HTML = [
   '<p><a id="mailto-idn" href="mailto:help@аpple.test">Write to us</a></p>',
   '<p><a id="invisible" href="https://evil.example/">paypal&#x2060;.com</a></p>',
   '<p><a id="mailto-separator" href="mailto:help@paypal.com%2Fx.evil.test">paypal.com</a></p>',
+  '<p><a id="mailto-comma" href="mailto:a@evil.test%2C@paypal.com">paypal.com</a></p>',
+  '<p><a id="mailto-bcc" href="mailto:help@shop.example?bcc=x@evil.test">shop.example</a></p>',
+  '<p><a id="mailto-cc-idn" href="mailto:help@shop.example?cc=x@аpple.test">Write to us</a></p>',
   '<p><a id="js" href="javascript:alert(1)">js</a> <a id="data" href="data:text/html,x">data</a></p>',
   '',
 ].join('\r\n');
@@ -208,8 +211,43 @@ test('each warning shows only when it applies, with the host marked @pane', asyn
         url: 'mailto:help@paypal.com%2Fx.evil.test',
         mismatch: true,
         lookalike: false,
+        unclear: true,
       },
       null,
+    ],
+    // Decoded, the address is "a@evil.test,@paypal.com": a mail app that
+    // decodes before it splits writes to evil.test.
+    [
+      '#mailto-comma',
+      {
+        title: 'paypal.com',
+        url: 'mailto:a@evil.test%2C@paypal.com',
+        mismatch: true,
+        lookalike: false,
+        unclear: true,
+      },
+      null,
+    ],
+    // Recipients in the fields count too.
+    [
+      '#mailto-bcc',
+      {
+        title: 'shop.example',
+        url: 'mailto:help@shop.example?bcc=x@evil.test',
+        mismatch: true,
+        lookalike: false,
+      },
+      'shop.example',
+    ],
+    [
+      '#mailto-cc-idn',
+      {
+        title: 'Write to us',
+        url: 'mailto:help@shop.example?cc=x@%D0%B0pple.test',
+        mismatch: false,
+        lookalike: true,
+      },
+      'shop.example',
     ],
   ];
   for (const [index, [id, want, host]] of cases.entries()) {
@@ -226,12 +264,21 @@ test('each warning shows only when it applies, with the host marked @pane', asyn
     await expect(dialog.locator('.link-lookalike')).toHaveText(
       want.lookalike ? ['URL uses look-alike characters'] : [],
     );
+    await expect(dialog.locator('.link-unclear')).toHaveText(
+      want.unclear ? ['Address is unclear'] : [],
+    );
+    const mail = (want.url as string).startsWith('mailto:');
     await expect(dialog.locator('.link-foot button')).toHaveText([
       'Cancel',
       'Copy link',
-      'Open in browser',
+      mail ? 'Open in mail app' : 'Open in browser',
     ]);
-    expect((await shown(pev))[index]).toMatchObject({ windowId: 1, ...want });
+    expect((await shown(pev))[index]).toMatchObject({
+      windowId: 1,
+      unclear: false,
+      mail,
+      ...want,
+    });
     await pev.page.click('.link-cancel');
     await expect(dialog).toHaveCount(0);
   }
@@ -309,6 +356,25 @@ test('Open in browser and Copy link go to the recorded stubs; the other choices 
     code: 'unknown_dialog',
   });
   expect(await external(pev)).toHaveLength(2);
+});
+
+test('Open in mail app sends a mailto link to the mail app, and no recipient reaches a log @pane', async ({
+  pev,
+}) => {
+  await source(pev);
+  const { frame, url } = await show(pev, 1, 'html');
+  await click(frame, '#mailto-bcc');
+  await dialogShown(pev, frame, url);
+  await expect(pev.page.locator('.link-open')).toHaveText('Open in mail app');
+  await pev.page.click('.link-open');
+  await expect(pev.page.locator('.link-dialog')).toHaveCount(0);
+  await expect
+    .poll(() => external(pev))
+    .toEqual([
+      { method: 'shell.openExternal', args: ['mailto:help@shop.example?bcc=x@evil.test'] },
+    ]);
+  expect(pev.hasLog('nav.link_action', { action: 'open', scheme: 'mailto' })).toBe(true);
+  expect(JSON.stringify(pev.logs())).not.toMatch(/help@|shop\.example|evil\.test/);
 });
 
 test('the shell sends only a dialog id and a choice, for its own dialog @pane', async ({ pev }) => {

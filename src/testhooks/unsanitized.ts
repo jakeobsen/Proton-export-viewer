@@ -4,7 +4,7 @@
 // body's CSP and the frame sandbox hold on their own, and that the request
 // records see what they stop.
 
-import type { SanitizedBody } from '../core/reader/sanitize';
+import type { HtmlSource, SanitizedBody } from '../core/reader/sanitize';
 import { markLoaded } from './marker';
 
 markLoaded();
@@ -19,9 +19,17 @@ export const READER_UNSANITIZED_ACTION = 'pev-reader-unsanitized';
 export const ASSET_BASE_MARK = '{{asset-base}}';
 
 /**
- * Keeps the HTML as it is: no references are rewritten, and no links are kept.
+ * Keeps the HTML as it is, its parts joined as the parser joins them: no
+ * references are rewritten, no links are kept, and no inline image is served.
  * The one change: the asset-base mark becomes the view's asset base.
  */
-export function unsanitized(html: string, assetBase: string): SanitizedBody {
-  return { html: html.replaceAll(ASSET_BASE_MARK, assetBase), links: [], remote: 0, cids: 0 };
+export function unsanitized(sources: readonly HtmlSource[], assetBase: string): SanitizedBody {
+  const html = sources.map((source) => source.html).join('<br/>\n');
+  return {
+    html: html.replaceAll(ASSET_BASE_MARK, assetBase),
+    links: [],
+    remote: 0,
+    cids: 0,
+    cidTargets: [],
+  };
 }

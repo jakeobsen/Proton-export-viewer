@@ -101,6 +101,7 @@ export function LinkDialog({ prompt }: { prompt: LinkPrompt }) {
           {prompt.lookalike && (
             <Warning className="link-lookalike" text="URL uses look-alike characters" />
           )}
+          {prompt.unclear && <Warning className="link-unclear" text="Address is unclear" />}
         </div>
         <div className="link-foot">
           <button
@@ -127,7 +128,7 @@ export function LinkDialog({ prompt }: { prompt: LinkPrompt }) {
             className="link-btn link-danger link-open"
             onClick={() => void answerLink('open')}
           >
-            Open in browser
+            {prompt.mail ? 'Open in mail app' : 'Open in browser'}
           </button>
         </div>
       </div>

@@ -5,6 +5,11 @@ export function dimensionBombPng(width: number, height: number): Buffer;
 export function gif(width: number, height: number, frames: number): Buffer;
 export function paddedPng(bytes: number): Buffer;
 
+/** Inline images the raster check refuses: a builder, and the reason it gives. */
+export const INLINE_BOMBS: Record<string, [() => Buffer, string]>;
+/** The colours of the inline images that must show. */
+export const INLINE_COLORS: Record<'cid' | 'data' | 'first' | 'second', [number, number, number]>;
+
 export const SCRIPT_MARKER: string;
 export const MARKER_ATTRIBUTE: string;
 
@@ -30,6 +35,8 @@ export interface HostilePlan {
   skipEml?: boolean;
   skipMetadata?: boolean;
   refs: HostileRefs;
+  /** The attachments the message carries, as its metadata lists them. */
+  attachments: Array<{ name: string; type: string; bytes: number }>;
 }
 
 export function hostileMessages(options: {

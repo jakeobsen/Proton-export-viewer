@@ -9,19 +9,28 @@ import type {
   CoreInit,
   CoreRequest,
   CoreResult,
+  IndexQueryRequest,
   OpenRequest,
   ProofFileRead,
   WorkerMessage,
   WorkerRequest,
 } from '../shared/core-protocol';
+import type { IndexMatch } from '../shared/index-types';
 import { errorData } from '../shared/log/schema';
 import { LogWriter, type Logger } from '../shared/log/writer';
-import type { ReadRequest, ReaderFailure } from '../shared/reader-protocol';
+import type {
+  LocateRequest,
+  ReadRequest,
+  ReaderFailure,
+  ReaderMatch,
+  StoredBody,
+} from '../shared/reader-protocol';
 import { WorkerThread, type ThreadRole } from './index/pool';
 import type { IndexOptions } from './index/service';
 import { READER_RETIRE_MB, ReaderLane } from './reader/lane';
 import { OpenTracker } from './reader/opens';
-import type { ReaderSource } from './reader/source';
+import { readSource } from './reader/source-read';
+import type { LocatedFile, ReaderSource } from './reader/source';
 import { SourceSession, type ReaderFile } from './source';
 
 process.umask(0o077);
@@ -50,10 +59,11 @@ const lane = new ReaderLane<WorkerRequest, WorkerMessage>({
     log?.warn(breach === 'timeout' ? 'reader.timeout' : 'reader.limit', { ms }),
   // A large message can leave the worker holding hundreds of MB: a new worker gives it back.
   retire: (message) =>
-    message.type === 'rendered' && message.heldBytes > READER_RETIRE_MB * 1024 * 1024,
+    (message.type === 'rendered' || message.type === 'sourced') &&
+    message.heldBytes > READER_RETIRE_MB * 1024 * 1024,
   onRetire: (message) =>
     log?.info('reader.worker_retired', {
-      bytes: message.type === 'rendered' ? message.heldBytes : 0,
+      bytes: message.type === 'rendered' || message.type === 'sourced' ? message.heldBytes : 0,
     }),
   onOther: (message) => {
     if (message.type === 'log') workerLog?.log(message.level, message.code, message.data);
@@ -68,6 +78,13 @@ const testState = {
   /** Message files opened for the reader. */
   fileOpens: 0,
   unsanitized: false,
+  /** Stored bodies go to the reader worker with ranges that fail its check. */
+  breakMarks: false,
+  /** Searches that reached core. */
+  searches: 0,
+  /** Searches and snippet requests are held, to answer them late. */
+  holdingSearches: false,
+  heldSearches: [] as IndexQueryRequest[],
   /** Holds reads once their message file is open, before the parse. */
   holdingOpened: false,
   heldOpened: [] as Array<() => void>,
@@ -77,6 +94,9 @@ const testState = {
 };
 /** Test builds can hold phase 1's writes. */
 let writeGate: import('../testhooks/core').WriteGate | null = null;
+let scanGate: import('../testhooks/core').WriteGate | null = null;
+let indexGate: import('../testhooks/core').WriteGate | null = null;
+let recentGate: import('../testhooks/core').RecentGate | null = null;
 
 process.on('uncaughtException', (err) => log?.error('core.uncaught', errorData(err, roots)));
 process.on('unhandledRejection', (reason) =>
@@ -125,7 +145,7 @@ const opens = new OpenTracker();
 
 /** The message to read: from the test source if a test set one, else from the open export. */
 async function openForRead(
-  request: ReadRequest,
+  request: Pick<ReadRequest, 'rowid' | 'generation' | 'search'>,
   stale: () => boolean,
 ): Promise<ReaderFile | { ok: false; code: 'no_source' }> {
   if (__PEV_TEST_HOOKS__ && readerSource) {
@@ -134,11 +154,47 @@ async function openForRead(
   }
   if (!session) return { ok: false, code: 'no_source' };
   return session
-    .openForReader(request.rowid, request.generation, stale)
+    .openForReader(request.rowid, request.generation, stale, request.search)
     .catch((): ReaderFile => ({ ok: false, code: 'not_found' }));
 }
 
-/** Answers a read that failed. */
+/** Finds the file a view was read from, for Show in folder: from the test source or the open export. */
+async function locate(request: LocateRequest): Promise<void> {
+  const { reqId, rowid, generation, file } = request;
+  let found: LocatedFile;
+  if (__PEV_TEST_HOOKS__ && readerSource) {
+    found = await readerSource
+      .locate(rowid, file)
+      .catch((): LocatedFile => ({ ok: false, code: 'not_found' }));
+  } else if (!session) {
+    found = { ok: false, code: 'no_source' };
+  } else {
+    found = await session
+      .locateForReader(rowid, generation, file)
+      .catch((): LocatedFile => ({ ok: false, code: 'not_found' }));
+  }
+  if (found.ok) reply({ type: 'result', reqId, ok: true, path: found.path });
+  else reply({ type: 'result', reqId, ok: false, code: found.code });
+}
+
+/** What main and the shell learn of a match: counts and column names, never text. */
+function readerMatch(match: IndexMatch | null | undefined): ReaderMatch | undefined {
+  if (!match) return undefined;
+  const { state, reason, columns, bodyMatches, changed } = match;
+  return { state, reason, columns, bodyMatches, changed };
+}
+
+/** The stored body as the reader worker gets it; test builds can break its ranges. */
+function testStored(stored: StoredBody): StoredBody {
+  if (__PEV_TEST_HOOKS__ && testState.breakMarks) {
+    // Every range moves past the text's end, so each fails the check and their number stays.
+    const end = stored.text.length;
+    return { text: stored.text, ranges: stored.ranges.map((): [number, number] => [end, end + 1]) };
+  }
+  return stored;
+}
+
+/** Answers a read that failed; the fallback and a missing file carry the match. */
 type ReadFail = (
   code: 'no_source' | 'not_found' | 'superseded' | 'unavailable' | 'eml_missing' | 'reader_failed',
   reason?: ReaderFailure,
@@ -150,24 +206,35 @@ type ReadFail = (
  * nothing is opened for it once a newer one has come in.
  */
 async function read(request: ReadRequest): Promise<void> {
-  const { reqId } = request;
-  const fail: ReadFail = (code, reason) =>
-    reply({ type: 'result', reqId, ok: false, code, ...(reason ? { reason } : {}) });
   const open = opens.begin(request.lane, request.openId);
   try {
-    await readOpen(request, open.stale, fail);
+    await readOpen(request, open.stale);
   } finally {
     open.end();
   }
 }
 
 /** The part of `read` between taking its place among the window's opens and leaving it. */
-async function readOpen(request: ReadRequest, stale: () => boolean, fail: ReadFail): Promise<void> {
+async function readOpen(request: ReadRequest, stale: () => boolean): Promise<void> {
   const { reqId } = request;
   const found = await openForRead(request, stale);
+  const indexMatch = 'match' in found ? found.match : null;
+  const match = readerMatch(indexMatch);
+  const fail: ReadFail = (code, reason) => {
+    const carries = match && (code === 'reader_failed' || code === 'eml_missing');
+    reply({
+      type: 'result',
+      reqId,
+      ok: false,
+      code,
+      ...(reason ? { reason } : {}),
+      ...(carries ? { match } : {}),
+    });
+  };
   if (!found.ok) return found.code === 'refused' ? fail('reader_failed', 'file') : fail(found.code);
   if (__PEV_TEST_HOOKS__) testState.fileOpens += 1;
   const opened = found.opened;
+  const stored = indexMatch?.body ?? null;
   try {
     if (__PEV_TEST_HOOKS__ && testState.holdingOpened) {
       await new Promise<void>((resolve) => testState.heldOpened.push(resolve));
@@ -180,6 +247,7 @@ async function readOpen(request: ReadRequest, stale: () => boolean, fail: ReadFa
         mode: request.mode,
         assetBase: `${ASSET_SCHEME}://${VIEW_HOST}/${request.token}`,
         ...(__PEV_TEST_HOOKS__ && testState.unsanitized ? { unsanitized: true as const } : {}),
+        ...(stored ? { stored: testStored(stored) } : {}),
       },
       { key: request.lane, order: request.openId },
     );
@@ -191,7 +259,14 @@ async function readOpen(request: ReadRequest, stale: () => boolean, fail: ReadFa
     const message = outcome.message;
     if (message.type !== 'rendered') return fail('reader_failed', 'crash');
     if (!message.ok) return fail('reader_failed', 'parse');
-    reply({ type: 'result', reqId, ok: true, read: message.message });
+    reply({
+      type: 'result',
+      reqId,
+      ok: true,
+      read: message.message,
+      file: opened.file,
+      ...(match ? { match } : {}),
+    });
   } finally {
     await opened.close().catch(() => undefined);
   }
@@ -234,6 +309,13 @@ function handle(request: CoreRequest): void {
             readerSource: () => readerSource,
             session,
             writeGate,
+            scanGate,
+            indexGate,
+            recentGate,
+            runSearch: (held) => {
+              if (session) session.handle(held);
+              else reply({ type: 'result', reqId: held.reqId, ok: false, code: 'no_source' });
+            },
           }),
         );
         return;
@@ -252,10 +334,29 @@ function handle(request: CoreRequest): void {
       }
       reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
       return;
+    case 'locate':
+      void locate(request);
+      return;
+    case 'source':
+      void readSource(request, {
+        open: (r) => openForRead(r, () => false),
+        job: (message, slot) => lane.job(message, slot),
+        reply,
+      });
+      return;
     case 'identify':
     case 'scan':
     case 'index':
     case 'index-query':
+    case 'recent':
+      if (__PEV_TEST_HOOKS__ && request.type === 'index-query') {
+        const { op } = request.query;
+        if (op === 'search') testState.searches += 1;
+        if ((op === 'search' || op === 'snippets') && testState.holdingSearches) {
+          testState.heldSearches.push(request);
+          return;
+        }
+      }
       if (!session) {
         reply({ type: 'result', reqId: request.reqId, ok: false, code: 'no_source' });
         return;
@@ -295,11 +396,23 @@ async function init(event: Electron.MessageEvent): Promise<void> {
   if (__PEV_TEST_HOOKS__ && init.test) {
     const hooks = await import('../testhooks/core');
     writeGate = new hooks.WriteGate(init.test.holdWrites === true);
+    scanGate = new hooks.WriteGate(init.test.holdScans === true);
+    indexGate = new hooks.WriteGate(init.test.holdIndexOpens === true);
     options = {
       ...(init.test.batchPairs ? { batchPairs: init.test.batchPairs } : {}),
+      ...(init.test.txnBytes ? { txnBytes: init.test.txnBytes } : {}),
+      ...(init.test.jobMs ? { jobMs: init.test.jobMs } : {}),
+      ...(init.test.stallBodyOf ? { stallBodyOf: init.test.stallBodyOf } : {}),
       readByName: init.test.readByName === true,
       beforeWrite: writeGate.beforeWrite,
+      beforeScan: scanGate.beforeWrite,
+      beforeIndexOpen: indexGate.beforeWrite,
     };
+  }
+  if (__PEV_TEST_HOOKS__) {
+    const hooks = await import('../testhooks/core');
+    recentGate = new hooks.RecentGate();
+    options = { ...options, recentHooks: recentGate.hooks };
   }
   session = new SourceSession(
     init.source,

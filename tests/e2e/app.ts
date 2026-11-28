@@ -3,7 +3,14 @@
 // the stock Electron binary. Each launch gets its own userData under test-output/,
 // removed again when the test passes.
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import {
   test as base,
@@ -15,7 +22,22 @@ import {
 } from '@playwright/test';
 import type { MessageOpenResult } from '../../src/shared/api';
 import type { OpenMode } from '../../src/shared/reader-protocol';
-import { REPO_ROOT, removeTestDirs, takeTestDirs, testDir } from '../paths';
+import { REPO_ROOT, TEST_OUTPUT, removeTestDirs, takeTestDirs, testDir } from '../paths';
+import { closeAndConfirm, type CloseWait } from './close-wait';
+import { startTimeOf, waitGone } from './process-wait';
+
+/** How long a close waits for core to exit after main has. */
+export const CORE_EXIT_MS = 10_000;
+
+/** Adds one close's wait for core to test-output/close-waits.jsonl: numbers and fixed words only. */
+function recordCloseWait(entry: CloseWait): void {
+  try {
+    mkdirSync(TEST_OUTPUT, { recursive: true });
+    appendFileSync(join(TEST_OUTPUT, 'close-waits.jsonl'), `${JSON.stringify(entry)}\n`);
+  } catch {
+    // The record is for reading afterwards; a test never depends on it.
+  }
+}
 
 /**
  * The tag, in its title, of a test that runs on the reader pane's body frame,
@@ -32,13 +54,36 @@ export interface LogLine {
   data: Record<string, unknown>;
 }
 
+/** The `index.opened` lines in the logs under `userData`, from every launch that used it. */
+function indexOpenedIn(userData: string): number {
+  const dir = join(userData, 'logs');
+  if (!existsSync(dir)) return 0;
+  let count = 0;
+  for (const file of readdirSync(dir).filter((f) => f.endsWith('.jsonl'))) {
+    for (const line of readFileSync(join(dir, file), 'utf8').split('\n')) {
+      if (!line.includes('"index.opened"')) continue;
+      try {
+        if ((JSON.parse(line) as LogLine).code === 'index.opened') count += 1;
+      } catch {
+        // A line cut short by an app that was killed while writing it.
+      }
+    }
+  }
+  return count;
+}
+
 export class PevApp {
   readonly consoleMessages: Array<{ type: string; text: string }> = [];
+  private closing: Promise<void> | null = null;
+  /** How the close's wait for core ended, once the close has finished. */
+  closeWait: CloseWait | null = null;
 
   constructor(
     readonly app: ElectronApplication,
     readonly page: Page,
     readonly userData: string,
+    /** `index.opened` lines in this user data's logs before this launch. */
+    private readonly openedAtLaunch = 0,
   ) {
     page.on('console', (m) => this.consoleMessages.push({ type: m.type(), text: m.text() }));
   }
@@ -158,8 +203,32 @@ export class PevApp {
     );
   }
 
-  async close(): Promise<void> {
-    await this.app.close().catch(() => undefined);
+  /**
+   * Closes the app, and returns once its core process has exited too: core
+   * can outlive main for a moment, with the index still open. A core still
+   * there after CORE_EXIT_MS is killed, and the close fails; so does a close
+   * that can't confirm core's exit while an index was open. Every caller
+   * waits for the same close.
+   */
+  close(): Promise<void> {
+    this.closing ??= this.closeAndWait();
+    return this.closing;
+  }
+
+  private async closeAndWait(): Promise<void> {
+    await closeAndConfirm({
+      corePid: () => this.main<number | undefined>('corePid'),
+      sourceOpen: async () => (await this.main<unknown>('sourceStamp')) !== null,
+      startTimeOf,
+      closeApp: () => this.app.close(),
+      waitGone: (pid, startTime) => waitGone(pid, { timeoutMs: CORE_EXIT_MS, startTime }),
+      openedCount: () => indexOpenedIn(this.userData),
+      openedAtLaunch: this.openedAtLaunch,
+      record: (entry) => {
+        this.closeWait = entry;
+        recordCloseWait(entry);
+      },
+    });
   }
 }
 
@@ -180,20 +249,35 @@ export interface LaunchOptions {
   /** Start with this userData, e.g. to launch again after a quit. */
   userData?: string;
   args?: string[];
+  /**
+   * Pages take the colour scheme the app gives them. Playwright otherwise
+   * emulates a light one in every page, whatever the app's theme.
+   */
+  appColorScheme?: boolean;
 }
 
 export async function launch(name: string, options: LaunchOptions = {}): Promise<PevApp> {
   const userData = options.userData ?? testDir(`e2e-${name}`);
+  // Counted before the launch: a reopened export logs its own line at start.
+  const openedAtLaunch = indexOpenedIn(userData);
   const app = await electron.launch({
-    args: [join(REPO_ROOT, 'out-test'), `--pev-user-data=${userData}`, ...(options.args ?? [])],
+    args: [
+      join(REPO_ROOT, 'out-test'),
+      `--pev-user-data=${userData}`,
+      // Screenshots in sRGB on every OS, so pixel checks compare like with like:
+      // macOS otherwise converts them to the display's colour profile.
+      '--force-color-profile=srgb',
+      ...(options.args ?? []),
+    ],
     cwd: REPO_ROOT,
     // Without this, Playwright turns Chromium's sandbox off on Linux.
     chromiumSandbox: true,
+    ...(options.appColorScheme ? { colorScheme: null } : {}),
   });
   const page = await app.firstWindow();
   await page.waitForLoadState('load');
   await waitForShell(page);
-  return new PevApp(app, page, userData);
+  return new PevApp(app, page, userData, openedAtLaunch);
 }
 
 /**

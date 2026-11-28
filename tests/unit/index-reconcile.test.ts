@@ -8,9 +8,11 @@
 import { describe, expect, it } from 'vitest';
 import type { MessageRow } from '../../src/core/index/metadata';
 import { threadOfMessage } from '../../src/core/index/queries';
-import { BODY_STATE, META_STATE } from '../../src/core/index/schema';
+import { BODY_STATE, CAPPED, META_STATE } from '../../src/core/index/schema';
+import { searchPage } from '../../src/core/index/search';
 import { asNumber, type Db } from '../../src/core/index/sql';
 import {
+  BODY_TOO_LARGE,
   PAIR_META_MISSING,
   classify,
   groupMembers,
@@ -22,9 +24,11 @@ import {
   type IndexWriter,
   type PairFiles,
   type Phase1Stats,
+  type Phase2Item,
   type ReconcilePlan,
   type StoredPair,
 } from '../../src/core/index/writer';
+import type { SearchKey, SearchPage, SearchQuery, SearchRow } from '../../src/shared/index-types';
 import { STAMP, checkAgainstScratch, expected, fresh, message, partition } from '../index-helpers';
 
 // --- A folder of pairs, as reconcile sees it ------------------------------------
@@ -118,7 +122,11 @@ class Folder {
    * stored conversations are checked against a from-scratch grouping after
    * every transaction.
    */
-  reconcile(): { plan: ReconcilePlan; applied: ApplyStats[]; written: Phase1Stats } {
+  reconcile(order: (items: ApplyItem[]) => ApplyItem[] = (items) => items): {
+    plan: ReconcilePlan;
+    applied: ApplyStats[];
+    written: Phase1Stats;
+  } {
     const scanned = this.scan();
     const plan = this.writer.planReconcile(scanned.metadata, scanned.eml);
     const item = (c: (typeof plan.changes)[number]): ApplyItem => ({
@@ -137,7 +145,7 @@ class Folder {
     const revs = new Map(applied[1]!.revs);
     const written = this.writer.phase1Batch(
       STAMP,
-      toRead.map((u) => {
+      order(toRead).map((u) => {
         const row = this.entries.get(u.change.protonId)!.row;
         return {
           pair: u.files,
@@ -824,5 +832,449 @@ describe('labels.json', () => {
     expect(writer.planReconcile(empty, empty).labelsStat).toBeNull();
     expect(count(db, 'SELECT count(*) FROM labels')).toBe(0);
     db.close();
+  });
+});
+
+// --- A changed message that lands alone ---------------------------------------
+
+const tid = (f: Folder, id: string) => threadOfMessage(f.db, rowidOf(f.db, id))!;
+
+let queryIds = 0;
+function search(f: Folder, sort: 'date' | 'relevance', after: SearchKey | null): SearchPage {
+  queryIds += 1;
+  return searchPage(f.db, {
+    op: 'search',
+    queryId: queryIds,
+    text: 'alpha',
+    sort,
+    after,
+  } as SearchQuery);
+}
+
+/** The rows of every page after `after`, following the keysets. */
+function rest(f: Folder, sort: 'date' | 'relevance', after: SearchKey | null): SearchRow[] {
+  const rows: SearchRow[] = [];
+  while (after) {
+    const page = search(f, sort, after);
+    rows.push(...page.rows);
+    after = page.next;
+  }
+  return rows;
+}
+
+describe('a changed message that lands alone', () => {
+  it("keeps its conversation ID, which is below a later conversation's", () => {
+    const f = folder()
+      .add(message('lone', ['lone']))
+      .add(message('later', ['later']));
+    f.reconcile();
+    const id = tid(f, 'lone');
+    expect(id).toBeLessThan(tid(f, 'later'));
+    f.change(message('lone', ['lone'], { subject: 'new subject' }));
+    const { written } = f.reconcile();
+    expect(written).toMatchObject({ replaced: 1, kept: 1, newThreads: 0, merges: 0, splits: 0 });
+    expect(tid(f, 'lone')).toBe(id);
+    // New keys that reach no other conversation: still the same conversation.
+    f.change(message('lone', ['lone-v3', 'nowhere']));
+    expect(f.reconcile().written).toMatchObject({ kept: 1, newThreads: 0 });
+    expect(tid(f, 'lone')).toBe(id);
+    expect(count(f.db, 'SELECT count(*) FROM threads')).toBe(2);
+  });
+
+  it('keeps the ID of a conversation that has a reply, as before', () => {
+    const f = folder()
+      .add(message('first', ['first']))
+      .add(message('reply', ['reply', 'first']))
+      .add(message('later', ['later']));
+    f.reconcile();
+    const id = tid(f, 'first');
+    f.change(message('first', ['first'], { subject: 'edited' }));
+    expect(f.reconcile().written).toMatchObject({ replaced: 1, kept: 0, newThreads: 0 });
+    expect(tid(f, 'first')).toBe(id);
+    expect(tid(f, 'reply')).toBe(id);
+  });
+
+  it('starts a new conversation when the one it left still has members', () => {
+    const f = folder()
+      .add(message('first', ['first']))
+      .add(message('reply', ['reply', 'first']))
+      .add(message('later', ['later']));
+    f.reconcile();
+    const id = tid(f, 'first');
+    // Its own ID changes, so nothing links it to the reply any more.
+    f.change(message('first', ['first-v2']));
+    expect(f.reconcile().written).toMatchObject({ kept: 0, newThreads: 1 });
+    expect(tid(f, 'reply')).toBe(id);
+    expect(tid(f, 'first')).not.toBe(id);
+    expect(count(f.db, 'SELECT count(*) FROM threads')).toBe(3);
+  });
+
+  it('joins the conversation its new keys reach, and its old ID is retired', () => {
+    const f = folder()
+      .add(message('lone', ['lone']))
+      .add(message('other', ['other']));
+    f.reconcile();
+    const old = tid(f, 'lone');
+    f.change(message('lone', ['lone', 'other']));
+    expect(f.reconcile().written).toMatchObject({ kept: 0, newThreads: 0 });
+    expect(tid(f, 'lone')).toBe(tid(f, 'other'));
+    expect(count(f.db, `SELECT count(*) FROM threads WHERE thread_id = ${old}`)).toBe(0);
+  });
+
+  it('keeps the highest ID while a new conversation starts in the same batch, in either order', () => {
+    for (const newFirst of [false, true]) {
+      const f = folder()
+        .add(message('early', ['early']))
+        .add(message('top', ['top']));
+      f.reconcile();
+      const id = tid(f, 'top');
+      expect(id).toBeGreaterThan(tid(f, 'early'));
+      f.change(message('top', ['top'], { subject: 'edited' }));
+      f.add(message('fresh', ['fresh']));
+      const { written } = f.reconcile((items) =>
+        [...items].sort((a, b) => {
+          const rank = (u: ApplyItem) => (u.change.protonId === 'fresh' ? 0 : 1);
+          return newFirst ? rank(a) - rank(b) : rank(b) - rank(a);
+        }),
+      );
+      expect(written, String(newFirst)).toMatchObject({ kept: 1, newThreads: 1 });
+      expect(tid(f, 'top'), String(newFirst)).toBe(id);
+      expect(tid(f, 'fresh'), String(newFirst)).not.toBe(id);
+      expect(count(f.db, 'SELECT count(*) FROM threads')).toBe(3);
+    }
+  });
+
+  it('shows once in a search by date read across the change, under the ID it had', () => {
+    const f = folder();
+    for (let i = 0; i < 205; i += 1) {
+      f.add(
+        message(`m${String(i).padStart(3, '0')}`, [`k${i}`], {
+          time: 1000 + i,
+          subject: `alpha ${i}`,
+        }),
+      );
+    }
+    f.reconcile();
+    const first = search(f, 'date', null);
+    expect(first.rows).toHaveLength(200);
+    // On page 1, and below the highest conversation ID.
+    const target = first.rows[10]!;
+    const id = target.threadId;
+    expect(id).toBeLessThan(Math.max(...first.rows.map((r) => r.threadId)));
+    const targetId = String(
+      f.db.stmt('SELECT proton_id FROM messages WHERE rowid = ?').get(target.anchorRowid)
+        ?.proton_id,
+    );
+    // Only the subject changes: the same time, and it still matches.
+    const i = Number(targetId.slice(1));
+    f.change(message(targetId, [`k${i}`], { time: 1000 + i, subject: `alpha ${i} edited` }));
+    f.reconcile();
+    const later = rest(f, 'date', first.next);
+    expect(later).toHaveLength(5);
+    expect(later.map((r) => r.anchorRowid)).not.toContain(target.anchorRowid);
+    const again = search(f, 'date', null).rows.find((r) => r.anchorRowid === target.anchorRowid);
+    expect(again?.threadId).toBe(id);
+  });
+
+  it('shows once in a search by relevance read across a change that moves it past the cursor', () => {
+    const f = folder();
+    f.add(message('s000', ['s000'], { time: 5000, subject: 'alpha alpha alpha' }));
+    for (let i = 0; i < 205; i += 1) {
+      f.add(
+        message(`m${String(i).padStart(3, '0')}`, [`k${i}`], { time: 1000 + i, subject: 'alpha' }),
+      );
+    }
+    f.reconcile();
+    const first = search(f, 'relevance', null);
+    expect(first.rows).toHaveLength(200);
+    const strong = rowidOf(f.db, 's000');
+    expect(first.rows[0]!.anchorRowid).toBe(strong);
+    // Page 1 stays shown while the message changes and ranks below the cursor.
+    f.change(
+      message('s000', ['s000'], {
+        time: 5000,
+        subject: 'alpha and a great many other words that rank it below the rest',
+      }),
+    );
+    f.reconcile();
+    const later = rest(f, 'relevance', first.next);
+    expect(later.some((r) => r.anchorRowid === strong)).toBe(true);
+    // What the list shows: page 1, then each later conversation not shown yet.
+    const shown = new Set(first.rows.map((r) => r.threadId));
+    const anchors = [
+      ...first.rows.map((r) => r.anchorRowid),
+      ...later.filter((r) => !shown.has(r.threadId)).map((r) => r.anchorRowid),
+    ];
+    expect(anchors.filter((a) => a === strong)).toHaveLength(1);
+    expect(new Set(anchors).size).toBe(anchors.length);
+  });
+});
+
+// --- Phase 2 ---------------------------------------------------------------------
+
+/** A phase 2 result for a message, read for `rev`. */
+function bodyItem(id: string, rev: number, extra: Partial<Phase2Item> = {}): Phase2Item {
+  return {
+    protonId: id,
+    rev,
+    state: BODY_STATE.indexed,
+    body: `body words of ${id}`,
+    attachments: [],
+    attachmentText: '',
+    attachmentsCapped: false,
+    error: null,
+    ...extra,
+  };
+}
+
+/** A result's attachments: rows and the names' text. */
+const named = (...names: string[]): Partial<Phase2Item> => ({
+  attachments: names.map((name, i) => ({
+    name,
+    mime: 'application/pdf',
+    contentId: `c${i}`,
+    size: 10 + i,
+  })),
+  attachmentText: names.join('\n'),
+});
+
+let queries = 0;
+/** The message IDs a search finds. */
+function found(db: Db, text: string): string[] {
+  queries += 1;
+  const page = searchPage(db, { op: 'search', queryId: queries, text, sort: 'date', after: null });
+  return page.rows
+    .map((r) =>
+      String(
+        db.stmt('SELECT proton_id FROM messages WHERE rowid = ?').get(r.anchorRowid)?.proton_id,
+      ),
+    )
+    .sort();
+}
+
+const attachmentRows = (db: Db, id: string) =>
+  db
+    .stmt(
+      'SELECT idx, filename, mime, size, content_id, source FROM attachments WHERE message_rowid = ? ORDER BY idx',
+    )
+    .all(rowidOf(db, id));
+
+const cappedOf = (db: Db, id: string) =>
+  count(db, 'SELECT capped FROM messages WHERE proton_id = ?', id);
+
+describe('phase 2 results', () => {
+  it('list the messages waiting for their text, newest first, with their files', () => {
+    const f = folder()
+      .add(message('old', ['old'], { time: 100 }))
+      .add(message('new', ['new'], { time: 300 }))
+      .add(message('tie', ['tie'], { time: 300 }))
+      .add(message('nofile', ['nofile'], { time: 400 }), { eml: null })
+      .add(message('nometa', ['nometa']), { meta: null });
+    f.reconcile();
+    const order = f.writer.bodyOrder();
+    // Ties go to the higher rowid; no message file, or no message, nothing to read.
+    expect(order).toEqual([rowidOf(f.db, 'tie'), rowidOf(f.db, 'new'), rowidOf(f.db, 'old')]);
+    const todo = f.writer.bodyTodo(order);
+    expect(todo.map((t) => t.protonId)).toEqual(['tie', 'new', 'old']);
+    const eml = f.files('new').eml!;
+    expect(todo[1]).toEqual({
+      protonId: 'new',
+      rev: asNumber(pairRow(f.db, 'new')?.rev),
+      rel: eml.rel,
+      size: eml.size,
+      mtimeNs: String(eml.mtimeNs),
+      dev: String(eml.dev),
+      ino: String(eml.ino),
+    });
+    // Once written, a message no longer waits.
+    f.writer.phase2Batch(STAMP, [bodyItem('new', todo[1]!.rev)]);
+    expect(f.writer.bodyTodo(order).map((t) => t.protonId)).toEqual(['tie', 'old']);
+    expect(f.writer.bodyOrder()).toEqual([rowidOf(f.db, 'tie'), rowidOf(f.db, 'old')]);
+  });
+
+  it('write text and attachments for the rev they were read for, and none after the file changes or goes', () => {
+    const f = folder()
+      .add(message('a', ['a']))
+      .add(message('b', ['b']));
+    f.reconcile();
+    const rev = (id: string) => asNumber(pairRow(f.db, id)?.rev);
+    const first = rev('a');
+    const stats = f.writer.phase2Batch(STAMP, [bodyItem('a', first, named('old report.pdf'))]);
+    expect(stats).toMatchObject({ stale: false, written: 1, dropped: 0, rest: 0, failed: [] });
+    expect(pairRow(f.db, 'a')).toMatchObject({ body_state: BODY_STATE.indexed, error_code: null });
+    expect(found(f.db, 'filename:"old report.pdf"')).toEqual(['a']);
+    expect(found(f.db, 'words')).toEqual(['a']);
+    expect(attachmentRows(f.db, 'a')).toEqual([
+      {
+        idx: 0,
+        filename: 'old report.pdf',
+        mime: 'application/pdf',
+        size: 10,
+        content_id: 'c0',
+        source: 'eml',
+      },
+    ]);
+
+    // The message file changes: everything read from it goes in the same transaction.
+    f.set('a', { eml: 2 });
+    f.reconcile();
+    expect(pairRow(f.db, 'a')).toMatchObject({ body_state: BODY_STATE.pending });
+    expect(found(f.db, 'filename:"old report.pdf"')).toEqual([]);
+    expect(found(f.db, 'words')).toEqual([]);
+    expect(attachmentRows(f.db, 'a')).toEqual([]);
+    // A late result read for the old rev restores nothing.
+    expect(
+      f.writer.phase2Batch(STAMP, [bodyItem('a', first, named('old report.pdf'))]),
+    ).toMatchObject({ written: 0, dropped: 1 });
+    expect(found(f.db, 'filename:"old report.pdf"')).toEqual([]);
+    expect(attachmentRows(f.db, 'a')).toEqual([]);
+
+    // The new file's result.
+    const second = rev('a');
+    f.writer.phase2Batch(STAMP, [bodyItem('a', second, named('new.pdf'))]);
+    expect(found(f.db, 'filename:new.pdf')).toEqual(['a']);
+    expect(found(f.db, 'filename:"old report.pdf"')).toEqual([]);
+    // The same result again changes nothing: the message no longer waits.
+    expect(f.writer.phase2Batch(STAMP, [bodyItem('a', second, named('x.pdf'))])).toMatchObject({
+      written: 0,
+      dropped: 1,
+    });
+    expect(found(f.db, 'filename:x.pdf')).toEqual([]);
+
+    // The message file goes: the same, with its own state.
+    f.set('a', { eml: null });
+    f.reconcile();
+    expect(pairRow(f.db, 'a')).toMatchObject({ body_state: BODY_STATE.emlMissing });
+    expect(found(f.db, 'filename:new.pdf')).toEqual([]);
+    expect(found(f.db, 'words')).toEqual([]);
+    expect(attachmentRows(f.db, 'a')).toEqual([]);
+    expect(f.writer.phase2Batch(STAMP, [bodyItem('a', second, named('new.pdf'))])).toMatchObject({
+      written: 0,
+      dropped: 1,
+    });
+    expect(found(f.db, 'filename:new.pdf')).toEqual([]);
+  });
+
+  it('read the text again once metadata that went, or stopped parsing, is back', () => {
+    const f = folder()
+      .add(message('a', ['a']))
+      .add(message('b', ['b']));
+    f.reconcile();
+    const rev = (id: string) => asNumber(pairRow(f.db, id)?.rev);
+    f.writer.phase2Batch(STAMP, [bodyItem('a', rev('a')), bodyItem('b', rev('b'))]);
+    expect(found(f.db, 'words')).toEqual(['a', 'b']);
+
+    // a's metadata goes; b's no longer parses. Their text goes with them.
+    f.set('a', { meta: null });
+    f.set('b', { row: null, meta: 2 });
+    f.reconcile();
+    expect(found(f.db, 'words')).toEqual([]);
+    for (const id of ['a', 'b']) {
+      expect(pairRow(f.db, id)).toMatchObject({ body_state: BODY_STATE.pending });
+    }
+
+    // Both are back: their message files are read again, and the text is found.
+    f.set('a', { meta: 3 });
+    f.change(message('b', ['b']));
+    f.reconcile();
+    expect(f.writer.bodyOrder().sort()).toEqual([rowidOf(f.db, 'a'), rowidOf(f.db, 'b')].sort());
+    f.writer.phase2Batch(STAMP, [bodyItem('a', rev('a')), bodyItem('b', rev('b'))]);
+    expect(found(f.db, 'words')).toEqual(['a', 'b']);
+  });
+
+  it('set the attachments cap flag, and clear only that one when the message file changes or goes', () => {
+    const other = CAPPED.labels | CAPPED.to;
+    const f = folder()
+      .add(message('c', ['c'], { capped: other }))
+      .add(message('d', ['d']));
+    f.reconcile();
+    const rev = (id: string) => asNumber(pairRow(f.db, id)?.rev);
+    const capped = { ...named('kept.pdf'), attachmentsCapped: true };
+    const stats = f.writer.phase2Batch(STAMP, [
+      bodyItem('c', rev('c'), capped),
+      bodyItem('d', rev('d'), capped),
+    ]);
+    const fileId = (id: string) => String(pairRow(f.db, id)?.file_id);
+    expect(stats.capped).toEqual([fileId('c'), fileId('d')]);
+    // c already had lists cut; d had none.
+    expect(stats.cappedNew).toBe(1);
+    expect(cappedOf(f.db, 'c')).toBe(other | CAPPED.attachments);
+    expect(cappedOf(f.db, 'd')).toBe(CAPPED.attachments);
+
+    // New metadata, same message file: the flag stays with the message file's text.
+    f.change(message('c', ['c'], { capped: other, subject: 'v2' }));
+    f.reconcile();
+    expect(cappedOf(f.db, 'c')).toBe(other | CAPPED.attachments);
+    expect(found(f.db, 'filename:kept.pdf')).toEqual(['c', 'd']);
+
+    f.set('c', { eml: 2 });
+    f.set('d', { eml: null });
+    f.reconcile();
+    expect(cappedOf(f.db, 'c')).toBe(other);
+    expect(cappedOf(f.db, 'd')).toBe(0);
+  });
+
+  it('keep each transaction within its text budget, and fail a message that alone is over it', () => {
+    const f = folder();
+    for (const id of ['a', 'b', 'c', 'big', 'gone']) f.add(message(id, [id]));
+    f.reconcile();
+    const rev = (id: string) => asNumber(pairRow(f.db, id)?.rev);
+    const text = (n: number) => 'w'.repeat(n);
+    const budget = 1000;
+    const items = ['a', 'b', 'c'].map((id) => bodyItem(id, rev(id), { body: text(400) }));
+    const first = f.writer.phase2Batch(STAMP, items, budget);
+    expect(first).toMatchObject({ written: 2, rest: 1 });
+    expect(first.bytes).toBeLessThanOrEqual(budget);
+    expect(pairRow(f.db, 'c')).toMatchObject({ body_state: BODY_STATE.pending });
+    expect(f.writer.phase2Batch(STAMP, items.slice(2), budget)).toMatchObject({
+      written: 1,
+      rest: 0,
+    });
+    expect(pairRow(f.db, 'c')).toMatchObject({ body_state: BODY_STATE.indexed });
+
+    // Alone over the budget: the failed state with its code, and none of its text.
+    const big = f.writer.phase2Batch(
+      STAMP,
+      [bodyItem('big', rev('big'), { body: text(budget) })],
+      budget,
+    );
+    expect(big).toMatchObject({ written: 1, rest: 0 });
+    expect(big.failed).toEqual([
+      { fileId: String(pairRow(f.db, 'big')?.file_id), code: BODY_TOO_LARGE },
+    ]);
+    expect(pairRow(f.db, 'big')).toMatchObject({
+      body_state: BODY_STATE.failed,
+      error_code: BODY_TOO_LARGE,
+    });
+    expect(
+      count(
+        f.db,
+        'SELECT length(body) FROM message_text WHERE rowid = ?',
+        String(rowidOf(f.db, 'big')),
+      ),
+    ).toBe(0);
+
+    // A file that couldn't be read: the failed state with its code.
+    const failed = f.writer.phase2Batch(STAMP, [
+      bodyItem('gone', rev('gone'), { state: BODY_STATE.failed, body: '', error: 'BODY_TIMEOUT' }),
+    ]);
+    expect(failed.failed).toEqual([
+      { fileId: String(pairRow(f.db, 'gone')?.file_id), code: 'BODY_TIMEOUT' },
+    ]);
+    expect(pairRow(f.db, 'gone')).toMatchObject({
+      body_state: BODY_STATE.failed,
+      error_code: 'BODY_TIMEOUT',
+    });
+  });
+
+  it('write nothing for another generation', () => {
+    const f = folder().add(message('a', ['a']));
+    f.reconcile();
+    const stats = f.writer.phase2Batch({ ...STAMP, generation: STAMP.generation + 1 }, [
+      bodyItem('a', asNumber(pairRow(f.db, 'a')?.rev)),
+    ]);
+    expect(stats).toMatchObject({ stale: true, written: 0 });
+    expect(pairRow(f.db, 'a')).toMatchObject({ body_state: BODY_STATE.pending });
+    expect(found(f.db, 'words')).toEqual([]);
   });
 });

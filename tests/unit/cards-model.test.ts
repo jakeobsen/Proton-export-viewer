@@ -3,7 +3,8 @@
 // opened, and what happens when the index moves on under it.
 
 import { describe, expect, it } from 'vitest';
-import { cardsWindow } from '../../src/core/index/queries';
+import { cardsAnswer } from '../../src/core/index/search';
+import { BODY_STATE } from '../../src/core/index/schema';
 import { asNumber, type Db } from '../../src/core/index/sql';
 import type { CardsQuery, CardsWindow } from '../../src/shared/index-types';
 import { CardsModel } from '../../src/renderer/cards';
@@ -24,10 +25,19 @@ function setup(n = 6) {
   const queries: CardsQuery[] = [];
   const actions: Array<['open', number] | ['close']> = [];
   let hold: Array<() => void> | null = null;
+  /** The revision of the snapshot each read is answered from. */
+  const index = { rev: 1 };
+  /** The text of each search by its query ID, as main puts it in. */
+  const texts = new Map<number, string>();
   const model = new CardsModel(
     (query) => {
       queries.push(query);
-      const answer = (): CardsWindow => cardsWindow(db, query);
+      const text = query.search ? texts.get(query.search.queryId) : undefined;
+      const call: CardsQuery =
+        query.search && text !== undefined
+          ? { ...query, search: { ...query.search, text } }
+          : query;
+      const answer = (): CardsWindow => cardsAnswer(db, call, index.rev);
       if (!hold) return Promise.resolve(answer());
       // A read held until the test lets it go, answered from the index as it is then.
       return new Promise((resolve) => hold!.push(() => resolve(answer())));
@@ -47,12 +57,22 @@ function setup(n = 6) {
     queries,
     actions,
     settle,
+    index,
+    texts,
     holdReads: () => {
       hold = [];
     },
     releaseReads: async () => {
       const waiting = hold ?? [];
       hold = null;
+      for (const go of waiting) go();
+      await settle();
+      await settle();
+    },
+    /** Lets the reads waiting now go, and holds the ones that follow. */
+    releaseHeld: async () => {
+      const waiting = hold ?? [];
+      hold = [];
       for (const go of waiting) go();
       await settle();
       await settle();
@@ -283,6 +303,240 @@ describe('the cards model', () => {
     db.close();
   });
 
+  it('moves to the next newer and older card, stopping at either end', async () => {
+    const { db, ids, model, actions, settle } = setup();
+    model.show(ids[2]!, null);
+    await settle();
+    const scroll = model.snapshot.scrollId;
+    expect(model.move(1)).toBe(true);
+    expect(model.snapshot.expanded).toBe(ids[3]);
+    expect(model.snapshot.scrollId).toBe(scroll + 1);
+    expect(model.move(-1)).toBe(true);
+    expect(model.move(-1)).toBe(true);
+    expect(model.snapshot.expanded).toBe(ids[1]);
+    expect(actions).toEqual([
+      ['open', ids[2]],
+      ['open', ids[3]],
+      ['open', ids[2]],
+      ['open', ids[1]],
+    ]);
+    // The oldest card: nothing older. The newest: nothing newer.
+    model.show(ids[0]!, null);
+    await settle();
+    expect(model.move(-1)).toBe(false);
+    model.show(ids[5]!, null);
+    await settle();
+    expect(model.move(1)).toBe(false);
+    expect(model.snapshot.expanded).toBe(ids[5]);
+    expect(actions.slice(4)).toEqual([
+      ['open', ids[0]],
+      ['open', ids[5]],
+    ]);
+    db.close();
+  });
+
+  it('does not move before the conversation is read, or with none shown', async () => {
+    const { db, ids, model, actions, settle } = setup();
+    expect(model.move(1)).toBe(false);
+    model.show(ids[2]!, null);
+    expect(model.move(1)).toBe(false);
+    await settle();
+    expect(model.snapshot.expanded).toBe(ids[2]);
+    expect(actions).toEqual([['open', ids[2]]]);
+    db.close();
+  });
+
+  it('reads at the expanded card first when the screen is elsewhere, then moves', async () => {
+    const { db, ids, model, actions, queries, settle } = setup(400);
+    model.show(ids[0]!, null);
+    await settle();
+    model.setViewport(300, 310);
+    await settle();
+    expect(model.expandedIndex()).toBeNull();
+    const reads = queries.length;
+    expect(model.move(1)).toBe(true);
+    await settle();
+    await settle();
+    expect(queries.length).toBe(reads + 1);
+    expect(queries.at(-1)!.anchor).toMatchObject({ rowid: ids[0] });
+    expect(model.snapshot.expanded).toBe(ids[1]);
+    expect(actions).toEqual([
+      ['open', ids[0]],
+      ['open', ids[1]],
+    ]);
+    db.close();
+  });
+
+  it('adds up the moves made while that read is under way, and opens only where they end', async () => {
+    const { db, ids, model, actions, settle, holdReads, releaseReads } = setup(400);
+    model.show(ids[10]!, null);
+    await settle();
+    model.setViewport(300, 310);
+    await settle();
+    holdReads();
+    model.move(1);
+    model.move(1);
+    model.move(1);
+    model.move(-1);
+    await releaseReads();
+    expect(model.snapshot.expanded).toBe(ids[12]);
+    expect(actions).toEqual([
+      ['open', ids[10]],
+      ['open', ids[12]],
+    ]);
+    db.close();
+  });
+
+  it('moves that add up past either end during that read stop at the end card', async () => {
+    for (const [start, step, end] of [
+      [398, 1, 399],
+      [1, -1, 0],
+    ] as const) {
+      const { db, ids, model, actions, settle, holdReads, releaseHeld, releaseReads } = setup(400);
+      model.show(ids[start]!, null);
+      await settle();
+      model.setViewport(200, 210);
+      await settle();
+      holdReads();
+      model.move(step);
+      model.move(step);
+      model.move(step);
+      // The end card is among those read at the expanded one: it opens with no other read.
+      await releaseHeld();
+      expect(model.snapshot.expanded).toBe(ids[end]);
+      await releaseReads();
+      expect(model.snapshot.expanded).toBe(ids[end]);
+      expect(actions).toEqual([
+        ['open', ids[start]],
+        ['open', ids[end]],
+      ]);
+      db.close();
+    }
+  });
+
+  it('keeps a move made while a read for the screen is under way, and opens only where it ends', async () => {
+    const { db, ids, model, actions, queries, settle, holdReads, releaseReads } = setup(400);
+    model.show(ids[10]!, null);
+    await settle();
+    model.setViewport(300, 310);
+    await settle();
+    expect(model.expandedIndex()).toBeNull();
+    // The screen moves again: its read is under way when the key comes.
+    holdReads();
+    model.setViewport(200, 210);
+    const reads = queries.length;
+    expect(queries.at(-1)!.anchor).not.toHaveProperty('rowid', ids[10]);
+    expect(model.move(1)).toBe(true);
+    await releaseReads();
+    await settle();
+    // The screen's read came back without the expanded card; the next read is at its place.
+    expect(queries.length).toBe(reads + 1);
+    expect(queries.at(-1)!.anchor).toMatchObject({ rowid: ids[10] });
+    expect(model.snapshot.expanded).toBe(ids[11]);
+    expect(actions).toEqual([
+      ['open', ids[10]],
+      ['open', ids[11]],
+    ]);
+    db.close();
+  });
+
+  it('moves that end past the cards read at the expanded one read there, then open only that card', async () => {
+    for (const [start, step, presses, end] of [
+      [100, -1, 60, 40],
+      [100, 1, 120, 220],
+    ] as const) {
+      const { db, ids, model, actions, queries, settle, holdReads, releaseReads } = setup(400);
+      model.show(ids[start]!, null);
+      await settle();
+      model.setViewport(300, 310);
+      await settle();
+      holdReads();
+      const reads = queries.length;
+      for (let i = 0; i < presses; i += 1) model.move(step);
+      await releaseReads();
+      await settle();
+      await settle();
+      // Read at the expanded card first, then where the moves end.
+      expect(queries[reads]!.anchor).toMatchObject({ rowid: ids[start] });
+      expect(queries[reads + 1]!.anchor).toEqual({ index: end });
+      expect(model.snapshot.expanded).toBe(ids[end]);
+      expect(actions).toEqual([
+        ['open', ids[start]],
+        ['open', ids[end]],
+      ]);
+      db.close();
+    }
+  });
+
+  it('adds moves made while the cards where moves end are read, stopping at either end', async () => {
+    for (const [start, view, step, first, more, end] of [
+      [100, 300, -1, 60, 5, 35],
+      [100, 300, -1, 60, 50, 0],
+      [300, 100, 1, 90, 20, 399],
+    ] as const) {
+      const { db, ids, model, actions, settle, holdReads, releaseHeld, releaseReads } = setup(400);
+      model.show(ids[start]!, null);
+      await settle();
+      model.setViewport(view, view + 10);
+      await settle();
+      holdReads();
+      for (let i = 0; i < first; i += 1) model.move(step);
+      // The read at the expanded card answers; the read where the moves end is held.
+      await releaseHeld();
+      expect(model.snapshot.expanded).toBe(ids[start]);
+      for (let i = 0; i < more; i += 1) model.move(step);
+      await releaseReads();
+      await settle();
+      expect(model.snapshot.expanded).toBe(ids[end]);
+      expect(actions).toEqual([
+        ['open', ids[start]],
+        ['open', ids[end]],
+      ]);
+      db.close();
+    }
+  });
+
+  it('a card expanded by hand while the cards where moves end are read replaces the move', async () => {
+    const { db, ids, model, actions, settle, holdReads, releaseHeld, releaseReads } = setup(400);
+    model.show(ids[100]!, null);
+    await settle();
+    model.setViewport(300, 310);
+    await settle();
+    holdReads();
+    for (let i = 0; i < 60; i += 1) model.move(-1);
+    await releaseHeld();
+    // The read at card 40 is held; card 150 is held from the read at the expanded card.
+    expect(model.expand(model.cardAt(150)!)).toBe(true);
+    await releaseReads();
+    await settle();
+    await settle();
+    expect(model.snapshot.expanded).toBe(ids[150]);
+    expect(actions).toEqual([
+      ['open', ids[100]],
+      ['open', ids[150]],
+    ]);
+    db.close();
+  });
+
+  it('a card expanded by hand while that read is under way replaces the move', async () => {
+    const { db, ids, model, actions, settle, holdReads, releaseReads } = setup(400);
+    model.show(ids[0]!, null);
+    await settle();
+    model.setViewport(300, 310);
+    await settle();
+    holdReads();
+    model.move(1);
+    expect(model.expand(model.cardAt(305)!)).toBe(true);
+    await releaseReads();
+    await settle();
+    expect(model.snapshot.expanded).toBe(ids[305]);
+    expect(actions).toEqual([
+      ['open', ids[0]],
+      ['open', ids[305]],
+    ]);
+    db.close();
+  });
+
   it('reads more cards when the screen leaves the ones held, and only then', async () => {
     const { db, ids, model, queries, settle } = setup(400);
     model.show(ids[0]!, null);
@@ -298,5 +552,136 @@ describe('the cards model', () => {
     expect(model.cardAt(305)?.rowid).toBe(ids[305]);
     expect(model.snapshot.expanded).toBe(ids[0]);
     db.close();
+  });
+});
+
+describe('the header count from a search', () => {
+  const setBody = (db: Db, id: string, body: string) => {
+    db.stmt('UPDATE message_text SET body = ? WHERE rowid = ?').run(body, rowidOf(db, id));
+    db.stmt('UPDATE pairs SET body_state = ? WHERE proton_id = ?').run(BODY_STATE.indexed, id);
+  };
+
+  /** A conversation whose t1 and t3 match "invoice", shown from a result of that search. */
+  async function fromSearch(n = 6) {
+    const t = setup(n);
+    for (const id of ['t1', 't3']) setBody(t.db, id, 'the invoice');
+    t.texts.set(1, 'invoice');
+    t.model.show(t.ids[0]!, null, 1);
+    await t.settle();
+    return t;
+  }
+
+  it('asks for the count on the first read, then only when the pair shown is behind', async () => {
+    const t = await fromSearch();
+    expect(t.queries[0]!.search).toEqual({ queryId: 1, countRev: null });
+    expect(t.model.snapshot.count).toEqual({ total: 6, matching: 2, rev: 1 });
+    t.model.refresh();
+    await t.settle();
+    expect(t.queries.at(-1)!.search).toEqual({ queryId: 1, countRev: 1 });
+    expect(t.model.snapshot.count).toEqual({ total: 6, matching: 2, rev: 1 });
+    t.db.close();
+  });
+
+  it('replaces N and M together from a newer snapshot, on a scroll before any change signal', async () => {
+    const t = await fromSearch(400);
+    expect(t.model.snapshot.count).toEqual({ total: 400, matching: 2, rev: 1 });
+    // A write adds a message and a match; the scroll's read sees it under a newer revision.
+    setBody(t.db, 't300', 'another invoice');
+    ingest(t.writer, [message('late', ['late', 't0'], { time: 50 })], 1);
+    t.index.rev = 2;
+    t.model.setViewport(300, 310);
+    await t.settle();
+    expect(t.queries.at(-1)!.search).toEqual({ queryId: 1, countRev: 1 });
+    expect(t.model.snapshot.count).toEqual({ total: 401, matching: 3, rev: 2 });
+    t.db.close();
+  });
+
+  it('replaces only N from an answer of the same snapshot, which brings no count', async () => {
+    const t = await fromSearch();
+    // The window changes without the revision moving (no count comes): M stays.
+    ingest(t.writer, [message('late', ['late', 't0'], { time: 50 })], 1);
+    setBody(t.db, 't5', 'an invoice that is not counted');
+    t.model.refresh();
+    await t.settle();
+    expect(t.model.snapshot.count).toEqual({ total: 7, matching: 2, rev: 1 });
+    t.db.close();
+  });
+
+  it('never changes the pair from an older snapshot than the one shown', async () => {
+    const t = await fromSearch();
+    t.index.rev = 3;
+    t.model.refresh();
+    await t.settle();
+    expect(t.model.snapshot.count).toEqual({ total: 6, matching: 2, rev: 3 });
+    // A counted read from an older snapshot, as one in flight when a change signal landed.
+    setBody(t.db, 't5', 'an invoice');
+    ingest(t.writer, [message('late', ['late', 't0'], { time: 50 })], 1);
+    t.index.rev = 2;
+    t.model.refresh();
+    await t.settle();
+    expect(t.queries.at(-1)!.search).toEqual({ queryId: 1, countRev: 3 });
+    expect(t.model.snapshot.count).toEqual({ total: 6, matching: 2, rev: 3 });
+    // The cards themselves follow the read.
+    expect(t.model.snapshot.total).toBe(7);
+    t.db.close();
+  });
+
+  it('counts once a result takes over the conversation shown, and not for a search main no longer has', async () => {
+    const t = setup();
+    for (const id of ['t1', 't3']) setBody(t.db, id, 'the invoice');
+    t.texts.set(1, 'invoice');
+    t.model.show(t.ids[0]!, null);
+    await t.settle();
+    expect(t.queries[0]!.search).toBeUndefined();
+    expect(t.model.snapshot.count).toEqual({ total: 6, matching: null, rev: 1 });
+    t.model.setSearch(1);
+    await t.settle();
+    expect(t.queries.at(-1)!.search).toEqual({ queryId: 1, countRev: null });
+    expect(t.model.snapshot.count).toEqual({ total: 6, matching: 2, rev: 1 });
+    // Main reads plain cards for a search it no longer has: the header shows N only.
+    t.model.setSearch(2);
+    await t.settle();
+    expect(t.queries.at(-1)!.search).toEqual({ queryId: 2, countRev: null });
+    expect(t.model.snapshot.count).toEqual({ total: 6, matching: null, rev: 1 });
+    t.db.close();
+  });
+
+  it('takes no count from a read for a search left behind while it was under way', async () => {
+    const t = setup();
+    for (const id of ['t1', 't3']) setBody(t.db, id, 'the invoice');
+    t.texts.set(1, 'invoice');
+    t.texts.set(2, 'invoice');
+    t.model.show(t.ids[0]!, null, 1);
+    await t.settle();
+    expect(t.model.snapshot.count).toEqual({ total: 6, matching: 2, rev: 1 });
+    // A read for search 1 is under way when a result of search 2 takes over.
+    t.holdReads();
+    t.model.refresh();
+    t.index.rev = 2;
+    t.model.setSearch(2);
+    expect(t.model.snapshot.count).toEqual({ total: 6, matching: null, rev: 1 });
+    // Its count is search 1's: the header leaves M out, and the next read counts.
+    await t.releaseHeld();
+    expect(t.queries.at(-2)!.search).toEqual({ queryId: 1, countRev: 1 });
+    expect(t.model.snapshot.count).toEqual({ total: 6, matching: null, rev: 2 });
+    await t.releaseReads();
+    expect(t.queries.at(-1)!.search).toEqual({ queryId: 2, countRev: null });
+    expect(t.model.snapshot.count).toEqual({ total: 6, matching: 2, rev: 2 });
+    t.db.close();
+  });
+
+  it('marks the cards that match, and gives the cards on screen', async () => {
+    const t = await fromSearch();
+    t.model.setViewport(0, 3);
+    expect(t.model.snapshot.cards.map((c) => c.matched)).toEqual([
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+    ]);
+    expect(t.model.visibleRowids()).toEqual(t.ids.slice(0, 4));
+    t.db.close();
   });
 });

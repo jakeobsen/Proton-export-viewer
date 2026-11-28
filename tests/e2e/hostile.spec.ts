@@ -133,9 +133,17 @@ function inspect(frame: Frame, token: string, hints: string[]) {
         [...text.matchAll(/(?:[a-z][a-z0-9+.-]*:)?\/\/[^\s"'()<>,]*/gi)].some(
           ([url]) => !url.startsWith(base),
         );
+      // The one other URL left may be an inline image's data: URL, only in <img src>.
+      const inlineImage = (el: Element, a: Attr) =>
+        el.localName === 'img' &&
+        a.name === 'src' &&
+        /^data:image\/(?:png|jpeg|gif|webp);base64,/.test(a.value);
       const strays: string[] = [];
       for (const el of document.querySelectorAll('*')) {
-        for (const a of el.attributes) if (stray(a.value)) strays.push(`${el.localName} ${a.name}`);
+        for (const a of el.attributes) {
+          if (inlineImage(el, a)) continue;
+          if (stray(a.value) || /data:/i.test(a.value)) strays.push(`${el.localName} ${a.name}`);
+        }
         if (el.localName === 'style' && stray(el.textContent ?? '')) strays.push('style sheet');
       }
       // A DNS-only hint is gone when its host is nowhere in the served body.

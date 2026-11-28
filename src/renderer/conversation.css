@@ -6,22 +6,42 @@
   padding: 16px 22px 8px;
 }
 
+/* The header's chips wrap to as many lines as they need. */
 .cv-head .chips {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  height: auto;
   margin-top: 6px;
+  overflow: visible;
 }
 
 .cv-head .chip {
   display: inline-flex;
   align-items: center;
+  gap: 5px;
   height: 20px;
   padding: 0 8px;
   border: 1px solid var(--line);
   border-radius: 10px;
   color: var(--muted);
   font-size: 11.5px;
+}
+
+.cv-head .chip-icon {
+  flex: none;
+}
+
+/* A focused chip shows its whole name, on as many lines as it takes. */
+.cv-head .chip:focus-visible {
+  height: auto;
+  min-height: 20px;
+  white-space: normal;
+}
+
+.cv-head .chip:focus-visible .chip-name {
+  overflow: visible;
+  overflow-wrap: anywhere;
 }
 
 .cv-scroll {
@@ -90,20 +110,52 @@
   background: transparent;
 }
 
-.ch-l1 {
+/* The name line, and under it on a collapsed card the message's lead line. */
+.ch-main {
   display: flex;
   flex: 1;
+  flex-direction: column;
+  justify-content: center;
+  min-width: 0;
+}
+
+.ch-l1 {
+  display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
 }
 
+/*
+ * A lead line or a snippet is mail data: an isolated run of text. Its line
+ * is kept while empty, so a card's name line doesn't move when it arrives.
+ */
+.ch-snip {
+  height: 16px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  unicode-bidi: isolate;
+}
+
+.ch-snip mark {
+  border-radius: 2px;
+  background: var(--accent-soft);
+  color: var(--fg);
+}
+
+/* The sender's name is mail data: an isolated run of text. */
 .ch-name {
   min-width: 0;
   overflow: hidden;
   font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
+  unicode-bidi: isolate;
 }
 
 .ch-l1 .pill {

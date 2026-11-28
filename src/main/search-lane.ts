@@ -2,7 +2,10 @@
 // Searches while the user types. A search can't be stopped once core runs it,
 // so each window has at most one search in core and one waiting; a newer
 // request takes the waiting one's place, and that one is answered as
-// superseded without running.
+// superseded without running. Requests can also come from several
+// requesters, each with its own waiting place: a newer request then takes
+// only its own requester's place, so no requester can keep another's request
+// from running.
 
 export const SUPERSEDED = Symbol('superseded');
 export type Superseded = typeof SUPERSEDED;
@@ -15,23 +18,29 @@ interface Waiting {
 
 interface Lane {
   running: boolean;
-  waiting: Waiting | null;
+  /** The waiting request of each requester, in the order their places were taken. */
+  waiting: Map<string, Waiting>;
 }
 
 export class SearchLanes<W extends object> {
   private readonly lanes = new WeakMap<W, Lane>();
 
-  /** Runs `task` for the window now, or after the one in core, unless a newer one replaces it. */
-  run<T>(win: W, task: () => Promise<T>): Promise<T | Superseded> {
+  /**
+   * Runs `task` for the window now, or after the one in core, unless a newer
+   * one from the same requester replaces it.
+   */
+  run<T>(win: W, task: () => Promise<T>, requester = ''): Promise<T | Superseded> {
     let lane = this.lanes.get(win);
     if (!lane) {
-      lane = { running: false, waiting: null };
+      lane = { running: false, waiting: new Map() };
       this.lanes.set(win, lane);
     }
     if (!lane.running) return this.start(lane, task);
+    const waiting = lane.waiting;
     return new Promise<T | Superseded>((resolve, reject) => {
-      lane.waiting?.resolve(SUPERSEDED);
-      lane.waiting = { task, resolve: resolve as (value: unknown) => void, reject };
+      waiting.get(requester)?.resolve(SUPERSEDED);
+      // A replacement keeps its requester's place in the order.
+      waiting.set(requester, { task, resolve: resolve as (value: unknown) => void, reject });
     });
   }
 
@@ -46,9 +55,12 @@ export class SearchLanes<W extends object> {
       return await task();
     } finally {
       lane.running = false;
-      const next = lane.waiting;
-      lane.waiting = null;
-      if (next) this.start(lane, next.task).then(next.resolve, next.reject);
+      const first = lane.waiting.entries().next();
+      if (!first.done) {
+        const [requester, next] = first.value;
+        lane.waiting.delete(requester);
+        this.start(lane, next.task).then(next.resolve, next.reject);
+      }
     }
   }
 }

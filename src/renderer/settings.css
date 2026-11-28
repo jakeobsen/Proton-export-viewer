@@ -1,0 +1,224 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/* Settings: tabs on the left, one panel on the right. */
+
+.settings {
+  --settings-danger-soft: #fdeeee;
+  --settings-scrim: rgba(20, 18, 32, 0.38);
+  display: grid;
+  flex: 1;
+  grid-template-columns: 220px minmax(0, 1fr);
+  min-height: 0;
+}
+
+@media (prefers-color-scheme: dark) {
+  .settings {
+    --settings-danger-soft: #371b20;
+    --settings-scrim: rgba(0, 0, 0, 0.55);
+  }
+}
+
+.settings .tabs {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 14px 8px;
+  overflow-y: auto;
+  border-right: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.settings .back {
+  align-self: flex-start;
+  margin: 0 2px 12px;
+}
+
+.settings .tab {
+  width: 100%;
+  height: 32px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.settings .tab:hover {
+  background: var(--hover);
+}
+
+.settings .tab[aria-selected='true'] {
+  background: var(--sel);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.settings .tabpanels {
+  min-width: 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.settings .settings-notice {
+  max-width: 860px;
+  margin: 16px 30px 0;
+  color: var(--danger);
+}
+
+.settings .tabpanel {
+  max-width: 860px;
+  padding: 24px 30px 60px;
+}
+
+.settings .tabpanel > h2 {
+  margin: 0 0 12px;
+  font-size: 19px;
+}
+
+.settings .sec {
+  margin-bottom: 12px;
+  padding: 15px 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg);
+}
+
+.settings .sec h3 {
+  margin: 0 0 6px;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.settings .sec p {
+  margin: 0;
+  color: var(--fg-2);
+}
+
+.settings .kv {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 14px;
+  margin: 4px 0 0;
+  font-size: 12.5px;
+}
+
+.settings .kv dt {
+  color: var(--muted);
+}
+
+.settings .kv dd {
+  min-width: 0;
+  margin: 0;
+}
+
+.settings .files .link {
+  color: var(--accent-text);
+}
+
+.settings .mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+}
+
+.settings .middle-clip {
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.settings .middle-clip.full {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.settings .row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.settings .row-actions.first {
+  margin-top: 0;
+}
+
+.settings .confirm-box {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--danger-line);
+  border-radius: 10px;
+  background: var(--settings-danger-soft);
+}
+
+.settings .confirm-box .row-actions {
+  margin-top: 10px;
+}
+
+.settings .radio-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.settings .radio-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.settings .radio-row label:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.settings-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: var(--settings-scrim);
+}
+
+.settings-modal {
+  width: min(420px, 100%);
+  padding: 18px 20px 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--bg);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+}
+
+.settings-modal h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.settings-modal p {
+  margin: 0;
+  color: var(--fg-2);
+}
+
+.settings-modal .row-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.settings .switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}

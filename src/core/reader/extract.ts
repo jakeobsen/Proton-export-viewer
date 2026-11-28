@@ -4,19 +4,33 @@
 // way mailparser does it (transfer encoding, format=flowed, then the charset
 // with the same refusals). Of each body kind, at most KEEP_BYTES of encoded
 // content is kept; the rest of it, and every other part, is read and dropped
-// without being decoded.
+// without being decoded. Every part is recorded in a PartTree, so that inline
+// images can be found by what the HTML body refers to. Each part the index
+// lists as an attachment is decoded as it streams by, kept only as its decoded
+// size and first bytes, for the reader's attachment list. A message past the
+// parser's limits (more than MAX_MIME_PARTS parts, or a header block over
+// MAX_HEAD_BYTES) is read up to there; any other read error fails the read.
 
-import { Readable, Writable } from 'node:stream';
+import { once } from 'node:events';
+import { Readable, Writable, type Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { Splitter, type MimeNode } from '@zone-eu/mailsplit';
 import FlowedDecoder from '@zone-eu/mailsplit/lib/flowed-decoder.js';
 import libmime from 'libmime';
 import { MailParser, type HeaderLines, type Headers } from 'mailparser';
+import { isAttachment } from '../index/body';
+import { MAX_HEAD_BYTES, MAX_MIME_PARTS } from '../mime-limits';
+import { PartTree } from './parts';
 
 /** Encoded bytes kept of each body kind (text, HTML); the rest is dropped. */
 export const KEEP_BYTES = 20 * 1024 * 1024;
-/** The longest header block read. */
-const MAX_HEAD_BYTES = 2 * 1024 * 1024;
+
+/** How the reader splits a message, on every read of it. */
+export const SPLITTER_OPTIONS = {
+  maxHeadSize: MAX_HEAD_BYTES,
+  maxChildNodes: MAX_MIME_PARTS,
+  ignoreEmbedded: true,
+} as const;
 
 /** Content types read as text bodies, as mailparser reads them. */
 const TEXT_TYPES = new Set(['text/plain', 'text/html', 'message/delivery-status']);
@@ -33,17 +47,59 @@ export interface Body {
   cut: boolean;
 }
 
+/** Where one HTML part is in the joined HTML body. */
+export interface HtmlPart {
+  /** Its index in the part tree. */
+  part: number;
+  /** Its first character in `html.content`. */
+  start: number;
+  /** The character after its last. */
+  end: number;
+}
+
+/** How many decoded bytes of an attachment are kept, to tell its format by its signature. */
+export const HEAD_BYTES = 16;
+
+/** A part the index lists as an attachment, as the reader read it. */
+export interface ListedPart {
+  /** Its index in the part tree. */
+  part: number;
+  /** Its decoded size, in bytes, as its transfer decoder gives it. */
+  size: number;
+  /** Its first decoded bytes, at most HEAD_BYTES. */
+  head: Buffer;
+}
+
 export interface ExtractedMessage {
   headers: Headers | null;
   lines: HeaderLines | null;
   text: Body;
   html: Body;
+  /** Every part of the message, as the splitter found it. */
+  tree: PartTree;
+  /** The HTML parts that make up `html.content`, in order. */
+  htmlParts: HtmlPart[];
+  /** The parser stopped at one of its limits: the bodies hold what came before. */
+  stopped: boolean;
+  /** The parts the index lists as attachments, in message order. */
+  listed: ListedPart[];
+}
+
+interface Counting {
+  part: number;
+  decoder: Transform;
+  size: number;
+  head: Buffer[];
+  headBytes: number;
 }
 
 type Kind = 'text' | 'html';
 
+/** What joins HTML parts into one body, as mailparser joins them. */
+const HTML_SEPARATOR = '<br/>\n';
+
 interface Collected {
-  parts: string[];
+  parts: Array<{ content: string; part: number }>;
   bytes: number;
   kept: number;
   cut: boolean;
@@ -51,11 +107,57 @@ interface Collected {
 
 interface ActivePart {
   node: MimeNode;
+  /** Its index in the part tree. */
+  part: number;
   kind: Kind;
   chunks: Buffer[];
 }
 
-type SplitChunk = MimeNode | { type: 'data' | 'body' | 'none'; value?: Buffer };
+export type SplitChunk = MimeNode | { type: 'data' | 'body' | 'none'; value?: Buffer };
+
+/**
+ * Runs `consume` over the chunks `splitter` makes of `input`. Resolves true
+ * when the splitter stopped at one of its limits (more than MAX_MIME_PARTS
+ * parts, or a header block over MAX_HEAD_BYTES): `consume` saw what came
+ * before, and its own end-of-message steps did not run. Resolves false at
+ * the message's end. Any other error rejects.
+ */
+export async function splitWithinLimits(
+  input: Readable,
+  splitter: Splitter,
+  consume: (source: AsyncIterable<SplitChunk>) => Promise<void>,
+): Promise<boolean> {
+  // Only the splitter's own limit error ends the read early. The input's
+  // errors and the reader's own reach the splitter too, as the pipeline
+  // passes them on, so each is told apart by where it was raised first.
+  const raisedElsewhere = new WeakSet<object>();
+  const noteElsewhere = (err: unknown) => {
+    if (typeof err === 'object' && err !== null) raisedElsewhere.add(err);
+  };
+  input.on('error', noteElsewhere);
+  let splitterLimit: unknown = null;
+  // The splitter's types name only its data events; it is a Transform stream.
+  (splitter as Transform).on('error', (err: unknown) => {
+    const code = (err as { code?: unknown } | null)?.code;
+    if (splitterLimit === null && code === 'EMAXLEN' && !raisedElsewhere.has(err as object)) {
+      splitterLimit = err;
+    }
+  });
+  try {
+    await pipeline(input, splitter, async (source: AsyncIterable<SplitChunk>) => {
+      try {
+        await consume(source);
+      } catch (err) {
+        noteElsewhere(err);
+        throw err;
+      }
+    });
+    return false;
+  } catch (err) {
+    if (splitterLimit === null || err !== splitterLimit) throw err;
+    return true;
+  }
+}
 
 /** Which body a leaf part belongs to, or null if it is not a body part (mailparser's rules). */
 export function bodyKind(node: MimeNode): Kind | null {
@@ -123,7 +225,22 @@ function parseHeaders(
 }
 
 function joined(collected: Collected, separator: string): Body {
-  return { content: collected.parts.join(separator), bytes: collected.bytes, cut: collected.cut };
+  return {
+    content: collected.parts.map((p) => p.content).join(separator),
+    bytes: collected.bytes,
+    cut: collected.cut,
+  };
+}
+
+/** Where each part is in what `joined` makes of them. */
+function offsets(collected: Collected, separator: string): HtmlPart[] {
+  const out: HtmlPart[] = [];
+  let at = 0;
+  for (const { content, part } of collected.parts) {
+    out.push({ part, start: at, end: at + content.length });
+    at += content.length + separator.length;
+  }
+  return out;
 }
 
 /** Reads a message: its header fields, and its text and HTML bodies within KEEP_BYTES each. */
@@ -131,7 +248,8 @@ export async function extractMessage(
   input: Readable,
   keepBytes = KEEP_BYTES,
 ): Promise<ExtractedMessage> {
-  const splitter = new Splitter({ maxHeadSize: MAX_HEAD_BYTES, ignoreEmbedded: true });
+  const splitter = new Splitter(SPLITTER_OPTIONS);
+  const tree = new PartTree();
   const collected: Record<Kind, Collected> = {
     text: { parts: [], bytes: 0, kept: 0, cut: false },
     html: { parts: [], bytes: 0, kept: 0, cut: false },
@@ -143,20 +261,54 @@ export async function extractMessage(
     const part = active;
     active = null;
     if (!part || part.chunks.length === 0) return;
-    collected[part.kind].parts.push(await decodePart(part.node, part.chunks));
+    const content = await decodePart(part.node, part.chunks);
+    collected[part.kind].parts.push({ content, part: part.part });
   };
 
-  await pipeline(input, splitter, async (source: AsyncIterable<SplitChunk>) => {
+  // The attachment being decoded, by the same transfer decoder a save of it
+  // streams through, so the size listed is the size saved.
+  const listed: ListedPart[] = [];
+  let counting: Counting | null = null;
+  const count = (node: MimeNode, part: number) => {
+    const decoder = node.getDecoder() as Transform;
+    const c: Counting = { part, decoder, size: 0, head: [], headBytes: 0 };
+    decoder.on('data', (bytes: Buffer) => {
+      c.size += bytes.length;
+      if (c.headBytes < HEAD_BYTES) {
+        const take = Buffer.from(bytes.subarray(0, HEAD_BYTES - c.headBytes));
+        c.head.push(take);
+        c.headBytes += take.length;
+      }
+    });
+    counting = c;
+  };
+  const finishCount = async () => {
+    const c = counting;
+    counting = null;
+    if (!c) return;
+    const ended = once(c.decoder, 'end');
+    c.decoder.end();
+    await ended;
+    listed.push({ part: c.part, size: c.size, head: Buffer.concat(c.head) });
+  };
+
+  async function consume(source: AsyncIterable<SplitChunk>): Promise<void> {
     for await (const chunk of source) {
       if (chunk.type === 'node') {
         await finish();
+        await finishCount();
         const node = chunk as MimeNode;
+        const part = tree.add(node);
         if (node.root) headerBlock = node.getHeaders();
         const kind = bodyKind(node);
-        if (kind) active = { node, kind, chunks: [] };
+        if (kind) active = { node, part, kind, chunks: [] };
+        if (isAttachment(node)) count(node, part);
         continue;
       }
-      if (chunk.type !== 'body' || !active || !('value' in chunk) || !chunk.value) continue;
+      if (chunk.type !== 'body' || !('value' in chunk) || !chunk.value) continue;
+      const decoding = counting as Counting | null;
+      if (decoding && !decoding.decoder.write(chunk.value)) await once(decoding.decoder, 'drain');
+      if (!active) continue;
       const into = collected[active.kind];
       const value = chunk.value;
       into.bytes += value.length;
@@ -172,7 +324,16 @@ export async function extractMessage(
       into.cut = true;
     }
     await finish();
-  });
+    await finishCount();
+  }
+
+  const stopped = await splitWithinLimits(input, splitter, consume);
+  if (stopped) {
+    // The limit is met in a part's header block, after the parts before it
+    // ended: they are kept, and listed.
+    await finish();
+    await finishCount();
+  }
 
   const { headers, lines } = headerBlock
     ? await parseHeaders(headerBlock)
@@ -181,6 +342,10 @@ export async function extractMessage(
     headers,
     lines,
     text: joined(collected.text, '\n'),
-    html: joined(collected.html, '<br/>\n'),
+    html: joined(collected.html, HTML_SEPARATOR),
+    tree,
+    htmlParts: offsets(collected.html, HTML_SEPARATOR),
+    stopped,
+    listed,
   };
 }

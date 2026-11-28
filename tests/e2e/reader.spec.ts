@@ -11,6 +11,7 @@ import type { MessageOpenResult } from '../../src/shared/api';
 import { BODY_CSP } from '../../src/shared/constants';
 import type { OpenMode, TestInput } from '../../src/shared/reader-protocol';
 import { hostileMessages } from '../../tools/gen-export/hostile.mjs';
+import { solidPng } from '../../tools/gen-export/images.mjs';
 import { testDir } from '../paths';
 import { expect, test, tokenOf, type PevApp } from './app';
 
@@ -179,6 +180,9 @@ test('a message opens as plain text, served by mail-body: with its body headers 
   expect(frame.url()).toBe(secondUrl);
 });
 
+/** The HTML message's cid: part: a PNG that isn't the placeholder. */
+const INLINE_PNG = solidPng(2, 2, [10, 20, 30]);
+
 const HTML = [
   'Subject: HTML body',
   'From: "Sender" <sender@example.org>',
@@ -201,7 +205,7 @@ const HTML = [
   'Content-ID: <part1@example.org>',
   'Content-Transfer-Encoding: base64',
   '',
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNgAAIAAAUAAen63NgAAAAASUVORK5CYII=',
+  INLINE_PNG.toString('base64'),
   '--rel--',
   '',
 ].join('\r\n');
@@ -262,7 +266,8 @@ test('an HTML message opens sanitized, with placeholders, and requests nothing r
     )
     .toBe(true);
 
-  // The placeholder serves; a cid and a link id serve nothing for now.
+  // The placeholder serves, and so does the cid part, as the PNG it is; a
+  // link id serves nothing.
   const asset = (id: string) =>
     pev.main<{ status: number; headers: Record<string, string>; length: number }>(
       'fetchIn',
@@ -271,7 +276,8 @@ test('an HTML message opens sanitized, with placeholders, and requests nothing r
     );
   expect(await asset('r1')).toMatchObject({ status: 200, length: 68 });
   expect((await asset('r1')).headers['content-type']).toBe('image/png');
-  expect((await asset('c1')).status).toBe(404);
+  expect(await asset('c1')).toMatchObject({ status: 200, length: INLINE_PNG.length });
+  expect((await asset('c1')).headers['content-type']).toBe('image/png');
   expect((await asset('l1')).status).toBe(404);
 
   // Nothing but this view's own URLs was requested, nothing was cancelled,
@@ -367,7 +373,7 @@ async function measured(
   const outcome = !result.ok
     ? result.code
     : result.outcome === 'view'
-      ? `${result.format}${result.htmlTooLarge ? ', HTML too large' : ''}${result.truncated ? ', first 1 MB' : ''}`
+      ? `${result.format}${result.htmlTooLarge ? ', HTML too large' : ''}${result.cut ? `, cut by ${result.cut}` : ''}`
       : 'fallback';
   console.log(
     `${label} (${mode}): ${outcome} in ${ms} ms; worker memory peak ${(workerPeak / MB).toFixed(0)} MB; core RSS +${(rssGrowth / MB).toFixed(0)} MB at peak`,
@@ -399,7 +405,7 @@ test('each reader ceiling: HTML too large, HTML anyway, the first 1 MB, and part
     format: 'plain',
     hasHtml: true,
     htmlTooLarge: true,
-    truncated: false,
+    cut: null,
   });
   const anyway = await measured(pev, 'HTML 6 MB', 2, 'html-anyway');
   expect(anyway.result).toMatchObject({ outcome: 'view', format: 'html', htmlTooLarge: false });
@@ -415,7 +421,7 @@ test('each reader ceiling: HTML too large, HTML anyway, the first 1 MB, and part
         outcome: 'view',
         format: 'plain',
         htmlTooLarge: false,
-        truncated: true,
+        cut: 'size',
       });
       const length = await bodyLength(cut.result);
       expect(length).toBeGreaterThan(0.9 * MB);
@@ -431,7 +437,7 @@ test('each reader ceiling: HTML too large, HTML anyway, the first 1 MB, and part
     outcome: 'view',
     format: 'plain',
     hasHtml: false,
-    truncated: false,
+    cut: null,
   });
   expect(drained.workerPeak).toBeLessThan(128 * MB);
 });
@@ -458,7 +464,7 @@ test('"Show HTML anyway" near 20 MB ends in a view or the fallback, and plain te
     await expect.poll(() => pev.hasLog('reader.worker_retired', { proc: 'core' })).toBe(true);
   }
   const plain = await measured(pev, 'HTML near 20 MB', 2, 'plain');
-  expect(plain.result).toMatchObject({ outcome: 'view', format: 'plain', truncated: false });
+  expect(plain.result).toMatchObject({ outcome: 'view', format: 'plain', cut: null });
   if (anyway.result.ok && anyway.result.outcome === 'view') {
     // Every worker here was ended on purpose (replaced, or for new limits): no exit is a warning.
     const exits = pev.logs('core').filter((l) => l.code === 'core.worker_exit');
@@ -476,14 +482,18 @@ test('a body too heavy to render as HTML gives the fallback, and its plain text 
   ]);
   // Rendering this HTML needs well over this heap; its plain text needs less.
   await pev.main('readerLimits', { heapMb: 64 });
-  expect(await openRow(pev, 2, 'html-anyway')).toMatchObject({ ok: true, outcome: 'fallback' });
+  expect(await openRow(pev, 2, 'html-anyway')).toMatchObject({
+    ok: true,
+    outcome: 'fallback',
+    fileRefused: false,
+  });
   expect(pev.hasLog('open.fallback', { reason: 'limit' })).toBe(true);
   // The fallback's action: the same message as plain text.
   expect(await openRow(pev, 2, 'plain')).toMatchObject({
     ok: true,
     outcome: 'view',
     format: 'plain',
-    truncated: false,
+    cut: null,
   });
 });
 

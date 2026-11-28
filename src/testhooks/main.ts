@@ -5,13 +5,14 @@
 import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { BrowserWindow, app, clipboard, dialog, shell } from 'electron';
+import { BrowserWindow, Menu, app, clipboard, dialog, nativeTheme, shell } from 'electron';
 import { bumpGeneration, notifySources, type AppContext } from '../main/context';
 import type { PolicyObserver } from '../main/harden';
 import { PROD_SWITCHES } from '../main/switches';
 import { ScopeError, type Picked } from '../main/sources/scope';
 import type { OrderStep } from '../main/sources/manager';
 import { createAppWindow } from '../main/windows';
+import { IPC } from '../shared/api';
 import type { CoreResult, CoreTestInit } from '../shared/core-protocol';
 import type { IndexQuery } from '../shared/index-types';
 import { errorData } from '../shared/log/schema';
@@ -360,6 +361,9 @@ export async function install(ctx: AppContext): Promise<boolean> {
     /** Serves later HTML bodies without the sanitizer and the CSS filter, or with them again. */
     readerUnsanitized: (on: boolean) =>
       ctx.core.request({ type: 'test', action: READER_UNSANITIZED_ACTION, payload: on }),
+    /** Sends later stored bodies to the reader worker with ranges that fail its check, or not. */
+    readerBreakMarks: (on: boolean) =>
+      ctx.core.request({ type: 'test', action: 'reader-break-marks', payload: on }),
     /** Opens a gate of the reader's test source; lookups waiting there go on. */
     readerGate: (name: string) =>
       ctx.core.request({ type: 'test', action: 'reader-gate', payload: name }),
@@ -421,7 +425,7 @@ export async function install(ctx: AppContext): Promise<boolean> {
     indexTestSettings: (settings: CoreTestInit | null) => {
       ctx.core.testInit = settings;
     },
-    /** Lets `count` held phase 1 writes through; null stops holding them. */
+    /** Lets `count` held writes through; null stops holding them. */
     releaseWrites: async (count: number | null) => {
       const result = await ctx.core.request({
         type: 'test',
@@ -429,6 +433,48 @@ export async function install(ctx: AppContext): Promise<boolean> {
         payload: { count },
       });
       if (!result.ok) throw new Error('release-writes');
+    },
+    /** Searches that reached core since it started. */
+    coreSearches: async () => {
+      const result = await core('searches');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
+    /** Core holds the searches and snippet requests that reach it until they are released. */
+    holdSearches: async () => {
+      if (!(await core('hold-searches')).ok) throw new Error('hold-searches');
+    },
+    /** Lets the held searches run; returns how many there were. */
+    releaseSearches: async () => {
+      const result = await core('release-searches');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
+    /** Searches and snippet requests core holds now. */
+    heldSearches: async () => {
+      const result = await core('held-searches');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
+    /** Core holds the recent searches' job at the head of its queue until released. */
+    holdRecent: async () => {
+      if (!(await core('hold-recent')).ok) throw new Error('hold-recent');
+    },
+    /** Stops holding recent jobs; returns how many were held. */
+    releaseRecent: async () => {
+      const result = await core('release-recent');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
+    /** Recent jobs core holds now. */
+    heldRecent: async () => {
+      const result = await core('held-recent');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
+    /** The next wipe of the recent searches fails in core, deleting nothing. */
+    failRecentWipe: async () => {
+      if (!(await core('fail-recent-wipe')).ok) throw new Error('fail-recent-wipe');
+    },
+    /** Recordings of recent searches that reached this core. */
+    recentReceived: async () => {
+      const result = await core('recent-received');
+      return result.ok ? (result.value ?? 0) : 0;
     },
     /**
      * Holds the shell's cards queries anchored at message `rowid` in core;
@@ -443,14 +489,135 @@ export async function install(ctx: AppContext): Promise<boolean> {
       if (!result.ok) throw new Error('hold-cards');
       return result.value ?? 0;
     },
+    /** The shell's cards queries core holds now. */
+    heldCards: async () => {
+      const result = await core('held-cards');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
     /** Phase 1 writes waiting to be let through. */
     heldWrites: async () => {
       const result = await core('held-writes');
       return result.ok ? (result.value ?? 0) : 0;
     },
+    /**
+     * Lets `count` held scan steps through; null stops holding them. A scan
+     * waits before it lists the run, and again once it has listed it.
+     */
+    releaseScans: async (count: number | null) => {
+      const result = await ctx.core.request({
+        type: 'test',
+        action: 'release-scans',
+        payload: { count },
+      });
+      if (!result.ok) throw new Error('release-scans');
+    },
+    /** Scan steps waiting to be let through. */
+    heldScans: async () => {
+      const result = await core('held-scans');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
+    /** Lets `count` held index opens through; null stops holding them. */
+    releaseIndexOpens: async (count: number | null) => {
+      const result = await ctx.core.request({
+        type: 'test',
+        action: 'release-index-opens',
+        payload: { count },
+      });
+      if (!result.ok) throw new Error('release-index-opens');
+    },
+    /** Index opens waiting to be let through. */
+    heldIndexOpens: async () => {
+      const result = await core('held-index-opens');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
     indexDir: () => join(app.getPath('userData'), 'index'),
-    /** Resets the app's data, as Settings will. */
-    resetApp: () => ctx.sources.reset(),
+    /** Resets the app's data, as Settings does, without its generation check. */
+    resetApp: () => ctx.sources.reset(null),
+    /** The theme Electron gives every frame: `system`, `light` or `dark`. */
+    themeSource: () => nativeTheme.themeSource,
+    /**
+     * Sends the first app window a key as main does for one typed in the body
+     * frame, whatever has the focus: the shell's own handling is tested apart
+     * from main's.
+     */
+    frameKeyFromMain: (key: string) => {
+      const contents = [...ctx.windows.values()][0]?.win.webContents;
+      if (!contents) throw new Error('no window');
+      contents.send(IPC.frameKey, key);
+    },
+    /**
+     * Runs main's own keyboard handler for a key press in the first app
+     * window, as if typed while its focused frame has the focus. Keys the
+     * test driver sends skip that handler (the browser never pre-handles
+     * them), so the tests call it here, with any modifiers or a repeat in
+     * `more`. Returns which frame had the focus.
+     */
+    keyInFocusedFrame: (
+      key: string,
+      more: {
+        shift?: boolean;
+        control?: boolean;
+        alt?: boolean;
+        meta?: boolean;
+        isAutoRepeat?: boolean;
+        code?: string;
+      } = {},
+    ) => {
+      const contents = [...ctx.windows.values()][0]?.win.webContents;
+      if (!contents) return 'no window';
+      const frame = contents.focusedFrame;
+      const focused = !frame
+        ? 'none'
+        : frame === contents.mainFrame
+          ? 'main'
+          : frame.parent === contents.mainFrame
+            ? `child:${frame.url.split(':')[0]}`
+            : 'nested';
+      contents.emit(
+        'before-input-event',
+        { preventDefault: () => undefined },
+        {
+          type: 'keyDown',
+          key,
+          code: `Key${key.toUpperCase()}`,
+          isAutoRepeat: false,
+          isComposing: false,
+          shift: false,
+          control: false,
+          alt: false,
+          meta: false,
+          location: 0,
+          modifiers: [],
+          ...more,
+        },
+      );
+      return focused;
+    },
+    /** Chooses an app menu item by its id, as if from the given app window (the first one by default). */
+    clickMenuItem: (id: string, windowId?: number) => {
+      const item = Menu.getApplicationMenu()?.getMenuItemById(id);
+      if (!item) throw new Error('no such menu item');
+      const appWin = [...ctx.windows.values()].find(
+        (w) => windowId === undefined || w.id === windowId,
+      );
+      if (!appWin) throw new Error('no such window');
+      (item.click as (event: unknown, window: unknown, contents: unknown) => void)(
+        {},
+        appWin.win,
+        appWin.win.webContents,
+      );
+    },
+    /** The app menu: each item's id, label, role and accelerator, by submenu. */
+    appMenu: () =>
+      (Menu.getApplicationMenu()?.items ?? []).map((top) => ({
+        label: top.label,
+        items: (top.submenu?.items ?? []).map((item) => ({
+          id: item.id,
+          label: item.label,
+          role: item.role ?? null,
+          accelerator: item.accelerator ?? null,
+        })),
+      })),
   };
   (globalThis as { __pevTest?: typeof api }).__pevTest = api;
 

@@ -3,9 +3,17 @@
 // one of them expanded in the reader. Like the list, only a window of cards
 // around what is on screen is held, read again when the index moves on or the
 // view leaves it. Each read follows the expanded message, so a merge or split
-// keeps the expansion. If the expanded message is gone, the nearest card
-// (the next newer one first) opens in its place; with no card left, the
-// reader closes and its view is revoked.
+// keeps the expansion, and a move steps it to the next newer or older card.
+// Moves made before the cards they need are held add up: the cards around the
+// expanded one are read, then those around where the moves end, and only the
+// card there opens.
+// If the expanded message is gone, the nearest card (the next newer one
+// first) opens in its place; with no card left, the reader closes and its
+// view is revoked.
+// A conversation opened from a result names that search in its reads: the
+// header then shows how many of its messages match. That count and the
+// message count are shown as a pair from one snapshot of the index, never
+// from an older snapshot than the pair shown.
 
 import {
   CARDS_AFTER,
@@ -25,6 +33,15 @@ export const CARD_MARGIN = 10;
 /** A position past any conversation's end: the index places it at the last card. */
 const PAST_END = 2 ** 31;
 
+/** The header's counts: the messages and, from a search, those that match, from one snapshot. */
+export interface CountPair {
+  total: number;
+  /** Null when the conversation isn't shown from a search. */
+  matching: number | null;
+  /** The revision of the snapshot the pair is from. */
+  rev: number;
+}
+
 export interface CardsSnapshot {
   /** A conversation is shown. */
   shown: boolean;
@@ -32,6 +49,12 @@ export interface CardsSnapshot {
   subject: string;
   /** Messages in the conversation. */
   total: number;
+  /** The header's counts; null until the first read. */
+  count: CountPair | null;
+  /** The search the conversation was opened from, by its query ID; null if none. */
+  queryId: number | null;
+  /** Its folder and label IDs, as its list row has them. */
+  labelIds: string[];
   /** The position of the first card held. */
   start: number;
   cards: CardRow[];
@@ -63,6 +86,9 @@ const EMPTY: CardsSnapshot = {
   threadId: null,
   subject: '',
   total: 0,
+  count: null,
+  queryId: null,
+  labelIds: [],
   start: 0,
   cards: [],
   expanded: null,
@@ -85,6 +111,13 @@ export class CardsModel {
   private again = false;
   /** The next read anchors at the expanded card's place, wherever the screen is. */
   private seekExpanded = false;
+  /** Cards to move the expansion by once the expanded card's neighbours are read. */
+  private pendingMove = 0;
+  /**
+   * Where waiting moves end, once that is known and its card isn't held: the
+   * next read anchors there.
+   */
+  private moveTarget: number | null = null;
   /** Conversation changes since the start; a read for an older one is dropped. */
   private epoch = 0;
 
@@ -96,6 +129,15 @@ export class CardsModel {
 
   get snapshot(): CardsSnapshot {
     return this.snap;
+  }
+
+  /**
+   * Which showing of a conversation is on screen, or null with none shown.
+   * Each show() starts a new one and hide() ends it; expanding a card or a
+   * read that finds the conversation merged or split keeps it.
+   */
+  get showing(): number | null {
+    return this.snap.shown ? this.epoch : null;
   }
 
   private set(patch: Partial<CardsSnapshot>): void {
@@ -120,20 +162,24 @@ export class CardsModel {
   /**
    * Shows the conversation that holds message `rowid`, with that message
    * expanded and opened in the reader. `rowid` is the conversation's newest
-   * message, as the list opens it: if it is gone before the first read finds
-   * its place, the newest card left takes its place.
+   * message, as the list opens it, or its newest matching one, as a result
+   * opens it with its search's `queryId`: if it is gone before the first
+   * read finds its place, the newest card left takes its place.
    */
-  show(rowid: number, threadId: number | null): void {
+  show(rowid: number, threadId: number | null, queryId: number | null = null): void {
     this.epoch += 1;
     this.first = 0;
     this.last = 0;
     this.selected = rowid;
     this.expandedKey = null;
     this.seekExpanded = false;
+    this.pendingMove = 0;
+    this.moveTarget = null;
     this.snap = {
       ...EMPTY,
       shown: true,
       threadId,
+      queryId,
       expanded: rowid,
       scrollId: this.snap.scrollId + 1,
       shiftId: this.snap.shiftId,
@@ -148,8 +194,47 @@ export class CardsModel {
     this.epoch += 1;
     this.selected = null;
     this.expandedKey = null;
+    this.pendingMove = 0;
+    this.moveTarget = null;
     this.snap = { ...EMPTY, scrollId: this.snap.scrollId, shiftId: this.snap.shiftId };
     this.onChange();
+  }
+
+  /**
+   * The conversation shown is now owned by a result of the search `queryId`:
+   * its header counts the messages that match, from the next read on.
+   */
+  setSearch(queryId: number | null): void {
+    if (!this.snap.shown || queryId === this.snap.queryId) return;
+    this.set({ queryId, count: this.snap.count && { ...this.snap.count, matching: null } });
+    this.refresh();
+  }
+
+  /** The messages of the cards on screen, oldest first. */
+  visibleRowids(): number[] {
+    const rowids: number[] = [];
+    for (let i = this.first; i <= this.last; i += 1) {
+      const card = this.cardAt(i);
+      if (card) rowids.push(card.rowid);
+    }
+    return rowids;
+  }
+
+  /**
+   * The header's counts after an answer read for the search `sentFor`. An
+   * answer from an older snapshot than the pair shown changes nothing. One
+   * with a matching count replaces both, unless it was read for a search left
+   * behind since; one without (core counts whenever the snapshot moved on, so
+   * it is from the same snapshot) replaces the message count only.
+   */
+  private nextCount(answer: CardsWindow, sentFor: number | null): CountPair {
+    const shown = this.snap.count;
+    if (shown !== null && answer.rev < shown.rev) return shown;
+    if (!answer.searched) return { total: answer.total, matching: null, rev: answer.rev };
+    if (answer.matching !== undefined && sentFor === this.snap.queryId) {
+      return { total: answer.total, matching: answer.matching, rev: answer.rev };
+    }
+    return { total: answer.total, matching: shown?.matching ?? null, rev: answer.rev };
   }
 
   /**
@@ -158,10 +243,64 @@ export class CardsModel {
    */
   expand(card: CardRow): boolean {
     if (!this.snap.shown || card.rowid === this.snap.expanded) return false;
+    // A card expanded by hand replaces any move still waiting for a read.
+    this.pendingMove = 0;
+    this.moveTarget = null;
     this.expandedKey = { time: card.time, rowid: card.rowid };
     this.set({ expanded: card.rowid, scrollId: this.snap.scrollId + 1 });
     this.actions.open(card.rowid);
     return true;
+  }
+
+  /**
+   * Expands the card `step` places from the expanded one: 1 is the next newer,
+   * -1 the next older. Nothing happens past either end. If that card isn't
+   * held, the cards around the expanded one are read first. Returns false if
+   * there is no card to move to.
+   */
+  move(step: 1 | -1): boolean {
+    const { shown, ready, expanded, total } = this.snap;
+    if (!shown || !ready || expanded === null) return false;
+    if (this.moveTarget !== null) {
+      // The cards where the waiting moves end are being read: this one adds to them.
+      const to = Math.max(0, Math.min(total - 1, this.moveTarget + step));
+      if (to === this.moveTarget) return false;
+      this.moveTarget = to;
+      this.refresh();
+      return true;
+    }
+    const at = this.expandedIndex();
+    if (at !== null && this.pendingMove === 0) {
+      const to = at + step;
+      if (to < 0 || to >= total) return false;
+      const card = this.cardAt(to);
+      if (card) return this.expand(card);
+    }
+    // The expanded card or its neighbour isn't held: read at its place, then move.
+    this.pendingMove += step;
+    this.seekExpanded = true;
+    this.refresh();
+    return true;
+  }
+
+  /**
+   * Moves the expansion by the moves that waited for a read of the expanded
+   * card's place, within the conversation. If the card where they end isn't
+   * held, the cards there are read first, and it opens then.
+   */
+  private applyMove(): void {
+    const step = this.pendingMove;
+    this.pendingMove = 0;
+    const at = this.expandedIndex();
+    if (at === null) return;
+    const to = Math.max(0, Math.min(this.snap.total - 1, at + step));
+    const card = this.cardAt(to);
+    if (card) {
+      this.expand(card);
+      return;
+    }
+    this.moveTarget = to;
+    this.again = true;
   }
 
   /** The positions on screen, first and last; reads more cards if they aren't held. */
@@ -201,10 +340,20 @@ export class CardsModel {
   }
 
   /**
-   * The anchor: the expanded card if it is on screen (or a read must find
-   * its place), else the top card on screen.
+   * The anchor: where waiting moves end, while those cards are read; else
+   * the expanded card if it is on screen (or a read must find its place);
+   * else the top card on screen.
    */
-  private anchor(): { anchor: CardsAnchor; index: number; atExpanded: boolean } {
+  private anchor(): {
+    anchor: CardsAnchor;
+    index: number;
+    atExpanded: boolean;
+    atTarget: boolean;
+  } {
+    if (this.moveTarget !== null) {
+      const index = this.moveTarget;
+      return { anchor: { index }, index, atExpanded: false, atTarget: true };
+    }
     const { expanded } = this.snap;
     const at = this.expandedIndex();
     const onScreen = at !== null && at >= this.first && at <= this.last;
@@ -218,6 +367,7 @@ export class CardsModel {
         },
         index,
         atExpanded: true,
+        atTarget: false,
       };
     }
     const top = this.cardAt(this.first);
@@ -230,17 +380,19 @@ export class CardsModel {
           },
           index: this.first,
           atExpanded: false,
+          atTarget: false,
         }
-      : { anchor: { index: this.first }, index: this.first, atExpanded: false };
+      : { anchor: { index: this.first }, index: this.first, atExpanded: false, atTarget: false };
   }
 
   /** Reads the cards once; false if no answer came. */
   private async readOnce(): Promise<boolean> {
     const epoch = this.epoch;
-    const { anchor, index, atExpanded } = this.anchor();
+    const { anchor, index, atExpanded, atTarget } = this.anchor();
     const expanded = this.snap.expanded;
     const follow = [...new Set([expanded, this.selected].filter((r): r is number => r !== null))];
     const screen = this.last - this.first + 1;
+    const { queryId, count } = this.snap;
     const answer = await this.read({
       op: 'cards',
       follow,
@@ -248,6 +400,15 @@ export class CardsModel {
       anchor,
       before: CARDS_ABOVE,
       after: Math.min(CARDS_AFTER, screen + 2 * CARD_MARGIN + CARDS_ABOVE),
+      // The count is asked for whenever the one shown isn't from this snapshot.
+      ...(queryId === null
+        ? {}
+        : {
+            search: {
+              queryId,
+              countRev: count !== null && count.matching !== null ? count.rev : null,
+            },
+          }),
     });
     if (!answer) return false;
     if (epoch !== this.epoch) return true;
@@ -259,11 +420,15 @@ export class CardsModel {
     if (answer.threadId === null) {
       // Nothing of the conversation is left.
       this.seekExpanded = false;
+      this.pendingMove = 0;
+      this.moveTarget = null;
       const hadExpanded = expanded !== null;
       this.set({
         threadId: null,
         subject: '',
         total: 0,
+        count: null,
+        labelIds: [],
         start: 0,
         cards: [],
         expanded: null,
@@ -277,13 +442,17 @@ export class CardsModel {
     if (removed && !atExpanded) {
       // This window may not hold the place of the card that went: read there.
       // Its view and any open of it are revoked now, not once that read is back.
+      // Moves waiting for it are dropped with it.
       this.seekExpanded = true;
+      this.moveTarget = null;
       this.again = true;
       this.set({ threadId: answer.threadId });
       this.actions.close();
       return true;
     }
-    this.seekExpanded = false;
+    // Only a read at the expanded card's place finds it: a read at the screen
+    // or at a move's end leaves a waiting search for it as it is.
+    if (atExpanded) this.seekExpanded = false;
     const moved = answer.anchorFound && answer.anchor !== null ? answer.anchor - index : 0;
     // Cards on screen stay in place by a shift; on a first read or a new
     // expansion the expanded card's header scrolls to the top instead.
@@ -302,6 +471,8 @@ export class CardsModel {
       threadId: answer.threadId,
       subject: answer.subject,
       total: answer.total,
+      count: this.nextCount(answer, queryId),
+      labelIds: answer.labelIds,
       start: answer.start,
       cards: answer.cards,
       expanded: next,
@@ -313,8 +484,29 @@ export class CardsModel {
     this.first = Math.max(0, this.first + moved);
     this.last = Math.max(this.first, this.last + moved);
     if (removed) {
+      // The nearest card opens in the removed one's place; a waiting move is dropped.
+      this.pendingMove = 0;
+      this.moveTarget = null;
       if (next !== null) this.actions.open(next);
       else this.actions.close();
+    } else if (atTarget && this.moveTarget !== null) {
+      // The cards where the moves end: open that card, or read there again if
+      // more moves took them past this window meanwhile.
+      const card = this.cardAt(Math.max(0, Math.min(this.moveTarget, answer.total - 1)));
+      if (card) {
+        this.moveTarget = null;
+        this.expand(card);
+      } else {
+        this.again = true;
+      }
+    } else if (this.pendingMove !== 0) {
+      // Moves made while the screen's cards were read wait for the expanded card's.
+      if (atExpanded) {
+        this.applyMove();
+      } else {
+        this.seekExpanded = true;
+        this.again = true;
+      }
     }
     return true;
   }
