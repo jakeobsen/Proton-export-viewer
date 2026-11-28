@@ -406,7 +406,7 @@ export function registerIpc(ctx: AppContext): void {
       hasHtml: message.hasHtml,
       remote: message.remote,
       htmlTooLarge: message.htmlTooLarge,
-      truncated: message.truncated,
+      cut: message.cut,
       headers: message.headers,
     };
   });

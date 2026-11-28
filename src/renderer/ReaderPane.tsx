@@ -161,9 +161,9 @@ function Lines({ rowid, view }: { rowid: number; view: ReaderView }) {
           </button>
         </div>
       )}
-      {view.truncated && (
+      {view.cut && (
         <div className="rp-line rp-truncated">
-          <b>First 1 MB shown</b>
+          <b>{view.cut === 'size' ? 'First 1 MB shown' : 'Only part of this message shown'}</b>
         </div>
       )}
     </>
