@@ -16,11 +16,13 @@ import { openReportFrom } from './Report';
 import './settings.css';
 import {
   changeSetting,
+  clearRecentSearches,
   forgetExport,
   getShellState,
   rebuildIndex,
   refreshGeneration,
   resetApp,
+  setKeepRecentSearches,
   showMail,
   useShellState,
 } from './shell';
@@ -49,6 +51,7 @@ function actionNotice(result: SourceActionResult | DoneResult): string | null {
   if (!result.ok) {
     if (result.code === 'refused') return "Not reset: an export is inside the app's data folder.";
     if (result.code === 'failed') return "Couldn't open the logs folder.";
+    if (result.code === 'core_unavailable') return 'Try again.';
     return 'Export changed. Try again.';
   }
   if (!('outcome' in result)) return null;
@@ -280,6 +283,22 @@ function IndexTab({ read, busy, say }: { read: Read; busy: boolean; say: Say }) 
             </button>
             <button
               type="button"
+              className="btn"
+              disabled={busy}
+              onClick={() => void clearRecentSearches(index.sourceKey, generation).then(say)}
+            >
+              Clear recent searches
+            </button>
+            <KeepRecent
+              key={`${index.sourceKey}:${generation}:${index.keepRecentSearches}`}
+              sourceKey={index.sourceKey}
+              generation={generation}
+              keep={index.keepRecentSearches}
+              busy={busy}
+              say={say}
+            />
+            <button
+              type="button"
               className="btn danger"
               disabled={busy}
               aria-expanded={forgetting}
@@ -374,6 +393,41 @@ function LogsTab({ read, say }: { read: Read; say: Say }) {
         </div>
       </div>
     </section>
+  );
+}
+
+/** "Keep recent searches": a switch for the export Settings shows. */
+function KeepRecent({
+  sourceKey,
+  generation,
+  keep,
+  busy,
+  say,
+}: {
+  sourceKey: string;
+  generation: number;
+  keep: boolean;
+  busy: boolean;
+  say: Say;
+}) {
+  const [on, setOn] = useState(keep);
+  return (
+    <label className="switch">
+      <input
+        type="checkbox"
+        role="switch"
+        checked={on}
+        disabled={busy}
+        onChange={(e) => {
+          const next = e.target.checked;
+          void setKeepRecentSearches(sourceKey, next, generation).then((result) => {
+            if (result.ok) setOn(next);
+            say(result);
+          });
+        }}
+      />
+      Keep recent searches
+    </label>
   );
 }
 

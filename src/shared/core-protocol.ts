@@ -18,6 +18,7 @@ import type {
   WorkerSource,
   WorkerSourced,
 } from './reader-protocol';
+import type { RecentAnswer, RecentJob } from './recent-search';
 import type { RunIdentity, ScanSummary, Stamp } from './sources';
 
 /** The export run core serves. `root` is null while the run is unavailable. */
@@ -227,6 +228,14 @@ export interface IndexQueryRequest {
   query: IndexQuery;
 }
 
+/** A job on the open source's recent searches. Core runs them in the order they come. */
+export interface RecentRequest {
+  type: 'recent';
+  reqId: number;
+  stamp: Stamp;
+  job: RecentJob;
+}
+
 export type CoreRequest =
   | OpenRequest
   | PingRequest
@@ -239,6 +248,7 @@ export type CoreRequest =
   | SourceRequest
   | IndexRequest
   | IndexQueryRequest
+  | RecentRequest
   | ForgetRequest
   | ResetRequest;
 
@@ -271,6 +281,8 @@ export type CoreResult =
       index?: IndexOpened;
       answer?: IndexAnswer;
       progress?: IndexProgress;
+      /** What a `recent` job did. */
+      recent?: RecentAnswer;
     }
   | {
       type: 'result';

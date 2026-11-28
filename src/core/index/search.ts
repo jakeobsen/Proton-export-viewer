@@ -25,7 +25,14 @@ import type {
 } from '../../shared/index-types';
 import { MAX_SNIPPET_THREADS } from '../../shared/index-types';
 import type { MatchColumn } from '../../shared/reader-protocol';
-import { parseQuery, wordsOf, type ParsedQuery, type Term, type TextColumn } from '../search/query';
+import type { Chip, SearchSpec } from '../../shared/search-chips';
+import {
+  searchTerms,
+  wordsOf,
+  type ParsedQuery,
+  type Term,
+  type TextColumn,
+} from '../search/query';
 import { markedToRanges, stripMarks } from '../search/ranges';
 import { SYSTEM_LABELS } from './labels';
 import { foldAddress } from './metadata';
@@ -125,6 +132,21 @@ export function labelIds(db: Db, scope: 'label' | 'folder', name: string): strin
 }
 
 /**
+ * A chip's folder or label ID, if the export has it in that scope: a label
+ * for a Label chip; a user folder or a system folder for a Folder chip. An ID
+ * the export doesn't have, or one of the other scope, matches nothing.
+ */
+export function labelIdById(db: Db, scope: 'label' | 'folder', id: string): string[] {
+  const r = db.stmt('SELECT kind FROM labels WHERE proton_id = ?').get(id);
+  if (r) {
+    const kind = String(r.kind);
+    const fits = scope === 'label' ? kind === 'label' : kind === 'folder' || kind === 'system';
+    return fits ? [id] : [];
+  }
+  return scope === 'folder' && SYSTEM_FOLDER_NAMES.some(([system]) => system === id) ? [id] : [];
+}
+
+/**
  * The stored address starts with the value, ignoring case: both are folded
  * by JavaScript (the stored one when it was written), so letters outside
  * ASCII compare without case too.
@@ -144,7 +166,10 @@ function condition(db: Db, term: Exclude<Term, { kind: 'text' }>): Condition {
       };
     }
     case 'label': {
-      const ids = labelIds(db, term.scope, term.name);
+      const ids =
+        term.id === undefined
+          ? labelIds(db, term.scope, term.name)
+          : labelIdById(db, term.scope, term.id);
       if (ids.length === 0) return { sql: '0', params: [] };
       return {
         sql: `EXISTS (SELECT 1 FROM message_labels ml WHERE ml.message_rowid = m.rowid
@@ -404,8 +429,8 @@ const BODY_COLUMN = 3;
  * whole search. Only the search's positive words are marked: negated words
  * and the words that narrow an address match aren't.
  */
-export function matchInfo(db: Db, rowid: number, text: string): IndexMatch | null {
-  const parsed = parseQuery(text);
+export function matchInfo(db: Db, rowid: number, search: SearchSpec): IndexMatch | null {
+  const parsed = searchTerms(search);
   const built = buildQuery(db, parsed);
   if (!built.hasText || built.match === null) return null;
   const whole = hits(built, false, 'one');
@@ -493,7 +518,7 @@ export function coverageOf(db: Db): SearchCoverage {
 
 /** One page of a search: matching conversations by date or relevance. */
 export function searchPage(db: Db, call: SearchQuery): SearchPage {
-  const built = buildQuery(db, parseQuery(call.text));
+  const built = buildQuery(db, searchTerms(call));
   // With no words to rank by, results are by date only.
   const sort: SearchSort = call.sort === 'relevance' && built.hasText ? 'relevance' : 'date';
   const page = (
@@ -573,7 +598,7 @@ export function searchPage(db: Db, call: SearchQuery): SearchPage {
  */
 export function searchSnippets(db: Db, call: SnippetsQuery): SearchSnippets {
   const threadIds = [...new Set(call.threadIds)].slice(0, MAX_SNIPPET_THREADS);
-  const built = buildQuery(db, parseQuery(call.text));
+  const built = buildQuery(db, searchTerms(call));
   const none = (dropped = 0, byThread = new Map<number, MarkedSnippet>()): SearchSnippets => ({
     queryId: call.queryId,
     snippets: threadIds.map((threadId) => ({ threadId, snippet: byThread.get(threadId) ?? null })),
@@ -621,7 +646,7 @@ export function cardsAnswer(db: Db, call: CardsQuery, rev: number): CardsWindow 
   const window = cardsWindow(db, call);
   const text = call.search?.text;
   if (text === undefined || window.threadId === null) return { ...window, rev, searched: false };
-  const built = buildQuery(db, parseQuery(text));
+  const built = buildQuery(db, searchTerms({ text, chips: call.search?.chips ?? [] }));
   const matched = matchedAmong(
     db,
     built,
@@ -641,14 +666,16 @@ export function cardsAnswer(db: Db, call: CardsQuery, rev: number): CardsWindow 
 
 /**
  * The snippets of those of these messages that match a query with words,
- * matched as the search matches them, with their ranges checked.
+ * matched as the search (its text and chips) matches them, with their ranges
+ * checked.
  */
 export function matchedSnippets(
   db: Db,
   text: string,
   rowids: number[],
+  chips: Chip[] = [],
 ): { byRowid: Map<number, MarkedSnippet>; dropped: number } {
-  const built = buildQuery(db, parseQuery(text));
+  const built = buildQuery(db, searchTerms({ text, chips }));
   if (!built.hasText || built.match === null) return { byRowid: new Map(), dropped: 0 };
   return snippets(db, built.match, [...matchedAmong(db, built, rowids)]);
 }

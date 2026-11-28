@@ -24,6 +24,7 @@ import type {
   IdentifyRequest,
   IndexQueryRequest,
   IndexRequest,
+  RecentRequest,
   ResetRequest,
   ScanRequest,
 } from '../shared/core-protocol';
@@ -32,6 +33,7 @@ import { errorClassOf } from '../shared/log/schema';
 import type { FileIdentity } from '../shared/reader-protocol';
 import type { Logger } from '../shared/log/writer';
 import type { ScanSummary } from '../shared/sources';
+import type { SearchSpec } from '../shared/search-chips';
 import {
   ContainmentError,
   addEntry,
@@ -210,7 +212,9 @@ export class SourceSession {
     return this.root !== null;
   }
 
-  handle(request: IdentifyRequest | ScanRequest | IndexRequest | IndexQueryRequest): void {
+  handle(
+    request: IdentifyRequest | ScanRequest | IndexRequest | IndexQueryRequest | RecentRequest,
+  ): void {
     const current = this.gate.current;
     if (!current) {
       this.send({ type: 'result', reqId: request.reqId, ok: false, code: 'no_source' });
@@ -222,8 +226,13 @@ export class SourceSession {
     }
     const root = this.root;
     const stamp: Stamp = { ...current };
-    // An unavailable run can still be browsed from its index.
-    if (root === null && request.type !== 'index' && request.type !== 'index-query') {
+    // An unavailable run can still be browsed from its index, and its recent searches kept.
+    if (
+      root === null &&
+      request.type !== 'index' &&
+      request.type !== 'index-query' &&
+      request.type !== 'recent'
+    ) {
       this.send({ type: 'result', reqId: request.reqId, ok: false, code: 'unavailable' });
       return;
     }
@@ -234,7 +243,9 @@ export class SourceSession {
           ? this.scan(request, root!, stamp)
           : request.type === 'index'
             ? this.openIndex(request, root, stamp)
-            : this.query(request, stamp);
+            : request.type === 'recent'
+              ? this.recent(request, stamp)
+              : this.query(request, stamp);
     work.catch((err: unknown) => {
       // Only the class and, for a thread's error, its reason: never a message.
       this.log.warn(
@@ -579,6 +590,30 @@ export class SourceSession {
   }
 
   /**
+   * Runs a job on the recent searches, in the order the jobs came. Only
+   * counts are logged, never a search.
+   */
+  private async recent(request: RecentRequest, stamp: Stamp): Promise<void> {
+    const service = this.index;
+    if (!service) {
+      this.send({ type: 'result', reqId: request.reqId, ok: false, code: 'no_index', stamp });
+      return;
+    }
+    if (service.isDamaged) {
+      this.send({ type: 'result', reqId: request.reqId, ok: false, code: 'damaged', stamp });
+      return;
+    }
+    const answer = await service.recent(request.job);
+    const src = { src: stamp.sourceKey };
+    if (answer.op !== 'wipe' && answer.invalid > 0) {
+      this.log.warn('recent.invalid_rows', { count: answer.invalid }, src);
+    }
+    if (answer.op === 'record') this.log.info('recent.recorded', {}, src);
+    if (answer.op === 'wipe') this.log.info('recent.cleared', { count: answer.deleted }, src);
+    this.send({ type: 'result', reqId: request.reqId, ok: true, stamp, recent: answer });
+  }
+
+  /**
    * The reader's source: the message file of an indexed message, under the
    * current generation, opened only through the contained open. A file that
    * changed since the scan is examined again and opened once more with its new
@@ -591,7 +626,7 @@ export class SourceSession {
     rowid: number,
     generation: number,
     stale: () => boolean,
-    search?: string,
+    search?: SearchSpec,
   ): Promise<ReaderFile> {
     const current = this.gate.current;
     if (!current) return { ok: false, code: 'no_source' };

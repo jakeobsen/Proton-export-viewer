@@ -49,7 +49,17 @@ export function openDb(path: string, readOnly = false, immutable = false): Db {
     target = pathToFileURL(path);
     target.searchParams.set('immutable', '1');
   }
-  const raw = new DatabaseSync(target, { readOnly: readOnly || immutable });
+  return wrap(new DatabaseSync(target, { readOnly: readOnly || immutable }));
+}
+
+/** Opens an existing database for reading and writing; it fails, creating nothing, if there is none. */
+export function openExistingDb(path: string): Db {
+  const target = pathToFileURL(path);
+  target.searchParams.set('mode', 'rw');
+  return wrap(new DatabaseSync(target));
+}
+
+function wrap(raw: DatabaseSync): Db {
   const cache = new Map<string, Statement>();
   return {
     exec: (sql) => {

@@ -49,6 +49,10 @@ const SourceSchema = z
     offline: z.boolean(),
     /** The identity of this source's index, written when the index is created. */
     dbUuid: Uuid.nullable().optional(),
+    /** "Keep recent searches"; absent means on. */
+    keepRecentSearches: z.boolean().optional(),
+    /** The switch was turned off and no wipe of its recent searches has committed since. */
+    recentWipePending: z.boolean().optional(),
   })
   .strict();
 

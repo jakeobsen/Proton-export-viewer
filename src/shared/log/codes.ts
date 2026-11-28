@@ -107,6 +107,11 @@ export const LOG_CODES = [
   'settings.write_failed',
   'logs.open_failed',
   'search.ranges_dropped',
+  'recent.recorded',
+  'recent.dropped',
+  'recent.wipe_failed',
+  'recent.cleared',
+  'recent.invalid_rows',
 ] as const;
 
 /** Codes that only exist in builds with test hooks. */
@@ -146,6 +151,9 @@ export const REASONS = [
   'not_main_frame',
   'bad_origin',
   'stale_generation',
+  'off',
+  'stale',
+  'wipe_owed',
   'superseded',
   'unknown_stub',
   'core_unavailable',
