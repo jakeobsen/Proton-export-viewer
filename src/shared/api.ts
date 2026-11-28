@@ -3,12 +3,15 @@
 
 import type { LinkAction } from './constants';
 import type {
+  CardsQuery,
+  CardsWindow,
   IndexProgress,
   ListWindow,
   SearchDateKey,
   SearchPage,
   SearchRankKey,
   Sidebar,
+  ThreadSnippet,
   WindowQuery,
 } from './index-types';
 import type { MessageHeaders, OpenMode } from './reader-protocol';
@@ -19,10 +22,12 @@ export const IPC = {
   ping: 'pev:ping',
   openStub: 'pev:open-stub',
   open: 'pev:open',
+  closeView: 'pev:close-view',
   log: 'pev:log',
   report: 'pev:report',
   linkDialog: 'pev:link-dialog',
   linkAction: 'pev:link-action',
+  cardKey: 'pev:card-key',
   sources: 'pev:sources',
   chooseFolder: 'pev:choose-folder',
   openExport: 'pev:open-export',
@@ -33,6 +38,7 @@ export const IPC = {
   index: 'pev:index',
   indexChanged: 'pev:index-changed',
   search: 'pev:search',
+  searchSnippets: 'pev:search-snippets',
 } as const;
 
 export type RejectCode =
@@ -78,15 +84,15 @@ export type MessageOpenResult =
       remote: number;
       /** HTML was asked for but is too large to show by default; "html-anyway" shows it. */
       htmlTooLarge: boolean;
-      /** Only the first part of the body's plain text is shown. */
-      truncated: boolean;
+      /** Why only part of the body is shown: its size, or its number of parts; null if whole. */
+      cut: 'size' | 'parts' | null;
       headers: MessageHeaders;
     }
   | { ok: true; openId: number; outcome: 'fallback' }
   | Rejected;
 
 /** What the shell reads from the open export's index. */
-export type ShellIndexQuery = { op: 'sidebar' } | WindowQuery;
+export type ShellIndexQuery = { op: 'sidebar' } | WindowQuery | CardsQuery;
 
 export type IndexResult<T> =
   { ok: true; generation: number; answer: T; progress: IndexProgress } | Rejected;
@@ -104,12 +110,16 @@ export interface LinkPrompt {
   title: string;
   /** The URL, with any non-ASCII host in punycode. */
   url: string;
-  /** Where the host is in `url`, or null when there is none. */
+  /** Where the host, or a mail link's first domain, is in `url`; null when there is none. */
   host: { start: number; end: number } | null;
   /** The title names a host other than the URL's. */
   mismatch: boolean;
-  /** The URL's host has non-ASCII characters. */
+  /** The URL's host, or a mail recipient's domain, has non-ASCII characters. */
   lookalike: boolean;
+  /** The link writes an email: the open choice goes to the mail app. */
+  mail: boolean;
+  /** A mail recipient's address can be read more than one way. */
+  unclear: boolean;
 }
 
 export type LinkActionResult = { ok: true } | Rejected;
@@ -123,6 +133,20 @@ export type SearchRequest =
 export type SearchResult =
   | { ok: true; generation: number; queryId: number; page: SearchPage; progress: IndexProgress }
   | Rejected;
+
+/** The keys that move the expanded card: `n` to the next newer, `p` to the next older. */
+export type CardKeyName = 'n' | 'p';
+
+/** Snippets for rows of one of this window's searches, named by its query ID. */
+export interface SnippetsRequest {
+  queryId: number;
+  threadIds: number[];
+}
+
+export type SnippetsResult =
+  { ok: true; generation: number; queryId: number; snippets: ThreadSnippet[] } | Rejected;
+
+export type CloseViewResult = { ok: true } | Rejected;
 
 export type ErrorKind = 'uncaught' | 'rejection' | 'error';
 
@@ -138,6 +162,8 @@ export interface PevApi {
   ping(generation: number): Promise<PingResult>;
   openStub(id: string, generation: number): Promise<OpenResult>;
   open(rowid: number, mode: OpenMode, generation: number): Promise<MessageOpenResult>;
+  /** Closes the reader: its view and any open still under way are revoked. */
+  closeView(generation: number): Promise<CloseViewResult>;
   log(
     level: 'error' | 'warn' | 'info',
     code: string,
@@ -149,6 +175,8 @@ export interface PevApi {
   onLinkDialog(listener: (prompt: LinkPrompt) => void): () => void;
   /** The user's choice in the link dialog. Only the dialog's id goes to main. */
   linkAction(dialogId: string, action: LinkAction, generation: number): Promise<LinkActionResult>;
+  /** Called with `n` or `p` typed while the body frame has the focus. */
+  onCardKey(listener: (key: CardKeyName) => void): () => void;
   sources(generation: number): Promise<SourcesResult>;
   chooseFolder(generation: number): Promise<SourceActionResult>;
   openExport(sourceKey: string, generation: number): Promise<SourceActionResult>;
@@ -162,6 +190,8 @@ export interface PevApi {
   sidebar(generation: number): Promise<IndexResult<Sidebar>>;
   /** A stretch of a folder's or label's conversations. */
   listWindow(query: WindowQuery, generation: number): Promise<IndexResult<ListWindow>>;
+  /** A stretch of one conversation's cards. */
+  cards(query: CardsQuery, generation: number): Promise<IndexResult<CardsWindow>>;
   /** Called as indexing moves on or the index's state changes. */
   onIndexChanged(listener: (update: IndexUpdate) => void): () => void;
   /**
@@ -170,4 +200,9 @@ export interface PevApi {
    * 'superseded'.
    */
   search(request: SearchRequest, generation: number): Promise<SearchResult>;
+  /**
+   * Snippets for result rows that came without one, for a search this window
+   * made; one of an older search is answered as 'superseded'.
+   */
+  searchSnippets(request: SnippetsRequest, generation: number): Promise<SnippetsResult>;
 }

@@ -8,10 +8,11 @@
 import { describe, expect, it } from 'vitest';
 import type { MessageRow } from '../../src/core/index/metadata';
 import { threadOfMessage } from '../../src/core/index/queries';
+import { BODY_STATE, CAPPED, META_STATE } from '../../src/core/index/schema';
 import { searchPage } from '../../src/core/index/search';
-import { BODY_STATE, META_STATE } from '../../src/core/index/schema';
 import { asNumber, type Db } from '../../src/core/index/sql';
 import {
+  BODY_TOO_LARGE,
   PAIR_META_MISSING,
   classify,
   groupMembers,
@@ -23,6 +24,7 @@ import {
   type IndexWriter,
   type PairFiles,
   type Phase1Stats,
+  type Phase2Item,
   type ReconcilePlan,
   type StoredPair,
 } from '../../src/core/index/writer';
@@ -1005,5 +1007,274 @@ describe('a changed message that lands alone', () => {
     ];
     expect(anchors.filter((a) => a === strong)).toHaveLength(1);
     expect(new Set(anchors).size).toBe(anchors.length);
+  });
+});
+
+// --- Phase 2 ---------------------------------------------------------------------
+
+/** A phase 2 result for a message, read for `rev`. */
+function bodyItem(id: string, rev: number, extra: Partial<Phase2Item> = {}): Phase2Item {
+  return {
+    protonId: id,
+    rev,
+    state: BODY_STATE.indexed,
+    body: `body words of ${id}`,
+    attachments: [],
+    attachmentText: '',
+    attachmentsCapped: false,
+    error: null,
+    ...extra,
+  };
+}
+
+/** A result's attachments: rows and the names' text. */
+const named = (...names: string[]): Partial<Phase2Item> => ({
+  attachments: names.map((name, i) => ({
+    name,
+    mime: 'application/pdf',
+    contentId: `c${i}`,
+    size: 10 + i,
+  })),
+  attachmentText: names.join('\n'),
+});
+
+let queries = 0;
+/** The message IDs a search finds. */
+function found(db: Db, text: string): string[] {
+  queries += 1;
+  const page = searchPage(db, { op: 'search', queryId: queries, text, sort: 'date', after: null });
+  return page.rows
+    .map((r) =>
+      String(
+        db.stmt('SELECT proton_id FROM messages WHERE rowid = ?').get(r.anchorRowid)?.proton_id,
+      ),
+    )
+    .sort();
+}
+
+const attachmentRows = (db: Db, id: string) =>
+  db
+    .stmt(
+      'SELECT idx, filename, mime, size, content_id, source FROM attachments WHERE message_rowid = ? ORDER BY idx',
+    )
+    .all(rowidOf(db, id));
+
+const cappedOf = (db: Db, id: string) =>
+  count(db, 'SELECT capped FROM messages WHERE proton_id = ?', id);
+
+describe('phase 2 results', () => {
+  it('list the messages waiting for their text, newest first, with their files', () => {
+    const f = folder()
+      .add(message('old', ['old'], { time: 100 }))
+      .add(message('new', ['new'], { time: 300 }))
+      .add(message('tie', ['tie'], { time: 300 }))
+      .add(message('nofile', ['nofile'], { time: 400 }), { eml: null })
+      .add(message('nometa', ['nometa']), { meta: null });
+    f.reconcile();
+    const order = f.writer.bodyOrder();
+    // Ties go to the higher rowid; no message file, or no message, nothing to read.
+    expect(order).toEqual([rowidOf(f.db, 'tie'), rowidOf(f.db, 'new'), rowidOf(f.db, 'old')]);
+    const todo = f.writer.bodyTodo(order);
+    expect(todo.map((t) => t.protonId)).toEqual(['tie', 'new', 'old']);
+    const eml = f.files('new').eml!;
+    expect(todo[1]).toEqual({
+      protonId: 'new',
+      rev: asNumber(pairRow(f.db, 'new')?.rev),
+      rel: eml.rel,
+      size: eml.size,
+      mtimeNs: String(eml.mtimeNs),
+      dev: String(eml.dev),
+      ino: String(eml.ino),
+    });
+    // Once written, a message no longer waits.
+    f.writer.phase2Batch(STAMP, [bodyItem('new', todo[1]!.rev)]);
+    expect(f.writer.bodyTodo(order).map((t) => t.protonId)).toEqual(['tie', 'old']);
+    expect(f.writer.bodyOrder()).toEqual([rowidOf(f.db, 'tie'), rowidOf(f.db, 'old')]);
+  });
+
+  it('write text and attachments for the rev they were read for, and none after the file changes or goes', () => {
+    const f = folder()
+      .add(message('a', ['a']))
+      .add(message('b', ['b']));
+    f.reconcile();
+    const rev = (id: string) => asNumber(pairRow(f.db, id)?.rev);
+    const first = rev('a');
+    const stats = f.writer.phase2Batch(STAMP, [bodyItem('a', first, named('old report.pdf'))]);
+    expect(stats).toMatchObject({ stale: false, written: 1, dropped: 0, rest: 0, failed: [] });
+    expect(pairRow(f.db, 'a')).toMatchObject({ body_state: BODY_STATE.indexed, error_code: null });
+    expect(found(f.db, 'filename:"old report.pdf"')).toEqual(['a']);
+    expect(found(f.db, 'words')).toEqual(['a']);
+    expect(attachmentRows(f.db, 'a')).toEqual([
+      {
+        idx: 0,
+        filename: 'old report.pdf',
+        mime: 'application/pdf',
+        size: 10,
+        content_id: 'c0',
+        source: 'eml',
+      },
+    ]);
+
+    // The message file changes: everything read from it goes in the same transaction.
+    f.set('a', { eml: 2 });
+    f.reconcile();
+    expect(pairRow(f.db, 'a')).toMatchObject({ body_state: BODY_STATE.pending });
+    expect(found(f.db, 'filename:"old report.pdf"')).toEqual([]);
+    expect(found(f.db, 'words')).toEqual([]);
+    expect(attachmentRows(f.db, 'a')).toEqual([]);
+    // A late result read for the old rev restores nothing.
+    expect(
+      f.writer.phase2Batch(STAMP, [bodyItem('a', first, named('old report.pdf'))]),
+    ).toMatchObject({ written: 0, dropped: 1 });
+    expect(found(f.db, 'filename:"old report.pdf"')).toEqual([]);
+    expect(attachmentRows(f.db, 'a')).toEqual([]);
+
+    // The new file's result.
+    const second = rev('a');
+    f.writer.phase2Batch(STAMP, [bodyItem('a', second, named('new.pdf'))]);
+    expect(found(f.db, 'filename:new.pdf')).toEqual(['a']);
+    expect(found(f.db, 'filename:"old report.pdf"')).toEqual([]);
+    // The same result again changes nothing: the message no longer waits.
+    expect(f.writer.phase2Batch(STAMP, [bodyItem('a', second, named('x.pdf'))])).toMatchObject({
+      written: 0,
+      dropped: 1,
+    });
+    expect(found(f.db, 'filename:x.pdf')).toEqual([]);
+
+    // The message file goes: the same, with its own state.
+    f.set('a', { eml: null });
+    f.reconcile();
+    expect(pairRow(f.db, 'a')).toMatchObject({ body_state: BODY_STATE.emlMissing });
+    expect(found(f.db, 'filename:new.pdf')).toEqual([]);
+    expect(found(f.db, 'words')).toEqual([]);
+    expect(attachmentRows(f.db, 'a')).toEqual([]);
+    expect(f.writer.phase2Batch(STAMP, [bodyItem('a', second, named('new.pdf'))])).toMatchObject({
+      written: 0,
+      dropped: 1,
+    });
+    expect(found(f.db, 'filename:new.pdf')).toEqual([]);
+  });
+
+  it('read the text again once metadata that went, or stopped parsing, is back', () => {
+    const f = folder()
+      .add(message('a', ['a']))
+      .add(message('b', ['b']));
+    f.reconcile();
+    const rev = (id: string) => asNumber(pairRow(f.db, id)?.rev);
+    f.writer.phase2Batch(STAMP, [bodyItem('a', rev('a')), bodyItem('b', rev('b'))]);
+    expect(found(f.db, 'words')).toEqual(['a', 'b']);
+
+    // a's metadata goes; b's no longer parses. Their text goes with them.
+    f.set('a', { meta: null });
+    f.set('b', { row: null, meta: 2 });
+    f.reconcile();
+    expect(found(f.db, 'words')).toEqual([]);
+    for (const id of ['a', 'b']) {
+      expect(pairRow(f.db, id)).toMatchObject({ body_state: BODY_STATE.pending });
+    }
+
+    // Both are back: their message files are read again, and the text is found.
+    f.set('a', { meta: 3 });
+    f.change(message('b', ['b']));
+    f.reconcile();
+    expect(f.writer.bodyOrder().sort()).toEqual([rowidOf(f.db, 'a'), rowidOf(f.db, 'b')].sort());
+    f.writer.phase2Batch(STAMP, [bodyItem('a', rev('a')), bodyItem('b', rev('b'))]);
+    expect(found(f.db, 'words')).toEqual(['a', 'b']);
+  });
+
+  it('set the attachments cap flag, and clear only that one when the message file changes or goes', () => {
+    const other = CAPPED.labels | CAPPED.to;
+    const f = folder()
+      .add(message('c', ['c'], { capped: other }))
+      .add(message('d', ['d']));
+    f.reconcile();
+    const rev = (id: string) => asNumber(pairRow(f.db, id)?.rev);
+    const capped = { ...named('kept.pdf'), attachmentsCapped: true };
+    const stats = f.writer.phase2Batch(STAMP, [
+      bodyItem('c', rev('c'), capped),
+      bodyItem('d', rev('d'), capped),
+    ]);
+    const fileId = (id: string) => String(pairRow(f.db, id)?.file_id);
+    expect(stats.capped).toEqual([fileId('c'), fileId('d')]);
+    // c already had lists cut; d had none.
+    expect(stats.cappedNew).toBe(1);
+    expect(cappedOf(f.db, 'c')).toBe(other | CAPPED.attachments);
+    expect(cappedOf(f.db, 'd')).toBe(CAPPED.attachments);
+
+    // New metadata, same message file: the flag stays with the message file's text.
+    f.change(message('c', ['c'], { capped: other, subject: 'v2' }));
+    f.reconcile();
+    expect(cappedOf(f.db, 'c')).toBe(other | CAPPED.attachments);
+    expect(found(f.db, 'filename:kept.pdf')).toEqual(['c', 'd']);
+
+    f.set('c', { eml: 2 });
+    f.set('d', { eml: null });
+    f.reconcile();
+    expect(cappedOf(f.db, 'c')).toBe(other);
+    expect(cappedOf(f.db, 'd')).toBe(0);
+  });
+
+  it('keep each transaction within its text budget, and fail a message that alone is over it', () => {
+    const f = folder();
+    for (const id of ['a', 'b', 'c', 'big', 'gone']) f.add(message(id, [id]));
+    f.reconcile();
+    const rev = (id: string) => asNumber(pairRow(f.db, id)?.rev);
+    const text = (n: number) => 'w'.repeat(n);
+    const budget = 1000;
+    const items = ['a', 'b', 'c'].map((id) => bodyItem(id, rev(id), { body: text(400) }));
+    const first = f.writer.phase2Batch(STAMP, items, budget);
+    expect(first).toMatchObject({ written: 2, rest: 1 });
+    expect(first.bytes).toBeLessThanOrEqual(budget);
+    expect(pairRow(f.db, 'c')).toMatchObject({ body_state: BODY_STATE.pending });
+    expect(f.writer.phase2Batch(STAMP, items.slice(2), budget)).toMatchObject({
+      written: 1,
+      rest: 0,
+    });
+    expect(pairRow(f.db, 'c')).toMatchObject({ body_state: BODY_STATE.indexed });
+
+    // Alone over the budget: the failed state with its code, and none of its text.
+    const big = f.writer.phase2Batch(
+      STAMP,
+      [bodyItem('big', rev('big'), { body: text(budget) })],
+      budget,
+    );
+    expect(big).toMatchObject({ written: 1, rest: 0 });
+    expect(big.failed).toEqual([
+      { fileId: String(pairRow(f.db, 'big')?.file_id), code: BODY_TOO_LARGE },
+    ]);
+    expect(pairRow(f.db, 'big')).toMatchObject({
+      body_state: BODY_STATE.failed,
+      error_code: BODY_TOO_LARGE,
+    });
+    expect(
+      count(
+        f.db,
+        'SELECT length(body) FROM message_text WHERE rowid = ?',
+        String(rowidOf(f.db, 'big')),
+      ),
+    ).toBe(0);
+
+    // A file that couldn't be read: the failed state with its code.
+    const failed = f.writer.phase2Batch(STAMP, [
+      bodyItem('gone', rev('gone'), { state: BODY_STATE.failed, body: '', error: 'BODY_TIMEOUT' }),
+    ]);
+    expect(failed.failed).toEqual([
+      { fileId: String(pairRow(f.db, 'gone')?.file_id), code: 'BODY_TIMEOUT' },
+    ]);
+    expect(pairRow(f.db, 'gone')).toMatchObject({
+      body_state: BODY_STATE.failed,
+      error_code: 'BODY_TIMEOUT',
+    });
+  });
+
+  it('write nothing for another generation', () => {
+    const f = folder().add(message('a', ['a']));
+    f.reconcile();
+    const stats = f.writer.phase2Batch({ ...STAMP, generation: STAMP.generation + 1 }, [
+      bodyItem('a', asNumber(pairRow(f.db, 'a')?.rev)),
+    ]);
+    expect(stats).toMatchObject({ stale: true, written: 0 });
+    expect(pairRow(f.db, 'a')).toMatchObject({ body_state: BODY_STATE.pending });
+    expect(found(f.db, 'words')).toEqual([]);
   });
 });

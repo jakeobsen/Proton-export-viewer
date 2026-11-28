@@ -8,15 +8,27 @@
 //   the view, `<assetBase>/l<n>`; the URL and the link text go to `links`;
 // - remote images and media (`src`, `srcset`, `background` and `poster` to
 //   http or https) become `<assetBase>/r<n>`, one id per distinct URL;
-// - `cid:` references become `<assetBase>/c<n>`, one id per distinct cid;
-// - any other URL is removed, `data:` images included.
+// - `cid:` references become `<assetBase>/c<n>`. Given the message's inline
+//   images, each id is one part the references name (or one reference that
+//   names none), resolved in the HTML part the reference is in; without
+//   them, one id per distinct cid;
+// - a `data:` image in `<img src>`, given the inline images, stays if it
+//   passes their checks, or becomes the placeholder;
+// - any other URL is removed, `data:` images elsewhere included.
 // Style sheets and style attributes keep the subset the CSS filter allows,
 // with their image URLs rewritten the same way.
+//
+// A body made of several HTML parts is sanitized part by part, each as a
+// document of its own, so that markup one part leaves open can't reach into
+// the next; ids and limits are shared. The parts are then put together as
+// the HTML parser puts joined parts together: each later part's content
+// follows a line break in the first part's body.
 
 import createDOMPurify, { type Config, type UponSanitizeAttributeHookEvent } from 'dompurify';
 import { JSDOM } from 'jsdom';
 import type { BodyLink } from '../../shared/reader-protocol';
 import { filterStyleAttribute, filterStyleSheet, type UrlRewriter } from './css';
+import type { CidTarget } from './parts';
 import { MAX_LINKS, MAX_URL_LENGTH, linkUrl } from './plain';
 
 /** The longest link text kept for the link dialog, in characters. */
@@ -106,6 +118,22 @@ export interface SanitizedBody {
   remote: number;
   /** How many distinct `cid:` references became `c<n>`. */
   cids: number;
+  /** What each `c<n>` names, `cidTargets[n - 1]`, when inline images were given. */
+  cidTargets: CidTarget[];
+}
+
+/** One HTML part of a body: its markup, and its index in the message's part tree. */
+export interface HtmlSource {
+  html: string;
+  part: number;
+}
+
+/** The message's inline images, as the sanitizer asks about them. */
+export interface ImageResolver {
+  /** The part a `cid:` URL in the HTML part `from` names. */
+  resolve(from: number, url: string): CidTarget;
+  /** The `src` an `<img>` keeps for a `data:` URL, or null if it goes. */
+  dataImage(value: string): string | null;
 }
 
 /** The per-body state the hooks write to. */
@@ -114,10 +142,17 @@ class References {
   readonly linkNodes: Array<[Element, number]> = [];
   private readonly remote = new Map<string, string>();
   private readonly cids = new Map<string, string>();
+  /** What each cid key names, when inline images are given. */
+  private readonly targets = new Map<string, CidTarget>();
   /** Every id handed out, as its map and key, in order, so the latest can be taken back. */
   private readonly handed: Array<[Map<string, string>, string]> = [];
+  /** The HTML part being sanitized. */
+  scope = -1;
 
-  constructor(private readonly base: string) {}
+  constructor(
+    private readonly base: string,
+    readonly images: ImageResolver | null = null,
+  ) {}
 
   get remoteCount(): number {
     return this.remote.size;
@@ -143,7 +178,14 @@ class References {
     if (raw.length > MAX_URL_LENGTH) return null;
     if (/^cid:/i.test(raw)) {
       const cid = raw.slice(4).trim().toLowerCase();
-      return cid === '' ? null : { map: this.cids, key: cid, prefix: 'c' };
+      if (cid === '') return null;
+      if (!this.images) return { map: this.cids, key: cid, prefix: 'c' };
+      const target = this.images.resolve(this.scope, raw);
+      // A resolved reference is keyed by its part, so that every reference to
+      // the part shares its id; one that resolves to nothing, by its URL.
+      const key = 'part' in target ? `part:${target.part}` : `none:${cid}`;
+      if (!this.targets.has(key)) this.targets.set(key, target);
+      return { map: this.cids, key, prefix: 'c' };
     }
     let url: URL;
     try {
@@ -153,6 +195,13 @@ class References {
     }
     if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.hostname === '') return null;
     return { map: this.remote, key: url.href, prefix: 'r' };
+  }
+
+  /** What each `c<n>` names, in id order. */
+  cidTargets(): CidTarget[] {
+    const out: CidTarget[] = [];
+    for (const key of this.cids.keys()) out.push(this.targets.get(key) ?? { refused: 'missing' });
+    return out;
   }
 
   /** The id URL an image or media reference gets, or null if it goes. */
@@ -264,6 +313,14 @@ function rewrite(node: Element, data: UponSanitizeAttributeHookEvent): void {
   let next: string | null | undefined;
   if (name === 'href') {
     next = LINK_ELEMENTS.has(node.nodeName.toLowerCase()) ? refs.link(node, data.attrValue) : null;
+  } else if (
+    name === 'src' &&
+    refs.images &&
+    node.nodeName.toLowerCase() === 'img' &&
+    /^[\t\n\f\r ]*data:/i.test(data.attrValue)
+  ) {
+    // The one place a data: image may stay.
+    next = refs.images.dataImage(data.attrValue);
   } else if (RESOURCE_ATTRIBUTES.has(name)) {
     next = refs.resource(data.attrValue);
   } else if (name === 'srcset') {
@@ -329,10 +386,10 @@ function filterCss(root: Element, refs: References): void {
   }
 }
 
-/** Sanitizes an HTML body for the view whose asset URLs start with `assetBase`. */
-export function sanitizeHtml(html: string, assetBase: string): SanitizedBody {
+/** Sanitizes one HTML part, as a document of its own, and filters its CSS. */
+function sanitizePart(html: string, part: number, refs: References): Element {
   const purify = instance();
-  const refs = new References(assetBase);
+  refs.scope = part;
   current = refs;
   let root: Node;
   try {
@@ -340,16 +397,65 @@ export function sanitizeHtml(html: string, assetBase: string): SanitizedBody {
   } finally {
     current = null;
   }
+  filterCss(root as Element, refs);
+  return root as Element;
+}
+
+/**
+ * Puts later parts into the first part's document: after a line break, each
+ * part's head and body content goes at the end of the first part's body, and
+ * its `<html>` and `<body>` attributes are added where the first part's
+ * elements lack them.
+ */
+function combine(roots: readonly Element[]): Element {
+  const [first, ...rest] = roots as [Element, ...Element[]];
+  const doc = first.ownerDocument;
+  const body = doc.body;
+  for (const root of rest) {
+    const part = root.ownerDocument;
+    body.append(doc.createElement('br'), doc.createTextNode('\n'));
+    for (const [from, to] of [
+      [part.documentElement, first],
+      [part.body, body],
+    ] as const) {
+      for (const attr of Array.from(from?.attributes ?? [])) {
+        if (!to.hasAttribute(attr.name)) to.setAttribute(attr.name, attr.value);
+      }
+    }
+    body.append(
+      ...Array.from(part.head?.childNodes ?? []),
+      ...Array.from(part.body?.childNodes ?? []),
+    );
+  }
+  return first;
+}
+
+/**
+ * Sanitizes an HTML body for the view whose asset URLs start with
+ * `assetBase`: one string, or the message's HTML parts. Given the message's
+ * inline images, `cid:` references resolve in the part they are in, and
+ * `data:` images in `<img src>` are checked.
+ */
+export function sanitizeHtml(
+  html: string | readonly HtmlSource[],
+  assetBase: string,
+  images: ImageResolver | null = null,
+): SanitizedBody {
+  const refs = new References(assetBase, images);
+  const sources = typeof html === 'string' ? [{ html, part: -1 }] : html;
+  const roots = (sources.length > 0 ? sources : [{ html: '', part: -1 }]).map((source) =>
+    sanitizePart(source.html, source.part, refs),
+  );
   for (const [node, index] of refs.linkNodes) {
     const link = refs.links[index];
     if (link) link.text = linkText(node);
   }
-  filterCss(root as Element, refs);
-  const outer = (root as Element).outerHTML ?? '';
+  const outer = combine(roots).outerHTML ?? '';
   return {
     html: `<!doctype html>${outer}`,
     links: refs.links,
     remote: refs.remoteCount,
     cids: refs.cidCount,
+    cidTargets: refs.cidTargets(),
   };
 }

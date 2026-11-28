@@ -8,6 +8,7 @@ import type { ReaderLane } from '../core/reader/lane';
 import type { ReaderSource } from '../core/reader/source';
 import type {
   CoreResult,
+  IndexQueryRequest,
   OpenRequest,
   TestRequest,
   WorkerMessage,
@@ -37,6 +38,13 @@ export interface CoreTestDeps {
     held: Array<OpenRequest | ReadRequest>;
     fileOpens: number;
     unsanitized: boolean;
+    searches: number;
+    holdingSearches: boolean;
+    heldSearches: IndexQueryRequest[];
+    holdingOpened: boolean;
+    heldOpened: Array<() => void>;
+    holdCardsAt: number | null;
+    heldCards: Array<() => void>;
   };
   open: (request: OpenRequest | ReadRequest) => void;
   toWorker: (message: WorkerRequest) => void;
@@ -49,6 +57,8 @@ export interface CoreTestDeps {
   setReaderSource: (source: ReaderSource) => void;
   readerSource: () => ReaderSource | null;
   writeGate: WriteGate | null;
+  /** Runs a search that was held. */
+  runSearch: (request: IndexQueryRequest) => void;
 }
 
 /** Holds phase 1's writes, while holding, until a test lets them through. */
@@ -131,8 +141,55 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
     case 'held':
       ok(deps.state.held.length);
       return;
+    case 'hold-opened':
+      deps.state.holdingOpened = true;
+      ok();
+      return;
+    case 'release-opened': {
+      deps.state.holdingOpened = false;
+      const held = deps.state.heldOpened.splice(0);
+      for (const go of held) go();
+      ok(held.length);
+      return;
+    }
+    case 'held-opened':
+      ok(deps.state.heldOpened.length);
+      return;
     case 'file-opens':
       ok(deps.state.fileOpens);
+      return;
+    case 'searches':
+      ok(deps.state.searches);
+      return;
+    case 'hold-searches':
+      deps.state.holdingSearches = true;
+      ok();
+      return;
+    case 'release-searches': {
+      deps.state.holdingSearches = false;
+      const held = deps.state.heldSearches.splice(0);
+      for (const search of held) deps.runSearch(search);
+      ok(held.length);
+      return;
+    }
+    case 'held-searches':
+      ok(deps.state.heldSearches.length);
+      return;
+    case 'hold-cards': {
+      // Holds the cards queries anchored at a message; null lets the held ones go.
+      const rowid = (request.payload as { rowid?: unknown } | undefined)?.rowid;
+      if (rowid !== null && !(Number.isSafeInteger(rowid) && (rowid as number) > 0)) {
+        deps.reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
+        return;
+      }
+      deps.state.holdCardsAt = rowid as number | null;
+      const held = rowid === null ? deps.state.heldCards.splice(0) : [];
+      for (const go of held) go();
+      ok(held.length);
+      return;
+    }
+    case 'held-cards':
+      ok(deps.state.heldCards.length);
       return;
     case 'release-writes': {
       const count = (request.payload as { count?: unknown } | undefined)?.count;

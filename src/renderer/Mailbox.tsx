@@ -172,8 +172,15 @@ function Folders({ sidebar, folder }: { sidebar: SidebarModel; folder: string })
   );
 }
 
-function Chips({ row, sidebar }: { row: Row; sidebar: SidebarModel | null }) {
-  const labels = (row.details?.labelIds ?? [])
+/** A conversation's labels, as chips. */
+export function Chips({
+  labelIds,
+  sidebar,
+}: {
+  labelIds: readonly string[] | undefined;
+  sidebar: SidebarModel | null;
+}) {
+  const labels = (labelIds ?? [])
     .map((id) => sidebar?.byId.get(id))
     .filter((e): e is SidebarEntry => e?.kind === 'label');
   if (labels.length === 0) return null;
@@ -242,7 +249,7 @@ function ConversationRow({
           <span className="clip" title="Has attachments" aria-label="Has attachments" />
         )}
       </div>
-      <Chips row={row} sidebar={sidebar} />
+      <Chips labelIds={row.details?.labelIds} sidebar={sidebar} />
     </div>
   );
 }

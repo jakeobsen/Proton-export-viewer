@@ -281,8 +281,10 @@ export class InlineThread implements IndexThread {
     this.calls.push(op);
     return new Promise<T>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | null = null;
+      let timedOut = false;
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
+          timedOut = true;
           this.respawns += 1;
           this.handle = threadHandler(this.role);
           this.onRespawn?.();
@@ -290,13 +292,21 @@ export class InlineThread implements IndexThread {
         }, timeoutMs);
       }
       if (this.hang(op, args)) return;
+      const handle = this.handle;
       setImmediate(() => {
-        if (timer) clearTimeout(timer);
-        try {
-          resolve(this.handle(op, args) as T);
-        } catch (err) {
-          reject(new ThreadError(codeOf(err)));
-        }
+        // An operation may answer with a promise, as in the worker thread.
+        void (async () => {
+          let value: unknown;
+          try {
+            value = await handle(op, args);
+          } catch (err) {
+            if (timer) clearTimeout(timer);
+            if (!timedOut) reject(new ThreadError(codeOf(err)));
+            return;
+          }
+          if (timer) clearTimeout(timer);
+          if (!timedOut) resolve(value as T);
+        })();
       });
     });
   }

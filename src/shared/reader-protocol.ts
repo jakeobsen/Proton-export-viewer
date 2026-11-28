@@ -29,6 +29,16 @@ export interface BodyLink {
   text: string;
 }
 
+/**
+ * An inline image a body shows as `mail-asset://v/<token>/<id>`: bytes that
+ * passed the raster check, and the Content-Type of the format it found.
+ */
+export interface InlineImage {
+  id: string;
+  contentType: string;
+  bytes: Uint8Array;
+}
+
 /** A message rendered by the reader worker. */
 export interface RenderedMessage {
   headers: MessageHeaders;
@@ -39,12 +49,22 @@ export interface RenderedMessage {
   format: 'plain' | 'html';
   /** How many distinct remote images and media the body refers to, each shown as a placeholder. */
   remote: number;
+  /** How many `cid:` ids (`c1`…) the body refers to. */
+  cids: number;
+  /** The `c<n>` ids that show an image; every other one shows the placeholder. */
+  images: InlineImage[];
+  /** How many inline images, `cid:` and `data:`, the body has that aren't shown. */
+  imagesRefused: number;
   /** True when the message has an HTML body. */
   hasHtml: boolean;
   /** True when HTML was asked for but its size alone kept it from being shown; it can be asked for anyway. */
   htmlTooLarge: boolean;
-  /** True when the body is so large that only the first part of its plain text is shown. */
-  truncated: boolean;
+  /**
+   * Why only part of the body is shown: 'size', it is so large that only the
+   * first part of its plain text is; 'parts', the message has more parts than
+   * are read. Null when the body is shown whole.
+   */
+  cut: 'size' | 'parts' | null;
 }
 
 /** A large synthetic message, generated while a test runs (test builds only). */

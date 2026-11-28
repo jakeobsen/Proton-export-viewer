@@ -101,6 +101,16 @@ export class ViewRegistry {
     return count;
   }
 
+  /**
+   * Closes the reader: revokes the live view and any pending open, which can
+   * then install nothing, not even its fallback. Returns how many views were live.
+   */
+  close(): number {
+    const revoked = this.revokeAll();
+    this.latestOpenId += 1;
+    return revoked;
+  }
+
   lookup(token: string): View | undefined {
     return TOKEN_RE.test(token) ? this.live.get(token) : undefined;
   }

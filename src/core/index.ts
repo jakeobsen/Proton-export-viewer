@@ -9,6 +9,7 @@ import type {
   CoreInit,
   CoreRequest,
   CoreResult,
+  IndexQueryRequest,
   OpenRequest,
   ProofFileRead,
   WorkerMessage,
@@ -68,6 +69,17 @@ const testState = {
   /** Message files opened for the reader. */
   fileOpens: 0,
   unsanitized: false,
+  /** Searches that reached core. */
+  searches: 0,
+  /** Searches and snippet requests are held, to answer them late. */
+  holdingSearches: false,
+  heldSearches: [] as IndexQueryRequest[],
+  /** Holds reads once their message file is open, before the parse. */
+  holdingOpened: false,
+  heldOpened: [] as Array<() => void>,
+  /** Holds the shell's cards queries anchored at this message, until a test lets them go. */
+  holdCardsAt: null as number | null,
+  heldCards: [] as Array<() => void>,
 };
 /** Test builds can hold phase 1's writes. */
 let writeGate: import('../testhooks/core').WriteGate | null = null;
@@ -163,6 +175,9 @@ async function readOpen(request: ReadRequest, stale: () => boolean, fail: ReadFa
   if (__PEV_TEST_HOOKS__) testState.fileOpens += 1;
   const opened = found.opened;
   try {
+    if (__PEV_TEST_HOOKS__ && testState.holdingOpened) {
+      await new Promise<void>((resolve) => testState.heldOpened.push(resolve));
+    }
     const outcome = await lane.job(
       {
         type: 'render',
@@ -224,6 +239,10 @@ function handle(request: CoreRequest): void {
             readerSource: () => readerSource,
             session,
             writeGate,
+            runSearch: (held) => {
+              if (session) session.handle(held);
+              else reply({ type: 'result', reqId: held.reqId, ok: false, code: 'no_source' });
+            },
           }),
         );
         return;
@@ -246,8 +265,27 @@ function handle(request: CoreRequest): void {
     case 'scan':
     case 'index':
     case 'index-query':
+      if (__PEV_TEST_HOOKS__ && request.type === 'index-query') {
+        const { op } = request.query;
+        if (op === 'search') testState.searches += 1;
+        if ((op === 'search' || op === 'snippets') && testState.holdingSearches) {
+          testState.heldSearches.push(request);
+          return;
+        }
+      }
       if (!session) {
         reply({ type: 'result', reqId: request.reqId, ok: false, code: 'no_source' });
+        return;
+      }
+      if (
+        __PEV_TEST_HOOKS__ &&
+        request.type === 'index-query' &&
+        request.query.op === 'cards' &&
+        testState.holdCardsAt !== null &&
+        request.query.anchor.rowid === testState.holdCardsAt
+      ) {
+        const held = session;
+        testState.heldCards.push(() => held.handle(request));
         return;
       }
       session.handle(request);
@@ -276,6 +314,7 @@ async function init(event: Electron.MessageEvent): Promise<void> {
     writeGate = new hooks.WriteGate(init.test.holdWrites === true);
     options = {
       ...(init.test.batchPairs ? { batchPairs: init.test.batchPairs } : {}),
+      ...(init.test.txnBytes ? { txnBytes: init.test.txnBytes } : {}),
       readByName: init.test.readByName === true,
       beforeWrite: writeGate.beforeWrite,
     };

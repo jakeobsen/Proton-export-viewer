@@ -161,9 +161,9 @@ function Lines({ rowid, view }: { rowid: number; view: ReaderView }) {
           </button>
         </div>
       )}
-      {view.truncated && (
+      {view.cut && (
         <div className="rp-line rp-truncated">
-          <b>First 1 MB shown</b>
+          <b>{view.cut === 'size' ? 'First 1 MB shown' : 'Only part of this message shown'}</b>
         </div>
       )}
     </>
@@ -187,19 +187,20 @@ export function refusedText(code: RejectCode): string | null {
   }
 }
 
-export function ReaderPane() {
+/**
+ * The open message below its header: the body switch, the recipients, the
+ * state lines and the body frame, or the line that says why it can't open.
+ * It fills the pane; in a card, the stylesheet makes it as high as the pane.
+ */
+export function MessageBody() {
   const reader = useReaderState();
   const { rowid, view, pending } = reader;
   if (rowid === null) return null;
   if (reader.refused !== null) {
     const text = refusedText(reader.refused);
-    return (
-      <div className="rp">
-        {text !== null && (
-          <div className="rp-line rp-state" role="status">
-            <b>{text}</b>
-          </div>
-        )}
+    return text === null ? null : (
+      <div className="rp-line rp-state" role="status">
+        <b>{text}</b>
       </div>
     );
   }
@@ -208,8 +209,7 @@ export function ReaderPane() {
   // ("Show HTML anyway" is offered when its size alone kept it back).
   const htmlKeptBack = view?.format === 'plain' && reader.mode !== 'plain';
   return (
-    <div className="rp" aria-busy={pending}>
-      {view && <Header headers={view.headers} />}
+    <>
       <div className="rp-actbar" role="toolbar" aria-label="Message actions">
         <div className="rp-seg" role="group" aria-label="Body view">
           <button
@@ -263,6 +263,19 @@ export function ReaderPane() {
           />
         )}
       </div>
+    </>
+  );
+}
+
+/** One message on its own, with its subject and sender: the reader outside a conversation. */
+export function ReaderPane() {
+  const reader = useReaderState();
+  if (reader.rowid === null) return null;
+  const view = reader.refused === null ? reader.view : null;
+  return (
+    <div className="rp" aria-busy={reader.pending}>
+      {view && <Header headers={view.headers} />}
+      <MessageBody />
     </div>
   );
 }
