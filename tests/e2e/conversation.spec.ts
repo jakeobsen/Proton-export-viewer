@@ -8,7 +8,7 @@
 // draws a bounded number of cards. `n` and `p` move the expansion from the
 // list, the cards and the body frame, but not from an editable control.
 
-import { realpathSync, rmSync } from 'node:fs';
+import { readdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Page } from '@playwright/test';
 import { CARD_HEIGHT } from '../../src/renderer/cards';
@@ -809,6 +809,40 @@ test('n and p typed in the body frame move the expanded card; in a field, a menu
   await pev.page.keyboard.press('p');
   await expanded(pev, ids[1]!);
   expect(await pev.main('externalCalls')).toEqual([]);
+  await checkHidden(pev);
+});
+
+test('n and p move no card while the index report shows, typed in the shell or passed on by main', async ({
+  pev,
+}) => {
+  const root = realpathSync(testDir('conv-keys-report'));
+  const written = writeThreads(root, { seed: 71, threads: [{ messages: 3 }] });
+  // A file the scan refuses, so the list header opens the report.
+  const eml = readdirSync(written.run).find((n) => n.endsWith('.eml'))!;
+  symlinkSync(join(written.run, eml), join(written.run, 'zz-link.metadata.json'));
+  await pev.main('queuePick', root, 'bm1');
+  await pev.shell('chooseFolder', []);
+  await phase1Done(pev, written.pairs);
+  await showAll(pev);
+  const row = await rowOf(pev, 3);
+  const ids = await cardIds(pev, row.newestRowid);
+  await pressRow(pev, row);
+  await expanded(pev, ids[2]!);
+
+  await press(pev.page, '.list-head .attention');
+  await expect(pev.page.locator('.ix-card')).toBeVisible();
+  await pev.page.keyboard.press('p');
+  await pev.main('cardKeyFromMain', 'p');
+  await stays(pev, ids[2]!);
+
+  // Back to the mail: both paths move the card again.
+  await press(pev.page, '.ix-foot button:text("Start browsing")');
+  await expect(pev.page.locator('.ix-card')).toHaveCount(0);
+  await pev.main('cardKeyFromMain', 'p');
+  await expanded(pev, ids[1]!);
+  await pev.page.locator('.card.expanded .card-h').focus();
+  await pev.page.keyboard.press('p');
+  await expanded(pev, ids[0]!);
   await checkHidden(pev);
 });
 

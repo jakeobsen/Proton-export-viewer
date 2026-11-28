@@ -10,6 +10,8 @@ import { formatCount, fullDate, listDate, loadingText, participantsText } from '
 import { exportLabel } from './labels';
 import { ROW_HEIGHT, type Row } from './list';
 import { list, selectRow, showFolder, useList, useMailbox } from './mailbox-state';
+import { openReportFrom } from './Report';
+import { attentionText } from '../shared/report-text';
 import { switchRun } from './shell';
 
 /** Up to two initials from the account's local part: "sam.rivera@…" gives "SR". */
@@ -122,7 +124,13 @@ function IndexStatus() {
     return (
       <div className="side-foot" role="status">
         {counted && (
-          <span className="loading-text">{loadingText(progress.loaded, progress.total)}</span>
+          <button
+            type="button"
+            className="link loading-text"
+            onClick={(e) => openReportFrom(e.currentTarget)}
+          >
+            {loadingText(progress.loaded, progress.total)}
+          </button>
         )}
         <div
           className="bar-track"
@@ -255,7 +263,7 @@ function ConversationRow({
 }
 
 export function ConversationList() {
-  const { sidebar, folder } = useMailbox();
+  const { sidebar, folder, progress, report } = useMailbox();
   const snap = useList();
   const scrollRef = useRef<HTMLDivElement>(null);
   // Where the virtualizer learns the scroll offset. A scroll the list makes
@@ -347,6 +355,15 @@ export function ConversationList() {
             {`${formatCount(snap.total)} ${snap.total === 1 ? 'conversation' : 'conversations'}`}
             {unread > 0 && ` · ${formatCount(unread)} unread`}
           </span>
+        )}
+        {progress?.phase === 'done' && report !== null && report.attention > 0 && (
+          <button
+            type="button"
+            className="link attention"
+            onClick={(e) => openReportFrom(e.currentTarget)}
+          >
+            {attentionText(report.attention)}
+          </button>
         )}
       </div>
       <div

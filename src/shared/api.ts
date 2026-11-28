@@ -6,6 +6,7 @@ import type {
   CardsQuery,
   CardsWindow,
   IndexProgress,
+  IndexReport,
   ListWindow,
   SearchDateKey,
   SearchPage,
@@ -42,6 +43,7 @@ export const IPC = {
   searchSnippets: 'pev:search-snippets',
   showInFolder: 'pev:show-in-folder',
   copyMessageId: 'pev:copy-message-id',
+  copyReport: 'pev:copy-report',
 } as const;
 
 export type RejectCode =
@@ -66,6 +68,7 @@ export type Rejected = { ok: false; code: RejectCode };
 
 export type StateResult = { ok: true; generation: number } | Rejected;
 export type PingResult = { ok: true; generation: number } | Rejected;
+export type CopyResult = { ok: true; generation: number } | Rejected;
 export type OpenResult = { ok: true; openId: number; url: string } | Rejected;
 export type SourcesResult = { ok: true; generation: number; sources: SourcesView } | Rejected;
 /** The outcome of an open, a switch, a Locate or a Forget, and the generation it left. */
@@ -112,7 +115,7 @@ export type MessageOpenResult =
   | Rejected;
 
 /** What the shell reads from the open export's index. */
-export type ShellIndexQuery = { op: 'sidebar' } | WindowQuery | CardsQuery;
+export type ShellIndexQuery = { op: 'sidebar' } | { op: 'report' } | WindowQuery | CardsQuery;
 
 export type IndexResult<T> =
   { ok: true; generation: number; answer: T; progress: IndexProgress } | Rejected;
@@ -216,6 +219,10 @@ export interface PevApi {
   listWindow(query: WindowQuery, generation: number): Promise<IndexResult<ListWindow>>;
   /** A stretch of one conversation's cards. */
   cards(query: CardsQuery, generation: number): Promise<IndexResult<CardsWindow>>;
+  /** The open export's index report. */
+  indexReport(generation: number): Promise<IndexResult<IndexReport>>;
+  /** Copies the open export's index report as plain text. */
+  copyReport(generation: number): Promise<CopyResult>;
   /** Called as indexing moves on or the index's state changes. */
   onIndexChanged(listener: (update: IndexUpdate) => void): () => void;
   /**
