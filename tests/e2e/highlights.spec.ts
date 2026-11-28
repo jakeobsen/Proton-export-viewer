@@ -201,7 +201,7 @@ test('from search, the plain view marks the matches and the HTML view counts the
       time: T0 + 1,
       text:
         'The invoice is attached. Pay at https://pay.example.test/invoice?id=7 today.\n' +
-        'Literal <mark>x</mark> and sentinel stay text.',
+        'Literal <mark>x</mark> and \ue000sentinel\ue001 stay text.',
     },
     {
       id: 'A2',
@@ -234,7 +234,7 @@ test('from search, the plain view marks the matches and the HTML view counts the
   expect(shown.inLinks).toEqual(['invoice']);
   // Markup and mark characters in mail stay text: the only marks are the matches.
   expect(shown.text).toContain('Literal <mark>x</mark> and sentinel stay text.');
-  expect(shown.text).not.toMatch(/[]/);
+  expect(shown.text).not.toMatch(/[\ue000\ue001]/);
   await expect(matchLine(pev)).toHaveCount(0);
   // That link still reaches the link dialog, with its URL.
   await frame.evaluate(() => (document.querySelector('a') as HTMLElement).click());

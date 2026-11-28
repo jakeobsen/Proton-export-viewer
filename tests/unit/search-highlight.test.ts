@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { BODY_STATE } from '../../src/core/index/schema';
 import { emlFile } from '../../src/core/index/queries';
 import { matchInfo } from '../../src/core/index/search';
+import { MAX_MARKS, plainBody } from '../../src/core/reader/plain';
 import { asNumber, type Db } from '../../src/core/index/sql';
 import { validRanges } from '../../src/core/search/ranges';
 import type { IndexMatch } from '../../src/shared/index-types';
@@ -219,10 +220,22 @@ describe('match info for the reader', () => {
     }
   });
 
+  it(`counts every body match past the ${MAX_MARKS} marks drawn`, () => {
+    const { db, rowid } = oneMessage('Note', 'th '.repeat(MAX_MARKS + 5));
+    const match = matchInfo(db, rowid, 'th')!;
+    expect(match.bodyMatches).toBe(MAX_MARKS + 5);
+    expect(match.body!.ranges).toHaveLength(MAX_MARKS + 5);
+    const { html } = plainBody(match.body!.text, 'mail-asset://v/x', match.body!.ranges);
+    expect(html.split('<mark>').length - 1).toBe(MAX_MARKS);
+  });
+
   it('drops marks that fail the check but still counts the column as matched', () => {
     // Mark characters written past the stripping, as an older index could hold them.
-    const { db, rowid } = oneMessage('Invoice', 'an invoice  with a stray mark');
-    db.stmt('UPDATE message_text SET subject = ? WHERE rowid = ?').run('Invoice  here', rowid);
+    const { db, rowid } = oneMessage('Invoice', 'an invoice \ue000 with a stray mark');
+    db.stmt('UPDATE message_text SET subject = ? WHERE rowid = ?').run(
+      'Invoice \ue001 here',
+      rowid,
+    );
     const match = matchInfo(db, rowid, 'invoice');
     expect(match).toMatchObject({ columns: ['subject'], bodyMatches: 0, body: null, dropped: 2 });
   });
