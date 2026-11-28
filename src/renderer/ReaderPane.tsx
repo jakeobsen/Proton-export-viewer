@@ -357,7 +357,14 @@ export function MessageBody() {
     );
   }
   if (reader.source !== null) {
-    return <SourceView source={reader.source} headers={view?.headers ?? null} />;
+    const refused = reader.source.refused;
+    return (
+      <SourceView
+        source={reader.source}
+        headers={view?.headers ?? null}
+        refused={refused === null ? null : refusedText(refused)}
+      />
+    );
   }
   const shown = view?.format ?? null;
   // HTML was asked for and plain text came back: this open can't show the HTML

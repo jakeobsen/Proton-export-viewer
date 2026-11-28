@@ -177,9 +177,12 @@ function Tree({ parts, selected }: { parts: readonly SourceNode[]; selected: str
 export function SourceView({
   source,
   headers,
+  refused,
 }: {
   source: SourceState;
   headers: MessageHeaders | null;
+  /** What the pane says when main refused the block; null when it wasn't. */
+  refused: string | null;
 }) {
   const [note, setNote] = useState<string | null>(null);
   useEffect(() => {
@@ -229,7 +232,7 @@ export function SourceView({
           )}
         </div>
         <div className="sv-body">
-          {source.url !== null && (
+          {source.url !== null ? (
             <iframe
               key={source.url}
               className="sv-frame"
@@ -238,6 +241,12 @@ export function SourceView({
               referrerPolicy={BODY_IFRAME_REFERRER}
               src={source.url}
             />
+          ) : (
+            refused !== null && (
+              <div className="rp-line rp-state" role="status">
+                <b>{refused}</b>
+              </div>
+            )
           )}
         </div>
       </section>

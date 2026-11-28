@@ -42,11 +42,17 @@ export interface ViewMessage {
 }
 
 /**
- * The source view of a window's message: the header block it shows, under a
- * URL of the view's own token that changes with each block.
+ * One showing of a window's message source, from View source to Back: the
+ * header block it shows, under a URL of the view's own token that changes
+ * with each block.
  */
 export interface SourceState {
-  /** Counts the blocks shown; part of the URL, so each one loads afresh. */
+  /**
+   * Names this showing among all of the window's: a read started for an
+   * earlier one never shows, nor changes its paths, in a later one.
+   */
+  session: number;
+  /** The number of the block shown, in its URL; 0 until the first. */
   n: number;
   /** The shell's latest selection; the answer to an older one is dropped. */
   seq: number;
@@ -73,13 +79,22 @@ export interface View {
   /** Set while the source view shows. */
   source: SourceState | null;
   /**
+   * The source blocks this view has shown, across every showing: a block's
+   * URL is never used twice in the view's life.
+   */
+  sourceBlocks: number;
+  /**
    * Only a source view, for an open the reader couldn't render: it has no
    * body, and its body URL is never authorized or served.
    */
   sourceOnly: boolean;
 }
 
-/** An open that ended with the reader's fallback: its message, for View source. */
+/**
+ * An open that ended with the reader's fallback: its message, for View
+ * source, as often as it is asked for until the next open. The token is the
+ * one the next source view of it gets.
+ */
 interface Fallback {
   openId: number;
   token: string;
@@ -114,6 +129,7 @@ export class ViewRegistry {
   private pendingToken: string | null = null;
   private authorized: string | null = null;
   private fallback: Fallback | null = null;
+  private sourceSessions = 0;
 
   constructor(private readonly newToken: () => string = () => randomBytes(16).toString('hex')) {}
 
@@ -150,6 +166,7 @@ export class ViewRegistry {
       links: new Map((body.links ?? []).map((l) => [l.id, { url: l.url, text: l.text }])),
       message: body.message ?? null,
       source: null,
+      sourceBlocks: 0,
       sourceOnly: false,
     };
     this.live.set(token, view);
@@ -183,8 +200,8 @@ export class ViewRegistry {
 
   /**
    * Starts the source view for the open `openId`: of its live view, or of its
-   * fallback, which becomes a view of its own with no body. Null when that
-   * open is no longer the window's latest.
+   * fallback, which becomes a view of its own with no body each time. Null
+   * when that open is no longer the window's latest.
    */
   beginSource(openId: number): View | null {
     let view = this.byOpenId(openId) ?? null;
@@ -204,20 +221,36 @@ export class ViewRegistry {
           links: new Map(),
           message: null,
           source: null,
+          sourceBlocks: 0,
           sourceOnly: true,
         };
         this.live.set(f.token, view);
-        this.fallback = null;
       }
     }
     if (!view || !from) return null;
-    view.source ??= { n: 0, seq: 0, doc: null, text: null, paths: null, ...from };
+    if (!view.source) {
+      this.sourceSessions += 1;
+      view.source = {
+        session: this.sourceSessions,
+        n: 0,
+        seq: 0,
+        doc: null,
+        text: null,
+        paths: null,
+        ...from,
+      };
+    }
     return view;
   }
 
   /** True while `view` is live and showing its source. */
   inSource(view: View): view is View & { source: SourceState } {
     return this.live.get(view.token) === view && view.source !== null;
+  }
+
+  /** True while `view` is live and still in the showing of its source named `session`. */
+  inSession(view: View, session: number): view is View & { source: SourceState } {
+    return this.inSource(view) && view.source.session === session;
   }
 
   /** A new selection in the source view; answers for older ones are then dropped. */
@@ -228,13 +261,15 @@ export class ViewRegistry {
   }
 
   /**
-   * Shows a header block as the view's next source document, if `seq` is still
-   * the latest selection and the view still shows its source. Its URL becomes
-   * the only one the body frame may load. Null if the answer came too late.
+   * Shows a header block as the view's next source document, if the showing
+   * `session` still shows and `seq` is still its latest selection. Its URL
+   * becomes the only one the body frame may load. Null if the answer came too
+   * late.
    */
-  showSource(view: View, seq: number, doc: string, text: string): string | null {
-    if (!this.inSource(view) || view.source.seq !== seq) return null;
-    view.source.n += 1;
+  showSource(view: View, session: number, seq: number, doc: string, text: string): string | null {
+    if (!this.inSession(view, session) || view.source.seq !== seq) return null;
+    view.sourceBlocks += 1;
+    view.source.n = view.sourceBlocks;
     view.source.doc = doc;
     view.source.text = text;
     this.authorized = sourceUrl(view.token, view.source.n);
@@ -248,7 +283,9 @@ export class ViewRegistry {
 
   /**
    * Leaves the source view. A view with a body gets its body URL back as the
-   * only one the frame may load; a source-only view is revoked.
+   * only one the frame may load. A source-only view is revoked; its fallback
+   * stays, under a new token, so View source can show it again with URLs
+   * the revoked one never had.
    */
   leaveSource(view: View): string | null {
     if (this.live.get(view.token) !== view) return null;
@@ -256,6 +293,8 @@ export class ViewRegistry {
     if (view.sourceOnly) {
       this.live.delete(view.token);
       this.authorized = null;
+      const f = this.fallback;
+      if (f && f.openId === view.openId && f.token === view.token) f.token = this.newToken();
       return null;
     }
     this.authorized = bodyUrl(view.token);

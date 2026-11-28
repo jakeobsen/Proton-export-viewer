@@ -83,13 +83,21 @@ describe('headerDocument', () => {
   });
 
   it('has nothing that runs or loads', () => {
-    const { html } = headerDocument(
-      bytes('X: <img src=x onerror=alert(1)><a href="//e.example">'),
+    const { html, text } = headerDocument(
+      bytes(
+        'X: <img src=x onerror=alert(1)><a href="//e.example">\r\n' +
+          '<script>alert(1)</script><img/src=x/onerror=alert(1)>&amp;: v\r\n',
+      ),
       false,
     );
     expect(html).not.toMatch(/<(?!\/?(?:html|head|meta|style|body|pre|span|p)\b|!doctype)/i);
     // The input shows as text: no tag carries an event handler.
     expect(html).not.toMatch(/<[^>]*\son\w+=/i);
+    // A field name with markup is escaped like a value.
+    expect(html).toContain(
+      '<span class="hn">&lt;script&gt;alert(1)&lt;/script&gt;&lt;img/src=x/onerror=alert(1)&gt;&amp;amp;:</span> v',
+    );
+    expect(text).toContain('<script>alert(1)</script><img/src=x/onerror=alert(1)>&amp;: v');
   });
 });
 

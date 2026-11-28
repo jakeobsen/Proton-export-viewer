@@ -204,9 +204,11 @@ export async function selectPart(path: string): Promise<SourceResult | null> {
   );
   if (session !== sourceSession || mine !== selection || !state.source) return shown;
   if (shown.ok) {
-    update({ source: { ...state.source, url: shown.url, truncated: shown.truncated } });
+    update({
+      source: { ...state.source, url: shown.url, truncated: shown.truncated, refused: null },
+    });
   } else if (shown.code !== 'superseded') {
-    update({ source: { ...state.source, refused: shown.code } });
+    update({ source: { ...state.source, url: null, refused: shown.code } });
   }
   return shown;
 }

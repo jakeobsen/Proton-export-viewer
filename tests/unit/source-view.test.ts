@@ -13,6 +13,8 @@ import {
 } from '../../src/core/reader/source-view';
 import { MAX_MIME_PARTS } from '../../src/core/mime-limits';
 import { extractMessage } from '../../src/core/reader/extract';
+import { READER_TIMEOUT_MS } from '../../src/core/reader/lane';
+import type { SourcePart } from '../../src/shared/reader-protocol';
 import { cleanFilename } from '../../src/shared/filename';
 import { bodiesAround } from '../mime-parts';
 
@@ -75,6 +77,53 @@ const NESTED = crlf([
   '--mx--',
   '',
 ]);
+
+/**
+ * A message with a text body and then `count` attachments with base64 bodies
+ * of different sizes and contents, wrapped at 76 characters.
+ */
+function base64Parts(count: number): Buffer {
+  const lines = [
+    'From: <sender@example.com>',
+    'Subject: Many parts',
+    'MIME-Version: 1.0',
+    'Content-Type: multipart/mixed; boundary="m"',
+    '',
+    '--m',
+    'Content-Type: text/plain; charset=utf-8',
+    '',
+    'Text.',
+  ];
+  let seed = 1;
+  for (let i = 0; i < count; i += 1) {
+    const bytes = Buffer.alloc(40 + ((i * 37) % 400));
+    for (let j = 0; j < bytes.length; j += 1) {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      bytes[j] = seed >>> 16;
+    }
+    lines.push(
+      '--m',
+      'Content-Type: application/octet-stream',
+      'Content-Transfer-Encoding: base64',
+      `Content-Disposition: attachment; filename="f${i}.bin"`,
+      '',
+      bytes.toString('base64').replace(/.{76}(?!$)/g, '$&\r\n'),
+    );
+  }
+  lines.push('--m--', '');
+  return Buffer.from(lines.join('\r\n'));
+}
+
+/**
+ * The attachment list's parts, as the reader lists them, beside the same
+ * paths in the source view's tree: each with its path and decoded size.
+ */
+async function listedBeside(eml: Buffer | string, parts: SourcePart[]) {
+  const reader = await extractMessage(stream(eml));
+  const tree = new Map(parts.map((p) => [p.path, p.size]));
+  const listed = reader.listed.map((l) => [reader.tree.parts[l.part]!.path, l.size] as const);
+  return { reader, listed, inTree: listed.map(([path]) => [path, tree.get(path)] as const) };
+}
 
 describe('messageHeaderBlock', () => {
   it('is the bytes up to the first empty line, CRLF or LF, kept as they are', async () => {
@@ -185,6 +234,14 @@ describe('messageStructure', () => {
     expect(parts.every((p) => !p.cut)).toBe(true);
   });
 
+  it("gives each part the attachment list lists the list's path and decoded size", async () => {
+    const parts = await messageStructure(stream(NESTED));
+    const { listed, inTree } = await listedBeside(NESTED, parts);
+    // The PDF: the inline image and the attached message aren't listed.
+    expect(listed).toEqual([['1.2', 3000]]);
+    expect(inTree).toEqual(listed);
+  });
+
   it('gives a single-part message as one part', async () => {
     const parts = await messageStructure(
       stream(crlf(['Subject: s', 'Content-Type: text/plain; charset=us-ascii', '', 'hello', ''])),
@@ -216,6 +273,20 @@ describe('messageStructure past the part limits', () => {
     expect(parts[1]).toMatchObject({ contentType: 'multipart/alternative', cut: false });
     expect(parts.slice(4).every((p) => p.size === 1)).toBe(true);
     expect(parts[0]!.size).toBe(parts.slice(2).reduce((sum, p) => sum + p.size, 0));
+  });
+
+  it('gives 10,000 parts with base64 bodies the paths and sizes the attachment list has, in time', async () => {
+    const eml = base64Parts(MAX_MIME_PARTS + 10);
+    const started = performance.now();
+    const parts = await messageStructure(stream(eml));
+    const ms = performance.now() - started;
+    expect(ms).toBeLessThan(READER_TIMEOUT_MS);
+    const { reader, listed, inTree } = await listedBeside(eml, parts);
+    expect(reader.stopped).toBe(true);
+    // Every part before the stop but the message and its text.
+    expect(listed).toHaveLength(MAX_MIME_PARTS - 2);
+    expect(new Set(listed.map(([, size]) => size)).size).toBe(400);
+    expect(inTree).toEqual(listed);
   });
 
   it('cuts every container open at a header block over the limit, and no leaf', async () => {

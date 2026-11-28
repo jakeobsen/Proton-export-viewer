@@ -436,8 +436,8 @@ export function registerIpc(ctx: AppContext): void {
     if (appWin.win.isDestroyed()) return reject('superseded', appWin);
 
     if (!result.ok) {
-      appWin.views.abandon(openId);
       if (result.code !== 'reader_failed') {
+        appWin.views.abandon(openId);
         if (result.code === 'unavailable') return reject('offline', appWin);
         const known = ['no_source', 'not_found', 'eml_missing', 'superseded'] as const;
         const code = known.find((c) => c === result.code);
@@ -445,6 +445,7 @@ export function registerIpc(ctx: AppContext): void {
       }
       // The fallback stands in for a view, so it follows the same rules.
       if (generation !== ctx.generation || openId !== appWin.views.latest) {
+        appWin.views.abandon(openId);
         const reason = generation !== ctx.generation ? 'generation' : 'open_id';
         ctx.log.info('open.stale', { reason, openId, windowId: appWin.id });
         return reject(reason === 'generation' ? 'stale_generation' : 'superseded', appWin);
@@ -454,7 +455,8 @@ export function registerIpc(ctx: AppContext): void {
         openId,
         windowId: appWin.id,
       });
-      // View source still works for it: the open's token is kept for that.
+      // View source still works for it: the open's token is kept for that,
+      // and is never installed as a view.
       appWin.views.markFallback(openId, generation, rowid);
       return { ok: true, openId, outcome: 'fallback' };
     }
@@ -589,27 +591,40 @@ export function registerIpc(ctx: AppContext): void {
     }
   };
 
-  /** True while `view` is live in a window still there, for the current generation, showing its source. */
-  const stillShowing = (appWin: AppWindow, view: View) =>
-    !appWin.win.isDestroyed() && view.generation === ctx.generation && appWin.views.inSource(view);
+  /**
+   * True while `view` is live in a window still there, for the current
+   * generation, in the showing of its source named `session`: a read started
+   * for an earlier showing never counts in a later one.
+   */
+  const stillShowing = (appWin: AppWindow, view: View, session: number) =>
+    !appWin.win.isDestroyed() &&
+    view.generation === ctx.generation &&
+    appWin.views.inSession(view, session);
 
-  /** The view in the source view for an action on it, or why there is none. */
+  /** The view in the source view for an action on it, with its showing, or why there is none. */
   const sourceView = (appWin: AppWindow, openId: number, generation: number) => {
     if (generation !== ctx.generation) return 'stale_generation' as const;
     const view = appWin.views.byOpenId(openId);
-    if (!view || !stillShowing(appWin, view)) return 'superseded' as const;
-    return view;
+    const session = view?.source?.session;
+    if (!view || session === undefined || !stillShowing(appWin, view, session)) {
+      return 'superseded' as const;
+    }
+    return { view, session };
   };
 
-  /** Reads a header block and shows it as the view's next source document, for selection `seq`. */
+  /**
+   * Reads a header block and shows it as the view's next source document,
+   * for selection `seq` of the showing `session`.
+   */
   const showBlock = async (
     appWin: AppWindow,
     view: View,
+    session: number,
     seq: number,
     what: SourceWhat,
   ): Promise<SourceResult> => {
     const result = await askSource(appWin, view, what, what.kind === 'part' ? seq : undefined);
-    if (!stillShowing(appWin, view)) return reject('superseded', appWin);
+    if (!stillShowing(appWin, view, session)) return reject('superseded', appWin);
     if (!result) return reject('core_unavailable', appWin);
     if (!result.ok) {
       const known = ['changed', 'eml_missing', 'not_found', 'superseded'] as const;
@@ -622,7 +637,7 @@ export function registerIpc(ctx: AppContext): void {
       return reject('invalid', appWin);
     }
     const { html, text } = headerDocument(headers.bytes, headers.truncated === true);
-    const url = appWin.views.showSource(view, seq, html, text);
+    const url = appWin.views.showSource(view, session, seq, html, text);
     if (url === null) return reject('superseded', appWin);
     return { ok: true, url, truncated: headers.truncated === true };
   };
@@ -634,21 +649,23 @@ export function registerIpc(ctx: AppContext): void {
     if (generation !== ctx.generation) return reject('stale_generation', appWin);
     if (ctx.sources.isOffline()) return reject('offline', appWin);
     const view = appWin.views.beginSource(openId);
-    if (!view || view.generation !== ctx.generation) return reject('superseded', appWin);
+    if (!view?.source || view.generation !== ctx.generation) return reject('superseded', appWin);
+    const { session } = view.source;
     const seq = appWin.views.select(view);
     if (seq === null) return reject('superseded', appWin);
     ctx.log.info('reader.source', { windowId: appWin.id });
-    return showBlock(appWin, view, seq, { kind: 'headers' });
+    return showBlock(appWin, view, session, seq, { kind: 'headers' });
   });
 
   guarded<SourceTreeResult>(IPC.sourceTree, async (appWin, raw) => {
     const args = ViewActionArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
     const [{ openId, generation }] = args.data;
-    const view = sourceView(appWin, openId, generation);
-    if (typeof view === 'string') return reject(view, appWin);
+    const shown = sourceView(appWin, openId, generation);
+    if (typeof shown === 'string') return reject(shown, appWin);
+    const { view, session } = shown;
     const result = await askSource(appWin, view, { kind: 'structure' });
-    if (!stillShowing(appWin, view)) return reject('superseded', appWin);
+    if (!stillShowing(appWin, view, session)) return reject('superseded', appWin);
     if (!result) return reject('core_unavailable', appWin);
     if (!result.ok) {
       if (result.code === 'changed') return reject('changed', appWin);
@@ -659,6 +676,7 @@ export function registerIpc(ctx: AppContext): void {
     const parts = SourcePartsReply.safeParse(result.parts);
     if (!parts.success || parts.data.length === 0) return { ok: true, parts: null };
     const read: SourcePart[] = parts.data;
+    // Still the showing that asked: checked above, with nothing awaited since.
     if (view.source) view.source.paths = new Set(read.map((p) => p.path));
     return { ok: true, parts: sourceNodes(read) };
   });
@@ -667,23 +685,30 @@ export function registerIpc(ctx: AppContext): void {
     const args = SourcePartArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
     const [{ openId, path, generation }] = args.data;
-    const view = sourceView(appWin, openId, generation);
-    if (typeof view === 'string') return reject(view, appWin);
+    const shown = sourceView(appWin, openId, generation);
+    if (typeof shown === 'string') return reject(shown, appWin);
+    const { view, session } = shown;
     // The message's own block is read as it is, without a parse.
     const message = path === null || path === '1';
     if (!message && !view.source?.paths?.has(path)) return reject('invalid', appWin);
     const seq = appWin.views.select(view);
     if (seq === null) return reject('superseded', appWin);
-    return showBlock(appWin, view, seq, message ? { kind: 'headers' } : { kind: 'part', path });
+    return showBlock(
+      appWin,
+      view,
+      session,
+      seq,
+      message ? { kind: 'headers' } : { kind: 'part', path },
+    );
   });
 
   guarded<ReaderActionResult>(IPC.copyHeaders, (appWin, raw) => {
     const args = ViewActionArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
     const [{ openId, generation }] = args.data;
-    const view = sourceView(appWin, openId, generation);
-    if (typeof view === 'string') return reject(view, appWin);
-    const text = appWin.views.shownText(view);
+    const shown = sourceView(appWin, openId, generation);
+    if (typeof shown === 'string') return reject(shown, appWin);
+    const text = appWin.views.shownText(shown.view);
     if (text === null) return reject('superseded', appWin);
     clipboard.writeText(text);
     ctx.log.info('reader.copy_headers', { windowId: appWin.id });

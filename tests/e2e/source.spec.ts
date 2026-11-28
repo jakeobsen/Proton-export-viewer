@@ -5,7 +5,7 @@
 // with the tree only when the structure can be read; the tree past 50 parts
 // with the keyboard; and nothing that leaves the protocols or reaches a log.
 
-import { realpathSync, writeFileSync } from 'node:fs';
+import { realpathSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Page } from '@playwright/test';
 import type { MessageOpenResult } from '../../src/shared/api';
@@ -116,7 +116,8 @@ function bigHtml(bytes: number): string {
   ]);
 }
 
-async function source(pev: PevApp, name: string, files: Record<string, string>): Promise<void> {
+/** Sets the reader's test source to these files, and returns their folder. */
+async function source(pev: PevApp, name: string, files: Record<string, string>): Promise<string> {
   const root = realpathSync(testDir(name));
   const map: Array<[number, { file: string }]> = [];
   let rowid = 0;
@@ -126,6 +127,7 @@ async function source(pev: PevApp, name: string, files: Record<string, string>):
     map.push([rowid, { file }]);
   }
   expect((await pev.main<{ ok: boolean }>('readerSource', root, map)).ok).toBe(true);
+  return root;
 }
 
 const openInReader = (pev: PevApp, rowid: number, mode?: string) =>
@@ -218,6 +220,15 @@ test('Source shows the tree and the raw headers under the view’s token, a part
   expect(await shown(pev)).toBe(body);
   expect((await reader(pev)).openId).toBe(openId);
   expect(pev.logs('main').filter((l) => l.code === 'view.installed')).toHaveLength(installed);
+
+  // Source again on the same view: the next number, never one it had.
+  await press(pev.page, '.rp-source');
+  const again = await sourceShown(pev, 3);
+  expect(again).toBe(`mail-body://v/${token}/source/3`);
+  expect(await frameText(pev, again)).toContain('Subject: Nested');
+  expect((await pev.main<{ status: number }>('fetchIn', 1, part)).status).toBe(404);
+  await press(pev.page, '.sv-back');
+  expect(await shown(pev)).toBe(body);
 });
 
 test('a header with script, bidi, control and tag characters shows as inert text with visible escapes', async ({
@@ -339,6 +350,15 @@ test('on the fallback, View source shows the headers; the tree shows when the st
   expect((await pev.main<{ status: number }>('fetchIn', 1, `mail-body://v/${token}`)).status).toBe(
     404,
   );
+  // View source again on the same open shows the headers again, under a URL
+  // the first one never had; the first one serves nothing now.
+  await press(pev.page, '.rp-view-source');
+  const again = await sourceShown(pev, 1);
+  expect(again).not.toBe(url);
+  expect(await frameText(pev, again)).toContain('Subject: Big');
+  expect((await pev.main<{ status: number }>('fetchIn', 1, url)).status).toBe(404);
+  await press(pev.page, '.sv-back');
+  await expect(pev.page.locator('.rp-fallback')).toHaveCount(1);
 
   // With a short time limit, the open and the structure both time out; the
   // headers, read without a parse, still show.
@@ -349,6 +369,22 @@ test('on the fallback, View source shows the headers; the tree shows when the st
   expect(await frameText(pev, await sourceShown(pev, 1))).toContain('Subject: Big');
   await expect.poll(async () => (await reader(pev)).source?.tree).toBe('none');
   await expect(pev.page.locator('.sv-node')).toHaveCount(0);
+});
+
+test('a Source main refuses says why in the pane, as the reader does', async ({ pev }) => {
+  const root = await source(pev, 'src-refused', { 'nested.eml': NESTED });
+  await openInReader(pev, 1);
+  await shown(pev);
+  // The file is replaced after the open, by one made while it was still there
+  // (so never on its inode): Source reads only the file the view came from.
+  writeFileSync(join(root, 'next.eml'), NESTED);
+  renameSync(join(root, 'next.eml'), join(root, 'nested.eml'));
+  await press(pev.page, '.rp-source');
+  await expect(pev.page.locator('.sv .rp-state')).toHaveText("Couldn't render this message");
+  await expect(pev.page.locator('.sv-frame')).toHaveCount(0);
+  await expect.poll(async () => (await reader(pev)).source?.tree).toBe('none');
+  await press(pev.page, '.sv-back');
+  await expect(pev.page.locator('.sv')).toHaveCount(0);
 });
 
 test('past 50 parts the tree makes only the rows in view, and the arrow keys walk across that boundary', async ({
