@@ -418,7 +418,7 @@ export async function install(ctx: AppContext): Promise<boolean> {
     indexTestSettings: (settings: CoreTestInit | null) => {
       ctx.core.testInit = settings;
     },
-    /** Lets `count` held phase 1 writes through; null stops holding them. */
+    /** Lets `count` held writes through; null stops holding them. */
     releaseWrites: async (count: number | null) => {
       const result = await ctx.core.request({
         type: 'test',
@@ -426,6 +426,25 @@ export async function install(ctx: AppContext): Promise<boolean> {
         payload: { count },
       });
       if (!result.ok) throw new Error('release-writes');
+    },
+    /** Searches that reached core since it started. */
+    coreSearches: async () => {
+      const result = await core('searches');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
+    /** Core holds the searches and snippet requests that reach it until they are released. */
+    holdSearches: async () => {
+      if (!(await core('hold-searches')).ok) throw new Error('hold-searches');
+    },
+    /** Lets the held searches run; returns how many there were. */
+    releaseSearches: async () => {
+      const result = await core('release-searches');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
+    /** Searches and snippet requests core holds now. */
+    heldSearches: async () => {
+      const result = await core('held-searches');
+      return result.ok ? (result.value ?? 0) : 0;
     },
     /**
      * Holds the shell's cards queries anchored at message `rowid` in core;

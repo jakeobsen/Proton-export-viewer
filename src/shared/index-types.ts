@@ -178,6 +178,8 @@ export interface SearchRow {
 export interface SearchCoverage {
   /** Messages whose body is in the index (whole or its first part). */
   indexed: number;
+  /** Messages whose body is still waiting to be indexed. */
+  pending: number;
   /** Messages in the index. */
   total: number;
 }
@@ -186,9 +188,41 @@ export interface SearchPage {
   queryId: number;
   /** The sort used: a query with no words to match is sorted by date. */
   sort: SearchSort;
+  /** Whether the query has words that rank its matches, so it can be sorted by relevance. */
+  ranked: boolean;
+  /** Matching conversations in all, on a first page; null on the pages after it. */
+  total: number | null;
   rows: SearchRow[];
+  /** The details of each row, in the same order. */
+  details: RowDetails[];
   next: SearchKey | null;
   coverage: SearchCoverage;
+  /** Snippets whose match ranges failed the check and were given without them. */
+  dropped: number;
+}
+
+/** The most conversations one snippets request covers. */
+export const MAX_SNIPPET_THREADS = 50;
+
+/** Snippets for result rows that came without one: the best match of each conversation. */
+export interface SnippetsQuery {
+  op: 'snippets';
+  /** The search the rows belong to; the answer carries it back. */
+  queryId: number;
+  text: string;
+  threadIds: number[];
+}
+
+export interface ThreadSnippet {
+  threadId: number;
+  /** Null when the conversation has no match with text to show. */
+  snippet: MarkedSnippet | null;
+}
+
+export interface SearchSnippets {
+  queryId: number;
+  /** One per conversation asked for, in the same order. */
+  snippets: ThreadSnippet[];
   /** Snippets whose match ranges failed the check and were given without them. */
   dropped: number;
 }
@@ -270,6 +304,7 @@ export type IndexQuery =
   | { op: 'eml'; rowid: number }
   | WindowQuery
   | SearchQuery
+  | SnippetsQuery
   | CardsQuery;
 
 export type IndexAnswer =
@@ -282,7 +317,8 @@ export type IndexAnswer =
   | ListWindow
   | CardsWindow
   | EmlFile
-  | SearchPage;
+  | SearchPage
+  | SearchSnippets;
 
 /**
  * Where a message's file is, as the scan last saw it: its name relative to the
@@ -307,7 +343,8 @@ export interface EmlFile {
 export type IndexCondition = 'ok' | 'verifying' | 'rebuilding' | 'damaged';
 
 /**
- * Where phase 1 stands. During it, list pages hold the rows loaded so far.
+ * Where indexing stands. During phase 1, list pages hold the rows loaded so
+ * far; during phase 2, searches find the text of the messages read so far.
  * 'unavailable': the export can't be read, and the index shows what it holds.
  */
 export interface IndexProgress {
@@ -323,6 +360,14 @@ export interface IndexProgress {
   /** Messages with a list cut to its limit. */
   capped: number;
   condition: IndexCondition;
+  /** Where phase 2, the text of the message files, stands: 'waiting' until phase 1 is done. */
+  bodyPhase: 'waiting' | 'indexing' | 'done' | 'failed';
+  /** Message files phase 2 has handled in this run: indexed, cut to the limit, or failed. */
+  bodiesDone: number;
+  /** Message files phase 2 has to read in this run. */
+  bodiesTotal: number;
+  /** Message files whose text couldn't be read. */
+  bodiesFailed: number;
 }
 
 /** What core reports once a source's index is open. */

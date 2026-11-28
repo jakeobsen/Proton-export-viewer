@@ -101,6 +101,15 @@ export class CardsModel {
     return this.snap;
   }
 
+  /**
+   * Which showing of a conversation is on screen, or null with none shown.
+   * Each show() starts a new one and hide() ends it; expanding a card or a
+   * read that finds the conversation merged or split keeps it.
+   */
+  get showing(): number | null {
+    return this.snap.shown ? this.epoch : null;
+  }
+
   private set(patch: Partial<CardsSnapshot>): void {
     this.snap = { ...this.snap, ...patch };
     this.onChange();

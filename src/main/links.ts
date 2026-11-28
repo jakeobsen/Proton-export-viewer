@@ -129,11 +129,16 @@ function decoded(text: string): string {
 interface Target {
   /** The URL as the dialog shows it. */
   shown: string;
-  /** The host the link goes to, in ASCII form, or null if it has none. */
-  host: string | null;
-  /** Where that host is in the shown URL. */
+  /**
+   * The hosts the link goes to, in ASCII form: one for a web link, one per
+   * recipient for a `mailto:` link. Null for a recipient with no plain host.
+   */
+  hosts: Array<string | null>;
+  /** Where the first host is in the shown URL. */
   span: { start: number; end: number } | null;
   lookalike: boolean;
+  /** A `mailto:` recipient whose address can't be read one way only. */
+  unclear: boolean;
 }
 
 function webTarget(url: URL): Target {
@@ -145,9 +150,10 @@ function webTarget(url: URL): Target {
   const end = start + url.hostname.length;
   return {
     shown: href,
-    host: asciiHost(url.hostname),
+    hosts: [asciiHost(url.hostname)],
     span: url.hostname && href.slice(start, end) === url.hostname ? { start, end } : null,
     lookalike: isLookalike(url.hostname),
+    unclear: false,
   };
 }
 
@@ -155,52 +161,130 @@ function webTarget(url: URL): Target {
 const LDH_HOST_RE = /^[a-z0-9-]+(?:\.[a-z0-9-]+)*$/;
 // A name made only of characters that a host name's labels and dots can hold.
 const HOST_CHARS_RE = /^[\p{L}\p{N}\p{M}.-]+$/u;
+// The header fields of a `mailto:` URL that name recipients.
+const RECIPIENT_FIELDS = new Set(['to', 'cc', 'bcc']);
 
 /**
- * An address domain in ASCII form, or null when its decoded form is not a
- * plain host name: one with a separator, a space or another character a host
- * can't hold, or one without an ASCII form made of letters, digits and hyphens.
+ * An address domain in ASCII form, or null when it is not a plain host name:
+ * one with a separator, a space or another character a host can't hold, or one
+ * without an ASCII form made of letters, digits and hyphens. `name` is decoded.
  */
-function mailDomain(domain: string): string | null {
-  const name = decoded(domain);
+function mailDomain(name: string): string | null {
   if (!HOST_CHARS_RE.test(name)) return null;
   const ascii = asciiHost(name);
   return LDH_HOST_RE.test(ascii) ? ascii : null;
 }
 
+// RFC 5322 specials other than the list comma: text holding one may be a
+// quoted local part, a display name, a comment or a group, which a mail app
+// reads as another address than the plain one shown.
+const SPECIALS_RE = /["<>()[\];:\\]/;
+
+interface Recipient {
+  /** The part before the domain, with its `@`, as written. */
+  local: string;
+  /** The domain as written. */
+  domain: string;
+  /** The domain in ASCII form, or null when the address is unclear. */
+  host: string | null;
+  lookalike: boolean;
+  unclear: boolean;
+}
+
+/**
+ * One address, as written, with `decode` giving the text each of its parts
+ * stands for (its parts decoded once). It is unclear when it has no domain,
+ * when its domain is not a plain host name, when its local part holds a comma,
+ * another `@` or white space, or when `unclear` says so already: the path or
+ * the field value it came from holds a special.
+ */
+function recipient(address: string, decode: (s: string) => string, unclear: boolean): Recipient {
+  const at = address.lastIndexOf('@');
+  const local = at < 0 ? address : address.slice(0, at);
+  const domain = at < 0 ? '' : address.slice(at + 1);
+  const localText = decode(local);
+  const domainText = decode(domain);
+  const ascii = domain === '' ? null : mailDomain(domainText);
+  const odd = unclear || ascii === null || /[,@\s]/u.test(localText);
+  return {
+    local: at < 0 ? address : `${local}@`,
+    domain,
+    host: odd ? null : ascii,
+    lookalike: isLookalike(domainText),
+    unclear: odd,
+  };
+}
+
+/**
+ * The fields of a `mailto:` URL's query, each name and value decoded once. A
+ * `+` stays a `+`: in a `mailto:` URL it is part of an address, never a space.
+ * A field that can't be decoded keeps its value as written, marked.
+ */
+function mailFields(search: string): Array<{ name: string; value: string; bad: boolean }> {
+  if (search.length <= 1) return [];
+  return search
+    .slice(1)
+    .split('&')
+    .map((pair) => {
+      const eq = pair.indexOf('=');
+      const name = eq < 0 ? pair : pair.slice(0, eq);
+      const value = eq < 0 ? '' : pair.slice(eq + 1);
+      try {
+        return { name: decodeURIComponent(name), value: decodeURIComponent(value), bad: false };
+      } catch {
+        return { name: decoded(name), value, bad: true };
+      }
+    });
+}
+
+/**
+ * A `mailto:` link's recipients: the addresses in its path, and those in its
+ * `to`, `cc` and `bcc` fields. Each one is checked, so a look-alike domain or
+ * an unclear address anywhere in the URL warns. A path or a field value that
+ * holds a special anywhere makes every address in it unclear, as its commas
+ * may then not separate addresses.
+ */
 function mailTarget(url: URL): Target {
-  const addresses = url.pathname.split(',').map((address) => {
-    const at = address.lastIndexOf('@');
-    const domain = at < 0 ? '' : address.slice(at + 1);
-    const ascii = domain === '' ? null : mailDomain(domain);
-    return {
-      local: at < 0 ? address : address.slice(0, at + 1),
-      domain,
-      ascii,
-      // A percent-encoded domain shows in its ASCII form; one that has none
-      // shows as it is in the URL.
-      shown: ascii !== null && domain.includes('%') ? ascii : domain,
-    };
-  });
-  const shown = `${url.protocol}${addresses.map((a) => a.local + a.shown).join(',')}${url.search}${url.hash}`;
-  const lookalike = addresses.some((a) => isLookalike(decoded(a.domain)));
-  const first = addresses[0];
-  if (!first || first.domain === '') return { shown, host: null, span: null, lookalike };
-  const start = url.protocol.length + first.local.length;
-  const end = start + first.shown.length;
+  const path = url.pathname;
+  const pathOdd = SPECIALS_RE.test(decoded(path));
+  const inPath =
+    path === '' ? [] : path.split(',').map((address) => recipient(address, decoded, pathOdd));
+  const inFields: Recipient[] = [];
+  for (const { name, value, bad } of mailFields(url.search)) {
+    if (!RECIPIENT_FIELDS.has(name.toLowerCase())) continue;
+    const odd = bad || SPECIALS_RE.test(value);
+    for (const address of value.split(',')) {
+      const trimmed = address.trim();
+      if (trimmed !== '') inFields.push(recipient(trimmed, (s) => s, odd));
+    }
+  }
+  // A percent-encoded domain shows in its ASCII form; any other shows as it
+  // is in the URL.
+  const shownDomain = (a: Recipient) =>
+    a.host !== null && a.domain.includes('%') ? a.host : a.domain;
+  const shown = `${url.protocol}${inPath.map((a) => a.local + shownDomain(a)).join(',')}${url.search}${url.hash}`;
+  const all = [...inPath, ...inFields];
+  const first = inPath[0];
+  let span: Target['span'] = null;
+  if (first && first.host !== null) {
+    const start = url.protocol.length + first.local.length;
+    const end = start + shownDomain(first).length;
+    // A domain without an ASCII form is not marked.
+    if (shown.slice(start, end) === shownDomain(first)) span = { start, end };
+  }
   return {
     shown,
-    // A domain without an ASCII form is not marked, and matches no host the
-    // title names.
-    host: first.ascii,
-    span: first.ascii !== null && shown.slice(start, end) === first.shown ? { start, end } : null,
-    lookalike,
+    hosts: all.map((a) => a.host),
+    span,
+    lookalike: all.some((a) => a.lookalike),
+    unclear: all.some((a) => a.unclear),
   };
 }
 
 /**
  * What the dialog shows for a link: the URL with its hosts in punycode, also
- * an address's domain in a `mailto:` URL. Main keeps the URL it acts on.
+ * an address's domain in a `mailto:` URL, and the warnings that apply. Main
+ * keeps the URL it acts on.
  */
 export function linkPrompt(dialogId: string, link: ViewLink): LinkPrompt {
   const title = displayTitle(link.text);
@@ -210,18 +294,25 @@ export function linkPrompt(dialogId: string, link: ViewLink): LinkPrompt {
   } catch {
     url = null;
   }
+  const mail = url?.protocol === 'mailto:';
   const target: Target = !url
-    ? { shown: link.url, host: null, span: null, lookalike: false }
-    : url.protocol === 'mailto:'
+    ? { shown: link.url, hosts: [null], span: null, lookalike: false, unclear: false }
+    : mail
       ? mailTarget(url)
       : webTarget(url);
+  // A host the title names must be the host of the link, and of every
+  // recipient of a mail link; a recipient with no plain host never matches.
   const named = hostsIn(title);
+  const differs = (host: string) =>
+    target.hosts.length === 0 || target.hosts.some((h) => h === null || !sameHost(host, h));
   return {
     dialogId,
     title,
     url: target.shown,
     host: target.span,
-    mismatch: named.some((host) => target.host === null || !sameHost(host, target.host)),
+    mismatch: named.some(differs),
     lookalike: target.lookalike,
+    mail,
+    unclear: target.unclear,
   };
 }

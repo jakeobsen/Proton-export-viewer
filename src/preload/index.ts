@@ -21,6 +21,8 @@ function isPrompt(value: unknown): value is LinkPrompt {
     typeof p.url === 'string' &&
     typeof p.mismatch === 'boolean' &&
     typeof p.lookalike === 'boolean' &&
+    typeof p.mail === 'boolean' &&
+    typeof p.unclear === 'boolean' &&
     (host === null ||
       (typeof host === 'object' && typeof host.start === 'number' && typeof host.end === 'number'))
   );
@@ -88,6 +90,12 @@ const api: PevApi = {
       text: request.text,
       sort: request.sort,
       after: request.after,
+      generation,
+    }),
+  searchSnippets: (request, generation) =>
+    ipcRenderer.invoke(IPC.searchSnippets, {
+      queryId: request.queryId,
+      threadIds: request.threadIds,
       generation,
     }),
 };

@@ -19,6 +19,7 @@ import {
   type Rejected,
   type RejectCode,
   type SearchResult,
+  type SnippetsResult,
   type SourceActionResult,
   type SourcesResult,
   type StateResult,
@@ -28,23 +29,25 @@ import {
   CARDS_BEFORE,
   CARDS_FOLLOW,
   MAX_QUERY_LENGTH,
+  MAX_SNIPPET_THREADS,
   WINDOW_AFTER,
   WINDOW_BEFORE,
   type SearchPage,
+  type SearchSnippets,
 } from '../shared/index-types';
 import type { SourceOutcome } from '../shared/sources';
 import { STALE, type Stale } from './sources/manager';
 import { APP_ORIGIN, LINK_ACTIONS } from '../shared/constants';
 import { isRendererLogCode } from '../shared/log/codes';
-import { OPEN_MODES } from '../shared/reader-protocol';
+import { OPEN_MODES, type RenderedMessage } from '../shared/reader-protocol';
 import { CoreUnavailableError } from './core-host';
 import type { AppContext, AppWindow } from './context';
 import { DIALOG_ID_RE } from './link-dialog';
 import { sameFrame } from './navigation';
 import { OPEN_GAP_MS, OpenPacer } from './open-pacer';
-import { PLACEHOLDER } from './placeholder';
+import { PLACEHOLDER } from '../shared/placeholder';
 import { SUPERSEDED, SearchLanes } from './search-lane';
-import { bodyUrl } from './views';
+import { bodyUrl, type ViewBody } from './views';
 
 const Generation = z
   .number()
@@ -186,6 +189,17 @@ const SearchArgs = z.tuple([
   ]),
 ]);
 
+// Snippets for result rows: the search they belong to and its conversations.
+const SnippetsArgs = z.tuple([
+  z
+    .object({
+      queryId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      threadIds: z.array(SearchThreadId).min(1).max(MAX_SNIPPET_THREADS),
+      generation: Generation,
+    })
+    .strict(),
+]);
+
 const SourceKey = z.uuid();
 const RunId = z.string().regex(/^[0-9a-f]{16}$/);
 const GenerationArgs = z.tuple([z.object({ generation: Generation }).strict()]);
@@ -212,6 +226,27 @@ export function checkSender(ctx: AppContext, event: Event): AppWindow | RejectCo
   if (!frame || !sameFrame(frame, event.sender.mainFrame)) return 'not_main_frame';
   if (frame.origin !== APP_ORIGIN && !isDevOrigin(frame.origin)) return 'bad_origin';
   return appWin;
+}
+
+/**
+ * The assets a rendered body's view serves: every remote image as the same
+ * neutral placeholder, and each inline image (`c<n>`) as its checked bytes,
+ * or the placeholder when it has none.
+ */
+function viewAssets(message: RenderedMessage): ViewBody['assets'] {
+  const remote = Array.from({ length: message.remote }, (_, i) => ({
+    id: `r${i + 1}`,
+    ...PLACEHOLDER,
+  }));
+  const images = new Map(message.images.map((image) => [image.id, image]));
+  const inline = Array.from({ length: message.cids }, (_, i) => {
+    const id = `c${i + 1}`;
+    const image = images.get(id);
+    return image
+      ? { id, contentType: image.contentType, bytes: image.bytes }
+      : { id, ...PLACEHOLDER };
+  });
+  return [...remote, ...inline];
 }
 
 export function registerIpc(ctx: AppContext): void {
@@ -371,11 +406,7 @@ export function registerIpc(ctx: AppContext): void {
 
     const outcome = appWin.views.install(openId, token, generation, ctx.generation, {
       html: message.html,
-      // Every remote image shows as the same neutral placeholder.
-      assets: Array.from({ length: message.remote }, (_, i) => ({
-        id: `r${i + 1}`,
-        ...PLACEHOLDER,
-      })),
+      assets: viewAssets(message),
       links: message.links,
     });
     if (!outcome.ok) {
@@ -436,6 +467,11 @@ export function registerIpc(ctx: AppContext): void {
    */
   const searchLanes = new SearchLanes<AppWindow>();
   let lastQueryId = 0;
+  /** Per window, its latest search's text, and the first query ID made with that text. */
+  const currentSearch = new WeakMap<
+    AppWindow,
+    { text: string; firstQueryId: number; generation: number }
+  >();
   guarded<SearchResult>(IPC.search, async (appWin, raw) => {
     const args = SearchArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
@@ -443,6 +479,10 @@ export function registerIpc(ctx: AppContext): void {
     if (generation !== ctx.generation) return reject('stale_generation', appWin);
     lastQueryId += 1;
     const queryId = lastQueryId;
+    const known = currentSearch.get(appWin);
+    if (known?.text !== request.text || known.generation !== generation) {
+      currentSearch.set(appWin, { text: request.text, firstQueryId: queryId, generation });
+    }
     const outcome = await searchLanes.run(appWin, async () =>
       // A search that waited is checked again when its turn comes.
       generation === ctx.generation
@@ -455,6 +495,40 @@ export function registerIpc(ctx: AppContext): void {
     const page = outcome.answer as SearchPage | null;
     if (page?.queryId !== queryId) return reject('invalid', appWin);
     return { ok: true, generation, queryId, page, progress: outcome.progress };
+  });
+
+  /**
+   * Snippets for rows of the window's current search, by its query ID: main
+   * uses the text that search was made with, so the window can't ask for any
+   * other. An older search's ID, or one from another generation, is
+   * superseded. One request runs per window and one waits, as for searches.
+   */
+  const snippetLanes = new SearchLanes<AppWindow>();
+  guarded<SnippetsResult>(IPC.searchSnippets, async (appWin, raw) => {
+    const args = SnippetsArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ queryId, threadIds, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    const search = currentSearch.get(appWin);
+    if (
+      !search ||
+      search.generation !== generation ||
+      queryId < search.firstQueryId ||
+      queryId > lastQueryId
+    ) {
+      return { ok: false, code: 'superseded' };
+    }
+    const outcome = await snippetLanes.run(appWin, async () =>
+      generation === ctx.generation
+        ? ctx.sources.queryIndex({ op: 'snippets', queryId, text: search.text, threadIds })
+        : null,
+    );
+    if (outcome === SUPERSEDED) return { ok: false, code: 'superseded' };
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    if (!outcome) return { ok: false, code: 'no_source' };
+    const answer = outcome.answer as SearchSnippets | null;
+    if (answer?.queryId !== queryId) return reject('invalid', appWin);
+    return { ok: true, generation, queryId, snippets: answer.snippets };
   });
 
   /**

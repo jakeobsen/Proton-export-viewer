@@ -10,6 +10,7 @@
 // profile, seed and nonce always give the same bytes. entries() yields every
 // file without writing anything; gen-export.mjs measures and writes them.
 
+import { gifImage, solidPng } from './images.mjs';
 import { Random } from './random.mjs';
 import {
   DOMAINS,
@@ -31,6 +32,14 @@ import { hostileMessages } from './hostile.mjs';
 /** The export run all corpora claim to come from (UTC). */
 export const EXPORT_TIME = Date.UTC(2025, 5, 30, 12, 0, 0) / 1000;
 export const RUN_FOLDER = 'mail_20250630_120000';
+/**
+ * The share of HTML messages that show inline images: about 10% of all
+ * messages up to 1 MB, as 55% are HTML. Their messages stay under
+ * INLINE_MAX_BYTES with the images in.
+ */
+const INLINE_SHARE = 0.18;
+const INLINE_MAX_BYTES = 768 * 1024;
+
 /** Messages are dated between these two times. */
 const FIRST_TIME = Date.UTC(2012, 0, 1) / 1000;
 const LAST_TIME = Date.UTC(2025, 5, 29) / 1000;
@@ -164,6 +173,8 @@ function planMix(profile, seed, labelInfo) {
     html: 0,
     plain: 0,
     with_attachments: 0,
+    inline_images: 0,
+    inline_data_images: 0,
     gaps: 0,
     duplicate_message_ids: 0,
     crafted_references: 0,
@@ -315,6 +326,14 @@ function planMix(profile, seed, labelInfo) {
         total -= bytes;
       }
       counts.with_attachments += 1;
+    }
+    // Inline images draw from a stream of their own, so every other draw
+    // stays as it was without them.
+    const irng = new Random(`inline/${p.key}`);
+    if (p.body === 'html' && p.emlBytes <= INLINE_MAX_BYTES && irng.chance(INLINE_SHARE)) {
+      p.inline = { cid: irng.int(1, 3), data: irng.chance(0.3) };
+      counts.inline_images += 1;
+      if (p.inline.data) counts.inline_data_images += 1;
     }
     counts[p.body] += 1;
     counts.messages += 1;
@@ -644,6 +663,50 @@ function boundary(rng) {
   return `=_${rng.bytes(12).toString('hex')}`;
 }
 
+/**
+ * The inline images of a message: decodable PNG parts that its HTML names by
+ * `cid:`, and a decodable GIF as a `data:` image, all of one colour each.
+ */
+function inlineImages(plan) {
+  const irng = new Random(`inline-images/${plan.key}`);
+  const color = () => [irng.int(0, 255), irng.int(0, 255), irng.int(0, 255)];
+  const parts = [];
+  const tags = [];
+  for (let i = 0; i < plan.inline.cid; i++) {
+    const side = irng.int(8, 40);
+    const cid = `image${i}.${irng.bytes(6).toString('hex')}@example.test`;
+    parts.push({ cid, name: `image${i}.png`, bytes: solidPng(side, side, color()) });
+    tags.push(`<img src="cid:${cid}" width="${side}" height="${side}" alt="">`);
+  }
+  if (plan.inline.data) {
+    const side = irng.int(8, 32);
+    const gif = gifImage(side, side, 1, { rgb: color(), full: true });
+    tags.push(
+      `<img src="data:image/gif;base64,${gif.toString('base64')}" width="${side}" height="${side}" alt="">`,
+    );
+  }
+  return { parts, html: `<p>${tags.join(' ')}</p>` };
+}
+
+/** Wraps a body in multipart/related with its inline image parts. */
+function relatedPart(rng, [mimeType, headers, body], parts) {
+  const b = boundary(rng);
+  const lines = [`--${b}`, ...headers, '', body];
+  for (const part of parts) {
+    lines.push(
+      `--${b}`,
+      'Content-Type: image/png',
+      `Content-ID: <${part.cid}>`,
+      `Content-Disposition: inline; filename="${part.name}"`,
+      'Content-Transfer-Encoding: base64',
+      '',
+      base64Lines(part.bytes),
+    );
+  }
+  lines.push(`--${b}--`);
+  return [mimeType, [`Content-Type: multipart/related; boundary="${b}"`], lines.join('\r\n')];
+}
+
 /** Returns [mime type, header lines, body] for the message's body part(s). */
 function bodyPart(rng, plan, bytes) {
   // textOfSize ends on a whole paragraph, so aim a little short.
@@ -656,10 +719,17 @@ function bodyPart(rng, plan, bytes) {
     ];
   }
   const b = boundary(rng);
+  // The images take their share of the message's size from the text.
+  const inline = plan.inline ? inlineImages(plan) : null;
+  const imageBytes = inline
+    ? inline.html.length + inline.parts.reduce((n, p) => n + 200 + (p.bytes.length * 4) / 3, 0)
+    : 0;
+  const textBytes = Math.max(0, bytes - imageBytes);
   // Quoted-printable adds about 5% to HTML; the two parts share the size.
-  const htmlText = htmlBody(rng, Math.round(bytes * 0.55));
-  const shortText = textOfSize(rng, Math.max(40, Math.round(bytes * 0.3)));
-  return [
+  let htmlText = htmlBody(rng, Math.round(textBytes * 0.55));
+  const shortText = textOfSize(rng, Math.max(40, Math.round(textBytes * 0.3)));
+  if (inline) htmlText = htmlText.replace('<body>', `<body>${inline.html}`);
+  const alternative = [
     'text/html',
     [`Content-Type: multipart/alternative; boundary="${b}"`],
     [
@@ -676,6 +746,7 @@ function bodyPart(rng, plan, bytes) {
       `--${b}--`,
     ].join('\r\n'),
   ];
+  return inline ? relatedPart(rng, alternative, inline.parts) : alternative;
 }
 
 function attachmentContent(rng, a) {
