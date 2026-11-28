@@ -759,6 +759,45 @@ describe('the second read', () => {
       expect(refused).toEqual({ changed: 2 });
     });
 
+    it('serves no cid: image when the file changed and the second read then failed after the first image', async () => {
+      const path = join(dir, `m${Math.random().toString(36).slice(2)}.eml`);
+      writeFileSync(path, bytes);
+      utimesSync(path, SET_TIME, SET_TIME);
+      const fd = openSync(path, 'r');
+      try {
+        const cut = bytes.indexOf('Content-ID: <b@x>');
+        const reread = {
+          ...fdReread(fd, async () => {
+            utimesSync(path, new Date(Date.UTC(2021, 0, 1)), new Date(Date.UTC(2021, 0, 1)));
+          }),
+          // Reads up to the boundary after the first image, then fails.
+          open: () =>
+            Promise.resolve(
+              Readable.from(
+                (async function* () {
+                  yield bytes.subarray(0, cut);
+                  await new Promise((resolve) => setTimeout(resolve, 50));
+                  throw new Error('read error');
+                })(),
+              ),
+            ),
+        };
+        let refused = new Map<ImageRefusal, number>();
+        const rendered = await renderMessage(fdRead(fd), {
+          mode: 'html',
+          assetBase: BASE,
+          reread,
+          onImagesRefused: (r) => {
+            refused = new Map(r);
+          },
+        });
+        expect(rendered.images).toEqual([]);
+        expect(Object.fromEntries(refused)).toEqual({ changed: 2 });
+      } finally {
+        closeSync(fd);
+      }
+    });
+
     it('serves no cid: image when only the size changed between the reads', async () => {
       const { rendered, refused } = await renderFile((_fd, path) => {
         writeFileSync(path, Buffer.from('\r\n'), { flag: 'a' });
