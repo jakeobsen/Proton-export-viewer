@@ -77,6 +77,7 @@ export const LOG_CODES = [
   'index.labels_failed',
   'index.meta_failed',
   'index.timeout',
+  'index.files_held',
   'index.capped',
   'index.idle_release',
   'index.verified',
