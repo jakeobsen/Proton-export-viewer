@@ -118,12 +118,14 @@
   min-width: 0;
 }
 
+/* The sender's name is mail data: an isolated run of text. */
 .ch-name {
   min-width: 0;
   overflow: hidden;
   font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
+  unicode-bidi: isolate;
 }
 
 .ch-l1 .pill {

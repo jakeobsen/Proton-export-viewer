@@ -12,6 +12,7 @@ import {
   useVirtualizer,
 } from '@tanstack/react-virtual';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { displayText } from '../shared/header-text';
 import type { CardRow } from '../shared/index-types';
 import { CARD_HEIGHT } from './cards';
 import { FolderChip, LabelChip } from './Chips';
@@ -33,7 +34,8 @@ function cardDate(time: number): string {
 
 function Card({ card, expanded }: { card: CardRow; expanded: boolean }) {
   const reader = useReaderState();
-  const name = card.senderName || card.senderAddress;
+  const address = displayText(card.senderAddress);
+  const name = displayText(card.senderName) || address;
   return (
     <article
       className={expanded ? 'card expanded' : 'card'}
@@ -54,7 +56,7 @@ function Card({ card, expanded }: { card: CardRow; expanded: boolean }) {
           {initialsOf(name)}
         </span>
         <span className="ch-l1">
-          <span className="ch-name" title={card.senderAddress || undefined}>
+          <span className="ch-name" title={address || undefined}>
             {name}
           </span>
           {card.spam && <span className="pill">Spam</span>}
@@ -175,7 +177,7 @@ export function Conversation() {
   return (
     <div className="rp cv">
       <div className="cv-head">
-        <h1 className="rp-subject">{snap.subject}</h1>
+        <h1 className="rp-subject">{displayText(snap.subject)}</h1>
         {snap.ready && (
           <div className="chips">
             {folderChips(snap.labelIds, sidebar).map((folder) => (
