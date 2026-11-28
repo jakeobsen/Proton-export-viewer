@@ -493,7 +493,11 @@ test('a body too heavy to render as HTML gives the fallback, and its plain text 
   ]);
   // Rendering this HTML needs well over this heap; its plain text needs less.
   await pev.main('readerLimits', { heapMb: 64 });
-  expect(await openRow(pev, 2, 'html-anyway')).toMatchObject({ ok: true, outcome: 'fallback' });
+  expect(await openRow(pev, 2, 'html-anyway')).toMatchObject({
+    ok: true,
+    outcome: 'fallback',
+    fileRefused: false,
+  });
   expect(pev.hasLog('open.fallback', { reason: 'limit' })).toBe(true);
   // The fallback's action: the same message as plain text.
   expect(await openRow(pev, 2, 'plain')).toMatchObject({

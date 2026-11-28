@@ -38,6 +38,7 @@ export interface CoreTestDeps {
     held: Array<OpenRequest | ReadRequest>;
     fileOpens: number;
     unsanitized: boolean;
+    breakMarks: boolean;
     searches: number;
     holdingSearches: boolean;
     heldSearches: IndexQueryRequest[];
@@ -313,6 +314,15 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
         return;
       }
       deps.state.unsanitized = request.payload;
+      ok();
+      return;
+    case 'reader-break-marks':
+      // Later opens from search send the worker match ranges that fail its check.
+      if (typeof request.payload !== 'boolean') {
+        deps.reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
+        return;
+      }
+      deps.state.breakMarks = request.payload;
       ok();
       return;
     case 'reader-lane':

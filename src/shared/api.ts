@@ -16,7 +16,7 @@ import type {
   WindowQuery,
 } from './index-types';
 import type { RasterFormat } from './attachment-types';
-import type { MessageDetails, MessageHeaders, OpenMode } from './reader-protocol';
+import type { MessageDetails, MessageHeaders, OpenMode, ReaderMatch } from './reader-protocol';
 import type { SourceOutcome, SourcesView } from './sources';
 
 export const IPC = {
@@ -110,8 +110,21 @@ export type MessageOpenResult =
       /** The attachments, by their index in this view's list; never their place in the message. */
       attachments: AttachmentItem[];
       details: MessageDetails;
+      /** The plain body is the indexed text with the search's matches marked. */
+      highlighted: boolean;
+      /** For an open from search: how the message matched; null otherwise. */
+      match: ReaderMatch | null;
     }
-  | { ok: true; openId: number; outcome: 'fallback' }
+  | {
+      ok: true;
+      openId: number;
+      outcome: 'fallback';
+      match: ReaderMatch | null;
+      /** The message file itself couldn't be opened, so no other view of it opens either. */
+      fileRefused: boolean;
+    }
+  /** A missing message file opened from search says how the message matched. */
+  | { ok: false; code: 'eml_missing'; match: ReaderMatch | null }
   | Rejected;
 
 /** What the shell reads from the open export's index. */
@@ -184,7 +197,16 @@ export interface PevApi {
   state(): Promise<StateResult>;
   ping(generation: number): Promise<PingResult>;
   openStub(id: string, generation: number): Promise<OpenResult>;
-  open(rowid: number, mode: OpenMode, generation: number): Promise<MessageOpenResult>;
+  /**
+   * Opens a message; with `queryId`, as part of that search's results, so its
+   * matches are marked or listed. Only the ID goes to main, never the text.
+   */
+  open(
+    rowid: number,
+    mode: OpenMode,
+    generation: number,
+    queryId?: number,
+  ): Promise<MessageOpenResult>;
   /** Closes the reader: its view and any open still under way are revoked. */
   closeView(generation: number): Promise<CloseViewResult>;
   /** Shows the open message's file in Finder. */

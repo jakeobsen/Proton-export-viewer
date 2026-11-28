@@ -358,6 +358,9 @@ export async function install(ctx: AppContext): Promise<boolean> {
     /** Serves later HTML bodies without the sanitizer and the CSS filter, or with them again. */
     readerUnsanitized: (on: boolean) =>
       ctx.core.request({ type: 'test', action: READER_UNSANITIZED_ACTION, payload: on }),
+    /** Sends later stored bodies to the reader worker with ranges that fail its check, or not. */
+    readerBreakMarks: (on: boolean) =>
+      ctx.core.request({ type: 'test', action: 'reader-break-marks', payload: on }),
     /** Opens a gate of the reader's test source; lookups waiting there go on. */
     readerGate: (name: string) =>
       ctx.core.request({ type: 'test', action: 'reader-gate', payload: name }),

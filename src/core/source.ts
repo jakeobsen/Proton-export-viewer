@@ -13,7 +13,7 @@
 // later, such as the outcome of a check, are looked at again under the lock
 // and dropped if their index is no longer the current one.
 
-import { closeSync } from 'node:fs';
+import { closeSync, fstatSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import type {
@@ -27,7 +27,7 @@ import type {
   ResetRequest,
   ScanRequest,
 } from '../shared/core-protocol';
-import type { EmlFile, IndexOpened, IndexReport } from '../shared/index-types';
+import type { EmlFile, IndexMatch, IndexOpened, IndexReport } from '../shared/index-types';
 import { errorClassOf } from '../shared/log/schema';
 import type { FileIdentity } from '../shared/reader-protocol';
 import type { Logger } from '../shared/log/writer';
@@ -41,6 +41,7 @@ import {
   openWithRescan,
   pairCounts,
   resolveRoot,
+  type FileRef,
   type Rejection,
   type RunScan,
 } from './containment';
@@ -68,15 +69,40 @@ const SCAN_REPORT_MS = 250;
 const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 /**
+ * The open file is the one the index read: same device, inode, size and
+ * modification time. A file rewritten in place keeps its inode, so the size
+ * and time are what tell it apart.
+ */
+function isIndexedFile(fd: number, indexed: FileRef): boolean {
+  const st = fstatSync(fd, { bigint: true });
+  return (
+    st.dev === indexed.dev &&
+    st.ino === indexed.ino &&
+    Number(st.size) === indexed.size &&
+    st.mtimeNs === indexed.mtimeNs
+  );
+}
+
+/**
+ * A match whose stored body belongs to an older version of the file: the
+ * body's matches go, and the other columns stay, until the file is indexed again.
+ */
+function unindexedBody(match: IndexMatch): IndexMatch {
+  return { ...match, body: null, bodyMatches: 0, changed: true };
+}
+
+/**
  * The reader's open of a message file, or why there is none: no source or a
  * newer generation or open, the run unavailable, no such message, its file
  * missing, or a file the checks refused.
  */
 export type ReaderFile =
-  | { ok: true; opened: OpenedMessage }
+  | { ok: true; opened: OpenedMessage; match?: IndexMatch | null }
   | {
       ok: false;
       code: 'no_source' | 'superseded' | 'unavailable' | 'not_found' | 'eml_missing' | 'refused';
+      /** For `eml_missing` or `refused` from search: how the message matched. */
+      match?: IndexMatch | null;
     };
 
 /** What the writer keeps about the open source until the index takes it over. */
@@ -537,11 +563,14 @@ export class SourceSession {
    * changed since the scan is examined again and opened once more with its new
    * identity; a link, a FIFO or another file type is never opened. `stale`
    * tells whether a newer open has come in since, so nothing is opened for it.
+   * With a search, the answer also says how the message matched it; when the
+   * file opened isn't the one indexed, its stored body isn't used.
    */
   async openForReader(
     rowid: number,
     generation: number,
     stale: () => boolean,
+    search?: string,
   ): Promise<ReaderFile> {
     const current = this.gate.current;
     if (!current) return { ok: false, code: 'no_source' };
@@ -550,32 +579,53 @@ export class SourceSession {
     if (root === null) return { ok: false, code: 'unavailable' };
     const service = this.index;
     if (!service || service.isDamaged) return { ok: false, code: 'not_found' };
-    const file = (await service.ask({ op: 'eml', rowid })) as EmlFile | null;
+    const file = (await service.ask(
+      search === undefined ? { op: 'eml', rowid } : { op: 'eml', rowid, search },
+    )) as EmlFile | null;
     // Nothing is opened for a generation, an index or an open that moved on meanwhile.
     if (!this.gate.isCurrent(current) || this.index !== service || service.isDamaged || stale()) {
       return { ok: false, code: 'superseded' };
     }
     if (!file) return { ok: false, code: 'not_found' };
+    // Only an open from search has a match, and only then does the answer carry one.
+    const match = file.match;
+    const withMatch = match === undefined ? {} : { match };
     if (file.rel === null || file.bodyState === BODY_STATE.emlMissing) {
-      return { ok: false, code: 'eml_missing' };
+      return { ok: false, code: 'eml_missing', ...withMatch };
     }
-    const opened = openWithRescan(root, {
+    const indexed: FileRef = {
       rel: file.rel,
       kind: 'eml',
       dev: BigInt(file.dev),
       ino: BigInt(file.ino),
       size: file.size,
       mtimeNs: BigInt(file.mtimeNs),
-    });
+    };
+    const opened = openWithRescan(root, indexed);
     if (!opened.ok) {
       this.log.info('open.file_refused', {
         reason: opened.gone ? 'eml_missing' : opened.rejection.kind,
       });
-      return { ok: false, code: opened.gone ? 'eml_missing' : 'refused' };
+      return { ok: false, code: opened.gone ? 'eml_missing' : 'refused', ...withMatch };
     }
     const fd = opened.fd;
+    let indexedFile: boolean;
+    try {
+      indexedFile = !match || isIndexedFile(fd, indexed);
+    } catch {
+      // The open file can't be checked: it is closed, and refused like one that can't be opened.
+      try {
+        closeSync(fd);
+      } catch {
+        // Closed already.
+      }
+      this.log.info('open.file_refused', { reason: 'unreadable' });
+      return { ok: false, code: 'refused', ...withMatch };
+    }
+    const changed = match && !indexedFile;
     return {
       ok: true,
+      ...(changed ? { match: unindexedBody(match) } : withMatch),
       opened: {
         input: { kind: 'fd', fd },
         file: { dev: opened.ref.dev.toString(), ino: opened.ref.ino.toString() },

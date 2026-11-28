@@ -11,6 +11,8 @@
 // larger than its decoded text.
 // An HTML body comes with its inline images (see images.ts): the `cid:`
 // parts it names, read again from the message, and its `data:` images.
+// Opened from search, a plain view shows the stored body with its matches
+// marked, once the match ranges pass the check again here.
 
 import type { Readable } from 'node:stream';
 import type { AddressObject, HeaderLines, HeaderValue, Headers } from 'mailparser';
@@ -24,7 +26,9 @@ import {
   type MessageHeaders,
   type OpenMode,
   type RenderedMessage,
+  type StoredBody,
 } from '../../shared/reader-protocol';
+import { validRanges } from '../search/ranges';
 import { htmlTextParser } from '../text/html-to-text';
 import { KEEP_BYTES, extractMessage, type Body, type ExtractedMessage } from './extract';
 import { InlineImages, type ImageRefusal, type Reread } from './images';
@@ -58,6 +62,10 @@ export interface RenderOptions {
   reread?: Reread;
   /** Told, once the body is built, how many inline images weren't shown, by reason. */
   onImagesRefused?: (refused: ReadonlyMap<ImageRefusal, number>) => void;
+  /** The stored body with its match ranges, shown marked whenever the body is plain text. */
+  stored?: StoredBody;
+  /** Told how many match ranges were dropped because they failed the check. */
+  onMarksDropped?: (count: number) => void;
 }
 
 function cut(text: string, max: number): string {
@@ -276,10 +284,14 @@ export async function renderMessage(
       hasHtml,
       htmlTooLarge: false,
       cut: stopped ? 'parts' : null,
+      highlighted: false,
     };
   }
-  const plain = plainText(text, html);
-  const body = plainBody(plain.text, options.assetBase);
+  const marked = markedStored(options);
+  const plain = marked ? null : plainText(text, html);
+  const body = marked
+    ? plainBody(marked.text, options.assetBase, marked.ranges)
+    : plainBody(plain!.text, options.assetBase);
   const attachments = attachmentList(extracted, new Set());
   const details = detailsOf(parsedHeaders, { ...bodies, attachments: attachments.length });
   return {
@@ -300,6 +312,22 @@ export async function renderMessage(
       hasHtml &&
       html.bytes > HTML_VIEW_BYTES &&
       html.bytes <= HTML_ANYWAY_BYTES,
-    cut: plain.cut ? 'size' : stopped ? 'parts' : null,
+    // The stored body is the indexed text; how much of it was indexed is the match line's.
+    cut: marked ? null : plain!.cut ? 'size' : stopped ? 'parts' : null,
+    highlighted: marked !== null,
   };
+}
+
+/**
+ * The stored body to show marked, or null to show the message's own text.
+ * Its ranges are checked again against the exact text the links are found
+ * in; if they fail, or that text would change length, the marks go.
+ */
+function markedStored(options: RenderOptions): StoredBody | null {
+  const stored = options.stored;
+  if (!stored) return null;
+  const same = stored.text.replace(/\r\n?/g, '\n').length === stored.text.length;
+  if (same && validRanges(stored.text, stored.ranges)) return stored;
+  options.onMarksDropped?.(stored.ranges.length);
+  return null;
 }
