@@ -208,6 +208,11 @@ export interface LaunchOptions {
   /** Start with this userData, e.g. to launch again after a quit. */
   userData?: string;
   args?: string[];
+  /**
+   * Pages take the colour scheme the app gives them. Playwright otherwise
+   * emulates a light one in every page, whatever the app's theme.
+   */
+  appColorScheme?: boolean;
 }
 
 export async function launch(name: string, options: LaunchOptions = {}): Promise<PevApp> {
@@ -226,6 +231,7 @@ export async function launch(name: string, options: LaunchOptions = {}): Promise
     cwd: REPO_ROOT,
     // Without this, Playwright turns Chromium's sandbox off on Linux.
     chromiumSandbox: true,
+    ...(options.appColorScheme ? { colorScheme: null } : {}),
   });
   const page = await app.firstWindow();
   await page.waitForLoadState('load');

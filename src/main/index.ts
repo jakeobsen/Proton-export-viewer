@@ -2,7 +2,7 @@
 // Main process entry: the broker. It never parses mail and holds no network code.
 
 import { dirname, join, sep } from 'node:path';
-import { app, clipboard, protocol, shell } from 'electron';
+import { app, clipboard, nativeTheme, protocol, shell } from 'electron';
 import { SHELL_CSP } from '../shared/constants';
 import { errorData } from '../shared/log/schema';
 import { LogWriter } from '../shared/log/writer';
@@ -24,6 +24,7 @@ import { registerIpc } from './ipc';
 import { LinkDialog } from './link-dialog';
 import { SettingsStore } from './settings';
 import { applySwitches } from './switches';
+import { followTheme } from './theme';
 import { createAppWindow } from './windows';
 
 process.umask(0o077);
@@ -112,6 +113,8 @@ async function start(): Promise<void> {
     logs: logsDir,
   };
   const settings = SettingsStore.load(dirs.userData, log);
+  // Before the first window, so it never shows in the wrong theme.
+  followTheme(settings, nativeTheme);
   const core = new CoreHost({
     corePath: paths.corePath,
     logsDir,

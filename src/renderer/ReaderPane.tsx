@@ -30,6 +30,7 @@ import {
   openSource,
   showInFolder,
   useReaderState,
+  viewChoices,
   type ReaderView,
 } from './reader';
 import { useShellState } from './shell';
@@ -418,9 +419,9 @@ export function MessageBody() {
     );
   }
   const shown = view?.format ?? null;
-  // HTML was asked for and plain text came back: this open can't show the HTML
-  // ("Show HTML anyway" is offered when its size alone kept it back).
-  const htmlKeptBack = view?.format === 'plain' && reader.mode !== 'plain';
+  // HTML was asked for and plain text came back: the switch can't offer the
+  // HTML ("Show HTML anyway" is offered when its size alone kept it back).
+  const choices = viewChoices(reader);
   return (
     <>
       <div className="rp-actbar" role="toolbar" aria-label="Message actions">
@@ -429,7 +430,7 @@ export function MessageBody() {
             type="button"
             className="rp-plain"
             aria-pressed={shown === 'plain'}
-            disabled={pending || shown === 'plain'}
+            disabled={!choices.plain}
             onClick={() => void openInReader(rowid, 'plain')}
           >
             <PlainIcon />
@@ -439,7 +440,7 @@ export function MessageBody() {
             type="button"
             className="rp-html"
             aria-pressed={shown === 'html'}
-            disabled={pending || shown === 'html' || !view?.hasHtml || htmlKeptBack}
+            disabled={!choices.html}
             title={view && !view.hasHtml ? 'No HTML version' : undefined}
             onClick={() => void openInReader(rowid, 'html')}
           >

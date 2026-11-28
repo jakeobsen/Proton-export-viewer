@@ -4,6 +4,7 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import {
   IPC,
+  isFrameKey,
   type ErrorReport,
   type IndexUpdate,
   type LinkPrompt,
@@ -76,13 +77,13 @@ const api: PevApi = {
   },
   linkAction: (dialogId, action, generation) =>
     ipcRenderer.invoke(IPC.linkAction, { dialogId, action, generation }),
-  onCardKey: (listener) => {
+  onFrameKey: (listener) => {
     const handler = (_event: unknown, key: unknown) => {
-      if (key === 'n' || key === 'p') listener(key);
+      if (isFrameKey(key)) listener(key);
     };
-    ipcRenderer.on(IPC.cardKey, handler);
+    ipcRenderer.on(IPC.frameKey, handler);
     return () => {
-      ipcRenderer.off(IPC.cardKey, handler);
+      ipcRenderer.off(IPC.frameKey, handler);
     };
   },
   sources: (generation) => ipcRenderer.invoke(IPC.sources, { generation }),
