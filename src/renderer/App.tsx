@@ -2,7 +2,8 @@
 
 import { useEffect } from 'react';
 import type { IndexCondition } from '../shared/index-types';
-import { indexChanged, syncMailbox, useSearch } from './mailbox-state';
+import { Conversation } from './Conversation';
+import { indexChanged, syncMailbox, useCards, useSearch } from './mailbox-state';
 import { ConversationList, Sidebar } from './Mailbox';
 import { SearchBox, SearchResults } from './SearchResults';
 import { LinkDialog } from './LinkDialog';
@@ -21,6 +22,7 @@ export function App() {
   const state = useShellState();
   const reader = useReaderState();
   const results = useSearch().active;
+  const conversation = useCards();
 
   useEffect(() => window.pev.onLinkDialog(showLink), []);
   useEffect(() => window.pev.onSourcesChanged(() => void refreshSources()), []);
@@ -84,7 +86,7 @@ export function App() {
           {active && <Sidebar active={active} busy={state.busy} />}
           {active && (results ? <SearchResults /> : <ConversationList />)}
           <section className="reader" aria-label="Conversation">
-            <ReaderPane />
+            {conversation.shown ? <Conversation /> : <ReaderPane />}
           </section>
         </main>
       )}

@@ -41,6 +41,10 @@ export interface CoreTestDeps {
     searches: number;
     holdingSearches: boolean;
     heldSearches: IndexQueryRequest[];
+    holdingOpened: boolean;
+    heldOpened: Array<() => void>;
+    holdCardsAt: number | null;
+    heldCards: Array<() => void>;
   };
   open: (request: OpenRequest | ReadRequest) => void;
   toWorker: (message: WorkerRequest) => void;
@@ -137,6 +141,20 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
     case 'held':
       ok(deps.state.held.length);
       return;
+    case 'hold-opened':
+      deps.state.holdingOpened = true;
+      ok();
+      return;
+    case 'release-opened': {
+      deps.state.holdingOpened = false;
+      const held = deps.state.heldOpened.splice(0);
+      for (const go of held) go();
+      ok(held.length);
+      return;
+    }
+    case 'held-opened':
+      ok(deps.state.heldOpened.length);
+      return;
     case 'file-opens':
       ok(deps.state.fileOpens);
       return;
@@ -156,6 +174,22 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
     }
     case 'held-searches':
       ok(deps.state.heldSearches.length);
+      return;
+    case 'hold-cards': {
+      // Holds the cards queries anchored at a message; null lets the held ones go.
+      const rowid = (request.payload as { rowid?: unknown } | undefined)?.rowid;
+      if (rowid !== null && !(Number.isSafeInteger(rowid) && (rowid as number) > 0)) {
+        deps.reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
+        return;
+      }
+      deps.state.holdCardsAt = rowid as number | null;
+      const held = rowid === null ? deps.state.heldCards.splice(0) : [];
+      for (const go of held) go();
+      ok(held.length);
+      return;
+    }
+    case 'held-cards':
+      ok(deps.state.heldCards.length);
       return;
     case 'release-writes': {
       const count = (request.payload as { count?: unknown } | undefined)?.count;

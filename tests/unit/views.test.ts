@@ -56,6 +56,27 @@ describe('ViewRegistry', () => {
     expect(views.liveCount).toBe(0);
   });
 
+  it('close revokes the live view and the open under way, whose view or fallback is then stale', () => {
+    const views = new ViewRegistry(tokens());
+    const first = views.accept();
+    views.install(first.openId, first.token, 1, 1, body);
+    const pending = views.accept();
+    expect(views.close()).toBe(0);
+    expect(views.lookup(first.token)).toBeUndefined();
+    expect(views.authorizedUrl()).toBeNull();
+    // A late view installs nothing, and a late fallback, checked by open id, is stale too.
+    expect(views.install(pending.openId, pending.token, 1, 1, body)).toEqual({
+      ok: false,
+      reason: 'open_id',
+    });
+    expect(views.latest).not.toBe(pending.openId);
+    // A view that was live when the reader closed is counted.
+    const next = views.accept();
+    views.install(next.openId, next.token, 1, 1, body);
+    expect(views.close()).toBe(1);
+    expect(views.lookup(next.token)).toBeUndefined();
+  });
+
   it('ignores lookups that are not 128-bit hex tokens', () => {
     const views = new ViewRegistry(tokens());
     expect(views.lookup('../x')).toBeUndefined();

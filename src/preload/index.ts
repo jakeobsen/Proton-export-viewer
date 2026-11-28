@@ -31,6 +31,7 @@ const api: PevApi = {
   ping: (generation) => ipcRenderer.invoke(IPC.ping, { generation }),
   openStub: (id, generation) => ipcRenderer.invoke(IPC.openStub, { id, generation }),
   open: (rowid, mode, generation) => ipcRenderer.invoke(IPC.open, { rowid, mode, generation }),
+  closeView: (generation) => ipcRenderer.invoke(IPC.closeView, { generation }),
   log: (level, code, generation, data) =>
     ipcRenderer.send(
       IPC.log,
@@ -65,6 +66,7 @@ const api: PevApi = {
   },
   sidebar: (generation) => ipcRenderer.invoke(IPC.index, { query: { op: 'sidebar' }, generation }),
   listWindow: (query, generation) => ipcRenderer.invoke(IPC.index, { query, generation }),
+  cards: (query, generation) => ipcRenderer.invoke(IPC.index, { query, generation }),
   onIndexChanged: (listener) => {
     const handler = (_event: unknown, update: IndexUpdate) => listener(update);
     ipcRenderer.on(IPC.indexChanged, handler);

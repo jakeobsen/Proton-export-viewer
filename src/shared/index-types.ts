@@ -227,6 +227,74 @@ export interface SearchSnippets {
   dropped: number;
 }
 
+/** One message of a conversation, as its card shows it. */
+export interface CardRow {
+  rowid: number;
+  time: number;
+  senderName: string;
+  senderAddress: string;
+  /** The message is in Spam (label ID 4). */
+  spam: boolean;
+  /** The message is in Trash (label ID 3). */
+  trash: boolean;
+}
+
+/** Where a card stands in its conversation, oldest first: by date, then by rowid. */
+export interface CardKey {
+  time: number;
+  rowid: number;
+}
+
+/**
+ * Where a cards window is placed: at message `rowid` if it is still in the
+ * conversation, else at the card nearest `key` (the next newer one first),
+ * else at position `index`.
+ */
+export interface CardsAnchor {
+  rowid?: number;
+  key?: CardKey;
+  index: number;
+}
+
+/** The most cards a window holds before its anchor, and from it on. */
+export const CARDS_BEFORE = 100;
+export const CARDS_AFTER = 200;
+/** The most messages a cards query may name to follow. */
+export const CARDS_FOLLOW = 4;
+
+export interface CardsQuery {
+  op: 'cards';
+  /**
+   * Messages that say which conversation to show, in order of preference:
+   * the conversation of the first one still in the index.
+   */
+  follow: number[];
+  /** The conversation to show if none of `follow` is left. */
+  threadId: number | null;
+  anchor: CardsAnchor;
+  before: number;
+  after: number;
+}
+
+/** A stretch of one conversation's cards, oldest first, read from one snapshot. */
+export interface CardsWindow {
+  /** The conversation shown, or null when there is none left. */
+  threadId: number | null;
+  /** The message of `follow` that named it; null if none is left. */
+  followed: number | null;
+  /** The subject of its earliest message. */
+  subject: string;
+  /** Messages in the conversation, from every folder. */
+  total: number;
+  /** The position of the first card. */
+  start: number;
+  cards: CardRow[];
+  /** The anchor card's position; null for an empty window. */
+  anchor: number | null;
+  /** The anchor card is message `anchor.rowid` itself. */
+  anchorFound: boolean;
+}
+
 export type IndexQuery =
   | { op: 'sidebar' }
   | { op: 'page'; labelId: string; after: PageKey | null; limit?: number }
@@ -236,7 +304,8 @@ export type IndexQuery =
   | { op: 'eml'; rowid: number }
   | WindowQuery
   | SearchQuery
-  | SnippetsQuery;
+  | SnippetsQuery
+  | CardsQuery;
 
 export type IndexAnswer =
   | Sidebar
@@ -246,6 +315,7 @@ export type IndexAnswer =
   | null
   | IndexTotals
   | ListWindow
+  | CardsWindow
   | EmlFile
   | SearchPage
   | SearchSnippets;

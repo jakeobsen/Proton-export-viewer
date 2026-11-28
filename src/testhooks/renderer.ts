@@ -2,7 +2,7 @@
 // Shell test hooks, reached by tests as window.__pevTest.
 
 import { reportError } from '../renderer/errors';
-import { list, search } from '../renderer/mailbox-state';
+import { cards, list, search } from '../renderer/mailbox-state';
 import {
   chooseFolder,
   clearLink,
@@ -129,6 +129,11 @@ export function install(): void {
       const { rows, ...rest } = search.snapshot;
       return { ...rest, threadIds: rows.map((r) => r.threadId) };
     },
+    /** The conversation's cards: which one is expanded, and what is held. */
+    cards: () => cards.snapshot,
+    /** Body frames in the shell's own tree, with their URLs. */
+    readerFrames: () =>
+      [...document.querySelectorAll<HTMLIFrameElement>('iframe.rp-frame')].map((f) => f.src),
     refreshGeneration,
     open: (id: string) => openStub(id),
     /** Opens a message in the reader pane. */
