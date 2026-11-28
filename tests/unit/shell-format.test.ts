@@ -42,6 +42,16 @@ describe('list text', () => {
       ]),
     ).toBe('Theo Martins, billing@example.com, x@example.org');
   });
+
+  it('cleans each sender for display, and uses the address when the name cleans to nothing', () => {
+    expect(
+      participantsText([
+        { name: '\u202eEve\u0007\tMallory', address: 'eve@example.com' },
+        { name: '\u200b\u2066\u2069', address: '\u202ebob@example.org' },
+        { name: '', address: '\u200b' },
+      ]),
+    ).toBe('Eve␇ Mallory, bob@example.org');
+  });
 });
 
 const row = (id: string, kind: FolderRow['kind'], extra: Partial<FolderRow> = {}): FolderRow => ({

@@ -481,6 +481,7 @@ body,
   min-width: 0;
 }
 
+/* Names and subjects are mail data: each an isolated run of text. */
 .conv .from,
 .conv .subj .t {
   flex: 1;
@@ -489,6 +490,7 @@ body,
   color: var(--fg-2);
   text-overflow: ellipsis;
   white-space: nowrap;
+  unicode-bidi: isolate;
 }
 
 .conv .date {

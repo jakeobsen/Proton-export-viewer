@@ -4,6 +4,7 @@
 
 import { observeElementOffset, useVirtualizer } from '@tanstack/react-virtual';
 import { useCallback, useEffect, useLayoutEffect, useRef, type KeyboardEvent } from 'react';
+import { displayText } from '../shared/header-text';
 import type { ActiveExport } from '../shared/sources';
 import type { SidebarEntry, SidebarModel } from './folders';
 import { formatCount, fullDate, listDate, loadingText, participantsText } from './format';
@@ -215,6 +216,7 @@ function ConversationRow({
 }) {
   const unread = row.unreadHere > 0;
   const who = participantsText(row.details?.participants ?? []);
+  const subject = displayText(row.details?.subject ?? '');
   return (
     <div
       className={`conv${unread ? ' unread' : ''}${selected ? ' selected' : ''}`}
@@ -242,8 +244,8 @@ function ConversationRow({
         </span>
       </div>
       <div className="subj">
-        <span className="t" title={row.details?.subject}>
-          {row.details?.subject ?? ''}
+        <span className="t" title={subject || undefined}>
+          {subject}
         </span>
         {row.attachments && (
           <span className="clip" title="Has attachments" aria-label="Has attachments" />

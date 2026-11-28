@@ -6,6 +6,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { AttachmentItem, RejectCode } from '../shared/api';
 import { BODY_IFRAME_REFERRER, BODY_IFRAME_SANDBOX } from '../shared/constants';
+import { displayText, headerText } from '../shared/header-text';
 import type { MessageDetails, MessageHeaders } from '../shared/reader-protocol';
 import {
   ATT_ROW,
@@ -85,11 +86,13 @@ function WarnIcon() {
 
 function Header({ headers }: { headers: MessageHeaders }) {
   const sender = senderOf(headers.from);
+  const subject = displayText(headers.subject);
+  const name = displayText(sender.name);
   return (
     <>
-      {headers.subject !== '' && (
+      {subject !== '' && (
         <div className="rp-head">
-          <h1 className="rp-subject">{headers.subject}</h1>
+          <h1 className="rp-subject">{subject}</h1>
         </div>
       )}
       <div className="rp-sender">
@@ -98,9 +101,9 @@ function Header({ headers }: { headers: MessageHeaders }) {
           style={{ background: avatarColor(sender.address || sender.name) }}
           aria-hidden="true"
         >
-          {initialsOf(sender.name)}
+          {initialsOf(name)}
         </span>
-        <span className="rp-name">{sender.name}</span>
+        <span className="rp-name">{name}</span>
         <span className="rp-date">{shortDate(headers.date)}</span>
       </div>
     </>
@@ -110,11 +113,12 @@ function Header({ headers }: { headers: MessageHeaders }) {
 function Who({ headers, details: more }: { headers: MessageHeaders; details: MessageDetails }) {
   const [details, setDetails] = useState(false);
   const sender = senderOf(headers.from);
-  const recipients = [headers.to, headers.cc].filter((r) => r !== '').join(', ');
+  const address = displayText(sender.address);
+  const recipients = displayText([headers.to, headers.cc].filter((r) => r !== '').join(', '));
   return (
     <div className="rp-who">
-      {sender.address !== '' && sender.address !== sender.name && (
-        <span className="rp-addr">&lt;{sender.address}&gt;</span>
+      {address !== '' && address !== displayText(sender.name) && (
+        <span className="rp-addr">&lt;{address}&gt;</span>
       )}
       {recipients !== '' && <span className="rp-to">to {recipients}</span>}
       <button
@@ -128,17 +132,17 @@ function Who({ headers, details: more }: { headers: MessageHeaders; details: Mes
       {details && (
         <dl className="rp-details">
           <dt>From</dt>
-          <dd>{headers.from}</dd>
+          <dd>{headerText(headers.from)}</dd>
           {headers.to !== '' && (
             <>
               <dt>To</dt>
-              <dd>{headers.to}</dd>
+              <dd>{headerText(headers.to)}</dd>
             </>
           )}
           {headers.cc !== '' && (
             <>
               <dt>Cc</dt>
-              <dd>{headers.cc}</dd>
+              <dd>{headerText(headers.cc)}</dd>
             </>
           )}
           {headers.date !== null && (
