@@ -31,6 +31,7 @@
     "check:release": "node scripts/check-release.mjs",
     "check:sandbox": "node scripts/check-sandbox.mjs",
     "package:folder-proof": "cross-env PEV_TEST_HOOKS=1 PEV_FOLDER_PROOF=1 electron-vite build && node scripts/package.mjs mas-folderproof",
+    "package:fetcher-proof": "cross-env PEV_TEST_HOOKS=1 PEV_FOLDER_PROOF=1 PEV_FOLDER_PROOF_STEP=fetcher electron-vite build && node scripts/package.mjs mas-fetcherproof",
     "ci": "node scripts/ci.mjs",
     "ci:linux": "node scripts/ci.mjs linux"
   },

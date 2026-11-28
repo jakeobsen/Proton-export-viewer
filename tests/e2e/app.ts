@@ -208,6 +208,8 @@ export interface LaunchOptions {
   /** Start with this userData, e.g. to launch again after a quit. */
   userData?: string;
   args?: string[];
+  /** Added to the app's environment. */
+  env?: Record<string, string>;
   /**
    * Pages take the colour scheme the app gives them. Playwright otherwise
    * emulates a light one in every page, whatever the app's theme.
@@ -229,6 +231,7 @@ export async function launch(name: string, options: LaunchOptions = {}): Promise
       ...(options.args ?? []),
     ],
     cwd: REPO_ROOT,
+    ...(options.env ? { env: { ...(process.env as Record<string, string>), ...options.env } } : {}),
     // Without this, Playwright turns Chromium's sandbox off on Linux.
     chromiumSandbox: true,
     ...(options.appColorScheme ? { colorScheme: null } : {}),

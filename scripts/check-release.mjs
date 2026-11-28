@@ -58,6 +58,9 @@ const FORBIDDEN_CONTENT = [
   'beforeIndexOpen',
   'holdIndexOpens',
   'hold-searches',
+  // The fetcher's test-hook entry and its record of connects.
+  'loopbackAllow',
+  'recordConnects',
   '__pevTestRenderFault',
   // The self-test's smoke drives the body frame through the DevTools protocol.
   ...SELFTEST_ONLY,

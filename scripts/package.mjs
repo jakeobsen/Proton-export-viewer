@@ -8,6 +8,8 @@
 //   mas-folderproof  Mac App Store flavor, sandboxed, the folder-access proof
 //                 (from out-proof/), with its own bundle ID. It shows the
 //                 system folder picker, so tests never launch it.
+//   mas-fetcherproof  the same, built with PEV_FOLDER_PROOF_STEP=fetcher: the
+//                 fetcher's proof (one pick), with a bundle ID of its own.
 //   mas-local     Mac App Store flavor, sandboxed, no test hooks       (from out/)
 //                 The build to run on one's own Mac outside the App Store:
 //                 its own bundle ID and app group, so its data never shares a
@@ -24,6 +26,7 @@ export const APP_ID = 'com.example.pev';
 // The app group in the entitlements, APP_ID, is a prefix of this bundle ID, as
 // the Mac App Store build of Electron requires.
 export const FOLDER_PROOF_APP_ID = `${APP_ID}.folderproof2`;
+export const FETCHER_PROOF_APP_ID = `${APP_ID}.fetcherproof`;
 // The local build's bundle ID is also its own app group.
 export const LOCAL_APP_ID = `${APP_ID}.viewer`;
 export const PRODUCT_NAME = appName();
@@ -44,6 +47,7 @@ const FLAVORS = {
   'mas-selftest': { out: 'out-test', mas: true },
   test: { out: 'out-test', mas: false },
   'mas-folderproof': { out: 'out-proof', mas: true, appId: FOLDER_PROOF_APP_ID },
+  'mas-fetcherproof': { out: 'out-proof', mas: true, appId: FETCHER_PROOF_APP_ID },
   'mas-local': {
     out: 'out',
     mas: true,

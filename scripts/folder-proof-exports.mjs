@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// The two exports the folder-proof build accepts. The build takes them from
+// The two exports the folder-proof build accepts (one for the fetcher's
+// proof). The build takes them from
 // PEV_FOLDER_PROOF_EXPORTS="<first>:<second>": two folders made by the
 // synthetic export generator, each with its manifest next to it
 // (<folder>.manifest.json). Each folder must still match its manifest's
@@ -53,8 +54,12 @@ function accountFolder(root) {
  * and manifest digest, and its account folder's. Refuses anything but two
  * separate generated exports that match their manifests.
  */
-export function expectedExports(value) {
+export function expectedExports(value, count = 2) {
   const folders = value ? value.split(':') : [];
+  if (count === 1) {
+    if (folders.length !== 1) throw new Error('PEV_FOLDER_PROOF_EXPORTS must name one export');
+    return folders.map(expectedExport);
+  }
   if (folders.length !== 2) {
     throw new Error('PEV_FOLDER_PROOF_EXPORTS must name two exports: "<first>:<second>"');
   }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Main process entry: the broker. It never parses mail and holds no network code.
+// Main process entry: the broker. It never parses mail and holds no network
+// code: remote images are fetched by the fetcher process.
 
 import { dirname, join, sep } from 'node:path';
 import { app, clipboard, nativeTheme, protocol, shell } from 'electron';
@@ -18,6 +19,7 @@ import {
   type Paths,
 } from './context';
 import { CoreHost } from './core-host';
+import { FetcherHost } from './fetcher-host';
 import { systemPicker, systemScopes } from './sources/access';
 import { SourceManager } from './sources/manager';
 import { registerIpc } from './ipc';
@@ -43,6 +45,7 @@ const paths: Paths = {
   rendererDir: join(outRoot, 'renderer'),
   preloadPath: join(outRoot, 'preload', 'index.cjs'),
   corePath: join(mainDir, 'core.js'),
+  fetcherPath: join(mainDir, 'fetcher.js'),
 };
 
 if (__PEV_TEST_HOOKS__) {
@@ -153,6 +156,12 @@ async function start(): Promise<void> {
     generation: 1,
     windows: new Map(),
     core,
+    fetcher: new FetcherHost({
+      fetcherPath: paths.fetcherPath,
+      log,
+      relay: log.forProc('fetcher'),
+      spawnGuard: (spawn) => sources.withScopeReleased(spawn),
+    }),
     sources,
     linkDialog: new LinkDialog(log),
     shellCsp: SHELL_CSP,
@@ -164,7 +173,10 @@ async function start(): Promise<void> {
   core.onEvent = (event) => sources.handleCoreEvent(event);
   core.onExit = (source) => sources.coreExited(source);
   core.exports = () => sources.exportRoots();
-  app.on('will-quit', () => sources.close());
+  app.on('will-quit', () => {
+    void ctx.fetcher.stop();
+    sources.close();
+  });
   registerIpc(ctx);
   installAppMenu(ctx);
   if (__PEV_TEST_HOOKS__) {
