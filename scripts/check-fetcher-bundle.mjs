@@ -32,6 +32,7 @@ const FORBIDDEN_CALLS = [
   /\bcreateRequire\b/,
   /\b(?:WebSocket|EventSource|XMLHttpRequest|undici)\b/,
   /\bglobalThis\s*(?:\.\s*fetch\b|\[)/,
+  /\bglobal\s*\.\s*fetch\b/, // the older name of the global object
   /(?<![.\w$'"`])fetch\s*\((?![^()]*\)\s*\{)/, // the global fetch called, not a method defined
 ];
 
