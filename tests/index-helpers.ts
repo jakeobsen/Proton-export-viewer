@@ -404,7 +404,9 @@ export async function holdIndexLock(
       heard = () => {
         if (out.includes(`${line}\n`)) resolve();
       };
-      child.once('exit', () => (out.includes(`${line}\n`) ? resolve() : reject(new Error('holder exited'))));
+      child.once('exit', () =>
+        out.includes(`${line}\n`) ? resolve() : reject(new Error('holder exited')),
+      );
       heard();
     });
   await waitFor('held');

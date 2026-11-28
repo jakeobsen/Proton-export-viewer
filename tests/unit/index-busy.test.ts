@@ -54,17 +54,31 @@ function files(dir: string): Record<string, string> {
   );
 }
 
+/** The code a query thread's open fails with, as it crosses the thread; null if it opened. */
+async function queryOpenCode(dbPath: string, uuid: string, busyMs: number) {
+  try {
+    await new InlineThread('query').call('open', { dbPath, expectedUuid: uuid, busyMs });
+    return null;
+  } catch (err) {
+    return err instanceof ThreadError ? err.code : `not a thread error: ${String(err)}`;
+  }
+}
+
 const sqliteError = (errcode: number) =>
   Object.assign(new Error('sqlite'), { code: 'ERR_SQLITE_ERROR', errcode });
 
 describe('isBusy', () => {
   it('is true for SQLITE_BUSY and SQLITE_LOCKED, with their extended codes', () => {
     // BUSY, LOCKED, BUSY_RECOVERY, BUSY_SNAPSHOT, LOCKED_SHAREDCACHE.
-    for (const code of [5, 6, 261, 517, 262]) expect(isBusy(sqliteError(code)), String(code)).toBe(true);
+    for (const code of [5, 6, 261, 517, 262]) {
+      expect(isBusy(sqliteError(code)), String(code)).toBe(true);
+    }
   });
 
   it('is false for anything else', () => {
-    for (const code of [1, 11, 13, 26, 4]) expect(isBusy(sqliteError(code)), String(code)).toBe(false);
+    for (const code of [1, 11, 13, 26, 4]) {
+      expect(isBusy(sqliteError(code)), String(code)).toBe(false);
+    }
     expect(isBusy(new Error('database is locked'))).toBe(false);
     expect(isBusy(null)).toBe(false);
   });
@@ -167,13 +181,7 @@ describe("the query thread's open", () => {
     const { dbPath, uuid } = newIndex('busy-query-held');
     await held(dbPath, 5000);
     expect(() => new QueryState().open(dbPath, uuid, 200)).toThrow(IndexBusy);
-    const thread = new InlineThread('query');
-    const failure = await thread.call('open', { dbPath, expectedUuid: uuid, busyMs: 200 }).then(
-      () => null,
-      (err: unknown) => err,
-    );
-    expect(failure).toBeInstanceOf(ThreadError);
-    expect((failure as ThreadError).code).toBe('INDEX_BUSY');
+    expect(await queryOpenCode(dbPath, uuid, 200)).toBe('INDEX_BUSY');
   });
 
   it('held after a probe that took no lock still waits, then opens', async () => {
@@ -191,12 +199,7 @@ describe("the query thread's open", () => {
   it('held after a probe that took no lock, past its timeout, says busy, not damaged', async () => {
     const { dbPath, uuid } = newIndex('busy-query-identity-held');
     await held(dbPath, 5000, false);
-    const thread = new InlineThread('query');
-    const failure = await thread.call('open', { dbPath, expectedUuid: uuid, busyMs: 200 }).then(
-      () => null,
-      (err: unknown) => err,
-    );
-    expect((failure as ThreadError).code).toBe('INDEX_BUSY');
+    expect(await queryOpenCode(dbPath, uuid, 200)).toBe('INDEX_BUSY');
   });
 
   it('released inside its timeout opens', async () => {

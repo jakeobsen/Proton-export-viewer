@@ -497,7 +497,8 @@ export class IndexService {
     const query = this.query;
     const uuid = this.opened?.uuid;
     if (!query || !uuid || this.closed) return Promise.reject(new ThreadError('NOT_OPEN'));
-    this.queryReady ??= query.call('open', { dbPath: this.dbPath, expectedUuid: uuid, ...this.busyArg() }).then(
+    const args = { dbPath: this.dbPath, expectedUuid: uuid, ...this.busyArg() };
+    this.queryReady ??= query.call('open', args).then(
       () => {
         this.queryEntry = this.connections.add({ role: 'query', dbPath: this.dbPath });
       },

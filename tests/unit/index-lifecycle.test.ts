@@ -539,7 +539,13 @@ class OpenedWriter extends InlineThread {
   }
 
   override call<T>(op: string): Promise<T> {
-    const opened = { uuid: this.uuid, created: false, replaced: false, mismatch: null, phase1Done: true };
+    const opened = {
+      uuid: this.uuid,
+      created: false,
+      replaced: false,
+      mismatch: null,
+      phase1Done: true,
+    };
     return Promise.resolve((op === 'open' ? opened : null) as T);
   }
 }
@@ -558,9 +564,8 @@ describe('an index another connection holds', () => {
       { reason: 'busy' },
     ]);
     const codes = c.logs.map((l) => l.code);
-    for (const code of ['index.damaged', 'index.deleted', 'index.created', 'index.schema_pending']) {
-      expect(codes).not.toContain(code);
-    }
+    const never = ['index.damaged', 'index.deleted', 'index.created', 'index.schema_pending'];
+    for (const code of never) expect(codes).not.toContain(code);
     expect(c.events.some((e) => e.damaged || e.progress.condition === 'damaged')).toBe(false);
   }
 
@@ -572,7 +577,12 @@ describe('an index another connection holds', () => {
       const before = inodes(indexDir);
       const lock = await holdIndexLock(join(indexDir, `${KEY}.sqlite`), 4000);
       try {
-        const c = core({ root: online ? run : null, indexDir, generation: 2, options: { busyMs: 200 } });
+        const c = core({
+          root: online ? run : null,
+          indexDir,
+          generation: 2,
+          options: { busyMs: 200 },
+        });
         refusedAsBusy(c, await c.openIndex(uuid));
         await c.session.close();
         // The holder's -wal and -shm files are its own; the index file is the same.

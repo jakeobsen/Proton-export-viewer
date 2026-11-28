@@ -84,11 +84,7 @@ export function setBusyTimeout(db: Db, busyMs: number = INDEX_BUSY_MS): void {
  * one unit of work can leave unwritten (see limits.ts); the query thread keeps
  * a larger one.
  */
-export function configure(
-  db: Db,
-  role: 'writer' | 'reader',
-  busyMs: number = INDEX_BUSY_MS,
-): void {
+export function configure(db: Db, role: 'writer' | 'reader', busyMs: number = INDEX_BUSY_MS): void {
   setBusyTimeout(db, busyMs);
   if (role === 'writer') {
     db.exec('PRAGMA journal_mode = WAL');
