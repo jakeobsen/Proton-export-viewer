@@ -5,6 +5,7 @@ import { IPC, type IndexUpdate } from '../shared/api';
 import type { IndexProgress } from '../shared/index-types';
 import type { LogWriter } from '../shared/log/writer';
 import type { CoreHost } from './core-host';
+import type { FetcherHost } from './fetcher-host';
 import type { PolicyObserver } from './harden';
 import type { LinkDialog } from './link-dialog';
 import type { SourceManager } from './sources/manager';
@@ -16,6 +17,7 @@ export interface Paths {
   rendererDir: string;
   preloadPath: string;
   corePath: string;
+  fetcherPath: string;
 }
 
 export interface AppWindow {
@@ -35,6 +37,8 @@ export interface AppContext {
   /** App windows keyed by their webContents id. */
   windows: Map<number, AppWindow>;
   core: CoreHost;
+  /** The remote-image fetcher: started on demand, never holding the export's folder access. */
+  fetcher: FetcherHost;
   /** The export sources: picks, runs, scopes and the open one. */
   sources: SourceManager;
   linkDialog: LinkDialog;

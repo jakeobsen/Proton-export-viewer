@@ -467,6 +467,32 @@ export async function install(ctx: AppContext): Promise<boolean> {
     indexDir: () => join(app.getPath('userData'), 'index'),
     /** Resets the app's data, as Settings will. */
     resetApp: () => ctx.sources.reset(),
+    /** The fetcher's test entry and connect record, for the next fetcher started. */
+    fetcherAllow: (address: string, port: number) => {
+      ctx.fetcher.testInit = { loopbackAllow: { address, port }, recordConnects: true };
+    },
+    /** Fetches one image through the fetcher, as consent will; the bytes come back as a count. */
+    fetcherFetch: async (viewKey: string, ref: string, url: string) => {
+      const result = await ctx.fetcher.fetch(viewKey, ref, url);
+      return result.ok
+        ? {
+            ok: true,
+            format: result.format,
+            contentType: result.contentType,
+            insecure: result.insecure,
+            bytes: result.bytes.length,
+          }
+        : result;
+    },
+    fetcherAbort: (viewKey: string) => ctx.fetcher.abort(viewKey),
+    /** Starts the fetcher by the production path and has it open a file for reading. */
+    fetcherRead: async (path: string) => {
+      await ctx.fetcher.ensure();
+      return ctx.fetcher.testCall('read', path);
+    },
+    fetcherDestinations: () => ctx.fetcher.testCall('destinations'),
+    fetcherPid: () => ctx.fetcher.pid ?? null,
+    fetcherStop: () => ctx.fetcher.stop(),
   };
   (globalThis as { __pevTest?: typeof api }).__pevTest = api;
 
@@ -487,7 +513,7 @@ export async function install(ctx: AppContext): Promise<boolean> {
 
   const selfTest = process.argv.includes('--pev-selftest');
   if (selfTest) {
-    await runSelfTest(ctx, process.argv, windowEvents, api.queuePick);
+    await runSelfTest(ctx, process.argv, windowEvents, api.queuePick, api.sourceOrder);
     return true;
   }
   return false;

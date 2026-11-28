@@ -13,13 +13,20 @@
 // messages, switches to plain text, clicks a link, opens a message whose file
 // is missing, and forgets the export again (smoke, in the result).
 //
+// With the export open, the smoke also starts the remote-image fetcher by the
+// production path (folder access released around the spawn) and has it read a
+// file of the export (smoke.fetcher). The smoke's export lives in the app's
+// container, which every helper can read, so that read succeeds: it shows the
+// limit, not the release. Whether the fetcher is denied a picked folder is
+// proven by the folder proof, through a real pick.
+//
 // Besides the end state (shownWindows), the result carries the record of every
 // show and focus event during the run (windowEvents, which must be empty), and
 // a probe of the recorder on the self-test's own window (recorderProbe: one
 // show and one focus for that window), which proves the record was connected.
 
 import { once } from 'node:events';
-import { writeFileSync } from 'node:fs';
+import { readdirSync, writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -27,6 +34,7 @@ import { BrowserWindow, app, type WebContents } from 'electron';
 import type { MessageOpenResult, SourceActionResult } from '../shared/api';
 import type { EmlFile, IndexTotals, ListWindow } from '../shared/index-types';
 import type { AppContext, AppWindow } from '../main/context';
+import type { OrderStep } from '../main/sources/manager';
 import { bodyUrl } from '../main/views';
 import { createAppWindow } from '../main/windows';
 import { markLoaded } from './marker';
@@ -78,8 +86,23 @@ export interface Smoke {
   plain: { format: string; body: number; oldBody: number } | null;
   link: { dialogs: number } | null;
   missing: { code: string | null; text: string | null } | null;
+  /** The fetcher, started with the export open: ready, its read of a container file, the steps around its spawn. */
+  fetcher: { ready: boolean; read: Outcome; order: string[] } | null;
   forgotten: string | null;
   error: string | null;
+}
+
+/** The first file named `name` under `dir`, or null. */
+function findFile(dir: string, name: string): string | null {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isFile() && entry.name === name) return path;
+    if (entry.isDirectory()) {
+      const found = findFile(path, name);
+      if (found) return found;
+    }
+  }
+  return null;
 }
 
 /** All Mail: every conversation of the export. */
@@ -178,6 +201,7 @@ async function runSmoke(
   appWin: AppWindow,
   root: string,
   queuePick: (path: string, bookmark: string) => void,
+  order: () => OrderStep[],
 ): Promise<Smoke> {
   const smoke: Smoke = {
     chosen: null,
@@ -186,6 +210,7 @@ async function runSmoke(
     plain: null,
     link: null,
     missing: null,
+    fetcher: null,
     forgotten: null,
     error: null,
   };
@@ -270,6 +295,27 @@ async function runSmoke(
       break;
     }
 
+    // The fetcher, by the production path, with the export open.
+    const before = order().length;
+    let ready = false;
+    try {
+      await ctx.fetcher.ensure();
+      ready = true;
+    } catch {
+      // Reported as not ready.
+    }
+    const labels = findFile(root, 'labels.json');
+    const read: Outcome =
+      ready && labels ? await ctx.fetcher.testCall('read', labels) : { ok: false, code: 'NOT_RUN' };
+    smoke.fetcher = {
+      ready,
+      read,
+      order: order()
+        .slice(before)
+        .map((s) => s.step),
+    };
+    await ctx.fetcher.stop();
+
     const key = ctx.sources.stamp()?.sourceKey;
     const forgotten = key
       ? await shell<SourceActionResult>(`window.__pevTest.forgetExport(${JSON.stringify(key)})`)
@@ -293,6 +339,7 @@ export async function runSelfTest(
   argv: string[],
   recorder: WindowEventRecorder,
   queuePick: (path: string, bookmark: string) => void,
+  order: () => OrderStep[],
 ): Promise<void> {
   const result = {
     nonce: argValue(argv, 'pev-selftest-nonce') ?? null,
@@ -335,7 +382,7 @@ export async function runSelfTest(
     const port = Number(argValue(argv, 'pev-selftest-port'));
     result.connect = Number.isInteger(port) && port > 0 ? await tryConnect(port) : result.connect;
     const smokeRoot = argValue(argv, 'pev-selftest-smoke');
-    if (smokeRoot) result.smoke = await runSmoke(ctx, appWin, smokeRoot, queuePick);
+    if (smokeRoot) result.smoke = await runSmoke(ctx, appWin, smokeRoot, queuePick, order);
   } catch (err) {
     result.error = err instanceof Error ? err.constructor.name : 'NonError';
   }

@@ -1406,3 +1406,140 @@ describe('Reset', () => {
     expect(existsSync(join(t.userData, 'index'))).toBe(false);
   });
 });
+
+describe('spawning with the folder access released', () => {
+  async function opened(name: string) {
+    const t = setup(name);
+    const root = tool(`${name}-tool`);
+    t.picks.push({ path: root, bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    t.order.length = 0;
+    return { ...t, root };
+  }
+
+  it('releases the scope, spawns, then starts it again; core keeps running', async () => {
+    const t = await opened('mgr-fetcher');
+    const stamp = t.manager.stamp()!;
+    const starts = t.core.started.length;
+    const during: Array<{ live: string[]; core: boolean }> = [];
+    await t.manager.withScopeReleased(async () => {
+      during.push({ live: [...t.live.values()] as string[], core: t.core.running });
+    });
+    expect(during).toEqual([{ live: [], core: true }]);
+    expect(steps(t.order)).toEqual(['scope.release', 'fetcher.spawn', 'scope.start']);
+    expect(t.order.every((s) => s.generation === stamp.generation)).toBe(true);
+    expect([...t.live.values()]).toEqual(['bm1']);
+    expect(t.core.started).toHaveLength(starts);
+    expect(t.manager.stamp()).toEqual(stamp);
+    expect(t.manager.view().active?.status).toBe('online');
+    expect(t.lines.some((l) => l.includes('"scope.released"') && l.includes('"fetcher"'))).toBe(
+      true,
+    );
+  });
+
+  it('starts the scope again when the spawn fails, and passes the failure on', async () => {
+    const t = await opened('mgr-fetcher-fail');
+    await expect(
+      t.manager.withScopeReleased(() => Promise.reject(new Error('spawn failed'))),
+    ).rejects.toThrow('spawn failed');
+    expect(steps(t.order)).toEqual(['scope.release', 'fetcher.spawn', 'scope.start']);
+    expect([...t.live.values()]).toEqual(['bm1']);
+    expect(t.manager.view().active?.status).toBe('online');
+  });
+
+  it('a restart that fails takes the source offline: core again without a root, new generation', async () => {
+    const t = await opened('mgr-fetcher-restart');
+    const stamp = t.manager.stamp()!;
+    await t.manager.withScopeReleased(async () => {
+      t.failing.add('bm1');
+    });
+    expect(steps(t.order)).toEqual([
+      'scope.release',
+      'fetcher.spawn',
+      'scope.failed',
+      'core.stop',
+      'core.spawn',
+    ]);
+    expect(t.manager.stamp()).toEqual({
+      sourceKey: stamp.sourceKey,
+      generation: stamp.generation + 1,
+    });
+    expect(t.core.started.at(-1)).toEqual({ ...t.manager.stamp(), root: null });
+    expect(t.manager.view().active).toMatchObject({
+      sourceKey: stamp.sourceKey,
+      status: 'offline',
+    });
+    expect(t.manager.registry.source(stamp.sourceKey)?.offline).toBe(true);
+    expect([...t.live.values()]).toEqual([]);
+    expect(t.lines.some((l) => l.includes('"scope.failed"'))).toBe(true);
+  });
+
+  it('a folder gone during the spawn takes the source offline and releases the scope again', async () => {
+    const t = await opened('mgr-fetcher-gone');
+    await t.manager.withScopeReleased(async () => {
+      renameSync(join(t.root, 'secret.account@example.com'), join(t.root, 'moved'));
+    });
+    expect(steps(t.order)).toEqual([
+      'scope.release',
+      'fetcher.spawn',
+      'scope.start',
+      'scope.release',
+      'core.stop',
+      'core.spawn',
+    ]);
+    expect(t.core.started.at(-1)?.root).toBeNull();
+    expect(t.manager.view().active?.status).toBe('offline');
+    expect([...t.live.values()]).toEqual([]);
+  });
+
+  it('with no scope held (nothing open, or offline) it only spawns', async () => {
+    const t = setup('mgr-fetcher-none');
+    let spawned = 0;
+    await t.manager.withScopeReleased(async () => {
+      spawned += 1;
+    });
+    expect(spawned).toBe(1);
+    expect(steps(t.order)).toEqual(['fetcher.spawn']);
+    expect(t.order[0]).toMatchObject({ pickId: null, sourceKey: null });
+  });
+
+  it('runs in the source queue: a switch waits, and the scope held at its turn is the one released', async () => {
+    const t = await opened('mgr-fetcher-queue');
+    const two = runAt(join(realpathSync(testDir('mgr-fetcher-queue-2')), 'mail_20250701_090000'), [
+      'x',
+    ]);
+    t.picks.push({ path: two, bookmark: 'bm2' });
+    // The switch to the second pick is queued first, the spawn after it.
+    const switched = t.manager.chooseFolder(null, t.generation());
+    let release!: () => void;
+    const spawning = t.manager.withScopeReleased(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    expect(await switched).toBe('opened');
+    // A switch back, queued during the spawn, waits for it.
+    const back = t.manager.openRecent(t.manager.view().recent.at(-1)!.sourceKey, t.generation());
+    await settle();
+    expect(steps(t.order)).toEqual([
+      'core.stop',
+      'scope.release',
+      'scope.start',
+      'core.spawn',
+      'scope.release',
+      'fetcher.spawn',
+    ]);
+    // The scope released is the second pick's: the one held when the spawn's turn came.
+    const secondPick = t.order[2]!.pickId;
+    expect(t.order[1]!.pickId).not.toBe(secondPick);
+    expect(t.order[4]!.pickId).toBe(secondPick);
+    expect([...t.live.values()]).toEqual([]);
+    release();
+    await spawning;
+    expect(t.order[6]).toMatchObject({ step: 'scope.start', pickId: secondPick });
+    expect(await back).toBe('opened');
+    expect(steps(t.order).slice(7, 9)).toEqual(['core.stop', 'scope.release']);
+  });
+});

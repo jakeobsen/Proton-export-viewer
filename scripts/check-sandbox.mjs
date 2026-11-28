@@ -351,6 +351,22 @@ async function main() {
         smoke.missing?.code === 'eml_missing' && smoke.missing.text === 'Message file missing',
         `smoke: the missing message file shows its state (${JSON.stringify(smoke.missing)})`,
       );
+      const fetcher = smoke.fetcher;
+      check(
+        fetcher?.ready === true,
+        `smoke: the fetcher starts sandboxed (${JSON.stringify(fetcher)})`,
+      );
+      check(
+        JSON.stringify(fetcher?.order) ===
+          JSON.stringify(['scope.release', 'fetcher.spawn', 'scope.start']),
+        `smoke: the fetcher is spawned with the folder access released (${JSON.stringify(fetcher?.order)})`,
+      );
+      // The smoke's export is in the container, which every helper can read:
+      // the limit, documented. The folder proof shows the release itself.
+      check(
+        fetcher?.read?.ok === true,
+        `smoke: the fetcher reads a file in the container (${JSON.stringify(fetcher?.read)})`,
+      );
       check(smoke.forgotten === 'forgotten', `smoke: the export is forgotten (${smoke.forgotten})`);
       check(
         smokeResult.shownWindows === 0 && noWindowEvents(smokeResult),

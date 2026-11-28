@@ -53,6 +53,9 @@ const FORBIDDEN_CONTENT = [
   'openGapMs',
   // Core's test hold for searches.
   'hold-searches',
+  // The fetcher's test-hook entry and its record of connects.
+  'loopbackAllow',
+  'recordConnects',
   // The self-test's smoke drives the body frame through the DevTools protocol.
   ...SELFTEST_ONLY,
   // Core's hold of a read once its message file is open.

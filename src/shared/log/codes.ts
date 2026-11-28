@@ -91,6 +91,16 @@ export const LOG_CODES = [
   'app.reset',
   'app.reset_refused',
   'search.ranges_dropped',
+  'fetcher.spawn',
+  'fetcher.ready',
+  'fetcher.exit',
+  'fetcher.ready_timeout',
+  'fetcher.stop_timeout',
+  'fetcher.fetched',
+  'fetcher.refused',
+  'fetcher.uncaught',
+  'fetcher.rejection',
+  'fetcher.relay_dropped',
 ] as const;
 
 /** Codes that only exist in builds with test hooks. */
@@ -204,6 +214,16 @@ export const REASONS = [
   'eml_missing',
   'offline',
   'file',
+  'userinfo',
+  'port',
+  'address',
+  'dns',
+  'network',
+  'tls',
+  'status',
+  'redirects',
+  'aborted',
+  'fetcher',
 ] as const;
 
 /** The lists of a message whose entries can be cut to a limit when indexed. */

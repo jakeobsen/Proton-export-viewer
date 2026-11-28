@@ -17,6 +17,13 @@ declare const __PEV_FOLDER_PROOF__: boolean;
  */
 declare const __PEV_FOLDER_PROOF_EXPORTS__: string;
 
+/**
+ * Which proof the folder-proof build runs: "folders" (the folder-access
+ * proof, two exports) or "fetcher" (the fetcher's proof, one export).
+ * "folders" in every other build.
+ */
+declare const __PEV_FOLDER_PROOF_STEP__: 'folders' | 'fetcher';
+
 /** True only when running under the Vite dev server. */
 declare const __PEV_DEV__: boolean;
 

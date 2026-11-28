@@ -7,6 +7,7 @@ export default defineConfig({
     __PEV_TEST_HOOKS__: 'true',
     __PEV_FOLDER_PROOF__: 'false',
     __PEV_FOLDER_PROOF_EXPORTS__: JSON.stringify('[]'),
+    __PEV_FOLDER_PROOF_STEP__: JSON.stringify('folders'),
     __PEV_DEV__: 'false',
     __PEV_APP_NAME__: JSON.stringify('Test App'),
   },

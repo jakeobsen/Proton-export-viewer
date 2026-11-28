@@ -16,7 +16,7 @@ import {
 export const LEVELS = ['error', 'warn', 'info', 'debug'] as const;
 export type Level = (typeof LEVELS)[number];
 
-export const PROCS = ['main', 'core', 'worker', 'renderer'] as const;
+export const PROCS = ['main', 'core', 'worker', 'renderer', 'fetcher'] as const;
 export type Proc = (typeof PROCS)[number];
 
 export interface LogInput {

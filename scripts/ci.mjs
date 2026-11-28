@@ -19,6 +19,7 @@ const ALL_STEPS = [
   ['e2e build', 'npx', ['electron-vite', 'build'], { PEV_TEST_HOOKS: '1' }],
   ['e2e tests', 'npx', ['playwright', 'test']],
   ['release build', 'npx', ['electron-vite', 'build']],
+  ['fetcher bundle check', 'node', ['scripts/check-fetcher-bundle.mjs', 'out']],
   ['license check', 'node', ['scripts/check-licenses.mjs', 'out']],
   ['license check (test build)', 'node', ['scripts/check-licenses.mjs', 'out-test']],
   ['package release', 'node', ['scripts/package.mjs', 'release']],
