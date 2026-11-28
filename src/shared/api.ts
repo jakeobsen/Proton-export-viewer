@@ -18,6 +18,7 @@ import type {
 } from './index-types';
 import type { RasterFormat } from './attachment-types';
 import type { MessageDetails, MessageHeaders, OpenMode, ReaderMatch } from './reader-protocol';
+import type { Chip, SearchSpec } from './search-chips';
 import type { AppSettings, SettingKey } from './settings';
 import type { SourceOutcome, SourcesView } from './sources';
 
@@ -31,7 +32,7 @@ export const IPC = {
   report: 'pev:report',
   linkDialog: 'pev:link-dialog',
   linkAction: 'pev:link-action',
-  cardKey: 'pev:card-key',
+  frameKey: 'pev:frame-key',
   sources: 'pev:sources',
   chooseFolder: 'pev:choose-folder',
   openExport: 'pev:open-export',
@@ -61,6 +62,10 @@ export const IPC = {
   sourcePart: 'pev:source-part',
   copyHeaders: 'pev:copy-headers',
   sourceBack: 'pev:source-back',
+  commitSearch: 'pev:commit-search',
+  recentSearches: 'pev:recent-searches',
+  keepRecent: 'pev:keep-recent',
+  clearRecent: 'pev:clear-recent',
 } as const;
 
 export type RejectCode =
@@ -206,10 +211,13 @@ export interface LinkPrompt {
 
 export type LinkActionResult = { ok: true } | Rejected;
 
-/** A search of the open export: the text, the sort, and where the page continues. */
-export type SearchRequest =
-  | { text: string; sort: 'date'; after: SearchDateKey | null }
-  | { text: string; sort: 'relevance'; after: SearchRankKey | null };
+/**
+ * A search of the open export: the text, its chips (none if left out), the
+ * sort, and where the page continues.
+ */
+export type SearchRequest = { text: string; chips?: Chip[] } & (
+  { sort: 'date'; after: SearchDateKey | null } | { sort: 'relevance'; after: SearchRankKey | null }
+);
 
 /** One page of results; `queryId` names the request it answers. */
 export type SearchResult =
@@ -218,6 +226,14 @@ export type SearchResult =
 
 /** The keys that move the expanded card: `n` to the next newer, `p` to the next older. */
 export type CardKeyName = 'n' | 'p';
+
+/** The only keys main passes on to the shell when they are typed in the body frame. */
+export const FRAME_KEYS = ['j', 'k', 'n', 'p', 'u', 'Escape'] as const;
+export type FrameKeyName = (typeof FRAME_KEYS)[number];
+
+export function isFrameKey(key: unknown): key is FrameKeyName {
+  return typeof key === 'string' && (FRAME_KEYS as readonly string[]).includes(key);
+}
 
 /** Snippets for rows of one of this window's searches, named by its query ID. */
 export interface SnippetsRequest {
@@ -253,6 +269,8 @@ export interface SettingsIndex {
   bytes: number;
   /** When the index last changed, in ms since the epoch. */
   updatedAt: number | null;
+  /** "Keep recent searches" for this export. */
+  keepRecentSearches: boolean;
 }
 
 /** What Settings shows. */
@@ -268,6 +286,9 @@ export type SettingsResult = { ok: true; generation: number; view: SettingsView 
 export type SetSettingResult = { ok: true; settings: AppSettings } | Rejected;
 /** An action that leaves no outcome but the generation it left. */
 export type DoneResult = { ok: true; generation: number } | Rejected;
+/** The open export's recent searches, newest first. */
+export type RecentSearchesResult =
+  { ok: true; generation: number; entries: SearchSpec[] } | Rejected;
 
 export type ErrorKind = 'uncaught' | 'rejection' | 'error';
 
@@ -322,8 +343,8 @@ export interface PevApi {
   onLinkDialog(listener: (prompt: LinkPrompt) => void): () => void;
   /** The user's choice in the link dialog. Only the dialog's id goes to main. */
   linkAction(dialogId: string, action: LinkAction, generation: number): Promise<LinkActionResult>;
-  /** Called with `n` or `p` typed while the body frame has the focus. */
-  onCardKey(listener: (key: CardKeyName) => void): () => void;
+  /** Called with a shortcut key typed while the body frame has the focus (FRAME_KEYS only). */
+  onFrameKey(listener: (key: FrameKeyName) => void): () => void;
   sources(generation: number): Promise<SourcesResult>;
   chooseFolder(generation: number): Promise<SourceActionResult>;
   openExport(sourceKey: string, generation: number): Promise<SourceActionResult>;
@@ -387,4 +408,16 @@ export interface PevApi {
   openLogs(generation: number): Promise<DoneResult>;
   /** Copies the diagnostics summary; main builds it, and the shell never sees it. */
   copyDiagnostics(generation: number): Promise<DoneResult>;
+  /**
+   * Records the search this window ran as `queryId` in the open export's
+   * recent searches. Main takes the search itself from its own record of it;
+   * an older search's ID is 'superseded'.
+   */
+  commitSearch(queryId: number, generation: number): Promise<DoneResult>;
+  /** The open export's recent searches, newest first. */
+  recentSearches(generation: number): Promise<RecentSearchesResult>;
+  /** "Keep recent searches" for the export Settings showed; off deletes them. */
+  setKeepRecent(sourceKey: string, keep: boolean, generation: number): Promise<DoneResult>;
+  /** Deletes the recent searches of the export Settings showed. */
+  clearRecent(sourceKey: string, generation: number): Promise<DoneResult>;
 }

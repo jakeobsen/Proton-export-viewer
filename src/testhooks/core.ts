@@ -17,6 +17,7 @@ import type {
 } from '../shared/core-protocol';
 import { errorData } from '../shared/log/schema';
 import type { LogWriter } from '../shared/log/writer';
+import type { RecentHooks } from '../core/index/service';
 import type { SourceSession } from '../core/source';
 import type { ReadRequest } from '../shared/reader-protocol';
 import { markLoaded } from './marker';
@@ -65,6 +66,58 @@ export interface CoreTestDeps {
   indexGate: WriteGate | null;
   /** Runs a search that was held. */
   runSearch: (request: IndexQueryRequest) => void;
+  /** Holds and counts the recent searches' jobs. */
+  recentGate: RecentGate | null;
+}
+
+/**
+ * The recent searches' jobs as tests see them: how many recordings reached
+ * core, holding the job at the head of the queue (never reordering), and
+ * making the next wipe fail.
+ */
+export class RecentGate {
+  private holding = false;
+  private failNext = false;
+  private recordings = 0;
+  private readonly waiting: Array<() => void> = [];
+
+  readonly hooks: RecentHooks = {
+    received: (job) => {
+      if (job.op === 'record') this.recordings += 1;
+    },
+    before: () =>
+      this.holding ? new Promise<void>((resolve) => this.waiting.push(resolve)) : Promise.resolve(),
+    failWipe: () => {
+      const fail = this.failNext;
+      this.failNext = false;
+      return fail;
+    },
+  };
+
+  hold(): void {
+    this.holding = true;
+  }
+
+  /** Stops holding and lets the held job go; returns how many were held. */
+  release(): number {
+    this.holding = false;
+    const held = this.waiting.splice(0);
+    for (const go of held) go();
+    return held.length;
+  }
+
+  failNextWipe(): void {
+    this.failNext = true;
+  }
+
+  get held(): number {
+    return this.waiting.length;
+  }
+
+  /** Recordings that reached core. */
+  get received(): number {
+    return this.recordings;
+  }
 }
 
 /** Holds work (phase 1's writes, or scans), while holding, until a test lets it through. */
@@ -209,6 +262,23 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
     }
     case 'held-searches':
       ok(deps.state.heldSearches.length);
+      return;
+    case 'hold-recent':
+      deps.recentGate?.hold();
+      ok();
+      return;
+    case 'release-recent':
+      ok(deps.recentGate?.release() ?? 0);
+      return;
+    case 'held-recent':
+      ok(deps.recentGate?.held ?? 0);
+      return;
+    case 'fail-recent-wipe':
+      deps.recentGate?.failNextWipe();
+      ok();
+      return;
+    case 'recent-received':
+      ok(deps.recentGate?.received ?? 0);
       return;
     case 'hold-cards': {
       // Holds the cards queries anchored at a message; null lets the held ones go.

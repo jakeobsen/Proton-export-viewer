@@ -3,15 +3,7 @@
 import { useEffect } from 'react';
 import type { IndexCondition } from '../shared/index-types';
 import { Conversation } from './Conversation';
-import { typedCardKey } from './card-keys';
-import {
-  indexChanged,
-  moveCard,
-  syncMailbox,
-  useCards,
-  useMailbox,
-  useSearch,
-} from './mailbox-state';
+import { indexChanged, syncMailbox, useCards, useMailbox, useSearch } from './mailbox-state';
 import { ConversationList, Sidebar } from './Mailbox';
 import { SearchBox, SearchResults } from './SearchResults';
 import { LinkDialog } from './LinkDialog';
@@ -19,6 +11,8 @@ import { generationChanged, useReaderState } from './reader';
 import { ReaderPane } from './ReaderPane';
 import { ReportView } from './Report';
 import { Settings } from './Settings';
+import { frameKey, shortcutKey, useShortcutsOverlay } from './shortcut-actions';
+import { ShortcutsOverlay } from './ShortcutsOverlay';
 import {
   appWasReset,
   loadSettings,
@@ -64,19 +58,18 @@ export function App() {
   const results = useSearch().active;
   const conversation = useCards();
   const { reportOpen } = useMailbox();
+  const shortcutsShown = useShortcutsOverlay();
 
   useEffect(() => window.pev.onLinkDialog(showLink), []);
   useEffect(() => window.pev.onSourcesChanged(() => void refreshSources()), []);
   useEffect(() => window.pev.onIndexChanged(indexChanged), []);
-  // `n`/`p`: typed in the shell, or in the body frame and passed on by main.
-  useEffect(() => window.pev.onCardKey(moveCard), []);
+  // Shortcuts: typed in the shell, or in the body frame and passed on by main.
+  // The shell's are read before any other handler sees the key (capture), so
+  // a dialog's own Escape is still on screen when the dispatch checks for it.
+  useEffect(() => window.pev.onFrameKey(frameKey), []);
   useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      const key = typedCardKey(event);
-      if (key !== null) moveCard(key);
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('keydown', shortcutKey, { capture: true });
+    return () => window.removeEventListener('keydown', shortcutKey, { capture: true });
   }, []);
   useEffect(() => window.pev.onSettingsChanged(settingsChanged), []);
   useEffect(() => window.pev.onShowSettings(showSettings), []);
@@ -180,6 +173,7 @@ export function App() {
           )}
         </div>
       </div>
+      {shortcutsShown && <ShortcutsOverlay />}
       {state.link !== null && <LinkDialog key={state.link.dialogId} prompt={state.link} />}
     </div>
   );

@@ -19,6 +19,7 @@ export function settingsView(ctx: AppContext): SettingsView {
           account: active.account,
           runName: active.runName,
           ...indexFiles(ctx.dirs.index, active.sourceKey, home),
+          keepRecentSearches: ctx.sources.keepsRecent(active.sourceKey),
         }
       : null,
     logsLocation: folderLocation(ctx.dirs.logs, home),

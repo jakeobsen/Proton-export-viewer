@@ -107,6 +107,7 @@ export function parseSettings(input: unknown): { settings: AppSettings; reset: n
 
 export class SettingsStore {
   private current: AppSettings;
+  private readonly listeners = new Set<(settings: AppSettings) => void>();
 
   private constructor(
     private readonly dir: string,
@@ -141,6 +142,16 @@ export class SettingsStore {
     return { ...this.current };
   }
 
+  /** Calls `listener` with the settings after every change, a reset included. */
+  onChange(listener: (settings: AppSettings) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  private changed(): void {
+    for (const listener of this.listeners) listener(this.get());
+  }
+
   /**
    * Changes one setting and writes the file. False if the key or value isn't
    * valid; nothing changes then. A failed write keeps the new value for this
@@ -156,12 +167,14 @@ export class SettingsStore {
     } catch {
       this.log.warn('settings.write_failed');
     }
+    this.changed();
     return true;
   }
 
   /** Back to the defaults, in memory only: after a reset deleted the file. */
   clear(): void {
     this.current = { ...DEFAULT_SETTINGS };
+    this.changed();
   }
 
   private save(): void {

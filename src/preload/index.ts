@@ -4,6 +4,7 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import {
   IPC,
+  isFrameKey,
   type ErrorReport,
   type IndexUpdate,
   type LinkPrompt,
@@ -76,13 +77,13 @@ const api: PevApi = {
   },
   linkAction: (dialogId, action, generation) =>
     ipcRenderer.invoke(IPC.linkAction, { dialogId, action, generation }),
-  onCardKey: (listener) => {
+  onFrameKey: (listener) => {
     const handler = (_event: unknown, key: unknown) => {
-      if (key === 'n' || key === 'p') listener(key);
+      if (isFrameKey(key)) listener(key);
     };
-    ipcRenderer.on(IPC.cardKey, handler);
+    ipcRenderer.on(IPC.frameKey, handler);
     return () => {
-      ipcRenderer.off(IPC.cardKey, handler);
+      ipcRenderer.off(IPC.frameKey, handler);
     };
   },
   sources: (generation) => ipcRenderer.invoke(IPC.sources, { generation }),
@@ -116,6 +117,7 @@ const api: PevApi = {
   search: (request, generation) =>
     ipcRenderer.invoke(IPC.search, {
       text: request.text,
+      chips: request.chips ?? [],
       sort: request.sort,
       after: request.after,
       generation,
@@ -163,6 +165,13 @@ const api: PevApi = {
   rebuildIndex: (sourceKey, generation) =>
     ipcRenderer.invoke(IPC.rebuildIndex, { sourceKey, generation }),
   resetApp: (generation) => ipcRenderer.invoke(IPC.resetApp, { generation }),
+  commitSearch: (queryId, generation) =>
+    ipcRenderer.invoke(IPC.commitSearch, { queryId, generation }),
+  recentSearches: (generation) => ipcRenderer.invoke(IPC.recentSearches, { generation }),
+  setKeepRecent: (sourceKey, keep, generation) =>
+    ipcRenderer.invoke(IPC.keepRecent, { sourceKey, keep, generation }),
+  clearRecent: (sourceKey, generation) =>
+    ipcRenderer.invoke(IPC.clearRecent, { sourceKey, generation }),
   openLogs: (generation) => ipcRenderer.invoke(IPC.openLogs, { generation }),
   copyDiagnostics: (generation) => ipcRenderer.invoke(IPC.copyDiagnostics, { generation }),
 };

@@ -26,6 +26,7 @@ import {
   type PingResult,
   type Rejected,
   type RejectCode,
+  type RecentSearchesResult,
   type SearchResult,
   type SnippetsResult,
   type SetSettingResult,
@@ -49,7 +50,15 @@ import {
   type SearchPage,
   type SearchSnippets,
 } from '../shared/index-types';
+import { ChipsSchema } from '../shared/recent-search';
 import { reportText } from '../shared/report-text';
+import {
+  isEmptySearch,
+  normalizeSearch,
+  searchKey,
+  type Chip,
+  type SearchSpec,
+} from '../shared/search-chips';
 import { SETTING_KEYS } from '../shared/settings';
 import type { SourceOutcome } from '../shared/sources';
 import { RESET_FAILED, STALE, type Stale } from './sources/manager';
@@ -235,7 +244,7 @@ const ShellQuery = z.discriminatedUnion('op', [
 ]);
 const IndexArgs = z.tuple([z.object({ query: ShellQuery, generation: Generation }).strict()]);
 
-// A search: the text, the sort and its keyset, nothing else.
+// A search: the text, its chips, the sort and its keyset, nothing else.
 const SearchThreadId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const SearchText = z.string().max(MAX_QUERY_LENGTH);
 const SearchArgs = z.tuple([
@@ -243,6 +252,7 @@ const SearchArgs = z.tuple([
     z
       .object({
         text: SearchText,
+        chips: ChipsSchema,
         sort: z.literal('date'),
         after: z
           .object({
@@ -257,6 +267,7 @@ const SearchArgs = z.tuple([
     z
       .object({
         text: SearchText,
+        chips: ChipsSchema,
         sort: z.literal('relevance'),
         after: z.object({ rank: z.number(), threadId: SearchThreadId }).strict().nullable(),
         generation: Generation,
@@ -294,6 +305,10 @@ const RunId = z.string().regex(/^[0-9a-f]{16}$/);
 const GenerationArgs = z.tuple([z.object({ generation: Generation }).strict()]);
 const SourceArgs = z.tuple([z.object({ sourceKey: SourceKey, generation: Generation }).strict()]);
 const RunArgs = z.tuple([z.object({ runId: RunId, generation: Generation }).strict()]);
+const CommitArgs = z.tuple([z.object({ queryId: QueryId, generation: Generation }).strict()]);
+const KeepRecentArgs = z.tuple([
+  z.object({ sourceKey: SourceKey, keep: z.boolean(), generation: Generation }).strict(),
+]);
 // Main checks the value against the setting's own rule.
 const SettingArgs = z.tuple([
   z.object({ key: z.enum(SETTING_KEYS), value: z.unknown(), generation: Generation }).strict(),
@@ -423,26 +438,29 @@ export function registerIpc(ctx: AppContext): void {
   });
 
   let lastQueryId = 0;
-  /** Per window, its latest search's text, and the first query ID made with that text. */
+  /**
+   * Per window, its latest search (text and chips) with its canonical key,
+   * and the first query ID made with that key.
+   */
   const currentSearch = new WeakMap<
     AppWindow,
-    { text: string; firstQueryId: number; generation: number }
+    { search: SearchSpec; key: string; firstQueryId: number; generation: number }
   >();
   /**
-   * The text of the window's current search, if `queryId` is one of its IDs
-   * in this generation; null for an older search's ID or an unknown one.
+   * The window's current search, if `queryId` is one of its IDs in this
+   * generation; null for an older search's ID or an unknown one.
    */
-  const searchTextOf = (appWin: AppWindow, queryId: number, generation: number): string | null => {
-    const search = currentSearch.get(appWin);
+  const searchOf = (appWin: AppWindow, queryId: number, generation: number): SearchSpec | null => {
+    const current = currentSearch.get(appWin);
     if (
-      !search ||
-      search.generation !== generation ||
-      queryId < search.firstQueryId ||
+      !current ||
+      current.generation !== generation ||
+      queryId < current.firstQueryId ||
       queryId > lastQueryId
     ) {
       return null;
     }
-    return search.text;
+    return current.search;
   };
 
   const openPacer = new OpenPacer<AppWindow>(() =>
@@ -454,7 +472,7 @@ export function registerIpc(ctx: AppContext): void {
     const [{ rowid, mode, generation, queryId }] = args.data;
     if (generation !== ctx.generation) return reject('stale_generation', appWin);
     // From an older search, or an unknown one, the message still opens, without its matches.
-    const searchText = queryId === undefined ? null : searchTextOf(appWin, queryId, generation);
+    const search = queryId === undefined ? null : searchOf(appWin, queryId, generation);
 
     const { openId, token, revoked } = appWin.views.accept();
     if (revoked > 0) {
@@ -495,7 +513,7 @@ export function registerIpc(ctx: AppContext): void {
           rowid,
           mode,
           lane: appWin.id,
-          ...(searchText === null ? {} : { search: { text: searchText } }),
+          ...(search === null ? {} : { search }),
         },
         ctx.sources.stamp(),
       );
@@ -508,7 +526,7 @@ export function registerIpc(ctx: AppContext): void {
     if (appWin.win.isDestroyed()) return reject('superseded', appWin);
 
     // Only an open from search has a match, and only a view, the fallback and a missing file carry it.
-    const match = searchText === null ? null : (result.match ?? null);
+    const match = search === null ? null : (result.match ?? null);
     if (!result.ok) {
       if (result.code === 'eml_missing') {
         appWin.views.abandon(openId);
@@ -841,9 +859,15 @@ export function registerIpc(ctx: AppContext): void {
     if (generation !== ctx.generation) return reject('stale_generation', appWin);
     let query: IndexQuery = asked;
     if (asked.op === 'cards' && asked.search) {
-      const { search, ...plain } = asked;
-      const text = searchTextOf(appWin, search.queryId, generation);
-      query = text === null ? plain : { ...plain, search: { ...search, text } };
+      const { search: named, ...plain } = asked;
+      const search = searchOf(appWin, named.queryId, generation);
+      query =
+        search === null
+          ? plain
+          : {
+              ...plain,
+              search: { ...named, text: search.text, chips: normalizeSearch(search).chips },
+            };
     }
     const result = await ctx.sources.queryIndex(query);
     if (!result) return { ok: false, code: 'no_source' };
@@ -860,18 +884,23 @@ export function registerIpc(ctx: AppContext): void {
   guarded<SearchResult>(IPC.search, async (appWin, raw) => {
     const args = SearchArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
-    const [{ generation, ...request }] = args.data;
+    const [{ generation, chips, ...request }] = args.data;
     if (generation !== ctx.generation) return reject('stale_generation', appWin);
     lastQueryId += 1;
     const queryId = lastQueryId;
+    const search: SearchSpec = { text: request.text, chips: chips as Chip[] };
+    const key = searchKey(search);
+    // Any change of the text or the chips, as their canonical form, makes a
+    // new search: the older one's IDs no longer name it.
     const known = currentSearch.get(appWin);
-    if (known?.text !== request.text || known.generation !== generation) {
-      currentSearch.set(appWin, { text: request.text, firstQueryId: queryId, generation });
+    if (known?.key !== key || known.generation !== generation) {
+      currentSearch.set(appWin, { search, key, firstQueryId: queryId, generation });
     }
+    const normalChips = normalizeSearch(search).chips;
     const outcome = await searchLanes.run(appWin, async () =>
       // A search that waited is checked again when its turn comes.
       generation === ctx.generation
-        ? ctx.sources.queryIndex({ op: 'search', queryId, ...request })
+        ? ctx.sources.queryIndex({ op: 'search', queryId, ...request, chips: normalChips })
         : null,
     );
     if (outcome === SUPERSEDED) return { ok: false, code: 'superseded' };
@@ -884,8 +913,8 @@ export function registerIpc(ctx: AppContext): void {
 
   /**
    * Snippets for rows of the window's current search, by its query ID: main
-   * uses the text that search was made with, so the window can't ask for any
-   * other. An older search's ID, or one from another generation, is
+   * uses the text and chips that search was made with, so the window can't
+   * ask for any other. An older search's ID, or one from another generation, is
    * superseded. One request runs per window and one waits, as for searches.
    */
   const snippetLanes = new SearchLanes<AppWindow>();
@@ -894,11 +923,17 @@ export function registerIpc(ctx: AppContext): void {
     if (!args.success) return reject('invalid', appWin);
     const [{ queryId, threadIds, generation }] = args.data;
     if (generation !== ctx.generation) return reject('stale_generation', appWin);
-    const text = searchTextOf(appWin, queryId, generation);
-    if (text === null) return { ok: false, code: 'superseded' };
+    const search = searchOf(appWin, queryId, generation);
+    if (search === null) return { ok: false, code: 'superseded' };
     const outcome = await snippetLanes.run(appWin, async () =>
       generation === ctx.generation
-        ? ctx.sources.queryIndex({ op: 'snippets', queryId, text, threadIds })
+        ? ctx.sources.queryIndex({
+            op: 'snippets',
+            queryId,
+            text: search.text,
+            chips: normalizeSearch(search).chips,
+            threadIds,
+          })
         : null,
     );
     if (outcome === SUPERSEDED) return { ok: false, code: 'superseded' };
@@ -923,12 +958,14 @@ export function registerIpc(ctx: AppContext): void {
     if (!args.success) return reject('invalid', appWin);
     const [{ requester, rowids, queryId, generation }] = args.data;
     if (generation !== ctx.generation) return reject('stale_generation', appWin);
-    const text = queryId === undefined ? null : searchTextOf(appWin, queryId, generation);
+    const search = queryId === undefined ? null : searchOf(appWin, queryId, generation);
+    const named =
+      search === null ? {} : { text: search.text, chips: normalizeSearch(search).chips };
     const outcome = await leadLanes.run(
       appWin,
       async () =>
         generation === ctx.generation
-          ? ctx.sources.queryIndex({ op: 'leads', rowids, ...(text === null ? {} : { text }) })
+          ? ctx.sources.queryIndex({ op: 'leads', rowids, ...named })
           : null,
       requester,
     );
@@ -1018,6 +1055,55 @@ export function registerIpc(ctx: AppContext): void {
     if (!ctx.settings.set(key, value)) return reject('invalid', appWin);
     notifySettings(ctx);
     return { ok: true, settings: ctx.settings.get() };
+  });
+
+  /**
+   * A committed search (Enter, or a result opened): main records the search
+   * it ran as `queryId`, never text from the window. Checked, timed and
+   * queued in one step, so the switch it is checked against is the one in
+   * force when it arrived.
+   */
+  guarded<DoneResult>(IPC.commitSearch, (appWin, raw) => {
+    const args = CommitArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ queryId, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    const search = searchOf(appWin, queryId, generation);
+    if (search === null) return { ok: false, code: 'superseded' };
+    if (!isEmptySearch(search)) ctx.sources.recordSearch(searchKey(search), Date.now());
+    return { ok: true, generation };
+  });
+
+  guarded<RecentSearchesResult>(IPC.recentSearches, async (appWin, raw) => {
+    const args = GenerationArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    const entries = await ctx.sources.recentSearches();
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    return { ok: true, generation, entries };
+  });
+
+  guarded<DoneResult>(IPC.keepRecent, (appWin, raw) => {
+    const args = KeepRecentArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ sourceKey, keep, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    if (ctx.sources.setKeepRecent(sourceKey, keep, generation) === STALE) {
+      return reject('stale_generation', appWin);
+    }
+    return { ok: true, generation };
+  });
+
+  guarded<DoneResult>(IPC.clearRecent, async (appWin, raw) => {
+    const args = SourceArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ sourceKey, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    const outcome = await ctx.sources.clearRecent(sourceKey, generation);
+    if (outcome === STALE) return reject('stale_generation', appWin);
+    if (outcome === 'failed') return reject('core_unavailable', appWin);
+    return { ok: true, generation: ctx.generation };
   });
 
   sourceAction(

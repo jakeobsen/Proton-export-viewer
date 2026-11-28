@@ -167,6 +167,32 @@ export async function openInReader(
   return result;
 }
 
+/**
+ * Which of the body switch's two views can be asked for now: not while an
+ * open is under way or the view shown is that one; HTML only when the
+ * message has it and it wasn't kept back from this open.
+ */
+export function viewChoices(reader: ReaderState): { plain: boolean; html: boolean } {
+  const shown = reader.view?.format ?? null;
+  // HTML was asked for and plain text came back: this open can't show the HTML.
+  const htmlKeptBack = reader.view?.format === 'plain' && reader.mode !== 'plain';
+  return {
+    plain: !reader.pending && shown !== 'plain',
+    html: !reader.pending && shown !== 'html' && reader.view?.hasHtml === true && !htmlKeptBack,
+  };
+}
+
+/**
+ * The open message again in the other view, as the body switch would open
+ * it, and only when the switch offers it: not while the source view shows.
+ */
+export function toggleView(): void {
+  const { rowid, source, view, mode } = state;
+  if (rowid === null || source !== null) return;
+  const other = (view?.format ?? mode) === 'plain' ? 'html' : 'plain';
+  if (viewChoices(state)[other]) void openInReader(rowid, other);
+}
+
 async function guardedCall<T extends { ok: boolean }>(
   call: () => Promise<T>,
 ): Promise<T | { ok: false; code: RejectCode }> {

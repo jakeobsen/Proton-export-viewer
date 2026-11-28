@@ -5,6 +5,7 @@
 
 import type { CAPPED_LIST_NAMES } from './log/codes';
 import type { ReaderMatch, StoredBody } from './reader-protocol';
+import type { Chip, SearchSpec } from './search-chips';
 import type { RejectKind } from './sources';
 
 export type FolderKind = 'system' | 'folder' | 'label';
@@ -145,6 +146,8 @@ export type SearchQuery = {
   /** Main's ID for this request; the answer carries it back. */
   queryId: number;
   text: string;
+  /** The search's chips, checked by main; none if left out. */
+  chips?: Chip[];
 } & (
   { sort: 'date'; after: SearchDateKey | null } | { sort: 'relevance'; after: SearchRankKey | null }
 );
@@ -214,6 +217,8 @@ export interface SnippetsQuery {
   /** The search the rows belong to; the answer carries it back. */
   queryId: number;
   text: string;
+  /** None if left out. */
+  chips?: Chip[];
   threadIds: number[];
 }
 
@@ -276,6 +281,8 @@ export interface CardsSearch {
   countRev: number | null;
   /** The search's text: main puts it in from the search the query ID names, never the shell. */
   text?: string;
+  /** The search's chips, put in by main with its text; none if left out. */
+  chips?: Chip[];
 }
 
 export interface CardsQuery {
@@ -342,6 +349,8 @@ export interface LeadsQuery {
    * message that matches it gets the search's snippet in place of its lead.
    */
   text?: string;
+  /** That search's chips, put in by main with its text; none if left out. */
+  chips?: Chip[];
 }
 
 /** A message's lead line: the first words of its stored body, cleaned for one line. */
@@ -366,7 +375,7 @@ export type IndexQuery =
   | { op: 'details'; threadIds: number[] }
   | { op: 'resolve'; rowid: number }
   | { op: 'totals' }
-  | { op: 'eml'; rowid: number; search?: string }
+  | { op: 'eml'; rowid: number; search?: SearchSpec }
   | { op: 'report' }
   | WindowQuery
   | SearchQuery
