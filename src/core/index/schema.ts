@@ -7,7 +7,7 @@ import { statSync } from 'node:fs';
 import { CRISIS_MERGE } from './limits';
 import { openDb, type Db } from './sql';
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /** The full-text index's prefix lengths. */
 export const FTS_PREFIX = '2 3';
@@ -45,11 +45,15 @@ export type CappedList = keyof typeof CAPPED;
 export const CAPPED_LISTS = Object.keys(CAPPED) as CappedList[];
 
 // A message's rowid is never used again once it is gone (AUTOINCREMENT), so a
-// row a list or reader still holds can't come to mean another message.
+// row a list or reader still holds can't come to mean another message. The
+// *_fold columns hold the sender's address and the To and Cc addresses (a
+// JSON array) in lower case, folded by JavaScript rather than by SQLite,
+// whose lower() changes ASCII letters only.
 const TABLES = `
 CREATE TABLE messages(
   rowid INTEGER PRIMARY KEY AUTOINCREMENT, proton_id TEXT UNIQUE NOT NULL, time INT, subject TEXT,
   sender_name TEXT, sender_addr TEXT, to_json, cc_json, bcc_json, reply_to_json,
+  sender_fold TEXT, to_fold TEXT, cc_fold TEXT,
   flags INT, unread INT, replied INT, replied_all INT, forwarded INT, size INT,
   num_attachments INT, mime_type TEXT, message_id TEXT, in_reply_to_json TEXT,
   references_json TEXT, dmarc TEXT,

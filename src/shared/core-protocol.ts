@@ -34,11 +34,13 @@ export interface CoreInit {
   test?: CoreTestInit;
 }
 
-/** Builds with test hooks only: settings for phase 1 in tests. */
+/** Builds with test hooks only: settings for indexing in tests. */
 export interface CoreTestInit {
   /** Pairs per write transaction. */
   batchPairs?: number;
-  /** Phase 1 writes wait until a test lets them through. */
+  /** Bytes of text one phase 2 transaction writes, at most. */
+  txnBytes?: number;
+  /** Writes, phase 1's and phase 2's, wait until a test lets them through. */
   holdWrites?: boolean;
   /** New metadata files are read in name order, and their batches written in that order. */
   readByName?: boolean;

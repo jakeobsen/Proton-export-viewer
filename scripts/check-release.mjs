@@ -49,6 +49,7 @@ const FORBIDDEN_CONTENT = [
   'pev-no-resolver-rule',
   'sessionPreconnects',
   'readByName',
+  'txnBytes',
   'openGapMs',
   // The self-test's smoke drives the body frame through the DevTools protocol.
   ...SELFTEST_ONLY,

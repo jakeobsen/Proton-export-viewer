@@ -418,7 +418,7 @@ export async function install(ctx: AppContext): Promise<boolean> {
     indexTestSettings: (settings: CoreTestInit | null) => {
       ctx.core.testInit = settings;
     },
-    /** Lets `count` held phase 1 writes through; null stops holding them. */
+    /** Lets `count` held writes through; null stops holding them. */
     releaseWrites: async (count: number | null) => {
       const result = await ctx.core.request({
         type: 'test',

@@ -20,6 +20,7 @@ import type {
 import { parseQuery, wordsOf, type ParsedQuery, type Term, type TextColumn } from '../search/query';
 import { markedToRanges, stripMarks } from '../search/ranges';
 import { SYSTEM_LABELS } from './labels';
+import { foldAddress } from './metadata';
 import { BODY_STATE, META_STATE } from './schema';
 import { asNumber, scalar, type Db, type SqlValue } from './sql';
 
@@ -114,19 +115,22 @@ export function labelIds(db: Db, scope: 'label' | 'folder', name: string): strin
   return [...ids].sort();
 }
 
-/** The stored address starts with the value, ignoring case. */
-const ADDRESS_PREFIX = (column: string) =>
-  `substr(lower(${column}), 1, length(lower(?))) = lower(?)`;
+/**
+ * The stored address starts with the value, ignoring case: both are folded
+ * by JavaScript (the stored one when it was written), so letters outside
+ * ASCII compare without case too.
+ */
+const ADDRESS_PREFIX = (column: string) => `substr(${column}, 1, length(?)) = ?`;
 
 function condition(db: Db, term: Exclude<Term, { kind: 'text' }>): Condition {
   switch (term.kind) {
     case 'address': {
-      const v = term.value;
-      if (term.field === 'from') return { sql: ADDRESS_PREFIX('m.sender_addr'), params: [v, v] };
-      const list = term.field === 'to' ? 'm.to_json' : 'm.cc_json';
+      const v = foldAddress(term.value);
+      if (term.field === 'from') return { sql: ADDRESS_PREFIX('m.sender_fold'), params: [v, v] };
+      const list = term.field === 'to' ? 'm.to_fold' : 'm.cc_fold';
       return {
         sql: `CASE WHEN json_valid(${list}) THEN EXISTS (SELECT 1 FROM json_each(${list}) j
-                WHERE ${ADDRESS_PREFIX("json_extract(j.value, '$.address')")}) ELSE 0 END`,
+                WHERE ${ADDRESS_PREFIX('j.value')}) ELSE 0 END`,
         params: [v, v],
       };
     }
