@@ -4,6 +4,7 @@
 // source's gates, report the reader's memory, and turn the unsanitized path
 // on or off.
 
+import type { BatchResult } from '../core/index/ops';
 import type { ReaderLane } from '../core/reader/lane';
 import type { ReaderSource } from '../core/reader/source';
 import type {
@@ -96,6 +97,35 @@ export class WriteGate {
   get held(): number {
     return this.waiting.length;
   }
+}
+
+/** One phase 1 write transaction: its time and what regrouping did in it. */
+export interface RecordedBatch {
+  ms: number;
+  messages: number;
+  repointedMessages: number;
+  repointedKeys: number;
+  repointedLabelRows: number;
+  maxRepointed: number;
+  indexBytes: number;
+}
+
+/** At most this many batches are kept: more than a 200,000-message export writes. */
+const MAX_RECORDED_BATCHES = 100_000;
+const recordedBatches: RecordedBatch[] = [];
+
+/** Keeps a phase 1 write transaction's time and stats, for the gate's report. */
+export function recordBatch(ms: number, result: BatchResult): void {
+  if (recordedBatches.length >= MAX_RECORDED_BATCHES) return;
+  recordedBatches.push({
+    ms,
+    messages: result.messages,
+    repointedMessages: result.repointedMessages,
+    repointedKeys: result.repointedKeys,
+    repointedLabelRows: result.repointedLabelRows,
+    maxRepointed: result.maxRepointed,
+    indexBytes: result.indexBytes,
+  });
 }
 
 function limits(payload: unknown): { heapMb?: number; timeoutMs?: number } | null {
@@ -371,6 +401,14 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
             },
           });
         });
+      return;
+    case 'gate-batches':
+      deps.reply({
+        type: 'result',
+        reqId: request.reqId,
+        ok: true,
+        data: recordedBatches.map((b) => ({ ...b })),
+      });
       return;
     case 'source-records': {
       const records = deps.session?.records ?? null;
