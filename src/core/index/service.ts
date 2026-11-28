@@ -618,12 +618,12 @@ export class IndexService {
    * clock) at most: a thread stuck in a read on a dead disk exits whenever
    * that read ends.
    */
-  private async stopPool(until = Infinity): Promise<void> {
+  private async stopPool(until: number): Promise<void> {
     const pool = this.pool;
     this.pool = null;
     if (!pool) return;
-    const stopped = pool.stop();
-    if (until === Infinity) return stopped;
+    // Left running past the deadline: a later failure there has nothing to stop.
+    const stopped = pool.stop().catch(() => undefined);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<void>((resolve) => {
       timer = setTimeout(resolve, Math.max(0, until - performance.now()));
