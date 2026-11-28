@@ -7,6 +7,7 @@
 
 import { EventEmitter } from 'node:events';
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -14,7 +15,7 @@ import {
   readdirSync,
   writeFileSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   MAX_WAITING,
@@ -478,6 +479,26 @@ describe('SaveManager', () => {
       expect(kept.map((l) => l.data)).toEqual(inside ? [{ reason: 'export_root' }] : []);
     }
   });
+
+  // Root can remove a folder from a read-only parent, so the failure can't be made there.
+  it.skipIf(process.getuid?.() === 0)(
+    'at quit, a staging folder that can’t be removed is logged, and quit doesn’t throw',
+    () => {
+      const t = setup();
+      t.staging.ensure();
+      writeFileSync(t.staging.newFile(), 'staged');
+      const userData = dirname(t.staging.dir);
+      chmodSync(userData, 0o555);
+      try {
+        expect(() => t.manager.quit()).not.toThrow();
+      } finally {
+        chmodSync(userData, 0o755);
+      }
+      expect(t.logged.filter((l) => l.code === 'save.staging_failed')).toEqual([
+        { level: 'warn', code: 'save.staging_failed', data: {} },
+      ]);
+    },
+  );
 
   it('a download that never starts fails the save', async () => {
     const t = setup({ downloadStartMs: 50 });

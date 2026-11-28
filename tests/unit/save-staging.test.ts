@@ -5,6 +5,7 @@
 // export guard allows.
 
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -191,6 +192,29 @@ describe('Staging', () => {
     new Staging(userData).sweep(anywhere);
     expect(existsSync(folder)).toBe(true);
   });
+
+  // Root can remove a folder from a read-only parent, so the failure can't be made there.
+  it.skipIf(process.getuid?.() === 0)(
+    'a staging folder that can’t be removed is reported, the sweep doesn’t throw, and the next one removes it',
+    () => {
+      const userData = testDir('save-staging');
+      const staging = new Staging(userData);
+      staging.ensure();
+      writeFileSync(staging.newFile(), 'staged');
+      const failed: string[] = [];
+      chmodSync(userData, 0o555);
+      try {
+        expect(() => staging.sweep(anywhere, undefined, () => failed.push('failed'))).not.toThrow();
+      } finally {
+        chmodSync(userData, 0o755);
+      }
+      expect(failed).toEqual(['failed']);
+      expect(existsSync(staging.dir)).toBe(true);
+      staging.sweep(anywhere, undefined, () => failed.push('again'));
+      expect(failed).toEqual(['failed']);
+      expect(existsSync(staging.dir)).toBe(false);
+    },
+  );
 });
 
 function idOf(path: string): { dev: string; ino: string; birth: string } {

@@ -44,6 +44,7 @@ export const LOG_CODES = [
   'save.queue_full',
   'save.shown',
   'save.partial_kept',
+  'save.staging_failed',
   'protocol.not_found',
   'view.installed',
   'reader.show_in_folder',

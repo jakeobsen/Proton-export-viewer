@@ -343,6 +343,7 @@ export class SaveManager {
     this.deps.staging.sweep(
       (dir) => !insideExport(dir, this.deps.exportRoots()),
       (reason) => this.deps.log.warn('save.partial_kept', { reason }),
+      () => this.deps.log.warn('save.staging_failed'),
     );
   }
 

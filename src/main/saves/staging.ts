@@ -149,9 +149,15 @@ export class Staging {
    * Removes everything a save left: a noted fallback copy, if its path still
    * names the file the app created (see removeOwned) and `mayDelete` allows
    * its folder, then the staging folder's contents. `onKept` hears of a noted
-   * copy that is there but left in place.
+   * copy that is there but left in place, and `onFailed` of a staging folder
+   * that couldn't be removed. It never throws: whatever it can't remove stays,
+   * and the next sweep tries again.
    */
-  sweep(mayDelete: (dir: string) => boolean, onKept?: (reason: KeptReason) => void): void {
+  sweep(
+    mayDelete: (dir: string) => boolean,
+    onKept?: (reason: KeptReason) => void,
+    onFailed?: () => void,
+  ): void {
     try {
       const note = JSON.parse(readFileSync(join(this.dir, PARTIAL_NOTE), 'utf8')) as Record<
         string,
@@ -178,6 +184,10 @@ export class Staging {
     } catch {
       return;
     }
-    rmSync(this.dir, { recursive: true, force: true });
+    try {
+      rmSync(this.dir, { recursive: true, force: true });
+    } catch {
+      onFailed?.();
+    }
   }
 }

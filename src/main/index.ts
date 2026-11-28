@@ -127,6 +127,7 @@ async function start(): Promise<void> {
   staging.sweep(
     (dir) => !insideExport(dir, sources.exportRoots()),
     (reason) => log.warn('save.partial_kept', { reason }),
+    () => log.warn('save.staging_failed'),
   );
   const saves = new SaveManager({
     log,
