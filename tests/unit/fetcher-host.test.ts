@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // FetcherHost against a fake utility process: it starts only through the
-// guard, with an empty environment; a spawn is bounded (a throw, an exit
+// guard, with an environment of its own and nothing of main's; a spawn is bounded (a throw, an exit
 // before ready and a silent fetcher each fail it, and the guard's finally
 // runs); a crash fails pending images and the next fetch spawns again through
 // the guard; main trusts nothing the fetcher sends.
@@ -139,12 +139,17 @@ beforeEach(() => {
 });
 
 describe('starting the fetcher', () => {
-  it('spawns only through the guard, with an empty environment, and waits for ready', async () => {
+  it('spawns only through the guard, with an environment of its own, and waits for ready', async () => {
     const { host, guard, codes } = make();
     const started = host.ensure();
     expect(guard).toEqual(['release']);
+    // One fixed entry and nothing else: an empty map would make Electron pass
+    // main's whole environment on.
     expect(fake.forks).toEqual([
-      { path: 'fetcher.js', options: { serviceName: 'Fetcher', stdio: 'ignore', env: {} } },
+      {
+        path: 'fetcher.js',
+        options: { serviceName: 'Fetcher', stdio: 'ignore', env: { PEV_PROCESS: 'fetcher' } },
+      },
     ]);
     ready(0);
     await started;

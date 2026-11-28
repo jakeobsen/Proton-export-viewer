@@ -18,6 +18,7 @@ import {
   type Server,
   type Socket,
 } from 'node:net';
+import type { Duplex } from 'node:stream';
 
 export interface DualServer {
   port: number;
@@ -33,6 +34,22 @@ async function listen(server: Server): Promise<number> {
 }
 
 const closed = (server: Server) => new Promise<void>((resolve) => server.close(() => resolve()));
+
+/**
+ * Joins a client's connection to the internal server's, both ways. When the
+ * internal server ends its side, the pipe ends the client's side once every
+ * byte written to it is flushed, so a large body arrives whole. Only a back
+ * connection that closes without ending (an error) cuts the client off at
+ * once; a client that goes away closes the back connection.
+ */
+export function bridge(front: Duplex, back: Duplex): void {
+  back.on('close', () => {
+    if (!back.readableEnded) front.destroy();
+  });
+  front.on('close', () => back.destroy());
+  front.pipe(back);
+  back.pipe(front);
+}
 
 export async function dualServer(
   handler: RequestListener,
@@ -55,11 +72,8 @@ export async function dualServer(
     socket.once('data', (first) => {
       const back = connect(first[0] === 0x16 ? httpsPort : httpPort, '127.0.0.1');
       track(back);
-      back.on('close', () => socket.destroy());
-      socket.on('close', () => back.destroy());
       back.write(first);
-      socket.pipe(back);
-      back.pipe(socket);
+      bridge(socket, back);
     });
   });
   const port = await listen(front);

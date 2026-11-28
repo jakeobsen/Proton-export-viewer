@@ -37,6 +37,14 @@ import type { Logger } from '../shared/log/writer';
 
 export const READY_TIMEOUT_MS = 10_000;
 export const STOP_TIMEOUT_MS = 5_000;
+/**
+ * The fetcher's whole environment. Not empty: Electron gives a utility
+ * process its parent's environment when the map it gets is empty.
+ */
+export const FETCHER_ENV: Readonly<Record<string, string>> = Object.freeze({
+  PEV_PROCESS: 'fetcher',
+});
+
 /** At most this many relayed log events per window; the rest are counted and dropped. */
 export const RELAY_LIMIT = { events: 200, windowMs: 10_000 };
 
@@ -193,8 +201,10 @@ export class FetcherHost {
           serviceName: 'Fetcher',
           stdio: 'ignore',
           // Nothing of main's environment: no proxy, no extra certificates,
-          // no TLS or Node options can reach the fetcher.
-          env: {},
+          // no TLS or Node options can reach the fetcher. Electron starts a
+          // utility process with its parent's environment when the map is
+          // empty, so the map holds one fixed entry and nothing else.
+          env: { ...FETCHER_ENV },
         });
       } catch (err) {
         reject(err instanceof Error ? err : new FetcherUnavailableError());

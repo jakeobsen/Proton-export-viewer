@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The fetcher in the running app, driven through main's test hooks (consent
-// comes later): it starts with an empty environment, so none of main's TLS,
+// comes later): it starts with an environment of its own, so none of main's TLS,
 // proxy, certificate or Node settings reach it; it connects only to the test
 // entry; and no marker in a URL or host name reaches a log through any of
 // its paths (success, refusal, redirect, timeout, crash).
@@ -150,11 +150,13 @@ test('no marker in a URL or host name reaches a log through the fetcher', async 
     for (const reason of ['status', 'port', 'userinfo', 'timeout']) {
       expect(pev.hasLog('fetcher.refused', { proc: 'fetcher', reason })).toBe(true);
     }
-    // The logs folder still has its three files, and no marker is in any.
-    const files = readdirSync(pev.logsDir())
-      .filter((f) => f.endsWith('.jsonl'))
-      .sort();
-    expect(files).toEqual(['core.jsonl', 'main.jsonl', 'renderer.jsonl']);
+    // The fetcher adds no log file of its own: the folder holds only the app's
+    // three, each made at its first event, and no marker is in any.
+    const files = readdirSync(pev.logsDir()).sort();
+    expect(
+      files.filter((f) => !['core.jsonl', 'main.jsonl', 'renderer.jsonl'].includes(f)),
+    ).toEqual([]);
+    expect(files).toContain('main.jsonl');
     const text = files.map((f) => readFileSync(join(pev.logsDir(), f), 'utf8')).join('\n');
     expect(findMarkers(text)).toEqual([]);
   } finally {
