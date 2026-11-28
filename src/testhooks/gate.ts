@@ -14,7 +14,7 @@ import { once } from 'node:events';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { cpus, release, totalmem } from 'node:os';
 import { join } from 'node:path';
-import { app, contentTracing } from 'electron';
+import { app, screen } from 'electron';
 import { Random } from '../../tools/gen-export/random.mjs';
 import { checkNewFile } from '../../tools/bench/workspace.mjs';
 import type { AppContext, AppWindow } from '../main/context';
@@ -26,6 +26,7 @@ import { readConfig, type GateConfig } from './gate-config';
 import type {
   ExpansionItem,
   FirstRows,
+  FrameRun,
   LogMark,
   ProgressMark,
   RafProbe,
@@ -45,8 +46,6 @@ const ALL_MAIL = '5';
 /** Main log codes the gate notes, with their time. */
 const NOTED = /^(index|source|scan)\./;
 const MAX_MARKS = 5000;
-/** Trace categories for the frame record. */
-const TRACE_CATEGORIES = ['benchmark', 'cc', 'viz'];
 
 const epoch = (at: number) => performance.timeOrigin + at;
 
@@ -161,9 +160,10 @@ async function openShell(
   ctx: AppContext,
   config: GateConfig,
 ): Promise<{ appWin: AppWindow; shell: Shell }> {
-  const appWin = createAppWindow(ctx);
+  // Hidden windows are throttled; the gate window alone is not, and draws
+  // frames for the whole window while hidden.
+  const appWin = createAppWindow(ctx, { framesWhileHidden: true });
   const contents = appWin.win.webContents;
-  // Hidden windows are throttled; the gate window alone is not.
   contents.setBackgroundThrottling(false);
   if (contents.isLoading()) await once(contents, 'did-finish-load');
   const js = <T>(code: string, ms = config.stepMs): Promise<T> => {
@@ -206,32 +206,19 @@ function pick(
   return { pickedAt: () => pickedAt, chosen };
 }
 
-/** Records a trace around `run`, into the workspace; returns the file, or null without a trace. */
-async function traced<T>(
-  config: GateConfig,
-  name: string,
-  run: () => Promise<T>,
-): Promise<{ value: T; trace: string | null }> {
-  if (!config.trace) return { value: await run(), trace: null };
-  const file = join(config.workspace, `trace-${name}-${config.nonce}.json`);
-  checkNewFile(config.workspace, config.nonce, file);
-  await contentTracing.startRecording({ included_categories: TRACE_CATEGORIES });
-  let value: T;
-  try {
-    value = await run();
-  } finally {
-    await contentTracing.stopRecording(file);
-  }
-  return { value, trace: file };
-}
-
-/** A scroll of the list or the conversation, with its window on main's clock. */
+/**
+ * A scroll of the list or the conversation. Its window and its steps' frame
+ * timestamps are on main's clock.
+ */
 interface TimedScroll {
   name: string;
   startedAt: number;
   endedAt: number;
-  run: ScrollRun;
-  trace: string | null;
+  steps: number;
+  stamps: number[];
+  stopped: boolean;
+  waitMs: number;
+  range: number;
 }
 
 async function scrollOnce(
@@ -241,12 +228,56 @@ async function scrollOnce(
   selector: string,
 ): Promise<TimedScroll> {
   const startedAt = performance.now();
-  const { value, trace } = await traced(config, name, () =>
-    shell.js<ScrollRun>(
-      `window.__pevTest.gate.scroll(${JSON.stringify(selector)}, ${config.scrollSteps}, ${config.frameMs})`,
-    ),
+  const run = await shell.js<ScrollRun>(
+    `window.__pevTest.gate.scroll(${JSON.stringify(selector)}, ${config.scrollSteps}, ${config.scrollWaitMs}, ${config.graceMs})`,
+    config.scrollSteps * (config.scrollWaitMs + config.graceMs) + config.stepMs,
   );
-  return { name, startedAt, endedAt: performance.now(), run: value, trace };
+  return {
+    name,
+    startedAt,
+    endedAt: performance.now(),
+    steps: run.steps,
+    stamps: run.stamps.map(shell.toMain),
+    stopped: run.stopped,
+    waitMs: run.waitMs,
+    range: run.range,
+  };
+}
+
+/**
+ * The frame cadence with nothing else going on: consecutive frames'
+ * timestamps, on main's clock. `name` is 'baseline' (before the pick) or
+ * 'check' (once indexing has ended).
+ */
+interface TimedCadence {
+  name: string;
+  startedAt: number;
+  endedAt: number;
+  stamps: number[];
+  timeouts: number;
+  timeoutMs: number;
+}
+
+async function cadence(
+  config: GateConfig,
+  shell: Shell,
+  record: Marks,
+  name: 'baseline' | 'check',
+): Promise<TimedCadence> {
+  record.phase(`cadence-${name}`);
+  const startedAt = performance.now();
+  const run = await shell.js<FrameRun>(
+    `window.__pevTest.gate.frameRun(${config.cadenceFrames}, ${config.frameMs})`,
+    config.cadenceFrames * config.frameMs + config.stepMs,
+  );
+  return {
+    name,
+    startedAt,
+    endedAt: performance.now(),
+    stamps: run.stamps.map(shell.toMain),
+    timeouts: run.timeouts,
+    timeoutMs: run.timeoutMs,
+  };
 }
 
 /** The conversation with the most messages, from All Mail's pages. */
@@ -371,6 +402,8 @@ async function runFresh(
   result: Result,
   probe: boolean,
 ): Promise<void> {
+  const cadences: TimedCadence[] = [await cadence(config, shell, record, 'baseline')];
+  result.cadences = cadences;
   if (probe) {
     record.phase('raf-before');
     result.rafBefore = await shell.js<RafProbe>(
@@ -413,6 +446,7 @@ async function runFresh(
   }
   const indexedAt = await untilIndexed(record, config);
   if (probe) {
+    cadences.push(await cadence(config, shell, record, 'check'));
     const largest = await largestConversation(ctx);
     if (largest) {
       await shell.js(
@@ -441,6 +475,7 @@ async function runFresh(
   result.indexedAt = indexedAt;
   result.scrolls = scrolls;
   result.idle = probe ? null : await idle(record, config);
+  if (!probe) cadences.push(await cadence(config, shell, record, 'check'));
 }
 
 async function runReopen(
@@ -507,18 +542,22 @@ async function runOpens(
 ): Promise<void> {
   const sample = config.sample;
   if (!sample) throw new Error('no sample');
+  const cadences: TimedCadence[] = [await cadence(config, shell, record, 'baseline')];
+  result.cadences = cadences;
   record.phase('phase1');
   const picked = pick(ctx, shell, config.root);
   void picked.chosen.then((c) => {
     result.chosen = c;
   });
   const indexedAt = await untilIndexed(record, config);
+  result.pickedAt = picked.pickedAt();
   result.indexedAt = indexedAt;
   record.phase('sample');
   const totals = await totalsOf(ctx);
   if (!totals) throw new Error('no totals');
   const items = await pickExpansions(ctx, totals.totals.messages, sample);
   result.sample = items.map(({ rel, size, rowid }) => ({ rel, size, rowid }));
+  cadences.push(await cadence(config, shell, record, 'check'));
   const largest = await largestConversation(ctx);
   if (largest) {
     await shell.js(
@@ -598,13 +637,15 @@ export async function runGate(
     result.inputs = {
       backgroundThrottling: false,
       capBytes: config.capBytes,
+      framesWhileHidden: true,
       frameMs: config.frameMs,
       rafProbes: config.rafProbes,
+      cadenceFrames: config.cadenceFrames,
       scrollSteps: config.scrollSteps,
+      scrollWaitMs: config.scrollWaitMs,
+      graceMs: config.graceMs,
       settleMs: config.settleMs,
       idleMs: config.idleMs,
-      trace: config.trace,
-      traceCategories: config.trace ? TRACE_CATEGORIES : [],
     };
     result.processUptimeMs = Math.round(process.uptime() * 1000);
     result.timeOriginEpoch = performance.timeOrigin;
@@ -616,6 +657,10 @@ export async function runGate(
     };
 
     const { appWin, shell } = await openShell(ctx, config);
+    // The display's nominal refresh rate, beside the cadence the window measures.
+    result.display = {
+      frequency: screen.getDisplayMatching(appWin.win.getBounds()).displayFrequency,
+    };
     attach(ctx, appWin, record);
     record.phase('start');
 

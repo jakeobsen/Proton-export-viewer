@@ -9,10 +9,16 @@ import { checkOutside, checkWorkspace } from '../../tools/bench/workspace.mjs';
 
 /**
  * What one launch does:
- * - probe: frame delivery in the hidden window, and a traced scroll during and after phase 1;
- * - fresh: picks the export into a new profile and times first rows and phase 1, then stays idle;
+ * - probe: frame delivery in the hidden window, scrolls during and after phase 1, and a
+ *   conversation's scroll once indexing has ended;
+ * - fresh: picks the export into a new profile and times first rows and phase 1, with the
+ *   same scrolls, then stays idle;
  * - reopen: reopens the export the profile already knows, and times the first rows after it opens;
- * - opens: picks the export, waits until indexing has ended, and times expansions.
+ * - opens: picks the export, waits until indexing has ended, scrolls a conversation and times
+ *   expansions.
+ *
+ * A launch that scrolls records the frame cadence twice with nothing else
+ * going on: before the pick, and once indexing has ended.
  */
 export type GateMode = 'probe' | 'fresh' | 'reopen' | 'opens';
 
@@ -41,6 +47,11 @@ export interface GateConfig {
   stepMs: number;
   /** The longest a wait for one animation frame may take, in ms. */
   frameMs: number;
+  /** Consecutive frames in each record of the frame cadence. */
+  cadenceFrames: number;
+  /** The longest a scroll step waits for its frame, then the grace after it, in ms. */
+  scrollWaitMs: number;
+  graceMs: number;
   /** DOM changes the frame probe times. */
   rafProbes: number;
   /** Steps in each scroll. */
@@ -48,8 +59,6 @@ export interface GateConfig {
   /** Once indexing has ended: the wait before the idle window, then the window, in ms. */
   settleMs: number;
   idleMs: number;
-  /** Record a trace (benchmark, cc, viz) around each scroll. */
-  trace: boolean;
   /** For 'opens': the expansions to time. */
   sample: GateSample | null;
 }
@@ -87,10 +96,12 @@ export function parseConfig(value: unknown): GateConfig {
     whole(c.stepMs, 1, 3_600_000) &&
     whole(c.frameMs, 1, 60_000) &&
     whole(c.rafProbes, 0, 10_000) &&
+    whole(c.cadenceFrames, 0, 10_000) &&
+    whole(c.scrollWaitMs, 1, 60_000) &&
+    whole(c.graceMs, 0, 60_000) &&
     whole(c.scrollSteps, 0, 100_000) &&
     whole(c.settleMs, 0, 600_000) &&
     whole(c.idleMs, 0, 600_000) &&
-    typeof c.trace === 'boolean' &&
     sample !== undefined &&
     (c.mode === 'opens') === (sample !== null);
   if (!ok) throw new Error('invalid gate config');

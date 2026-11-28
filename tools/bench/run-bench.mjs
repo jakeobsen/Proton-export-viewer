@@ -236,8 +236,8 @@ function lstatOrNull(path) {
 }
 
 /** Refuses to start when less than 20 GiB of disk would stay free. */
-export function freeSpace(dir) {
-  const fs = statfsSync(dir);
+export function freeSpace(dir, statfs = statfsSync) {
+  const fs = statfs(dir);
   const free = fs.bavail * fs.bsize;
   if (free < MIN_FREE)
     throw new Error(`only ${(free / 2 ** 30).toFixed(1)} GiB free; 20 GiB needed`);

@@ -22,9 +22,15 @@
 //
 // Every launch is the app's gate mode (--pev-gate) in a hidden window, one at
 // a time. The first launch of each gate is the probe: frame delivery after DOM
-// changes, and traced scrolls. When animation frames aren't prompt there, the
-// first-rows and reopen times end at the DOM change instead, and the report
-// marks them as a proxy that needs a decision: a proxy never passes a row.
+// changes, the frame cadence, and scrolls. When animation frames aren't prompt
+// there, the first-rows and reopen times end at the DOM change instead, and the
+// report marks them as a proxy that needs a decision: a proxy never passes a row.
+//
+// Scrolls are measured by the cadence of the shell's animation frames, a proxy
+// for dropped frames that sees only what the renderer itself missed. A launch
+// that scrolls records the cadence with nothing else going on, before the pick
+// (its frame interval F serves every scroll of the launch) and once indexing
+// has ended (a check). A scroll row never passes on its own.
 //
 // Before the run it refuses when the lid is closed, the checkout has changes,
 // a corpus differs from its manifest, the out folder exists, less than 20 GiB
@@ -67,8 +73,21 @@ export const TARGETS = {
   peakMiB: 1536,
   openP95Ms: 150,
 };
-/** A frame within one 60 Hz frame of the DOM change counts as prompt (p95). */
-export const PROMPT_FRAME_MS = 16.7;
+/**
+ * A cadence counts as unthrottled when its median frame interval is at most
+ * this (about 54 Hz), or within DISPLAY_SHARE of the display's own interval.
+ */
+export const MAX_FRAME_MS = 18.4;
+export const DISPLAY_SHARE = 0.1;
+/** An interval longer than this many frame intervals holds missed frames. */
+export const LONG_INTERVAL = 1.5;
+/** The check after indexing must differ from the baseline by less than this share. */
+export const CHECK_SHARE = 0.1;
+/**
+ * Each timed expansion starts at least this long after the shown message's
+ * body loaded: the gap main's open pacer keeps between a window's opens.
+ */
+export const OPEN_GAP_MS = 60;
 /** Phase 1 at 20,000 messages, extrapolated linearly to 200,000. */
 export const PHASE1_SCALE = 10;
 /** The cap on the index's size on disk, with its WAL and shared memory. */
@@ -77,7 +96,10 @@ export const INDEX_CAP = 300 * 1000 * 1000;
 const STEP_MS = 10 * 60_000;
 const FRAME_MS = 250;
 const RAF_PROBES = 50;
+const CADENCE_FRAMES = 120;
 const SCROLL_STEPS = 240;
+const SCROLL_WAIT_MS = 2000;
+const GRACE_MS = 100;
 const SETTLE_MS = 5000;
 const IDLE_MS = 10_000;
 /** A launch that takes longer than this is stopped. */
@@ -104,52 +126,180 @@ export function sleepsBetween(text, fromMs, toMs) {
   return out;
 }
 
-/** Whether frames came promptly after DOM changes: p95 within one 60 Hz frame and none missing. */
-export function rafVerdict(probes) {
+/**
+ * Whether frames came promptly after DOM changes: p95 within LONG_INTERVAL
+ * frame intervals of the launch's cadence (`frameMs`), and none missing.
+ * Without a trusted cadence nothing is prompt.
+ */
+export function rafVerdict(probes, frameMs) {
   const list = probes.filter(Boolean);
   const samples = list.flatMap((p) => p.samples);
   const timeouts = list.reduce((n, p) => n + p.timeouts, 0);
-  const p95 = round(percentile(samples, 95));
+  const p95 = percentile(samples, 95);
+  const threshold = typeof frameMs === 'number' ? LONG_INTERVAL * frameMs : null;
   return {
     samples: samples.length,
     timeouts,
     p50: round(percentile(samples, 50)),
-    p95,
+    p95: round(p95),
     max: round(samples.length ? Math.max(...samples) : null),
-    thresholdMs: PROMPT_FRAME_MS,
-    prompt: samples.length > 0 && timeouts === 0 && p95 !== null && p95 <= PROMPT_FRAME_MS,
+    thresholdMs: round(threshold),
+    prompt:
+      samples.length > 0 &&
+      timeouts === 0 &&
+      threshold !== null &&
+      p95 !== null &&
+      p95 <= threshold,
+  };
+}
+
+/** The intervals between consecutive timestamps. */
+export function intervalsOf(stamps) {
+  const out = [];
+  for (let i = 1; i < stamps.length; i += 1) out.push(stamps[i] - stamps[i - 1]);
+  return out;
+}
+
+/**
+ * One record of the frame cadence with nothing else going on: its median
+ * frame interval F, and whether frames came unthrottled. They did if none
+ * timed out, F is at most MAX_FRAME_MS or within DISPLAY_SHARE of the
+ * display's own interval, and the p95 interval is at most LONG_INTERVAL × F.
+ */
+export function cadenceOf(run, displayHz) {
+  const stamps = Array.isArray(run?.stamps) ? run.stamps : [];
+  const intervals = intervalsOf(stamps);
+  const frameMs = median(intervals);
+  const p95 = percentile(intervals, 95);
+  const displayMs = typeof displayHz === 'number' && displayHz > 0 ? 1000 / displayHz : null;
+  const timeouts = run?.timeouts ?? 0;
+  const reasons = [];
+  if (!run) reasons.push('no record of the frame cadence');
+  if (timeouts > 0) reasons.push(`no frame within ${run.timeoutMs} ms, ${timeouts} times`);
+  if (frameMs === null) reasons.push('fewer than two frames');
+  else {
+    const rate =
+      frameMs <= MAX_FRAME_MS ||
+      (displayMs !== null && Math.abs(frameMs - displayMs) <= DISPLAY_SHARE * displayMs);
+    if (!rate)
+      reasons.push(
+        `a frame every ${round(frameMs)} ms (${round(1000 / frameMs)} Hz), slower than ${MAX_FRAME_MS} ms` +
+          (displayMs === null ? '' : ` and not the display's ${round(displayMs)} ms`),
+      );
+    if (p95 > LONG_INTERVAL * frameMs)
+      reasons.push(`gaps: p95 ${round(p95)} ms is over ${LONG_INTERVAL} × ${round(frameMs)} ms`);
+  }
+  return {
+    frames: stamps.length,
+    timeouts,
+    frameMs,
+    hz: frameMs ? round(1000 / frameMs) : null,
+    p95: round(p95),
+    max: round(intervals.length ? Math.max(...intervals) : null),
+    displayHz: typeof displayHz === 'number' ? displayHz : null,
+    trusted: reasons.length === 0,
+    reasons,
   };
 }
 
 /**
- * Frames in a trace (Chrome's JSON trace format): frames the display drew,
- * and the frame reporter's outcomes, among them the dropped frames.
+ * A launch's cadence: F comes from the baseline before the pick, always; the
+ * check once indexing has ended must be trusted too and differ from the
+ * baseline by less than CHECK_SHARE, or the launch's scrolls can't count.
  */
-export function frameStats(trace) {
-  const events = Array.isArray(trace) ? trace : (trace?.traceEvents ?? []);
-  let drawn = 0;
-  let reported = 0;
-  let presented = 0;
-  let dropped = 0;
-  let noUpdate = 0;
-  for (const e of events) {
-    if (e.name === 'Display::DrawAndSwap' && (e.ph === 'X' || e.ph === 'B')) drawn += 1;
-    if (e.name === 'PipelineReporter' && (e.ph === 'b' || e.ph === 'X')) {
-      reported += 1;
-      const state = e.args?.chrome_frame_reporter?.state ?? '';
-      if (state === 'STATE_DROPPED') dropped += 1;
-      else if (state === 'STATE_NO_UPDATE_DESIRED') noUpdate += 1;
-      else if (String(state).startsWith('STATE_PRESENTED')) presented += 1;
-    }
+export function launchCadence(cadences, displayHz) {
+  const list = Array.isArray(cadences) ? cadences : [];
+  const baseline = cadenceOf(list.find((c) => c.name === 'baseline') ?? null, displayHz);
+  const check = cadenceOf(list.find((c) => c.name === 'check') ?? null, displayHz);
+  const reasons = [
+    ...baseline.reasons.map((r) => `before the pick: ${r}`),
+    ...check.reasons.map((r) => `after indexing: ${r}`),
+  ];
+  if (
+    baseline.trusted &&
+    check.trusted &&
+    !(Math.abs(check.frameMs - baseline.frameMs) < CHECK_SHARE * baseline.frameMs)
+  ) {
+    reasons.push(
+      `the frame rate changed during the launch: a frame every ${round(baseline.frameMs)} ms before the pick, ${round(check.frameMs)} ms after indexing`,
+    );
   }
   return {
-    events: events.length,
-    drawn,
-    reported,
-    presented,
-    dropped,
-    noUpdate,
-    produced: drawn > 0 || presented > 0,
+    frameMs: baseline.frameMs,
+    hz: baseline.hz,
+    displayHz: baseline.displayHz,
+    baseline,
+    check,
+    trusted: reasons.length === 0,
+    reasons,
+  };
+}
+
+/** Missed frames in these intervals: each one over LONG_INTERVAL × F holds round(Δ / F) − 1, at least 1. */
+export function missedIn(intervals, frameMs) {
+  let long = 0;
+  let missed = 0;
+  for (const d of intervals) {
+    if (d > LONG_INTERVAL * frameMs) {
+      long += 1;
+      missed += Math.max(1, Math.round(d / frameMs) - 1);
+    }
+  }
+  return { intervals: intervals.length, long, missed };
+}
+
+/**
+ * One scroll's frames against its launch's cadence. With `phase1DoneAt`
+ * (main's clock), only intervals whose ending frame came before it count;
+ * the rest are given beside them. With none before it, the measurement is
+ * unavailable. A scroll that stopped, or a launch whose cadence isn't
+ * trusted, gives no number.
+ */
+export function scrollFrames(scroll, cadence, phase1DoneAt = null) {
+  const stamps = Array.isArray(scroll?.stamps) ? scroll.stamps : [];
+  const pairs = intervalsOf(stamps).map((d, i) => ({ d, end: stamps[i + 1] }));
+  const reasons = [];
+  if (!scroll) reasons.push('no scroll');
+  if (!cadence?.trusted) reasons.push(...(cadence?.reasons ?? ['no frame cadence']));
+  if (scroll?.stopped) reasons.push(`no frame within ${round(scroll.waitMs / 1000)} s`);
+  const trusted = reasons.length === 0;
+  const phased = phase1DoneAt !== null;
+  const counted = phased ? pairs.filter((p) => p.end < phase1DoneAt) : pairs;
+  const past = phased ? pairs.filter((p) => p.end >= phase1DoneAt) : [];
+  const available = counted.length > 0;
+  const frameMs = cadence?.frameMs ?? null;
+  const ds = counted.map((p) => p.d);
+  return {
+    name: scroll?.name ?? null,
+    steps: scroll?.steps ?? null,
+    made: stamps.length,
+    frameMs: round(frameMs),
+    hz: cadence?.hz ?? null,
+    trusted,
+    reasons,
+    available,
+    unavailable: available ? null : phased ? 'phase 1 ended before the scroll' : 'no intervals',
+    ...(trusted && available
+      ? missedIn(ds, frameMs)
+      : { intervals: counted.length, long: null, missed: null }),
+    p50: round(percentile(ds, 50)),
+    p95: round(percentile(ds, 95)),
+    max: round(ds.length ? Math.max(...ds) : null),
+    pastPhase1: phased
+      ? {
+          intervals: past.length,
+          missed:
+            trusted && past.length
+              ? missedIn(
+                  past.map((p) => p.d),
+                  frameMs,
+                ).missed
+              : null,
+          ranPastMs: stamps.length
+            ? round(Math.max(0, stamps[stamps.length - 1] - phase1DoneAt))
+            : null,
+        }
+      : null,
   };
 }
 
@@ -168,6 +318,13 @@ export function launchProblems(launch) {
     if (r.idle && r.idle.indexingDuring > 0) problems.push('indexing during the idle window');
     if (typeof r.indexingDuringOpens === 'number' && r.indexingDuringOpens > 0)
       problems.push('indexing during the opens');
+    const early = (Array.isArray(r.opens) ? r.opens : []).filter(
+      (o) => typeof o.gapMs === 'number' && o.gapMs < OPEN_GAP_MS,
+    );
+    if (early.length > 0)
+      problems.push(
+        `${early.length} expansions started less than ${OPEN_GAP_MS} ms after the shown body loaded (smallest ${round(Math.min(...early.map((o) => o.gapMs)))} ms), so main's open pacer may have held them`,
+      );
   }
   const exit = launch.exit;
   if (!exit || exit.code !== 0 || exit.signal !== null || exit.timedOut)
@@ -260,6 +417,24 @@ export function batchNumbers(batches) {
   };
 }
 
+/** The stress launches' write batches: the median over the launches of each number. */
+export function stressBatches(launches) {
+  const of = (k) => {
+    const v = launches.map((l) => l.batches?.[k]);
+    return v.length > 0 && v.every((x) => typeof x === 'number') ? round(median(v)) : null;
+  };
+  return {
+    launches: launches.length,
+    p50: of('p50'),
+    p95: of('p95'),
+    max: of('max'),
+    repointedMessages: of('repointedMessages'),
+    repointedKeys: of('repointedKeys'),
+    repointedLabelRows: of('repointedLabelRows'),
+    maxRepointed: of('maxRepointed'),
+  };
+}
+
 /** One opens launch: views, outcomes and percentiles of the timed expansions. */
 export function opensNumbers(opens) {
   const list = Array.isArray(opens) ? opens : [];
@@ -288,34 +463,46 @@ const medianOf = (values) => {
   return v.length === values.length && v.length > 0 ? round(median(v)) : null;
 };
 
-/** The scroll row: frames dropped in each traced scroll; not measurable when none were produced. */
-export function scrollRow(name, scrolls) {
-  const stats = scrolls.map((s) => s.frames ?? null);
-  const all = stats.length > 0 && stats.every(Boolean);
-  const produced = all && stats.every((s) => s.produced);
-  const dropped = all ? stats.reduce((n, s) => n + s.dropped, 0) : null;
-  return {
-    row: 'Scroll',
-    name,
-    value: dropped,
-    unit: 'dropped frames',
-    target: 0,
-    kind: 'measured',
-    verdict: !all
+/**
+ * A scroll row, from each launch's scroll frames (`scrollFrames`). Missed
+ * frames in a trusted scroll make it a MISS; otherwise a scroll that can't be
+ * trusted makes it not measurable, one without intervals unavailable, and
+ * none missed is still not a pass: the proxy can't see compositor frames.
+ */
+export function scrollRow(name, frames) {
+  const counted = frames.filter((f) => f.trusted && f.available);
+  const missed = counted.reduce((n, f) => n + f.missed, 0);
+  const verdict =
+    frames.length === 0
       ? 'INVALID'
-      : !produced
-        ? 'not measurable hidden: needs a decision'
-        : dropped === 0
-          ? 'within'
-          : 'MISS',
-    scrolls: scrolls.map((s) => ({
-      name: s.name,
-      frames: s.frames,
-      byFrame: s.run?.byFrame,
-      byTimer: s.run?.byTimer,
-    })),
+      : missed > 0
+        ? 'MISS (proxy)'
+        : frames.some((f) => !f.trusted)
+          ? 'not measurable hidden'
+          : frames.some((f) => !f.available)
+            ? 'unavailable'
+            : 'proxy: no missed frames seen, not a pass on its own';
+  const reasons = [
+    ...new Set(frames.flatMap((f) => [...f.reasons, ...(f.unavailable ? [f.unavailable] : [])])),
+  ];
+  return {
+    row: 'Scroll (renderer rAF-interval proxy)',
+    name,
+    value: counted.length === frames.length && frames.length > 0 ? missed : null,
+    unit: `missed frames (frame intervals over ${LONG_INTERVAL} × the launch's frame interval)`,
+    target: 0,
+    kind: "measured: the cadence of the shell's animation frames, not compositor frames",
+    verdict,
+    reasons,
+    scrolls: frames,
   };
 }
+
+/** The probe's scrolls and these launches' scrolls with this name. */
+const scrollsNamed = (report, launches, name) =>
+  [...(report.probe?.scrolls ?? []), ...launches.flatMap((l) => l.scrolls ?? [])].filter(
+    (s) => s.name === name,
+  );
 
 /** The indexing gate's rows from the launches' numbers. */
 export function indexRows(report) {
@@ -367,7 +554,8 @@ export function indexRows(report) {
       unit: 'ms',
       target: TARGETS.reopenMs,
       kind: 'measured',
-      start: "main's ready: the gate mode's start, right after the app's ready",
+      start:
+        "main's ready: the gate mode's start, right after the app's ready. An upper bound: the gate restores the export after the shell has loaded, while production restores it right after creating the window, alongside the load",
       end: `${endFrame}, after index.opened`,
       verdict: verdictOf(reopenMs, TARGETS.reopenMs, {
         proxy,
@@ -378,10 +566,8 @@ export function indexRows(report) {
         reconcileMs: medianOf(reopen.map((l) => l.numbers.reconcileMs)),
       },
     },
-    scrollRow('All Mail list, during and after phase 1', [
-      ...(report.probe?.scrolls ?? []).filter((s) => s.name.startsWith('list-')),
-      ...fresh.flatMap((l) => l.scrolls ?? []),
-    ]),
+    scrollRow('All Mail list, during phase 1', scrollsNamed(report, fresh, 'list-phase1')),
+    scrollRow('All Mail list, after phase 1', scrollsNamed(report, fresh, 'list-after')),
     {
       row: 'Memory, idle after indexing (all processes)',
       value: idle,
@@ -407,6 +593,14 @@ export function indexRows(report) {
   ];
 }
 
+const cell = (v) => (v === null || v === undefined ? 'n/a' : String(v));
+
+/** The smallest gap before a timed expansion, over these launches. */
+function minGap(launches) {
+  const gaps = launches.flatMap((l) => l.gaps ?? []);
+  return gaps.length ? round(Math.min(...gaps)) : null;
+}
+
 /** The cards gate's rows from the launches' numbers. */
 export function cardsRows(report) {
   const opens = report.opens.filter((l) => l.valid);
@@ -416,10 +610,7 @@ export function cardsRows(report) {
     (l) => l.numbers.views === l.numbers.opens && l.warmup?.views === l.warmup?.requested,
   );
   return [
-    scrollRow('the largest perf1 conversation', [
-      ...(report.probe?.scrolls ?? []).filter((s) => s.name === 'conversation'),
-      ...opens.flatMap((l) => l.scrolls ?? []),
-    ]),
+    scrollRow('the largest perf1 conversation', scrollsNamed(report, opens, 'conversation')),
     {
       row: 'Open message p95 (≤ 1 MB), idle: per expansion',
       value: p95,
@@ -430,8 +621,8 @@ export function cardsRows(report) {
       start: "the shell's performance.now() just before the cards model's expand",
       end: "the new body frame's load event for that view",
       verdict: verdictOf(p95, TARGETS.openP95Ms, { valid: ok && complete }),
-      pacer:
-        "Opens pass main's open pacer (at least 60 ms between a window's opens). With IPC jitter it can hold an open about 1 ms; that time counts, as it is the production path.",
+      pacer: `Each expansion started at least ${OPEN_GAP_MS} ms after the shown message's body loaded, so main's open pacer (at least ${OPEN_GAP_MS} ms between a window's opens) never held it; a shorter gap makes the launch invalid. Smallest gap: ${cell(minGap(report.opens))} ms.`,
+      sample: `Messages of at most ${report.sampleRule?.maxBytes ?? 'n/a'} B in conversations of two or more, never a conversation's newest: it opens expanded with its conversation, so it has no expansion to time. Picked with seed ${report.sampleRule?.seed ?? 'n/a'} from all such message files in name order.`,
     },
   ];
 }
@@ -451,16 +642,27 @@ export function testLogSummary(text) {
   };
 }
 
-const cell = (v) => (v === null || v === undefined ? 'n/a' : String(v));
-
 export function markdown(report) {
   const title = report.gate === 'index' ? 'Indexing gate' : 'Cards gate';
   const lines = [`# ${title}`, ''];
+  const cadence = report.probe?.cadence;
+  if (cadence) {
+    const c = (x) =>
+      `a frame every ${cell(round(x.frameMs))} ms (${cell(x.hz)} Hz), p95 ${cell(x.p95)} ms, ${x.timeouts} timeouts`;
+    lines.push(
+      `**Frame cadence in the hidden window (probe):** before the pick ${c(cadence.baseline)}; after indexing ${c(cadence.check)}. ` +
+        `The display reports ${cell(cadence.displayHz)} Hz. ` +
+        (cadence.trusted
+          ? 'Trusted: frames came unthrottled.'
+          : `**Not trusted:** ${cadence.reasons.join('; ')}.`),
+      '',
+    );
+  }
   const raf = report.probe?.raf;
   if (raf) {
     lines.push(
       `**Frames in the hidden window:** after a DOM change, the next animation frame came at p50 ${cell(raf.p50)} ms, p95 ${cell(raf.p95)} ms, max ${cell(raf.max)} ms (${raf.samples} changes, ${raf.timeouts} without a frame). ` +
-        `Prompt means p95 ≤ ${raf.thresholdMs} ms (one 60 Hz frame) and none missing: **${raf.prompt ? 'prompt' : 'NOT prompt'}**.` +
+        `Prompt means p95 ≤ ${cell(raf.thresholdMs)} ms (${LONG_INTERVAL} frame intervals of the probe's cadence) and none missing: **${raf.prompt ? 'prompt' : 'NOT prompt'}**.` +
         (raf.prompt
           ? ''
           : ' Rows that end on a frame end on the DOM change instead and are marked as a proxy that needs a decision.'),
@@ -482,14 +684,39 @@ export function markdown(report) {
         `- After the reopen, timed separately (medians): reconcile ${cell(r.after.reconcileMs)} ms, from index.opened to the index's next phase 'done'; verification ${cell(r.after.verifyMs)} ms, the quick check's own time (index.verified).`,
       );
   for (const r of report.rows) if (r.pacer) lines.push(`- ${r.pacer}`);
+  for (const r of report.rows) if (r.sample) lines.push(`- Sample: ${r.sample}`);
+  const scrollRows = report.rows.filter((r) => r.scrolls);
+  if (scrollRows.length) {
+    lines.push(
+      '',
+      '## Scrolls',
+      '',
+      "A proxy: the intervals between the shell's animation frames while it scrolls one step per frame, against the launch's frame interval F from its cadence before the pick. " +
+        `An interval over ${LONG_INTERVAL} × F holds round(interval / F) − 1 missed frames. A frame the compositor or display drops after the renderer made it isn't seen, so no missed frames is not a pass on its own.`,
+      '',
+    );
+    for (const r of scrollRows) {
+      lines.push(
+        `- **${r.name}:** ${r.verdict}.${r.reasons.length ? ` ${r.reasons.join('; ')}.` : ''}`,
+      );
+      for (const f of r.scrolls) {
+        const past = f.pastPhase1
+          ? `; after phase 1: ${f.pastPhase1.intervals} intervals, ${cell(f.pastPhase1.missed)} missed, ${cell(f.pastPhase1.ranPastMs)} ms past its end`
+          : '';
+        lines.push(
+          `  - ${f.made} of ${cell(f.steps)} steps, F ${cell(f.frameMs)} ms (${cell(f.hz)} Hz): ${f.intervals} intervals, p50 ${cell(f.p50)} ms, p95 ${cell(f.p95)} ms, max ${cell(f.max)} ms, ${cell(f.long)} long, ${cell(f.missed)} missed${past}.`,
+        );
+      }
+    }
+  }
   if (report.stress) {
     const s = report.stress;
     lines.push(
       '',
       '## Stress corpus',
       '',
-      `Phase 1 ${cell(s.phase1Ms)} ms (median); write batches p50 ${cell(s.batches.p50)} ms, p95 ${cell(s.batches.p95)} ms, max ${cell(s.batches.max)} ms; ` +
-        `re-pointed: ${s.batches.repointedMessages} messages, ${s.batches.repointedKeys} keys, ${s.batches.repointedLabelRows} label rows (most in one merge ${s.batches.maxRepointed}).`,
+      `Phase 1 ${cell(s.phase1Ms)} ms (median); write batches, each the median over ${s.valid} valid launches of that launch's number: p50 ${cell(s.batches.p50)} ms, p95 ${cell(s.batches.p95)} ms, max ${cell(s.batches.max)} ms; ` +
+        `re-pointed: ${cell(s.batches.repointedMessages)} messages, ${cell(s.batches.repointedKeys)} keys, ${cell(s.batches.repointedLabelRows)} label rows (most in one merge ${cell(s.batches.maxRepointed)}).`,
     );
   }
   lines.push('', '## Inputs', '');
@@ -499,7 +726,8 @@ export function markdown(report) {
     `- Build: ${i.build.app}; executable SHA-256 ${i.build.executableSha256}, app.asar SHA-256 ${i.build.asarSha256}.`,
     `- App: Electron ${cell(i.versions?.electron)}, Chrome ${cell(i.versions?.chrome)}, Node ${cell(i.versions?.node)}.`,
     `- Machine: ${i.machine.model}, ${i.machine.cpu}, ${i.machine.cores} cores, ${Math.round(i.machine.memoryBytes / 2 ** 30)} GiB, macOS ${i.machine.macos}.`,
-    `- The gate window runs without background throttling; a production window throttles when hidden.`,
+    `- The gate window runs without background throttling, set when it is created so it draws frames while hidden; a production window throttles when hidden.`,
+    `- Display: ${cell(i.display?.frequency)} Hz reported.`,
     `- Index cap ${INDEX_CAP} B; held: ${report.capHeld ? 'yes' : 'NO'}. Index folder peak ${cell(report.indexPeakMiB)} MiB.`,
     `- Runs: ${i.runs} per measurement, one launch at a time; seed ${i.seed}.`,
   );
@@ -599,10 +827,12 @@ async function launch(step, ctx) {
       stepMs: STEP_MS,
       frameMs: FRAME_MS,
       rafProbes: RAF_PROBES,
+      cadenceFrames: CADENCE_FRAMES,
       scrollSteps: SCROLL_STEPS,
+      scrollWaitMs: SCROLL_WAIT_MS,
+      graceMs: GRACE_MS,
       settleMs: SETTLE_MS,
       idleMs: IDLE_MS,
-      trace: step.mode !== 'reopen',
       sample:
         step.mode === 'opens'
           ? { seed: ctx.seed, count: ctx.count, maxBytes: ctx.maxBytes, warmup: ctx.warmup }
@@ -659,11 +889,16 @@ async function launch(step, ctx) {
   record.problems = launchProblems(record);
   record.valid = record.problems.length === 0;
   record.memory = result ? memoryOf(samples, result.phases, result.idle) : null;
-  record.scrolls = (result?.scrolls ?? []).map((s) => ({
-    ...s,
-    frames:
-      s.trace && existsSync(s.trace) ? frameStats(JSON.parse(readFileSync(s.trace, 'utf8'))) : null,
-  }));
+  record.cadence = result ? launchCadence(result.cadences, result.display?.frequency) : null;
+  record.scrolls = (result?.scrolls ?? []).map((s) =>
+    scrollFrames(
+      s,
+      record.cadence,
+      // Without phase 1's end, nothing counts as during it.
+      s.name === 'list-phase1' ? (result.phase1DoneAt ?? -Infinity) : null,
+    ),
+  );
+  record.gaps = (result?.opens ?? []).map((o) => o.gapMs).filter((g) => typeof g === 'number');
   return record;
 }
 
@@ -716,41 +951,69 @@ function parse(argv) {
   };
 }
 
-async function main() {
-  const args = parse(process.argv.slice(2));
-  const corpora = { perf: corpusOf('perf', args.perf) };
-  if (args.stress) corpora.stress = corpusOf('stress', args.stress);
-  if (!isAbsolute(args.out) || existsSync(args.out))
-    throw new Error(`${args.out} must be a new folder`);
-  // The corpora are only read: an output folder in one is refused before anything is written.
-  for (const c of Object.values(corpora)) checkOutside(c.root, args.out);
-  const executable = join(args.app, 'Contents', 'MacOS', PRODUCT_NAME);
-  const asar = join(args.app, 'Contents', 'Resources', 'app.asar');
-  if (!existsSync(executable) || !existsSync(asar))
-    throw new Error(`no packaged build at ${args.app}`);
-  const closed = lidClosed();
-  if (closed !== false)
-    throw new Error(closed === null ? "can't read the lid's state" : 'the lid is closed');
-  const status = read('git', ['-C', REPO_ROOT, 'status', '--porcelain']);
-  if (status === null || status !== '')
-    throw new Error('the checkout has changes (or git failed): commit or remove them first');
-  const head = read('git', ['-C', REPO_ROOT, 'rev-parse', 'HEAD']);
-  const disk = freeSpace(dirname(args.out));
+/** The app's containers on this Mac, where a test build may have left data. */
+function appContainers() {
   const containersRoot = join(homedir(), 'Library', 'Containers');
-  const containers = existsSync(containersRoot)
+  return existsSync(containersRoot)
     ? readdirSync(containersRoot)
         .filter((name) => name === APP_ID || name.startsWith(`${APP_ID}.`))
         .map((name) =>
           join(containersRoot, name, 'Data', 'Library', 'Application Support', PRODUCT_NAME),
         )
     : [];
-  const budget = budgetCheck(findTestData(args.scanData, { containers }), INDEX_CAP);
+}
+
+/** What the preflight reads from the system; tests pass their own. */
+export const SYSTEM = {
+  exists: existsSync,
+  lidClosed,
+  git: (args) => read('git', ['-C', REPO_ROOT, ...args]),
+  freeSpace: (dir) => freeSpace(dir),
+  containers: appContainers,
+  testData: (scanData, containers) => findTestData(scanData, { containers }),
+  budget: (folders) => budgetCheck(folders, INDEX_CAP),
+  corpusOf,
+  corpusState,
+};
+
+/**
+ * Every refusal before a run writes anything: an out folder that exists or is
+ * inside a corpus, no packaged build, the lid closed or unknown, a checkout
+ * with changes, less than 20 GiB free, test data that would pass 1 GB with
+ * this run, or a corpus that differs from its manifest.
+ */
+export function preflight(args, sys = SYSTEM) {
+  const corpora = { perf: sys.corpusOf('perf', args.perf) };
+  if (args.stress) corpora.stress = sys.corpusOf('stress', args.stress);
+  if (!isAbsolute(args.out) || sys.exists(args.out))
+    throw new Error(`${args.out} must be a new folder`);
+  // The corpora are only read: an output folder in one is refused before anything is written.
+  for (const c of Object.values(corpora)) checkOutside(c.root, args.out);
+  const executable = join(args.app, 'Contents', 'MacOS', PRODUCT_NAME);
+  const asar = join(args.app, 'Contents', 'Resources', 'app.asar');
+  if (!sys.exists(executable) || !sys.exists(asar))
+    throw new Error(`no packaged build at ${args.app}`);
+  const closed = sys.lidClosed();
+  if (closed !== false)
+    throw new Error(closed === null ? "can't read the lid's state" : 'the lid is closed');
+  const status = sys.git(['status', '--porcelain']);
+  if (status === null || status !== '')
+    throw new Error('the checkout has changes (or git failed): commit or remove them first');
+  const head = sys.git(['rev-parse', 'HEAD']);
+  const disk = sys.freeSpace(dirname(args.out));
+  const budget = sys.budget(sys.testData(args.scanData, sys.containers()));
   const before = {};
   for (const [k, c] of Object.entries(corpora)) {
-    before[k] = corpusState(c.root, c.manifest);
+    before[k] = sys.corpusState(c.root, c.manifest);
     if (!before[k].matches)
       throw new Error(`corpus ${k} differs from its manifest: ${before[k].differs}`);
   }
+  return { corpora, executable, asar, head, disk, budget, before };
+}
+
+async function main() {
+  const args = parse(process.argv.slice(2));
+  const { corpora, executable, asar, head, disk, budget, before } = preflight(args);
   const plan = planOf(args.gate, args.runs);
   if (args.dry) {
     console.log(
@@ -801,7 +1064,9 @@ async function main() {
         valid: l.valid,
         problems: l.problems,
         memory: l.memory,
+        cadence: l.cadence,
         scrolls: l.scrolls,
+        gaps: l.gaps,
         warmup: l.result?.warmup ?? null,
         numbers:
           l.mode === 'reopen'
@@ -818,7 +1083,11 @@ async function main() {
       ? {
           valid: probe.valid,
           problems: probe.problems,
-          raf: rafVerdict([probe.result?.rafBefore, probe.result?.rafAfter]),
+          cadence: probe.cadence,
+          raf: rafVerdict(
+            [probe.result?.rafBefore, probe.result?.rafAfter],
+            probe.cadence?.baseline.trusted ? probe.cadence.frameMs : null,
+          ),
           scrolls: probe.scrolls,
           conversation: probe.result?.conversation ?? null,
         }
@@ -843,7 +1112,8 @@ async function main() {
         before: before[k],
         after: after[k],
       })),
-      gateWindow: { backgroundThrottling: false },
+      gateWindow: { backgroundThrottling: false, framesWhileHidden: true },
+      display: { frequency: first?.display?.frequency ?? null },
     },
     frontmost: Object.fromEntries(seen),
     indexPeakMiB: mib(Math.max(0, ...launches.map((l) => l.indexPeakBytes))),
@@ -867,7 +1137,7 @@ async function main() {
       launches: stress.length,
       valid: valid.length,
       phase1Ms: medianOf(valid.map((l) => l.numbers.phase1Ms)),
-      batches: valid[0]?.batches ?? batchNumbers([]),
+      batches: stressBatches(valid),
       perLaunch: stress.map((l) => ({
         name: l.name,
         phase1Ms: l.numbers.phase1Ms,
@@ -879,6 +1149,7 @@ async function main() {
     const samples = launches
       .filter((l) => l.mode === 'opens')
       .map((l) => (l.result?.sample ?? []).map((s) => s.rel).join('\n') + '\n');
+    report.sampleRule = { seed: args.seed, maxBytes: args.maxBytes, count: args.count };
     report.sampleListSha256 = samples.length
       ? createHash('sha256').update(samples[0]).digest('hex')
       : null;

@@ -19,6 +19,11 @@ export interface WindowOptions {
   subframePreload?: boolean;
   /** Another subframe URL this window may load. Only test windows use this. */
   allowFrameUrl?: string;
+  /**
+   * Keeps drawing frames for the whole window while it is hidden, as a
+   * window with background throttling off does. Only test builds have it.
+   */
+  framesWhileHidden?: boolean;
 }
 
 function devServerUrl(): string | undefined {
@@ -70,6 +75,11 @@ export function createAppWindow(ctx: AppContext, options: WindowOptions = {}): A
       navigateOnDragDrop: false,
       safeDialogs: true,
       devTools: __PEV_TEST_HOOKS__ || __PEV_DEV__,
+      ...(__PEV_TEST_HOOKS__
+        ? options.framesWhileHidden
+          ? { backgroundThrottling: false }
+          : {}
+        : {}),
     },
   });
   if (!__PEV_TEST_HOOKS__ && (options.show ?? true)) {

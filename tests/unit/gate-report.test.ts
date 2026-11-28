@@ -1,39 +1,54 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The gate runner's parts that run without the app: the gate mode's config,
-// the lid and power-log checks, whether frames were prompt, frames in a
-// trace, a launch's validity, memory per phase, the numbers of each launch,
-// the rows and their verdicts (a proxy never passes), the plan, and the
-// refusals before anything is written.
+// the lid and power-log checks, whether frames were prompt, the frame
+// cadence and the missed frames of a scroll, a launch's validity, memory per
+// phase, the numbers of each launch, the rows and their verdicts (a proxy
+// never passes), the plan, and the refusals before anything is written. Also
+// the shell's two waits: a scroll step's frame and the gap before a timed
+// expansion.
 
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { budgetCheck, freeSpace } from '../../tools/bench/run-bench.mjs';
 import {
-  PROMPT_FRAME_MS,
+  CHECK_SHARE,
+  LONG_INTERVAL,
+  MAX_FRAME_MS,
+  OPEN_GAP_MS,
   TARGETS,
   batchNumbers,
-  frameStats,
+  cadenceOf,
   freshNumbers,
+  intervalsOf,
+  launchCadence,
   launchProblems,
   cardsRows,
   indexRows,
   markdown,
   memoryOf,
+  missedIn,
   opensNumbers,
   parseClamshell,
   planOf,
+  preflight,
   rafVerdict,
   reopenNumbers,
+  scrollFrames,
   scrollRow,
   sleepsBetween,
+  stressBatches,
   testLogSummary,
   verdictOf,
+  type System,
 } from '../../tools/bench/run-gate.mjs';
 import { createWorkspace } from '../../tools/bench/workspace.mjs';
 import { parseConfig, readConfig, type GateConfig } from '../../src/testhooks/gate-config';
+import { stepStamp } from '../../src/testhooks/gate-step';
 import type { TimedExpansion } from '../../src/testhooks/gate-types';
+import { OPEN_PACE_MS, waitSince, type PaceClock } from '../../src/testhooks/open-pace';
 import { REPO_ROOT, testDir } from '../paths';
 
 const RUNNER = join(REPO_ROOT, 'tools', 'bench', 'run-gate.mjs');
@@ -49,10 +64,12 @@ function config(over: Partial<GateConfig> = {}): GateConfig {
     stepMs: 60_000,
     frameMs: 250,
     rafProbes: 50,
+    cadenceFrames: 120,
     scrollSteps: 240,
+    scrollWaitMs: 2000,
+    graceMs: 100,
     settleMs: 5000,
     idleMs: 10_000,
-    trace: true,
     sample: null,
     ...over,
   };
@@ -77,7 +94,9 @@ describe('the gate config', () => {
       { mode: 'cold' as GateConfig['mode'] },
       { capBytes: 0 },
       { frameMs: 1.5 },
-      { trace: 'yes' as unknown as boolean },
+      { cadenceFrames: 1.5 },
+      { scrollWaitMs: 0 },
+      { graceMs: -1 },
     ]) {
       expect(() => parseConfig(config(bad)), JSON.stringify(bad)).toThrow('invalid gate config');
     }
@@ -128,59 +147,286 @@ describe('the lid and the power log', () => {
   });
 });
 
-describe('frames in the hidden window', () => {
-  const probe = (samples: number[], timeouts = 0) => ({ samples, timeouts, timeoutMs: 250 });
+/** Frame timestamps from these intervals, starting at `from`. */
+function stampsOf(intervals: number[], from = 0): number[] {
+  const out = [from];
+  for (const d of intervals) out.push(out[out.length - 1]! + d);
+  return out;
+}
 
-  it(`are prompt when p95 from a DOM change to the frame is within ${PROMPT_FRAME_MS} ms and none is missing`, () => {
-    const fast = Array.from({ length: 50 }, (_, i) => (i < 45 ? 8 : 16));
-    expect(rafVerdict([probe(fast), probe(fast)])).toMatchObject({
+/** A record of the frame cadence: `count` frames this far apart. */
+const steady = (ms: number, count = 120, timeouts = 0) => ({
+  stamps: stampsOf(Array<number>(count - 1).fill(ms)),
+  timeouts,
+  timeoutMs: 250,
+});
+
+describe('frames after a DOM change', () => {
+  const probe = (samples: number[], timeouts = 0) => ({ samples, timeouts, timeoutMs: 250 });
+  const p95Of = (ms: number) => Array.from({ length: 50 }, (_, i) => (i < 45 ? 8 : ms));
+
+  it(`are prompt when p95 is within ${LONG_INTERVAL} frame intervals of the launch's cadence and none is missing`, () => {
+    expect(rafVerdict([probe(p95Of(15)), probe(p95Of(15))], 10)).toMatchObject({
       samples: 100,
       timeouts: 0,
-      p95: 16,
-      thresholdMs: PROMPT_FRAME_MS,
+      p95: 15,
+      thresholdMs: 15,
       prompt: true,
     });
+    // One frame interval would be too tight: each sample is about one by construction.
+    expect(rafVerdict([probe(p95Of(12))], 10).prompt).toBe(true);
+    // Not a fixed 60 Hz frame: on a 50 Hz cadence 25 ms is prompt.
+    expect(rafVerdict([probe(p95Of(25))], 20).prompt).toBe(true);
   });
 
-  it('are not prompt with a slow p95, a frame that never came, or no samples', () => {
-    const slow = Array.from({ length: 50 }, (_, i) => (i < 45 ? 8 : 40));
-    expect(rafVerdict([probe(slow)]).prompt).toBe(false);
-    // Just over one 60 Hz frame.
-    const justOver = Array.from({ length: 50 }, (_, i) => (i < 45 ? 8 : 17));
-    expect(rafVerdict([probe(justOver)])).toMatchObject({ p95: 17, prompt: false });
-    expect(rafVerdict([probe(Array<number>(49).fill(8), 1)]).prompt).toBe(false);
-    expect(rafVerdict([null, undefined]).prompt).toBe(false);
+  it('are not prompt just over that, with a frame that never came, no samples or no cadence', () => {
+    expect(rafVerdict([probe(p95Of(15.125))], 10)).toMatchObject({ p95: 15.1, prompt: false });
+    expect(rafVerdict([probe(Array<number>(49).fill(8), 1)], 10).prompt).toBe(false);
+    expect(rafVerdict([null, undefined], 10).prompt).toBe(false);
+    expect(rafVerdict([probe(p95Of(8))], null)).toMatchObject({ thresholdMs: null, prompt: false });
   });
+});
 
-  it('are counted from the trace: drawn, presented and dropped', () => {
-    const reporter = (state: string) => ({
-      name: 'PipelineReporter',
-      ph: 'b',
-      args: { chrome_frame_reporter: { state } },
-    });
-    const trace = {
-      traceEvents: [
-        { name: 'Display::DrawAndSwap', ph: 'X' },
-        { name: 'Display::DrawAndSwap', ph: 'X' },
-        reporter('STATE_PRESENTED_ALL'),
-        reporter('STATE_PRESENTED_PARTIAL'),
-        reporter('STATE_DROPPED'),
-        reporter('STATE_NO_UPDATE_DESIRED'),
-        { name: 'PipelineReporter', ph: 'e' },
-        { name: 'Other', ph: 'X' },
-      ],
+describe('the frame cadence', () => {
+  it('is the intervals between timestamps, with F their median', () => {
+    expect(intervalsOf([0, 10, 25, 26])).toEqual([10, 15, 1]);
+    expect(intervalsOf([5])).toEqual([]);
+    // One long gap among 119 intervals moves neither F nor the p95.
+    const run = {
+      stamps: stampsOf([...Array<number>(118).fill(10), 200]),
+      timeouts: 0,
+      timeoutMs: 250,
     };
-    expect(frameStats(trace)).toEqual({
-      events: 8,
-      drawn: 2,
-      reported: 4,
-      presented: 2,
-      dropped: 1,
-      noUpdate: 1,
-      produced: true,
+    expect(cadenceOf(run, 60)).toMatchObject({
+      frameMs: 10,
+      hz: 100,
+      p95: 10,
+      max: 200,
+      trusted: true,
     });
-    expect(frameStats([]).produced).toBe(false);
-    expect(frameStats({ traceEvents: [reporter('STATE_NO_UPDATE_DESIRED')] }).produced).toBe(false);
+  });
+
+  it(`is trusted at a frame every ${MAX_FRAME_MS} ms or less, and not slower`, () => {
+    expect(cadenceOf(steady(18.375), null)).toMatchObject({ frameMs: 18.375, trusted: true });
+    const slow = cadenceOf(steady(18.5), null);
+    expect(slow.trusted).toBe(false);
+    expect(slow.reasons.join()).toContain('a frame every 18.5 ms');
+  });
+
+  it("is trusted at the display's own rate, so a 50 Hz display isn't read as throttled", () => {
+    expect(cadenceOf(steady(20), 50)).toMatchObject({ frameMs: 20, displayHz: 50, trusted: true });
+    expect(cadenceOf(steady(20), 60).trusted).toBe(false);
+    expect(cadenceOf(steady(20), 0).trusted).toBe(false);
+  });
+
+  it(`is not trusted with a timeout, too few frames or gaps over ${LONG_INTERVAL} × F`, () => {
+    const timedOut = cadenceOf(steady(16, 120, 1), 60);
+    expect(timedOut.trusted).toBe(false);
+    expect(timedOut.reasons.join()).toContain('no frame within 250 ms, 1 times');
+    expect(cadenceOf({ stamps: [3], timeouts: 0, timeoutMs: 250 }, 60).trusted).toBe(false);
+    expect(cadenceOf(null, 60).trusted).toBe(false);
+    // 90 intervals of 10 ms and 10 of 15: p95 is exactly 1.5 × F.
+    const edge = (long: number) => ({
+      stamps: stampsOf([...Array<number>(90).fill(10), ...Array<number>(10).fill(long)]),
+      timeouts: 0,
+      timeoutMs: 250,
+    });
+    expect(cadenceOf(edge(15), 60)).toMatchObject({ frameMs: 10, p95: 15, trusted: true });
+    const gaps = cadenceOf(edge(15.125), 60);
+    expect(gaps.trusted).toBe(false);
+    expect(gaps.reasons.join()).toContain('gaps');
+  });
+
+  it('of a launch takes F from before the pick; the check after indexing only confirms it', () => {
+    const c = launchCadence(
+      [
+        { name: 'baseline', ...steady(16) },
+        { name: 'check', ...steady(17) },
+      ],
+      60,
+    );
+    expect(c).toMatchObject({ frameMs: 16, trusted: true });
+    expect(c.check.frameMs).toBe(17);
+  });
+
+  it(`of a launch is not trusted when the check differs by ${CHECK_SHARE * 100}% or more, or isn't trusted, or is missing`, () => {
+    const at = (check: number) =>
+      launchCadence(
+        [
+          { name: 'baseline', ...steady(10) },
+          { name: 'check', ...steady(check) },
+        ],
+        null,
+      );
+    expect(at(10.9375).trusted).toBe(true);
+    const changed = at(11);
+    expect(changed.trusted).toBe(false);
+    expect(changed.reasons.join()).toContain('the frame rate changed during the launch');
+    expect(at(9).trusted).toBe(false);
+    const timedOut = launchCadence(
+      [
+        { name: 'baseline', ...steady(16) },
+        { name: 'check', ...steady(16, 120, 2) },
+      ],
+      60,
+    );
+    expect(timedOut.trusted).toBe(false);
+    expect(timedOut.reasons.join()).toContain('after indexing: no frame within');
+    expect(launchCadence([{ name: 'baseline', ...steady(16) }], 60).trusted).toBe(false);
+    expect(launchCadence(undefined, 60).trusted).toBe(false);
+  });
+});
+
+describe('missed frames', () => {
+  it(`count round(Δ / F) − 1 for each interval over ${LONG_INTERVAL} × F, and none at it`, () => {
+    expect(missedIn([10, 15], 10)).toEqual({ intervals: 2, long: 0, missed: 0 });
+    expect(missedIn([15.125], 10)).toEqual({ intervals: 1, long: 1, missed: 1 });
+    expect(missedIn([30, 10, 20], 10)).toEqual({ intervals: 3, long: 2, missed: 3 });
+    // A frame that came late is a miss, however late.
+    expect(missedIn([400], 16)).toEqual({ intervals: 1, long: 1, missed: 24 });
+  });
+});
+
+describe('a scroll', () => {
+  const trusted = launchCadence(
+    [
+      { name: 'baseline', ...steady(16) },
+      { name: 'check', ...steady(17) },
+    ],
+    60,
+  );
+  const scroll = (intervals: number[], over = {}) => ({
+    name: 'list-phase1',
+    steps: intervals.length + 1,
+    stamps: stampsOf(intervals, 1000),
+    stopped: false,
+    waitMs: 2100,
+    ...over,
+  });
+
+  it("counts its missed frames against the launch's F from before the pick", () => {
+    // 24.5 ms is over 1.5 × 16, though not over 1.5 × the check's 17.
+    const f = scrollFrames(scroll([16, 16, 24.5, 16, 400]), trusted);
+    expect(f).toMatchObject({
+      made: 6,
+      frameMs: 16,
+      trusted: true,
+      available: true,
+      intervals: 5,
+      long: 2,
+      missed: 25,
+    });
+  });
+
+  it('janky while indexing, under a trusted cadence, is a MISS and not "not measurable"', () => {
+    const janky = scrollFrames(scroll([16, 120, 16, 48, 33, 16, 250]), trusted, 1e9);
+    expect(janky.trusted).toBe(true);
+    expect(scrollRow('during', [janky]).verdict).toBe('MISS (proxy)');
+  });
+
+  it('counts for "during phase 1" only the intervals that end before it', () => {
+    // Frames at 1000, 1016, 1032, 1100: phase 1 ends at 1040.
+    const f = scrollFrames(scroll([16, 16, 68]), trusted, 1040);
+    expect(f).toMatchObject({ available: true, intervals: 2, missed: 0 });
+    expect(f.pastPhase1).toEqual({ intervals: 1, missed: 3, ranPastMs: 60 });
+  });
+
+  it('is unavailable for "during phase 1" when phase 1 ended before its second frame, never 0 missed', () => {
+    const f = scrollFrames(scroll([16, 16]), trusted, 1010);
+    expect(f).toMatchObject({
+      available: false,
+      unavailable: 'phase 1 ended before the scroll',
+      missed: null,
+    });
+    const row = scrollRow('during', [f]);
+    expect(row).toMatchObject({ verdict: 'unavailable', value: null });
+    expect(row.reasons).toContain('phase 1 ended before the scroll');
+  });
+
+  it("that stopped, or under a cadence that isn't trusted, gives no number", () => {
+    const stopped = scrollFrames(scroll([16, 16], { stopped: true }), trusted);
+    expect(stopped).toMatchObject({ trusted: false, missed: null });
+    expect(stopped.reasons).toContain('no frame within 2.1 s');
+    const untrusted = launchCadence([{ name: 'baseline', ...steady(40) }], 60);
+    const f = scrollFrames(scroll([16, 16]), untrusted);
+    expect(f).toMatchObject({ trusted: false, missed: null });
+    expect(scrollRow('x', [f])).toMatchObject({ verdict: 'not measurable hidden', value: null });
+  });
+});
+
+describe('the scroll row', () => {
+  const trusted = launchCadence(
+    [
+      { name: 'baseline', ...steady(16) },
+      { name: 'check', ...steady(16) },
+    ],
+    60,
+  );
+  const frames = (intervals: number[], cadence = trusted) =>
+    scrollFrames(
+      { name: 'a', steps: 10, stamps: stampsOf(intervals), stopped: false, waitMs: 2100 },
+      cadence,
+    );
+
+  it('is a proxy that never passes: no missed frames still needs a decision', () => {
+    const row = scrollRow('x', [frames([16, 16, 16]), frames([16, 17])]);
+    expect(row).toMatchObject({
+      row: 'Scroll (renderer rAF-interval proxy)',
+      value: 0,
+      verdict: 'proxy: no missed frames seen, not a pass on its own',
+    });
+    expect(row.verdict).not.toBe('within');
+    expect(row.kind).toContain('not compositor frames');
+  });
+
+  it('is a MISS when a trusted scroll missed frames, even beside one that is not measurable', () => {
+    const untrusted = launchCadence([{ name: 'baseline', ...steady(40) }], 60);
+    expect(scrollRow('x', [frames([16, 40]), frames([16], untrusted)]).verdict).toBe(
+      'MISS (proxy)',
+    );
+    expect(scrollRow('x', [frames([16, 16]), frames([16], untrusted)]).verdict).toBe(
+      'not measurable hidden',
+    );
+  });
+
+  it('is invalid with no scrolls', () => {
+    expect(scrollRow('x', []).verdict).toBe('INVALID');
+  });
+});
+
+describe("the shell's waits", () => {
+  it('take a frame that comes late, after the time limit, within the grace', async () => {
+    const waits: number[] = [];
+    const answers = [null, 2345.5];
+    const next = (ms: number) => {
+      waits.push(ms);
+      return Promise.resolve(answers.shift() ?? null);
+    };
+    expect(await stepStamp(next, 2000, 100)).toBe(2345.5);
+    expect(waits).toEqual([2000, 100]);
+    expect(await stepStamp(() => Promise.resolve(17), 2000, 100)).toBe(17);
+    expect(await stepStamp(() => Promise.resolve(null), 2000, 100)).toBeNull();
+  });
+
+  it(`start a timed expansion at least ${OPEN_PACE_MS} ms after the shown body loaded`, async () => {
+    expect(OPEN_GAP_MS).toBe(OPEN_PACE_MS);
+    let now = 130;
+    const slept: number[] = [];
+    const clock: PaceClock = {
+      now: () => now,
+      sleep: (ms) => {
+        slept.push(ms);
+        // A timer may fire a little early: the wait reads the clock again.
+        now += slept.length === 1 ? ms - 1 : ms;
+        return Promise.resolve();
+      },
+    };
+    expect(await waitSince(100, clock)).toBe(160);
+    expect(slept).toEqual([30, 1]);
+    slept.length = 0;
+    now = 175;
+    expect(await waitSince(100, clock)).toBe(175);
+    expect(slept).toEqual([]);
   });
 });
 
@@ -234,6 +480,20 @@ describe('a launch', () => {
       const problems = launchProblems({ ...clean, ...change } as typeof clean);
       expect(problems.join('; '), reason).toContain(reason);
     }
+  });
+
+  it(`is invalid when an expansion started less than ${OPEN_GAP_MS} ms after the shown body loaded`, () => {
+    const opens = (gaps: Array<number | null>) => ({
+      ...clean,
+      result: {
+        ...clean.result,
+        opens: gaps.map((gapMs, i) => ({ rowid: i + 1, ms: 9, gapMs, outcome: 'view' })),
+      },
+    });
+    expect(launchProblems(opens([60, 61.5, null]))).toEqual([]);
+    const early = launchProblems(opens([60, 59.9]));
+    expect(early.join('; ')).toContain('1 expansions started less than 60 ms');
+    expect(early.join('; ')).toContain('smallest 59.9 ms');
   });
 });
 
@@ -396,15 +656,19 @@ function indexReport({
   reopen?: number;
   valid?: boolean;
 }) {
-  const frames = {
-    events: 10,
-    drawn: 5,
-    reported: 5,
-    presented: 5,
-    dropped: 0,
-    noUpdate: 0,
-    produced: true,
-  };
+  const cadence = launchCadence(
+    [
+      { name: 'baseline', ...steady(16) },
+      { name: 'check', ...steady(16) },
+    ],
+    60,
+  );
+  const scroll = (name: string, intervals: number[]) =>
+    scrollFrames(
+      { name, steps: 240, stamps: stampsOf(intervals), stopped: false, waitMs: 2100 },
+      cadence,
+      name === 'list-phase1' ? 1e9 : null,
+    );
   const fresh = Array.from({ length: 4 }, (_, i) => ({
     name: `fresh-${i + 1}`,
     valid: valid || i > 0,
@@ -416,7 +680,7 @@ function indexReport({
       indexedMs: 60_000,
     },
     memory: { idleMiB: 400, idleRssMiB: 900, peakMiB: 1200, peakRssMiB: 2500 },
-    scrolls: [{ name: 'list-phase1', frames, run: { byFrame: 240, byTimer: 0 } }],
+    scrolls: [scroll('list-phase1', [16, 16, 17]), scroll('list-after', [16, 16])],
   }));
   const reopenLaunches = Array.from({ length: 4 }, (_, i) => ({
     name: `reopen-${i + 1}`,
@@ -438,8 +702,9 @@ function indexReport({
         p50: 8,
         p95: prompt ? 12 : 40,
         max: 60,
-        thresholdMs: PROMPT_FRAME_MS,
+        thresholdMs: 24,
       },
+      cadence,
       scrolls: [],
     },
     fresh,
@@ -475,7 +740,12 @@ describe('the indexing rows', () => {
       value: 1200,
       verdict: 'within',
     });
-    expect(byRow['Scroll']).toMatchObject({ value: 0, verdict: 'within' });
+    const scrolls = rows.filter((r) => r.row === 'Scroll (renderer rAF-interval proxy)');
+    expect(scrolls.map((r) => [r.name, r.value, r.verdict])).toEqual([
+      ['All Mail list, during phase 1', 0, 'proxy: no missed frames seen, not a pass on its own'],
+      ['All Mail list, after phase 1', 0, 'proxy: no missed frames seen, not a pass on its own'],
+    ]);
+    expect(byRow['Warm reopen to a usable list']?.start).toContain('An upper bound');
   });
 
   it('report a miss as a miss', () => {
@@ -504,46 +774,6 @@ describe('the indexing rows', () => {
   });
 });
 
-describe('the scroll row', () => {
-  const frames = (over = {}) => ({
-    events: 9,
-    drawn: 4,
-    reported: 4,
-    presented: 4,
-    dropped: 0,
-    noUpdate: 0,
-    produced: true,
-    ...over,
-  });
-
-  it('counts dropped frames over every traced scroll', () => {
-    expect(
-      scrollRow('x', [
-        { name: 'a', frames: frames() },
-        { name: 'b', frames: frames({ dropped: 2 }) },
-      ]),
-    ).toMatchObject({
-      value: 2,
-      verdict: 'MISS',
-    });
-  });
-
-  it('says when no frames were produced hidden, and is invalid without a trace', () => {
-    expect(
-      scrollRow('x', [{ name: 'a', frames: frames({ drawn: 0, presented: 0, produced: false }) }])
-        .verdict,
-    ).toBe('not measurable hidden: needs a decision');
-    expect(
-      scrollRow('x', [
-        { name: 'a', frames: frames() },
-        { name: 'b', frames: frames({ drawn: 0, presented: 0, produced: false }) },
-      ]).verdict,
-    ).toBe('not measurable hidden: needs a decision');
-    expect(scrollRow('x', [{ name: 'a', frames: null }]).verdict).toBe('INVALID');
-    expect(scrollRow('x', []).verdict).toBe('INVALID');
-  });
-});
-
 describe('the cards rows', () => {
   const launch = (p95: number, views = 1000) => ({
     name: 'opens',
@@ -560,16 +790,23 @@ describe('the cards rows', () => {
     },
     warmup: { requested: 20, count: 20, views: 20 },
     scrolls: [],
+    gaps: [61, 75.5],
   });
 
-  it('take the median of the launches’ p95s, and state the pacer', () => {
+  it('take the median of the launches’ p95s, and state the pacer and the sample rule', () => {
     const rows = cardsRows({
       probe: { scrolls: [] },
-      opens: [launch(100), launch(120), launch(140), launch(200)],
+      opens: [launch(100), launch(120), { ...launch(140), gaps: [60.2] }, launch(200)],
+      sampleRule: { seed: 1, maxBytes: 1_048_576, count: 1000 },
     });
     const open = rows.find((r) => r.row.startsWith('Open message p95'));
     expect(open).toMatchObject({ value: 130, p95s: [100, 120, 140, 200], verdict: 'within' });
-    expect(open?.pacer).toContain('60 ms');
+    expect(open?.pacer).toContain('at least 60 ms after the shown message');
+    expect(open?.pacer).toContain('never held it');
+    expect(open?.pacer).toContain('Smallest gap: 60.2 ms');
+    expect(open?.sample).toContain('at most 1048576 B in conversations of two or more');
+    expect(open?.sample).toContain("never a conversation's newest");
+    expect(open?.sample).toContain('seed 1');
   });
 
   it('are invalid when an expansion didn’t show its view', () => {
@@ -602,11 +839,21 @@ describe('the report', () => {
     } as Record<string, unknown>;
     report.rows = indexRows(report);
     const md = markdown(report);
-    expect(md).toContain(`p95 ≤ ${PROMPT_FRAME_MS} ms`);
+    expect(md).toContain('p95 ≤ 24 ms (1.5 frame intervals');
     expect(md).toContain('NOT prompt');
+    expect(md).toContain('before the pick a frame every 16 ms (62.5 Hz)');
+    expect(md).toContain('Trusted: frames came unthrottled.');
+    expect(md).toContain('## Scrolls');
+    expect(md).toContain(
+      "A frame the compositor or display drops after the renderer made it isn't seen",
+    );
+    expect(md).toContain(
+      '- **All Mail list, during phase 1:** proxy: no missed frames seen, not a pass on its own.',
+    );
+    expect(md).toContain('An upper bound');
     expect(md).toContain('PROXY: needs a decision');
     expect(md).toContain('| Cold: first rows visible |');
-    expect(md).toContain('without background throttling');
+    expect(md).toContain('without background throttling, set when it is created');
     expect(md).toContain('Frontmost app, sampled once a second: Terminal 9');
     expect(md).toContain('| probe | probe | true | - |');
   });
@@ -622,6 +869,89 @@ describe('the report', () => {
     const s = testLogSummary(log);
     expect(s.counts).toHaveLength(3);
     expect(s.conversation).toHaveLength(1);
+  });
+});
+
+describe('the stress batches', () => {
+  it('are the median over the valid launches of each launch’s number', () => {
+    const launch = (p50: number, p95: number, max: number) => ({
+      batches: { ...batchNumbers([]), p50, p95, max, repointedMessages: 7 },
+    });
+    expect(
+      stressBatches([launch(10, 40, 90), launch(12, 44, 300), launch(11, 50, 100)]),
+    ).toMatchObject({
+      launches: 3,
+      p50: 11,
+      p95: 44,
+      max: 100,
+      repointedMessages: 7,
+    });
+    expect(stressBatches([]).p95).toBeNull();
+    expect(stressBatches([{ batches: null }]).p95).toBeNull();
+  });
+});
+
+describe('the preflight', () => {
+  const parent = testDir('gate-preflight');
+  const corpus = join(parent, 'perf');
+  mkdirSync(corpus, { recursive: true });
+  const app = join(parent, 'test.app');
+  const args = {
+    out: join(parent, 'out'),
+    perf: corpus,
+    stress: null,
+    app,
+    scanData: [parent],
+  };
+  const ok: System = {
+    exists: (path) => path.startsWith(app),
+    lidClosed: () => false,
+    git: (a) => (a[0] === 'status' ? '' : 'c0ffee'),
+    freeSpace: (dir) => freeSpace(dir, () => ({ bavail: 2 ** 30, bsize: 4096 })),
+    containers: () => [],
+    testData: () => [corpus],
+    budget: (folders) => budgetCheck(folders, 300_000_000, () => 100_000_000),
+    corpusOf: (name, folder) => ({ name, root: folder, manifestPath: `${folder}.m`, manifest: {} }),
+    corpusState: () => ({ matches: true }),
+  };
+
+  it('passes a clean setup, and reads the checkout it runs from', () => {
+    expect(preflight(args, ok)).toMatchObject({
+      head: 'c0ffee',
+      before: { perf: { matches: true } },
+    });
+  });
+
+  it('refuses each thing before the run writes anything, and says which', () => {
+    const cases: Array<[Partial<System> | null, Partial<typeof args>, string]> = [
+      [{ exists: (p) => p === args.out || p.startsWith(app) }, {}, 'must be a new folder'],
+      [null, { out: 'out' }, 'must be a new folder'],
+      [null, { out: join(corpus, 'out') }, 'is inside'],
+      [{ exists: () => false }, {}, 'no packaged build'],
+      [{ lidClosed: () => true }, {}, 'the lid is closed'],
+      [{ lidClosed: () => null }, {}, "can't read the lid's state"],
+      [
+        { git: (a) => (a[0] === 'status' ? ' M src/x.ts' : 'c0ffee') },
+        {},
+        'the checkout has changes',
+      ],
+      [{ git: () => null }, {}, 'the checkout has changes (or git failed)'],
+      [
+        { freeSpace: (dir) => freeSpace(dir, () => ({ bavail: 1000, bsize: 4096 })) },
+        {},
+        '20 GiB needed',
+      ],
+      [{ budget: (f) => budgetCheck(f, 300_000_000, () => 900_000_000) }, {}, 'would pass'],
+      [
+        { corpusState: () => ({ matches: false, differs: 'a.eml' }) },
+        {},
+        'differs from its manifest',
+      ],
+    ];
+    for (const [sys, over, message] of cases) {
+      expect(() => preflight({ ...args, ...over }, { ...ok, ...sys }), message).toThrow(message);
+    }
+    expect(readdirSync(parent)).toEqual(['perf']);
   });
 });
 

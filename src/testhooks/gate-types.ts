@@ -23,14 +23,32 @@ export interface FirstRows {
   rows: number;
 }
 
-/** A scroll of one element, one step per animation frame (or per timer tick when none came). */
+/**
+ * Consecutive animation frames with nothing changing in the DOM: each
+ * callback's own timestamp (the frame's start), for the frames that came.
+ */
+export interface FrameRun {
+  stamps: number[];
+  /** Waits for a frame that ended at the time limit instead. */
+  timeouts: number;
+  timeoutMs: number;
+}
+
+/**
+ * A scroll of one element, one step per animation frame. Each step's frame
+ * timestamp is kept; a step whose frame didn't come within the time limit
+ * and its grace ends the scroll.
+ */
 export interface ScrollRun {
   selector: string;
+  /** Steps asked for. */
   steps: number;
-  /** Steps that an animation frame drove. */
-  byFrame: number;
-  /** Steps a timer drove, after no frame came within the time limit. */
-  byTimer: number;
+  /** The frame timestamp of each step made, in order. */
+  stamps: number[];
+  /** No frame came within the time limit and its grace, so the scroll ended there. */
+  stopped: boolean;
+  /** The time limit plus grace that a step waited, in ms. */
+  waitMs: number;
   ms: number;
   /** The element's scroll range; 0 when there was nothing to scroll. */
   range: number;
@@ -48,6 +66,8 @@ export interface ExpansionItem {
 export interface TimedExpansion {
   rowid: number;
   ms: number | null;
+  /** From the shown message's body load to the expand's start; null if it didn't get that far. */
+  gapMs: number | null;
   outcome: 'view' | 'timeout' | 'not-held' | 'not-expanded';
 }
 

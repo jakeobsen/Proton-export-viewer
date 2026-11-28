@@ -44,11 +44,14 @@ const FORBIDDEN_CONTENT = [
   'pev-script-marker',
   'pev-bench',
   'pev-open-bench',
-  // The gate mode, and core's record of phase 1's write transactions for it.
+  // The gate mode, core's record of phase 1's write transactions for it, and
+  // the gate window's frames while hidden.
   'pev-gate',
   'gate-batches',
   'recordBatches',
   'onBatch',
+  'framesWhileHidden',
+  'backgroundThrottling',
   'pev-reader-test-source',
   'pev-reader-unsanitized',
   'pev-no-resolver-rule',

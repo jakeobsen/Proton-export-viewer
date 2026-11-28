@@ -13,9 +13,10 @@ import { join } from 'node:path';
 import type { GateConfig } from '../../src/testhooks/gate-config';
 import type { FirstRows, RafProbe, TimedExpansion } from '../../src/testhooks/gate-types';
 import {
+  OPEN_GAP_MS,
   batchNumbers,
-  frameStats,
   freshNumbers,
+  launchCadence,
   opensNumbers,
   rafVerdict,
   reopenNumbers,
@@ -48,7 +49,16 @@ interface Result {
   ok: boolean;
   error?: string;
   mode: string;
-  inputs: { backgroundThrottling: boolean; capBytes: number };
+  inputs: { backgroundThrottling: boolean; framesWhileHidden: boolean; capBytes: number };
+  display?: { frequency: number };
+  cadences?: Array<{
+    name: string;
+    startedAt: number;
+    endedAt: number;
+    stamps: number[];
+    timeouts: number;
+    timeoutMs: number;
+  }>;
   window: { visible: boolean; focused: boolean };
   windowEvents: unknown[];
   phases: Array<{ phase: string; atEpoch: number }>;
@@ -61,8 +71,12 @@ interface Result {
   indexedAt?: number | null;
   scrolls?: Array<{
     name: string;
-    trace: string | null;
-    run: { steps: number; byFrame: number; byTimer: number };
+    startedAt: number;
+    endedAt: number;
+    steps: number;
+    stamps: number[];
+    stopped: boolean;
+    waitMs: number;
   }>;
   idle?: { indexingDuring: number; fromEpoch: number; toEpoch: number } | null;
   openedAt?: number;
@@ -94,10 +108,12 @@ async function launch(
     stepMs: 60_000,
     frameMs: 250,
     rafProbes: 5,
+    cadenceFrames: 5,
     scrollSteps: 6,
+    scrollWaitMs: 2000,
+    graceMs: 100,
     settleMs: 300,
     idleMs: 700,
-    trace: false,
     sample: null,
     ...over,
   };
@@ -136,6 +152,54 @@ function hidden(result: Result): void {
   expect(result.window).toEqual({ visible: false, focused: false });
   expect(result.windowEvents).toEqual([]);
   expect(result.inputs.backgroundThrottling).toBe(false);
+  expect(result.inputs.framesWhileHidden).toBe(true);
+  expect(typeof result.display?.frequency).toBe('number');
+}
+
+/** When the gate noted a phase, on the epoch clock. */
+function phaseAt(result: Result, phase: string): number {
+  const at = result.phases.find((p) => p.phase === phase)?.atEpoch;
+  expect(at, phase).toBeDefined();
+  return at!;
+}
+
+/**
+ * A launch that scrolls records the frame cadence twice, with nothing else
+ * going on: before the pick, and after indexing (after `after`, a phase).
+ * Its scrolls keep each step's frame timestamp. No trace is written.
+ */
+function cadences(result: Result, workspace: string, after: string): void {
+  const [baseline, check] = result.cadences!;
+  expect(result.cadences!.map((c) => c.name)).toEqual(['baseline', 'check']);
+  for (const c of [baseline!, check!]) expect(c.stamps.length + c.timeouts).toBe(5);
+  // The baseline ends before the pick reaches main, and before phase 1's mark.
+  expect(baseline!.endedAt).toBeLessThan(result.pickedAt!);
+  expect(phaseAt(result, 'cadence-baseline')).toBeLessThan(phaseAt(result, 'phase1'));
+  // The check starts once indexing has ended, and after the given phase.
+  expect(check!.startedAt).toBeGreaterThanOrEqual(result.indexedAt!);
+  expect(phaseAt(result, 'cadence-check')).toBeGreaterThanOrEqual(phaseAt(result, after));
+  // Timing isn't judged here; the log shows what this machine gave.
+  const c = launchCadence(result.cadences, result.display?.frequency);
+  console.log(
+    `gate cadence (${result.mode}):`,
+    JSON.stringify({
+      frameMs: c.frameMs,
+      displayHz: c.displayHz,
+      trusted: c.trusted,
+      reasons: c.reasons,
+    }),
+  );
+  for (const s of result.scrolls!) {
+    // A scroll ends early only when no frame came within its wait.
+    if (s.stopped) expect(s.stamps.length, s.name).toBeLessThan(6);
+    else expect(s.stamps, s.name).toHaveLength(6);
+    expect(s.waitMs, s.name).toBe(2100);
+    expect(
+      [...s.stamps].sort((a, b) => a - b),
+      s.name,
+    ).toEqual(s.stamps);
+  }
+  expect(readdirSync(workspace).filter((f) => f.includes('trace'))).toEqual([]);
 }
 
 test('the gate mode runs each launch hidden, records what the report needs, and reads the export only', async () => {
@@ -145,30 +209,28 @@ test('the gate mode runs each launch hidden, records what the report needs, and 
   const before = snapshot(root);
   const profile = testDir('gate-profile');
 
-  // The probe: frames after DOM changes, and traced scrolls during and after phase 1.
-  const probe = await launch('probe', root, testDir('gate-probe-profile'), {
-    mode: 'probe',
-    trace: true,
-  });
+  // The probe: the frame cadence, frames after DOM changes, and scrolls during
+  // and after phase 1 and in a conversation.
+  const probe = await launch('probe', root, testDir('gate-probe-profile'), { mode: 'probe' });
   hidden(probe.result);
   for (const p of [probe.result.rafBefore, probe.result.rafAfter]) {
     expect(p!.samples.length + p!.timeouts).toBe(5);
   }
   expect(
-    rafVerdict([probe.result.rafBefore, probe.result.rafAfter]).samples,
+    rafVerdict([probe.result.rafBefore, probe.result.rafAfter], 16).samples,
   ).toBeGreaterThanOrEqual(0);
-  const scrolls = probe.result.scrolls!;
-  expect(scrolls.map((s) => s.name)).toEqual(['list-phase1', 'list-after', 'conversation']);
-  for (const s of scrolls) {
-    expect(s.run.byFrame + s.run.byTimer).toBe(6);
-    expect(s.trace).not.toBeNull();
-    const stats = frameStats(JSON.parse(readFileSync(s.trace!, 'utf8')));
-    expect(stats.events).toBeGreaterThan(0);
-  }
+  expect(probe.result.scrolls!.map((s) => s.name)).toEqual([
+    'list-phase1',
+    'list-after',
+    'conversation',
+  ]);
+  cadences(probe.result, probe.workspace, 'phase2');
 
   // A fresh index: first rows after the pick, phase 1, phase 2, then idle with nothing indexing.
   const fresh = await launch('fresh', root, profile, {});
   hidden(fresh.result);
+  expect(fresh.result.scrolls!.map((s) => s.name)).toEqual(['list-phase1', 'list-after']);
+  cadences(fresh.result, fresh.workspace, 'idle-end');
   const f = freshNumbers(fresh.result as unknown as Record<string, unknown>);
   expect(f.firstRowsCommitMs).toBeGreaterThan(0);
   expect(f.phase1Ms).toBeGreaterThanOrEqual(f.firstRowsCommitMs!);
@@ -199,6 +261,10 @@ test('the gate mode runs each launch hidden, records what the report needs, and 
   expect(opens.result.warmup).toEqual({ requested: 1, count: 1, views: 1 });
   expect(opensNumbers(opens.result.opens)).toMatchObject({ opens: 4, views: 4 });
   expect(opens.result.indexingDuringOpens).toBe(0);
+  // Each timed expand started at least the pacer's gap after the shown body loaded.
+  for (const o of opens.result.opens!) expect(o.gapMs).toBeGreaterThanOrEqual(OPEN_GAP_MS);
+  expect(opens.result.scrolls!.map((s) => s.name)).toEqual(['conversation']);
+  cadences(opens.result, opens.workspace, 'sample');
 
   // The export was only read.
   expect(snapshot(root)).toEqual(before);

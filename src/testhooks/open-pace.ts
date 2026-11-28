@@ -41,3 +41,16 @@ export async function paced<T, R>(
   }
   return out;
 }
+
+/**
+ * Waits until at least OPEN_PACE_MS have passed since `since`, on the same
+ * clock, and returns the time it then reads. An open started at that time
+ * comes at least OPEN_PACE_MS after whatever happened at `since`.
+ */
+export async function waitSince(since: number, clock: PaceClock = realClock): Promise<number> {
+  for (let wait = since + OPEN_PACE_MS - clock.now(); wait > 0;) {
+    await clock.sleep(Math.ceil(wait));
+    wait = since + OPEN_PACE_MS - clock.now();
+  }
+  return clock.now();
+}
