@@ -430,6 +430,19 @@ export async function install(ctx: AppContext): Promise<boolean> {
       });
       if (!result.ok) throw new Error('release-writes');
     },
+    /**
+     * Holds the shell's cards queries anchored at message `rowid` in core;
+     * null lets the held ones go and returns how many there were.
+     */
+    holdCards: async (rowid: number | null) => {
+      const result = await ctx.core.request({
+        type: 'test',
+        action: 'hold-cards',
+        payload: { rowid },
+      });
+      if (!result.ok) throw new Error('hold-cards');
+      return result.value ?? 0;
+    },
     /** Phase 1 writes waiting to be let through. */
     heldWrites: async () => {
       const result = await core('held-writes');

@@ -62,6 +62,12 @@ const FORBIDDEN_CONTENT = [
   ...STUB_ONLY,
   // The stub open's old refusal code, gone with it from the release code.
   'unknown_stub',
+  // Core's hold of a read once its message file is open.
+  'holdingOpened',
+  'hold-opened',
+  // Core's hold of the shell's cards queries.
+  'holdCardsAt',
+  'hold-cards',
   'better-sqlite3',
   'ws://localhost',
   "style-src 'self' 'unsafe-inline'",
