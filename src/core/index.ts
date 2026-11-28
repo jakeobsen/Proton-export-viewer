@@ -144,7 +144,7 @@ const opens = new OpenTracker();
 
 /** The message to read: from the test source if a test set one, else from the open export. */
 async function openForRead(
-  request: Pick<ReadRequest, 'rowid' | 'generation'>,
+  request: Pick<ReadRequest, 'rowid' | 'generation' | 'search'>,
   stale: () => boolean,
 ): Promise<ReaderFile | { ok: false; code: 'no_source' }> {
   if (__PEV_TEST_HOOKS__ && readerSource) {
