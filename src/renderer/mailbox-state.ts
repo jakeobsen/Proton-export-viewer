@@ -292,6 +292,8 @@ export function syncMailbox(): void {
 export function indexChanged(update_: IndexUpdate): void {
   if (keyOf(update_.generation) !== state.key || state.key === null) return;
   setProgress(update_.progress);
+  // A scan's progress changes nothing in the index, so nothing is read again for it.
+  if (update_.progress.phase === 'scanning') return;
   void readSidebar();
   list.refresh();
   cards.refresh();
