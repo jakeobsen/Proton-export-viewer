@@ -2,8 +2,8 @@
 // The index report in the shell: opened from the list header once the export
 // is loaded and from the loading line while it loads, its counts and rows for
 // a generated export with files that need attention, focus moving to it and
-// back, "Copy report" with no file name in the logs, and the checks on its
-// channel.
+// back, the mail kept under it unseen and inert, "Copy report" with no file
+// name in the logs, and the checks on its channel.
 
 import {
   readFileSync,
@@ -45,6 +45,13 @@ const invoke = (pev: PevApp, channel: string, ...args: unknown[]) =>
     [channel, args] as const,
   );
 
+/** An element's box in the window. */
+const rectOf = (page: Page, selector: string) =>
+  page.locator(selector).evaluate((el) => {
+    const r = el.getBoundingClientRect();
+    return [r.left, r.top, r.width, r.height];
+  });
+
 /** The text of each clipboard write; test builds record them instead. */
 async function clipboardWrites(pev: PevApp): Promise<string[]> {
   const calls = await pev.main<Array<{ method: string; args: string[] }>>('externalCalls');
@@ -78,6 +85,14 @@ test('the report lists the files that need attention, and copies them as text', 
   await expect(card.locator('h1')).toHaveText('Index report');
   await expect(card.locator('h1')).toBeFocused();
   await expect(card.locator('.phase h3 .pill')).toHaveText('Done');
+  // The mail stays mounted under the report, unseen and inert, and the report
+  // takes exactly its place.
+  const mail = pev.page.locator('main.content');
+  await expect(mail).toHaveCount(1);
+  await expect(mail).toHaveAttribute('inert', '');
+  await expect(mail).toBeHidden();
+  await expect(pev.page.locator('.list-scroll')).toBeHidden();
+  expect(await rectOf(pev.page, 'main.center')).toEqual(await rectOf(pev.page, 'main.content'));
   // 12 pairs, less the two whose metadata is missing or isn't JSON.
   await expect(card.locator('.ix-stats')).toContainText('10 messages');
   await expect(card.locator('.ix-stats')).toContainText('folders and labels');
@@ -123,6 +138,7 @@ test('the report lists the files that need attention, and copies them as text', 
   // Closed, focus goes back to the link that opened it.
   await press(pev.page, '.ix-foot button:text("Start browsing")');
   await expect(card).toHaveCount(0);
+  await expect(mail).not.toHaveAttribute('inert', '');
   await expect(pev.page.locator('.list-scroll')).toBeVisible();
   await expect(link).toBeFocused();
 });
@@ -156,6 +172,11 @@ test('the loading line opens the report while the export loads', async ({ pev })
   await expect(card.locator('.ix-stats')).toContainText(`Loading 10 of ${written.pairs}…`);
   await expect(card.locator('.progress')).toHaveAttribute('aria-valuenow', '10');
   await expect(card.locator('.report')).toHaveCount(0);
+  // The open message's frame stays under the report, unseen.
+  const frame = pev.page.locator('.reader iframe.rp-frame');
+  await expect(frame).toHaveAttribute('src', shown.view!.url);
+  await expect(frame).toBeHidden();
+  await expect(pev.page.locator('main.content')).toHaveAttribute('inert', '');
 
   await pev.main('releaseWrites', null);
   await expect.poll(() => progress(pev), { timeout: 20_000 }).toMatchObject({ phase: 'done' });
@@ -169,7 +190,8 @@ test('the loading line opens the report while the export loads', async ({ pev })
   // The mail stayed as it was under the report: the same message and its
   // frame, with the body not loaded again.
   expect(await reader(pev)).toMatchObject({ rowid: shown.rowid, view: { url: shown.view!.url } });
-  await expect(pev.page.locator('.reader iframe.rp-frame')).toHaveAttribute('src', shown.view!.url);
+  await expect(frame).toHaveAttribute('src', shown.view!.url);
+  await expect(frame).toBeVisible();
   await pev.page.waitForTimeout(300);
   expect(await loads()).toBe(loaded);
 });

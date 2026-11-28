@@ -82,10 +82,30 @@ body,
   font-weight: 600;
 }
 
+/* The mail and, while it shows, the index report over it. */
+.stage {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
 .content {
   display: flex;
   flex: 1;
   min-height: 0;
+}
+
+/* Under the report the mail keeps its layout, so its lists, cards and open
+   message come back as they were; it is only unseen. */
+.content[hidden] {
+  visibility: hidden;
+}
+
+.stage > .center {
+  position: absolute;
+  inset: 0;
 }
 
 .reader {

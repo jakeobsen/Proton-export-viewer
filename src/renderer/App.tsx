@@ -103,9 +103,10 @@ export function App() {
       {welcome ? (
         <Welcome recent={state.sources?.recent ?? []} busy={state.busy} notice={state.notice} />
       ) : (
-        <>
+        <div className="stage">
           {showReport && <ReportView active={active} />}
-          {/* Under the report the mail stays as it was, with its open message. */}
+          {/* Under the report the mail stays as it was, with its open message:
+              still laid out, but unseen and inert. */}
           <main className="content" hidden={showReport} inert={showReport}>
             {active && <Sidebar active={active} busy={state.busy} />}
             {active && (results ? <SearchResults /> : <ConversationList />)}
@@ -113,7 +114,7 @@ export function App() {
               {conversation.shown ? <Conversation /> : <ReaderPane />}
             </section>
           </main>
-        </>
+        </div>
       )}
       {state.link !== null && <LinkDialog key={state.link.dialogId} prompt={state.link} />}
     </div>
