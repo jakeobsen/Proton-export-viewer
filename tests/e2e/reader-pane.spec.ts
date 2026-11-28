@@ -131,6 +131,8 @@ test('a message opens in the pane as HTML first, with its header fields', async 
   expect(await pane(pev).locator('button').allTextContents()).toEqual([
     'Plain text',
     'HTML',
+    'Show in folder',
+    'Message-ID',
     'Details',
   ]);
   expect(await pane(pev).locator('.rp-line').allTextContents()).toEqual([
