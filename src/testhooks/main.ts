@@ -12,6 +12,7 @@ import { PROD_SWITCHES } from '../main/switches';
 import { ScopeError, type Picked } from '../main/sources/scope';
 import type { OrderStep } from '../main/sources/manager';
 import { createAppWindow } from '../main/windows';
+import { IPC } from '../shared/api';
 import type { CoreResult, CoreTestInit } from '../shared/core-protocol';
 import type { IndexQuery } from '../shared/index-types';
 import { errorData } from '../shared/log/schema';
@@ -470,6 +471,16 @@ export async function install(ctx: AppContext): Promise<boolean> {
     indexDir: () => join(app.getPath('userData'), 'index'),
     /** Resets the app's data, as Settings will. */
     resetApp: () => ctx.sources.reset(),
+    /**
+     * Sends the first app window a card key as main does for one typed in the
+     * body frame, whatever has the focus: the shell's own handling is tested
+     * apart from main's.
+     */
+    cardKeyFromMain: (key: string) => {
+      const contents = [...ctx.windows.values()][0]?.win.webContents;
+      if (!contents) throw new Error('no window');
+      contents.send(IPC.cardKey, key);
+    },
     /**
      * Runs main's own keyboard handler for a key press in the first app
      * window, as if typed while its focused frame has the focus. Keys the

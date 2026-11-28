@@ -4,6 +4,7 @@
 
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useCallback, useEffect, useLayoutEffect, useRef, type KeyboardEvent } from 'react';
+import { displayText } from '../shared/header-text';
 import { MAX_QUERY_LENGTH, type MarkedSnippet, type SearchSort } from '../shared/index-types';
 import type { SidebarModel } from './folders';
 import { formatCount, fullDate, listDate, participantsText } from './format';
@@ -16,7 +17,7 @@ import {
   useMailbox,
   useSearch,
 } from './mailbox-state';
-import { Chips } from './Mailbox';
+import { Chips } from './Chips';
 import {
   RESULT_ROW_HEIGHT,
   conversationsText,
@@ -70,6 +71,7 @@ function ResultItem({
 }) {
   const unread = row.unread > 0;
   const who = participantsText(row.details?.participants ?? []);
+  const subject = displayText(row.details?.subject ?? '');
   return (
     <div
       className={`conv result${unread ? ' unread' : ''}${selected ? ' selected' : ''}`}
@@ -97,8 +99,8 @@ function ResultItem({
         </span>
       </div>
       <div className="subj">
-        <span className="t" title={row.details?.subject}>
-          {row.details?.subject ?? ''}
+        <span className="t" title={subject || undefined}>
+          {subject}
         </span>
         {row.matching > 1 && (
           <span className="match-n">{`${formatCount(row.matching)} matching`}</span>

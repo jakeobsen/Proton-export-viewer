@@ -86,6 +86,9 @@ const api: PevApi = {
   sidebar: (generation) => ipcRenderer.invoke(IPC.index, { query: { op: 'sidebar' }, generation }),
   listWindow: (query, generation) => ipcRenderer.invoke(IPC.index, { query, generation }),
   cards: (query, generation) => ipcRenderer.invoke(IPC.index, { query, generation }),
+  indexReport: (generation) =>
+    ipcRenderer.invoke(IPC.index, { query: { op: 'report' }, generation }),
+  copyReport: (generation) => ipcRenderer.invoke(IPC.copyReport, { generation }),
   onIndexChanged: (listener) => {
     const handler = (_event: unknown, update: IndexUpdate) => listener(update);
     ipcRenderer.on(IPC.indexChanged, handler);

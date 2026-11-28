@@ -36,6 +36,8 @@ export interface CardsSnapshot {
   subject: string;
   /** Messages in the conversation. */
   total: number;
+  /** Its folder and label IDs, as its list row has them. */
+  labelIds: string[];
   /** The position of the first card held. */
   start: number;
   cards: CardRow[];
@@ -67,6 +69,7 @@ const EMPTY: CardsSnapshot = {
   threadId: null,
   subject: '',
   total: 0,
+  labelIds: [],
   start: 0,
   cards: [],
   expanded: null,
@@ -356,6 +359,7 @@ export class CardsModel {
         threadId: null,
         subject: '',
         total: 0,
+        labelIds: [],
         start: 0,
         cards: [],
         expanded: null,
@@ -398,6 +402,7 @@ export class CardsModel {
       threadId: answer.threadId,
       subject: answer.subject,
       total: answer.total,
+      labelIds: answer.labelIds,
       start: answer.start,
       cards: answer.cards,
       expanded: next,

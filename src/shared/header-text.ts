@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Header values the reader's Details show, such as the Message-ID: mail data
-// shown in the shell. Nothing in a value may reorder or hide the text around
-// it, a control character shows as what it is, and a value has at most the
-// length of one header line.
+// Header text the shell shows: values in the reader's Details, such as the
+// Message-ID, and subjects and names in rows and headers. Nothing in a value
+// may reorder or hide the text around it, a control character shows as what
+// it is, and a value has at most the length of one header line.
 
 /** The longest value shown, in characters: the length of one header line. */
 export const MAX_HEADER_VALUE = 998;
 
-// Format characters: bidi marks, embeddings, overrides and isolates,
-// zero-width characters, the word joiner and the byte order mark among them.
-const INVISIBLE_RE = /\p{Cf}/gu;
+// Format characters: bidi marks, embeddings, overrides and isolates, the
+// zero-width space, the word joiner, the soft hyphen and the byte order mark
+// among them, and the whole tag block, assigned or not. The zero-width
+// non-joiner and joiner stay: they shape letters in Persian and Indic scripts
+// and join emoji sequences, and they can't reorder or hide the text around
+// them.
+const INVISIBLE_RE = /(?![\u200c\u200d])[\p{Cf}\u{e0000}-\u{e007f}]/gu;
+// White space as a row or a header shows it: any run, line breaks included,
+// is one space.
+const SPACES_RE = /\s+/gu;
 // Control characters, and the line and paragraph separators, which break a
 // line as a control does: C0 and DEL show as their symbols from the Control
 // Pictures block; C1 and the separators, which have none, as the replacement
@@ -33,4 +40,13 @@ export function headerText(raw: string): string {
   return chars.length <= MAX_HEADER_VALUE
     ? clean
     : `${chars.slice(0, MAX_HEADER_VALUE - 1).join('')}…`;
+}
+
+/**
+ * A subject or a name as a row or a header shows it: as headerText, with each
+ * run of white space, line breaks and tabs included, shown as one space.
+ * Invisible characters go first, so one between two spaces leaves one space.
+ */
+export function displayText(raw: string): string {
+  return headerText(raw.replace(INVISIBLE_RE, '').replace(SPACES_RE, ' '));
 }

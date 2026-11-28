@@ -4,12 +4,16 @@
 
 import { observeElementOffset, useVirtualizer } from '@tanstack/react-virtual';
 import { useCallback, useEffect, useLayoutEffect, useRef, type KeyboardEvent } from 'react';
+import { displayText } from '../shared/header-text';
 import type { ActiveExport } from '../shared/sources';
+import { Chips } from './Chips';
 import type { SidebarEntry, SidebarModel } from './folders';
 import { formatCount, fullDate, listDate, loadingText, participantsText } from './format';
 import { exportLabel } from './labels';
 import { ROW_HEIGHT, type Row } from './list';
 import { list, selectRow, showFolder, useList, useMailbox } from './mailbox-state';
+import { openReportFrom } from './Report';
+import { attentionText } from '../shared/report-text';
 import { switchRun } from './shell';
 
 /** Up to two initials from the account's local part: "sam.rivera@…" gives "SR". */
@@ -122,7 +126,13 @@ function IndexStatus() {
     return (
       <div className="side-foot" role="status">
         {counted && (
-          <span className="loading-text">{loadingText(progress.loaded, progress.total)}</span>
+          <button
+            type="button"
+            className="link loading-text"
+            onClick={(e) => openReportFrom(e.currentTarget)}
+          >
+            {loadingText(progress.loaded, progress.total)}
+          </button>
         )}
         <div
           className="bar-track"
@@ -172,34 +182,6 @@ function Folders({ sidebar, folder }: { sidebar: SidebarModel; folder: string })
   );
 }
 
-/** A conversation's labels, as chips. */
-export function Chips({
-  labelIds,
-  sidebar,
-}: {
-  labelIds: readonly string[] | undefined;
-  sidebar: SidebarModel | null;
-}) {
-  const labels = (labelIds ?? [])
-    .map((id) => sidebar?.byId.get(id))
-    .filter((e): e is SidebarEntry => e?.kind === 'label');
-  if (labels.length === 0) return null;
-  return (
-    <div className="chips">
-      {labels.map((label) => (
-        <span key={label.id} className="chip">
-          <span
-            className={label.color ? 'dot' : 'dot plain'}
-            style={label.color ? { background: label.color } : undefined}
-            aria-hidden="true"
-          />
-          <span className="chip-name">{label.name}</span>
-        </span>
-      ))}
-    </div>
-  );
-}
-
 function ConversationRow({
   row,
   index,
@@ -215,6 +197,7 @@ function ConversationRow({
 }) {
   const unread = row.unreadHere > 0;
   const who = participantsText(row.details?.participants ?? []);
+  const subject = displayText(row.details?.subject ?? '');
   return (
     <div
       className={`conv${unread ? ' unread' : ''}${selected ? ' selected' : ''}`}
@@ -242,8 +225,8 @@ function ConversationRow({
         </span>
       </div>
       <div className="subj">
-        <span className="t" title={row.details?.subject}>
-          {row.details?.subject ?? ''}
+        <span className="t" title={subject || undefined}>
+          {subject}
         </span>
         {row.attachments && (
           <span className="clip" title="Has attachments" aria-label="Has attachments" />
@@ -255,7 +238,7 @@ function ConversationRow({
 }
 
 export function ConversationList() {
-  const { sidebar, folder } = useMailbox();
+  const { sidebar, folder, progress, report } = useMailbox();
   const snap = useList();
   const scrollRef = useRef<HTMLDivElement>(null);
   // Where the virtualizer learns the scroll offset. A scroll the list makes
@@ -347,6 +330,15 @@ export function ConversationList() {
             {`${formatCount(snap.total)} ${snap.total === 1 ? 'conversation' : 'conversations'}`}
             {unread > 0 && ` · ${formatCount(unread)} unread`}
           </span>
+        )}
+        {progress?.phase === 'done' && report !== null && report.attention > 0 && (
+          <button
+            type="button"
+            className="link attention"
+            onClick={(e) => openReportFrom(e.currentTarget)}
+          >
+            {attentionText(report.attention)}
+          </button>
         )}
       </div>
       <div

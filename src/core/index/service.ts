@@ -300,6 +300,8 @@ export class IndexService {
     bodiesTotal: 0,
     bodiesFailed: 0,
   };
+  /** How long phase 1 took when it last ran to the end, in ms. */
+  took: number | null = null;
   private readonly poolSize: number;
   private readonly jobMs: number;
   private readonly metaJob: number;
@@ -708,12 +710,13 @@ export class IndexService {
       await this.readAndWrite(pool, writer, toRead, scan.metadata);
       if (!this.current()) throw new ThreadError('STALE');
       await writer.call('finish', { stamp });
+      this.took = Math.round(performance.now() - started);
       this.progress.phase = 'done';
       if (this.progress.condition === 'rebuilding') this.progress.condition = 'ok';
       this.report(true);
       this.deps.log.info(
         'index.phase1_done',
-        { count: this.progress.loaded, ms: Math.round(performance.now() - started) },
+        { count: this.progress.loaded, ms: this.took },
         this.src,
       );
       return true;

@@ -34,6 +34,7 @@ import {
   sidebar,
   threadOfMessage,
 } from './queries';
+import { indexReport } from './report';
 import { matchInfo, searchPage, searchSnippets } from './search';
 import {
   META,
@@ -451,6 +452,9 @@ export class QueryState {
         return searchPage(db, call);
       case 'snippets':
         return searchSnippets(db, call);
+      case 'report':
+        // The source adds the files its scan refused and the time phase 1 took.
+        return { ...indexReport(db, SYSTEM_IDS), took: null };
     }
   }
 

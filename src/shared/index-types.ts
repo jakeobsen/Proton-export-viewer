@@ -3,7 +3,9 @@
 // conversation list pages and the details of the rows on screen, plus where
 // indexing stands. Shared by core, main and the shell.
 
+import type { CAPPED_LIST_NAMES } from './log/codes';
 import type { ReaderMatch, StoredBody } from './reader-protocol';
+import type { RejectKind } from './sources';
 
 export type FolderKind = 'system' | 'folder' | 'label';
 
@@ -288,6 +290,8 @@ export interface CardsWindow {
   subject: string;
   /** Messages in the conversation, from every folder. */
   total: number;
+  /** Its folder and label IDs: the same as its list row's. */
+  labelIds: string[];
   /** The position of the first card. */
   start: number;
   cards: CardRow[];
@@ -304,6 +308,7 @@ export type IndexQuery =
   | { op: 'resolve'; rowid: number }
   | { op: 'totals' }
   | { op: 'eml'; rowid: number; search?: string }
+  | { op: 'report' }
   | WindowQuery
   | SearchQuery
   | SnippetsQuery
@@ -320,7 +325,8 @@ export type IndexAnswer =
   | CardsWindow
   | EmlFile
   | SearchPage
-  | SearchSnippets;
+  | SearchSnippets
+  | IndexReport;
 
 /**
  * Where a message's file is, as the scan last saw it: its name relative to the
@@ -343,6 +349,79 @@ export interface IndexMatch extends ReaderMatch {
   body: StoredBody | null;
   /** Columns whose marks failed the range check and were dropped. */
   dropped: number;
+}
+
+/** A list of a message whose entries were cut to a limit when it was indexed. */
+export type CappedListName = (typeof CAPPED_LIST_NAMES)[number];
+
+/**
+ * Why a file needs attention: a kind of file the checks refused (when the
+ * folder was scanned or when the file was read), a message file without its
+ * metadata or metadata without its message file, metadata that couldn't be
+ * used, or a message with a list cut to its limit.
+ */
+export type ReportReason =
+  | RejectKind
+  | 'meta_missing'
+  | 'eml_missing'
+  | 'meta_json'
+  | 'meta_shape'
+  | 'meta_id'
+  | 'timeout'
+  | 'failed'
+  | 'capped';
+
+/** Metadata that couldn't be used, by reason. */
+export type FailedReason = 'meta_json' | 'meta_shape' | 'meta_id' | 'failed';
+
+/**
+ * What became of a file: 'skipped' files aren't listed, a 'listed' message
+ * has no message file, and a 'truncated' one has a list cut to its limit.
+ */
+export type ReportResult = 'skipped' | 'listed' | 'truncated';
+
+export interface ReportRow {
+  result: ReportResult;
+  /** The file's name, relative to the export's folder. */
+  file: string;
+  reason: ReportReason;
+  /** For 'capped': the lists that were cut. */
+  lists?: CappedListName[];
+}
+
+/** The most rows an index report carries. */
+export const REPORT_ROWS = 500;
+
+/** The index report: what was indexed, and each file that needs attention. */
+export interface IndexReport {
+  messages: number;
+  /** User folders and labels. */
+  folders: number;
+  /** How long phase 1 took when it last ran, in ms; null until it is done. */
+  took: number | null;
+  /** Files refused by the checks, by reason. */
+  rejected: Partial<Record<RejectKind, number>>;
+  /** Message files without their metadata: not listed. */
+  metaMissing: number;
+  /** Metadata without its message file: listed, with no body. */
+  emlMissing: number;
+  /** Metadata that couldn't be used, by reason: not listed. */
+  failed: Partial<Record<FailedReason, number>>;
+  /** Metadata files that took too long to read: not listed. */
+  timeouts: number;
+  /** Messages with a list cut to its limit, by list. */
+  capped: Partial<Record<CappedListName, number>>;
+  /** Label IDs on messages that labels.json doesn't name; they aren't shown. */
+  hiddenLabelIds: number;
+  /**
+   * Files that need attention. A listed message with no message file and a
+   * list cut to its limit is one file with two rows.
+   */
+  attention: number;
+  /** The first rows, at most REPORT_ROWS: one per file and reason. */
+  rows: ReportRow[];
+  /** Rows left out after the first REPORT_ROWS. */
+  more: number;
 }
 
 /**
