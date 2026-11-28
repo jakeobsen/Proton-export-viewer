@@ -89,8 +89,11 @@ afterAll(() => {
 
 describe("the list rows' lead lines", () => {
   it('are asked for only while the list is on screen', async () => {
-    mailbox.setListShown(true);
+    // The rows on screen are known before the list shows: nothing is asked yet.
     mailbox.setListViewport(0, 2);
+    await flush();
+    expect(listRequests()).toEqual([]);
+    mailbox.setListShown(true);
     await flush();
     expect(listRequests()).toEqual([rowids()]);
     expect(mailbox.listLeads.snapshot.size).toBe(3);
