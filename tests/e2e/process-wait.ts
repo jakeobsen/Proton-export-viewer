@@ -5,7 +5,7 @@
 // On Linux a process counts as gone only once its last thread has ended.
 
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 
 /** How a process looks from outside: running, exited but not yet reaped, or gone. */
 export type ProcessState = 'running' | 'zombie' | 'gone';
@@ -23,6 +23,12 @@ function statFields(stat: string): string[] | null {
 /** The state letter of a `/proc/<pid>/stat` line (field 3). */
 export function statState(stat: string): string | null {
   return statFields(stat)?.[0] ?? null;
+}
+
+/** The thread count of a `/proc/<pid>/stat` line (field 20), or null when it isn't a count. */
+export function statThreads(stat: string): number | null {
+  const raw = statFields(stat)?.[17];
+  return raw !== undefined && /^\d+$/.test(raw) ? Number(raw) : null;
 }
 
 /** The start time of a `/proc/<pid>/stat` line (field 22), in clock ticks since boot. */
@@ -43,31 +49,22 @@ function psState(pid: number): string | null {
   }
 }
 
-/** A process's state, and on Linux, when its stat said Z, how many of its threads were listed. */
+/** A process's state, and on Linux, when its stat said Z, its thread count (null: not a count). */
 export interface Probe {
   state: ProcessState;
-  tasks?: number;
+  threads?: number | null;
 }
 
 /**
- * The state of a Linux process from its stat line and the number of entries
- * in its task folder (null when that can't be read). The stat shows Z for the
+ * The state of a Linux process from its stat line. The stat shows Z for the
  * thread-group leader as soon as it exits, while its other threads may still
  * be ending with files open; the files, and the locks on them, go only with
- * the last thread. So it is a zombie only once the leader is alone.
+ * the last thread. So it is a zombie only when the same line counts exactly
+ * one thread; any other count, or none, leaves the exit unconfirmed.
  */
-export function linuxState(stat: string, tasks: number | null): ProcessState {
+export function linuxState(stat: string): ProcessState {
   if (statState(stat) !== 'Z') return 'running';
-  return tasks === null || tasks <= 1 ? 'zombie' : 'running';
-}
-
-/** How many threads `/proc/<pid>/task` lists, or null when it can't be read. */
-function taskCount(pid: number): number | null {
-  try {
-    return readdirSync(`/proc/${pid}/task`).length;
-  } catch {
-    return null;
-  }
+  return statThreads(stat) === 1 ? 'zombie' : 'running';
 }
 
 /**
@@ -87,8 +84,7 @@ export function probeProcess(pid: number): Probe {
       return { state: 'gone' };
     }
     if (statState(stat) !== 'Z') return { state: 'running' };
-    const tasks = taskCount(pid);
-    return { state: linuxState(stat, tasks), ...(tasks === null ? {} : { tasks }) };
+    return { state: linuxState(stat), threads: statThreads(stat) };
   }
   return { state: stateFromPs(psState(pid), () => probe(pid)) };
 }
@@ -168,18 +164,18 @@ export const MAX_Z_PROBES = 100;
 /** How a process waited for was found gone: exited, a zombie, or its number given to a new process. */
 export type GoneState = Exclude<ProcessState, 'running'> | 'reused';
 
-/** How a wait ended, with the thread count of each probe that saw a Linux Z. */
+/** How a wait ended, with the thread count of each probe that saw a Linux Z (null: not a count). */
 export interface Waited {
   ms: number;
   state: GoneState;
-  zTasks?: number[];
+  zThreads?: Array<number | null>;
 }
 
 /** A wait that ran out of time: the process was killed, and this is what was seen. */
 export class AliveAfterClose extends Error {
   constructor(
     readonly ms: number,
-    readonly zTasks: number[],
+    readonly zThreads: Array<number | null>,
   ) {
     super(`core_alive_after_close: ${ms}`);
   }
@@ -193,11 +189,13 @@ export class AliveAfterClose extends Error {
  */
 export async function waitGone(pid: number, options: WaitGoneOptions): Promise<Waited> {
   const started = Date.now();
-  const zTasks: number[] = [];
-  const seen = () => (zTasks.length > 0 ? { zTasks } : {});
+  const zThreads: Array<number | null> = [];
+  const seen = () => (zThreads.length > 0 ? { zThreads } : {});
   for (;;) {
     const probed = (options.probe ?? probeProcess)(pid);
-    if (probed.tasks !== undefined && zTasks.length < MAX_Z_PROBES) zTasks.push(probed.tasks);
+    if (probed.threads !== undefined && zThreads.length < MAX_Z_PROBES) {
+      zThreads.push(probed.threads);
+    }
     const ms = Date.now() - started;
     if (probed.state !== 'running') return { ms, state: probed.state, ...seen() };
     if (options.startTime !== null) {
@@ -206,7 +204,7 @@ export async function waitGone(pid: number, options: WaitGoneOptions): Promise<W
     }
     if (ms >= options.timeoutMs) {
       killIfSame(pid, options.startTime);
-      throw new AliveAfterClose(ms, zTasks);
+      throw new AliveAfterClose(ms, zThreads);
     }
     await new Promise((resolve) => setTimeout(resolve, options.pollMs ?? 25));
   }

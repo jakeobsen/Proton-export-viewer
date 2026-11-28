@@ -52,11 +52,11 @@ function indexOpenedIn(userData: string): number {
   let count = 0;
   for (const file of readdirSync(dir).filter((f) => f.endsWith('.jsonl'))) {
     for (const line of readFileSync(join(dir, file), 'utf8').split('\n')) {
-      if (
-        line.includes('"index.opened"') &&
-        (JSON.parse(line) as LogLine).code === 'index.opened'
-      ) {
-        count += 1;
+      if (!line.includes('"index.opened"')) continue;
+      try {
+        if ((JSON.parse(line) as LogLine).code === 'index.opened') count += 1;
+      } catch {
+        // A line cut short by an app that was killed while writing it.
       }
     }
   }

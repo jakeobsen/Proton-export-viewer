@@ -15,6 +15,7 @@ import {
   killIfSame,
   linuxState,
   processState,
+  statThreads,
   type Probe,
   startTimeOf,
   stateFromPs,
@@ -160,22 +161,33 @@ describe('process-wait', () => {
     expect(probes).toBe(3);
   });
 
-  it('counts a Linux zombie leader as exited only once its other threads have ended', () => {
-    const stat = (state: string) =>
-      `4242 (core) ${state} ${Array.from({ length: 20 }, (_, i) => String(i)).join(' ')}`;
-    expect(linuxState(stat('Z'), 2)).toBe('running');
-    expect(linuxState(stat('Z'), 3)).toBe('running');
-    expect(linuxState(stat('Z'), 1)).toBe('zombie');
-    // The task folder went with the process.
-    expect(linuxState(stat('Z'), null)).toBe('zombie');
-    expect(linuxState(stat('S'), 1)).toBe('running');
+  it('counts a Linux zombie leader as exited only when its stat counts exactly one thread', () => {
+    // Fields 3 to 22 of a stat line; field 20 (the thread count) is index 17.
+    const stat = (state: string, threads: string) => {
+      const fields = Array.from({ length: 20 }, (_, i) => String(i + 3));
+      fields[0] = state;
+      fields[17] = threads;
+      return `4242 (co re) (x)) ${fields.join(' ')}`;
+    };
+    expect(statThreads(stat('Z', '7'))).toBe(7);
+    expect(linuxState(stat('Z', '2'))).toBe('running');
+    expect(linuxState(stat('Z', '3'))).toBe('running');
+    expect(linuxState(stat('Z', '1'))).toBe('zombie');
+    // No count, or not one that can be true, confirms nothing.
+    expect(linuxState(stat('Z', '0'))).toBe('running');
+    expect(linuxState(stat('Z', 'x'))).toBe('running');
+    expect(statThreads(stat('Z', 'x'))).toBeNull();
+    expect(linuxState('4242 (core) Z 1 2')).toBe('running');
+    expect(statThreads('4242 (core) Z 1 2')).toBeNull();
+    expect(linuxState(stat('S', '1'))).toBe('running');
   });
 
   it('waits through a zombie leader with live threads, and records each such probe', async () => {
     const probes: Probe[] = [
-      { state: 'running', tasks: 3 },
-      { state: 'running', tasks: 2 },
-      { state: 'zombie', tasks: 1 },
+      { state: 'running', threads: 3 },
+      { state: 'running', threads: null },
+      { state: 'running', threads: 2 },
+      { state: 'zombie', threads: 1 },
     ];
     const waited = await waitGone(1, {
       timeoutMs: 5000,
@@ -183,13 +195,13 @@ describe('process-wait', () => {
       pollMs: 1,
       probe: () => probes.shift() ?? { state: 'gone' },
     });
-    expect(waited).toMatchObject({ state: 'zombie', zTasks: [3, 2, 1] });
+    expect(waited).toMatchObject({ state: 'zombie', zThreads: [3, null, 2, 1] });
     const plain = await waitGone(1, {
       timeoutMs: 5000,
       startTime: null,
       probe: () => ({ state: 'gone' }),
     });
-    expect(plain).not.toHaveProperty('zTasks');
+    expect(plain).not.toHaveProperty('zThreads');
   });
 
   it('keeps the probes it saw when it runs out of time, at most MAX_Z_PROBES of them', async () => {
@@ -197,14 +209,14 @@ describe('process-wait', () => {
       timeoutMs: 400,
       startTime: null,
       pollMs: 0,
-      probe: () => ({ state: 'running', tasks: 2 }),
+      probe: () => ({ state: 'running', threads: 2 }),
     });
     await expect(failed).rejects.toThrow(/^core_alive_after_close: \d+$/);
     const err = await failed.catch((e: unknown) => e);
     expect(err).toBeInstanceOf(AliveAfterClose);
-    const zTasks = (err as AliveAfterClose).zTasks;
+    const zThreads = (err as AliveAfterClose).zThreads;
     // A poll every few milliseconds for 400 ms sees more than the cap.
-    expect(zTasks).toHaveLength(MAX_Z_PROBES);
-    expect(new Set(zTasks)).toEqual(new Set([2]));
+    expect(zThreads).toHaveLength(MAX_Z_PROBES);
+    expect(new Set(zThreads)).toEqual(new Set([2]));
   });
 });

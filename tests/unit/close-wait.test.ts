@@ -145,14 +145,14 @@ describe('closeAndConfirm', () => {
   it('records a timeout with what it saw, and fails with the wait error', async () => {
     const t = steps({ waitGone: () => Promise.reject(new AliveAfterClose(10_001, [2, 2])) });
     await expect(closeAndConfirm(t.steps)).rejects.toThrow('core_alive_after_close: 10001');
-    expect(t.records).toEqual([{ state: 'timeout', ms: 10_001, zTasks: [2, 2] }]);
+    expect(t.records).toEqual([{ state: 'timeout', ms: 10_001, zThreads: [2, 2] }]);
   });
 
   it('keeps the thread counts of a Linux zombie wait in the record', async () => {
     const t = steps({
-      waitGone: () => Promise.resolve({ ms: 40, state: 'zombie', zTasks: [3, 1] }),
+      waitGone: () => Promise.resolve({ ms: 40, state: 'zombie', zThreads: [3, 1] }),
     });
     await closeAndConfirm(t.steps);
-    expect(t.records).toEqual([{ ms: 40, state: 'zombie', zTasks: [3, 1] }]);
+    expect(t.records).toEqual([{ ms: 40, state: 'zombie', zThreads: [3, 1] }]);
   });
 });

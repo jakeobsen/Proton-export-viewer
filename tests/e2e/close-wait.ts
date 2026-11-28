@@ -14,8 +14,8 @@ export type CloseState = GoneState | 'no_core' | 'no_answer' | 'timeout';
 export interface CloseWait {
   state: CloseState;
   ms?: number;
-  /** The thread count of each probe that saw a Linux zombie leader. */
-  zTasks?: number[];
+  /** The thread count of each probe that saw a Linux zombie leader (null: not a count). */
+  zThreads?: Array<number | null>;
 }
 
 export interface CloseEvidence {
@@ -93,7 +93,7 @@ export async function closeAndConfirm(steps: CloseSteps): Promise<CloseWait> {
       steps.record({
         state: 'timeout',
         ms: err.ms,
-        ...(err.zTasks.length > 0 ? { zTasks: err.zTasks } : {}),
+        ...(err.zThreads.length > 0 ? { zThreads: err.zThreads } : {}),
       });
     }
     throw err;
