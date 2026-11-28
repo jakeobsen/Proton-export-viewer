@@ -159,11 +159,13 @@ interface Shell {
 async function openShell(
   ctx: AppContext,
   config: GateConfig,
-): Promise<{ appWin: AppWindow; shell: Shell }> {
+): Promise<{ appWin: AppWindow; shell: Shell; createdThrottled: boolean }> {
   // Hidden windows are throttled; the gate window alone is not, and draws
   // frames for the whole window while hidden.
   const appWin = createAppWindow(ctx, { framesWhileHidden: true });
   const contents = appWin.win.webContents;
+  // What the window was created with, before the call below changes it.
+  const createdThrottled = contents.getBackgroundThrottling();
   contents.setBackgroundThrottling(false);
   if (contents.isLoading()) await once(contents, 'did-finish-load');
   const js = <T>(code: string, ms = config.stepMs): Promise<T> => {
@@ -183,7 +185,7 @@ async function openShell(
   );
   const shellOrigin = await js<number>('window.__pevTest.gate.timeOrigin()');
   const offset = shellOrigin - performance.timeOrigin;
-  return { appWin, shell: { js, toMain: (shellAt) => shellAt + offset } };
+  return { appWin, shell: { js, toMain: (shellAt) => shellAt + offset }, createdThrottled };
 }
 
 /** Picks the export as the user does: main's folder picker answers with it. Returns when the pick reached main. */
@@ -634,10 +636,8 @@ export async function runGate(
       os: `${process.platform} ${release()}`,
       arch: process.arch,
     };
-    result.inputs = {
-      backgroundThrottling: false,
+    const inputs: Record<string, unknown> = {
       capBytes: config.capBytes,
-      framesWhileHidden: true,
       frameMs: config.frameMs,
       rafProbes: config.rafProbes,
       cadenceFrames: config.cadenceFrames,
@@ -647,6 +647,7 @@ export async function runGate(
       settleMs: config.settleMs,
       idleMs: config.idleMs,
     };
+    result.inputs = inputs;
     result.processUptimeMs = Math.round(process.uptime() * 1000);
     result.timeOriginEpoch = performance.timeOrigin;
     // Core starts with the export: it gets the cap, and keeps each phase 1 batch's time.
@@ -656,7 +657,11 @@ export async function runGate(
       recordBatches: true,
     };
 
-    const { appWin, shell } = await openShell(ctx, config);
+    const { appWin, shell, createdThrottled } = await openShell(ctx, config);
+    // What the gate window has, read back from it: throttling now, and
+    // whether it was created without it (so it draws frames while hidden).
+    inputs.backgroundThrottling = appWin.win.webContents.getBackgroundThrottling();
+    inputs.framesWhileHidden = !createdThrottled;
     // The display's nominal refresh rate, beside the cadence the window measures.
     result.display = {
       frequency: screen.getDisplayMatching(appWin.win.getBounds()).displayFrequency,

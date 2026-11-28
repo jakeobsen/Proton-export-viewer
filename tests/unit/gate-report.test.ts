@@ -468,6 +468,7 @@ describe('a launch', () => {
       ],
       [{ result: { ...clean.result, indexingDuringOpens: 1 } }, 'indexing during the opens'],
       [{ exit: { code: 0, signal: null, timedOut: true } }, 'did not exit cleanly'],
+      [{ exit: { code: 1, signal: null, timedOut: false } }, 'did not exit cleanly'],
       [{ exit: { code: null, signal: 'SIGKILL', timedOut: false } }, 'did not exit cleanly'],
       [{ lidClosedAfter: true }, 'lid was closed'],
       [{ lidClosedAfter: null }, 'state is unknown'],
@@ -693,6 +694,8 @@ function indexReport({
   }));
   return {
     probe: {
+      valid: true,
+      problems: [] as string[],
       raf: {
         prompt,
         samples: 100,
@@ -770,6 +773,31 @@ describe('the indexing rows', () => {
     expect(rows.find((r) => r.row === 'Cold: first rows visible')?.verdict).toBe('INVALID');
     expect(verdictOf(null, 10)).toBe('INVALID');
   });
+
+  it('take nothing from an invalid probe: neither its frame check nor its scrolls', () => {
+    const report = indexReport({ prompt: true });
+    const missed = scrollFrames(
+      {
+        name: 'list-phase1',
+        steps: 5,
+        stamps: stampsOf([16, 80, 16]),
+        stopped: false,
+        waitMs: 2100,
+      },
+      report.probe.cadence,
+      1e9,
+    );
+    const probe = { ...report.probe, scrolls: [missed] };
+    const during = (r: unknown) =>
+      indexRows(r).find((row) => row.name === 'All Mail list, during phase 1')?.verdict;
+    expect(during({ ...report, probe })).toBe('MISS (proxy)');
+    const invalid = { ...report, probe: { ...probe, valid: false, problems: ['no result'] } };
+    const rows = indexRows(invalid);
+    expect(rows.find((r) => r.row === 'Cold: first rows visible')?.verdict).toBe(
+      'PROXY: needs a decision',
+    );
+    expect(during(invalid)).toBe('proxy: no missed frames seen, not a pass on its own');
+  });
 });
 
 describe('the cards rows', () => {
@@ -810,6 +838,16 @@ describe('the cards rows', () => {
   it('are invalid when an expansion didn’t show its view', () => {
     const rows = cardsRows({ probe: { scrolls: [] }, opens: [launch(100), launch(100, 999)] });
     expect(rows.find((r) => r.row.startsWith('Open message p95'))?.verdict).toBe('INVALID');
+  });
+
+  it('are invalid when the launches didn’t expand the same sample', () => {
+    const opens = [launch(100), launch(100)];
+    const open = (sampleSame: boolean) =>
+      cardsRows({ probe: { scrolls: [] }, opens, sampleSame }).find((r) =>
+        r.row.startsWith('Open message p95'),
+      )?.verdict;
+    expect(open(true)).toBe('within');
+    expect(open(false)).toBe('INVALID');
   });
 });
 
@@ -854,6 +892,40 @@ describe('the report', () => {
     expect(md).toContain('without background throttling, set when it is created');
     expect(md).toContain('Frontmost app, sampled once a second: Terminal 9');
     expect(md).toContain('| probe | probe | true | - |');
+  });
+
+  it('says when the probe is invalid, and when frames came at another rate than the display’s', () => {
+    const report = {
+      ...indexReport({ prompt: true }),
+      gate: 'index',
+      inputs,
+      frontmost: {},
+      capHeld: true,
+      indexPeakMiB: 1,
+      launches: [],
+      stress: null,
+    };
+    const withRows = (r: Record<string, unknown>) => ({ ...r, rows: indexRows(r) });
+    const at120 = launchCadence(
+      [
+        { name: 'baseline', ...steady(16) },
+        { name: 'check', ...steady(16) },
+      ],
+      120,
+    );
+    const plain = markdown(withRows(report));
+    expect(plain).not.toContain('Frames came at');
+    expect(plain).not.toContain('**The probe launch is invalid**');
+    expect(markdown(withRows({ ...report, probe: { ...report.probe, cadence: at120 } }))).toContain(
+      "Frames came at 62.5 Hz, not the display's 120 Hz.",
+    );
+    const invalid = {
+      ...report,
+      probe: { ...report.probe, valid: false, problems: ['no result'] },
+    };
+    expect(markdown(withRows(invalid))).toContain(
+      "**The probe launch is invalid** (no result): its frame checks and scrolls don't count",
+    );
   });
 
   it('reads test counts and the conversation specs from a log', () => {

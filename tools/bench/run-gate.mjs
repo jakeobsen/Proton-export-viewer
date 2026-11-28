@@ -498,15 +498,21 @@ export function scrollRow(name, frames) {
   };
 }
 
+/** What the probe gives the rows: nothing when the probe launch is invalid. */
+const probeOf = (report) =>
+  report.probe?.valid === true
+    ? { raf: report.probe.raf ?? { prompt: false }, scrolls: report.probe.scrolls ?? [] }
+    : { raf: { prompt: false }, scrolls: [] };
+
 /** The probe's scrolls and these launches' scrolls with this name. */
 const scrollsNamed = (report, launches, name) =>
-  [...(report.probe?.scrolls ?? []), ...launches.flatMap((l) => l.scrolls ?? [])].filter(
+  [...probeOf(report).scrolls, ...launches.flatMap((l) => l.scrolls ?? [])].filter(
     (s) => s.name === name,
   );
 
 /** The indexing gate's rows from the launches' numbers. */
 export function indexRows(report) {
-  const frames = report.probe?.raf ?? { prompt: false };
+  const frames = probeOf(report).raf;
   const proxy = !frames.prompt;
   const fresh = report.fresh.filter((l) => l.valid);
   const freshOk = fresh.length === report.fresh.length && fresh.length > 0;
@@ -620,7 +626,9 @@ export function cardsRows(report) {
       kind: 'measured',
       start: "the shell's performance.now() just before the cards model's expand",
       end: "the new body frame's load event for that view",
-      verdict: verdictOf(p95, TARGETS.openP95Ms, { valid: ok && complete }),
+      verdict: verdictOf(p95, TARGETS.openP95Ms, {
+        valid: ok && complete && report.sampleSame !== false,
+      }),
       pacer: `Each expansion started at least ${OPEN_GAP_MS} ms after the shown message's body loaded, so main's open pacer (at least ${OPEN_GAP_MS} ms between a window's opens) never held it; a shorter gap makes the launch invalid. Smallest gap: ${cell(minGap(report.opens))} ms.`,
       sample: `Messages of at most ${report.sampleRule?.maxBytes ?? 'n/a'} B in conversations of two or more, never a conversation's newest: it opens expanded with its conversation, so it has no expansion to time. Picked with seed ${report.sampleRule?.seed ?? 'n/a'} from all such message files in name order.`,
     },
@@ -645,13 +653,27 @@ export function testLogSummary(text) {
 export function markdown(report) {
   const title = report.gate === 'index' ? 'Indexing gate' : 'Cards gate';
   const lines = [`# ${title}`, ''];
+  if (report.probe && report.probe.valid !== true) {
+    lines.push(
+      `**The probe launch is invalid** (${(report.probe.problems ?? []).join('; ') || 'no result'}): its frame checks and scrolls don't count, so rows that end on a frame end on the DOM change instead.`,
+      '',
+    );
+  }
   const cadence = report.probe?.cadence;
   if (cadence) {
+    const shown = cadence.baseline.hz;
+    const display = cadence.displayHz;
+    const differs =
+      typeof shown === 'number' &&
+      typeof display === 'number' &&
+      display > 0 &&
+      Math.abs(shown - display) > DISPLAY_SHARE * display;
     const c = (x) =>
       `a frame every ${cell(round(x.frameMs))} ms (${cell(x.hz)} Hz), p95 ${cell(x.p95)} ms, ${x.timeouts} timeouts`;
     lines.push(
       `**Frame cadence in the hidden window (probe):** before the pick ${c(cadence.baseline)}; after indexing ${c(cadence.check)}. ` +
         `The display reports ${cell(cadence.displayHz)} Hz. ` +
+        (differs ? `Frames came at ${shown} Hz, not the display's ${display} Hz. ` : '') +
         (cadence.trusted
           ? 'Trusted: frames came unthrottled.'
           : `**Not trusted:** ${cadence.reasons.join('; ')}.`),
@@ -742,7 +764,9 @@ export function markdown(report) {
       .join(', ')}.`,
   );
   if (report.sampleListSha256)
-    lines.push(`- Expansion sample list SHA-256 ${report.sampleListSha256}.`);
+    lines.push(
+      `- Expansion sample list SHA-256 ${report.sampleListSha256}; the same in every launch: ${report.sampleSame === false ? 'NO' : 'yes'}.`,
+    );
   lines.push('', '## Launches', '', '| Launch | Mode | Valid | Problems |', '|---|---|---|---|');
   for (const l of report.launches)
     lines.push(`| ${l.name} | ${l.mode} | ${l.valid} | ${l.problems.join('; ') || '-'} |`);
