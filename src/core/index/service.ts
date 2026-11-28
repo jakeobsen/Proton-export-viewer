@@ -636,6 +636,10 @@ export class IndexService {
       // Changes that need nothing read: at most 1,000 pairs per transaction.
       const reconciled = performance.now();
       for (const part of chunk(now, WRITE_BATCH_PAIRS)) {
+        // Test builds can hold these writes too, to change the index under a reader.
+        if (__PEV_TEST_HOOKS__ && this.deps.options?.beforeWrite) {
+          await Promise.race([this.deps.options.beforeWrite(), this.closing]);
+        }
         if (!this.current()) throw new ThreadError('STALE');
         const result = await writer.call<ApplyResult>('apply', { stamp, items: part });
         if (result.stale) throw new ThreadError('STALE');
