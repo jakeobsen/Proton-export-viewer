@@ -3,7 +3,7 @@
 // the stock Electron binary. Each launch gets its own userData under test-output/,
 // removed again when the test passes.
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   test as base,
@@ -13,7 +13,21 @@ import {
   type Frame,
   type Page,
 } from '@playwright/test';
-import { REPO_ROOT, removeTestDirs, takeTestDirs, testDir } from '../paths';
+import { REPO_ROOT, TEST_OUTPUT, removeTestDirs, takeTestDirs, testDir } from '../paths';
+import { startTimeOf, waitGone } from './process-wait';
+
+/** How long a close waits for core to exit after main has. */
+export const CORE_EXIT_MS = 10_000;
+
+/** Adds one close's wait for core to test-output/close-waits.jsonl: numbers and fixed words only. */
+function recordCloseWait(entry: { state: string; ms?: number }): void {
+  try {
+    mkdirSync(TEST_OUTPUT, { recursive: true });
+    appendFileSync(join(TEST_OUTPUT, 'close-waits.jsonl'), `${JSON.stringify(entry)}\n`);
+  } catch {
+    // The record is for reading afterwards; a test never depends on it.
+  }
+}
 
 export interface LogLine {
   ts: string;
@@ -25,6 +39,7 @@ export interface LogLine {
 
 export class PevApp {
   readonly consoleMessages: Array<{ type: string; text: string }> = [];
+  private closed = false;
 
   constructor(
     readonly app: ElectronApplication,
@@ -117,8 +132,29 @@ export class PevApp {
     );
   }
 
+  /**
+   * Closes the app, and returns once its core process has exited too: core
+   * can outlive main for a moment, with the index still open. A core still
+   * there after CORE_EXIT_MS is killed, and the close fails.
+   */
   async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    let pid: number | undefined | null;
+    try {
+      pid = await this.main<number | undefined>('corePid');
+    } catch {
+      // Main didn't answer: there is no pid to wait for.
+      pid = null;
+    }
+    const startTime = typeof pid === 'number' ? startTimeOf(pid) : null;
     await this.app.close().catch(() => undefined);
+    if (typeof pid !== 'number') {
+      recordCloseWait({ state: pid === null ? 'no_answer' : 'no_core' });
+      return;
+    }
+    const waited = await waitGone(pid, { timeoutMs: CORE_EXIT_MS, startTime });
+    recordCloseWait(waited);
   }
 }
 

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The index's lifecycle in the app: a damaged index is found by its check
 // after a reopen and rebuilt; while the export is gone it is deleted and
-// rebuilt once the export is located; Forget leaves no file of the index; and
-// Reset deletes the app's own data once the open export is torn down. The
+// rebuilt once the export is located; Forget leaves no file of the index;
+// Reset deletes the app's own data once the open export is torn down; and a
+// close returns only once core has exited and left the index free. The
 // exports are never changed, not even one put inside the app's data folder.
 
 import {
@@ -14,6 +15,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { openDb } from '../../src/core/index/sql';
 import type { SourceActionResult } from '../../src/shared/api';
 import type { IndexProgress, IndexTotals } from '../../src/shared/index-types';
 import type { SourcesView, Stamp } from '../../src/shared/sources';
@@ -21,7 +23,8 @@ import { digest } from '../../tools/gen-export/tree.mjs';
 import { writeExport } from '../exports';
 import { damageTablePage } from '../index-helpers';
 import { testDir } from '../paths';
-import { expect, launch, test, type PevApp } from './app';
+import { CORE_EXIT_MS, expect, launch, test, type PevApp } from './app';
+import { isGone, startTimeOf, waitGone } from './process-wait';
 
 type Answer<T> = { answer: T; progress: IndexProgress } | null;
 
@@ -334,4 +337,68 @@ test('after 3 restarts within a minute the export is closed, and Reopen opens it
   await phase1Done(pev, written.pairs);
   expect((await view(pev)).active).toMatchObject({ status: 'online', closed: false });
   await checkHidden(pev);
+});
+
+test('close returns only once core has exited, and the index is free', async () => {
+  const root = realpathSync(testDir('life-close-wait'));
+  const written = writeExport(root, { seed: 28, messages: 8 });
+  const pev = await launch('life-close-wait');
+  let pid: number | undefined;
+  let startTime: string | null = null;
+  let stopped = false;
+  try {
+    await pev.main('queuePick', root, 'bm1');
+    await pev.shell('chooseFolder', []);
+    await phase1Done(pev, written.pairs);
+    const stamp = await pev.main<Stamp>('sourceStamp');
+    const indexDir = await pev.main<string>('indexDir');
+    await checkHidden(pev);
+    pid = await pev.main<number>('corePid');
+    expect(pid).toBeGreaterThan(0);
+    startTime = startTimeOf(pid);
+    expect(startTime).not.toBeNull();
+
+    // A stopped process can't exit, so core outlives main for sure. It is
+    // let go only once main has exited, and a while after.
+    const mainExited = new Promise<void>((resolve) => pev.app.process().once('exit', () => resolve()));
+    process.kill(pid, 'SIGSTOP');
+    stopped = true;
+    let closedAt = 0;
+    const closing = pev.close().then(() => {
+      closedAt = Date.now();
+    });
+    await mainExited;
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(isGone(pid)).toBe(false);
+    const contAt = Date.now();
+    process.kill(pid, 'SIGCONT');
+    stopped = false;
+    await closing;
+
+    // close came back after core was let go, and core is gone.
+    expect(closedAt).toBeGreaterThanOrEqual(contAt);
+    expect(isGone(pid)).toBe(true);
+    // Nothing holds the index: it opens with no busy timeout, checkpoints and takes a write lock.
+    const db = openDb(join(indexDir, `${stamp.sourceKey}.sqlite`));
+    try {
+      db.stmt('PRAGMA wal_checkpoint(TRUNCATE)').get();
+      db.exec('BEGIN IMMEDIATE');
+      db.exec('ROLLBACK');
+    } finally {
+      db.close();
+    }
+  } finally {
+    // Whatever failed, no stopped core is left behind.
+    if (pid !== undefined && stopped) {
+      try {
+        process.kill(pid, 'SIGCONT');
+      } catch {
+        // Already gone.
+      }
+    }
+    await pev.close().catch(() => undefined);
+    if (pid !== undefined) {
+      await waitGone(pid, { timeoutMs: CORE_EXIT_MS, startTime }).catch(() => undefined);
+    }
+  }
 });
