@@ -22,7 +22,7 @@ import type {
 import { INBOX, sidebarModel, type SidebarModel } from './folders';
 import { CardsModel } from './cards';
 import { ListModel, type Row } from './list';
-import { closeReaderAndView, getReaderState, openInReader } from './reader';
+import { closeReaderAndView, getReaderState, openInReader, setReaderSearch } from './reader';
 import { SearchModel, type ResultRow } from './search';
 import { getShellState, refreshGeneration } from './shell';
 
@@ -152,6 +152,7 @@ let resultShowing: number | null = null;
 function leaveSearch(drop: () => void): void {
   const owned = resultShowing;
   resultShowing = null;
+  setReaderSearch(null);
   drop();
   if (owned !== null && cards.showing === owned) {
     cards.hide();
@@ -177,11 +178,13 @@ export function clearSearch(): void {
 /**
  * Selects a result and shows its conversation's cards, with its newest
  * matching message expanded in the reader. The list's selection goes: the
- * reader no longer shows it.
+ * reader no longer shows it. Opens in that conversation are made from the
+ * search, so the reader shows how each message matched it.
  */
 export function selectResult(row: ResultRow): void {
   search.select(row);
   list.clearSelection();
+  setReaderSearch(search.currentQueryId);
   const reader = getReaderState();
   const shown = cards.snapshot;
   if (
@@ -190,7 +193,8 @@ export function selectResult(row: ResultRow): void {
     reader.rowid === row.anchorRowid &&
     reader.refused === null
   ) {
-    // Shown already; with the list's selection gone, the result owns it.
+    // Shown already; with the list's selection gone, the result owns it. Its
+    // next open, by a card, a key or the body switch, is made from the search.
     resultShowing = cards.showing;
     return;
   }
@@ -262,6 +266,7 @@ export function syncMailbox(): void {
   update({ key, sidebar: null, progress: null, folder });
   list.reset(key === null ? null : folder);
   // A new export or generation: main revoked the reader's view, and nothing is selected.
+  setReaderSearch(null);
   cards.hide();
   if (key !== null) void readSidebar();
 }
@@ -293,6 +298,8 @@ export function showFolder(id: string): void {
  */
 export function selectRow(row: Row): void {
   list.select(row);
+  // A row of the folder's list: its opens aren't from a search.
+  setReaderSearch(null);
   const reader = getReaderState();
   const shown = cards.snapshot;
   if (

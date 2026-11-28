@@ -118,6 +118,11 @@ export class SearchModel {
     private readonly pauseMs: number = TYPING_PAUSE_MS,
   ) {}
 
+  /** The ID of the search whose results are shown; null with none. */
+  get currentQueryId(): number | null {
+    return this.queryId;
+  }
+
   get snapshot(): SearchSnapshot {
     return this.snap;
   }

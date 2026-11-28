@@ -6,6 +6,7 @@ import type {
   BodyLink,
   ReadRequest,
   ReaderFailure,
+  ReaderMatch,
   RenderedMessage,
   WorkerRender,
   WorkerRendered,
@@ -44,6 +45,10 @@ export interface CoreTestInit {
   holdWrites?: boolean;
   /** New metadata files are read in name order, and their batches written in that order. */
   readByName?: boolean;
+  /** Each indexing job's time limit, in ms. */
+  jobMs?: number;
+  /** This message's body job never ends, so it runs past its time limit. */
+  stallBodyOf?: string;
 }
 
 export interface StubAssetMessage {
@@ -240,6 +245,8 @@ export type CoreResult =
       scan?: ScanSummary;
       /** The rendered message of a `read`. */
       read?: RenderedMessage;
+      /** For a `read` from search: how the message matched. */
+      match?: ReaderMatch;
       index?: IndexOpened;
       answer?: IndexAnswer;
       progress?: IndexProgress;
@@ -265,6 +272,8 @@ export type CoreResult =
         | 'busy';
       /** Why the reader gave no body, for `reader_failed`. */
       reason?: ReaderFailure;
+      /** For a `read` from search that failed as `reader_failed` or `eml_missing`: how the message matched. */
+      match?: ReaderMatch;
       /** Test builds only: why a test action failed. */
       detail?: string;
       stamp?: Stamp;

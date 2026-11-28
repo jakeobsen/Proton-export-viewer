@@ -2,10 +2,12 @@
 // Reader state: the message in the reader pane and how it is shown. Every
 // open, a switch between plain text and HTML included, is a new open in main
 // with its own token. The old body frame goes as soon as an open starts.
+// While the conversation shown came from a search result, every open carries
+// that search's ID, so main can say how the message matched it.
 
 import { useSyncExternalStore } from 'react';
 import type { MessageOpenResult, RejectCode } from '../shared/api';
-import type { OpenMode } from '../shared/reader-protocol';
+import type { OpenMode, ReaderMatch } from '../shared/reader-protocol';
 import { clearLink, getShellState, refreshGeneration } from './shell';
 
 export type ReaderView = Extract<MessageOpenResult, { outcome: 'view' }>;
@@ -22,6 +24,10 @@ export interface ReaderState {
   fallback: boolean;
   /** Main refused the open. */
   refused: RejectCode | null;
+  /** The search the latest open was made from; null outside search. */
+  queryId: number | null;
+  /** How the message matched that search: on a view, the fallback or a missing file. */
+  match: ReaderMatch | null;
 }
 
 const CLOSED: ReaderState = {
@@ -31,11 +37,22 @@ const CLOSED: ReaderState = {
   view: null,
   fallback: false,
   refused: null,
+  queryId: null,
+  match: null,
 };
 
 let state: ReaderState = CLOSED;
 let latest = 0;
 let openGeneration: number | null = null;
+let searchQueryId: number | null = null;
+
+/**
+ * The search whose result showed the conversation in the reader, or null
+ * once the reader no longer shows a result's conversation. Later opens carry it.
+ */
+export function setReaderSearch(queryId: number | null): void {
+  searchQueryId = queryId;
+}
 const listeners = new Set<() => void>();
 
 function update(patch: Partial<ReaderState>): void {
@@ -64,8 +81,18 @@ export async function openInReader(
 ): Promise<MessageOpenResult> {
   latest += 1;
   const mine = latest;
+  const queryId = searchQueryId;
   clearLink();
-  update({ rowid, mode, pending: true, view: null, fallback: false, refused: null });
+  update({
+    rowid,
+    mode,
+    pending: true,
+    view: null,
+    fallback: false,
+    refused: null,
+    queryId,
+    match: null,
+  });
   const generation = getShellState().generation ?? (await refreshGeneration().catch(() => null));
   if (generation === null) {
     if (mine === latest) update({ pending: false, refused: 'stale_generation' });
@@ -74,7 +101,9 @@ export async function openInReader(
   openGeneration = generation;
   let result: MessageOpenResult;
   try {
-    result = await window.pev.open(rowid, mode, generation);
+    result = await (queryId === null
+      ? window.pev.open(rowid, mode, generation)
+      : window.pev.open(rowid, mode, generation, queryId));
   } catch {
     // The call itself failed: the pane ends refused, not pending.
     result = { ok: false, code: 'core_unavailable' };
@@ -82,12 +111,13 @@ export async function openInReader(
   // A newer open owns the pane now.
   if (mine !== latest) return result;
   if (!result.ok) {
-    update({ pending: false, refused: result.code });
+    const match = 'match' in result ? result.match : null;
+    update({ pending: false, refused: result.code, match });
     if (result.code === 'stale_generation') await refreshGeneration();
   } else if (result.outcome === 'fallback') {
-    update({ pending: false, fallback: true });
+    update({ pending: false, fallback: true, match: result.match });
   } else {
-    update({ pending: false, view: result });
+    update({ pending: false, view: result, match: result.match });
   }
   return result;
 }

@@ -14,7 +14,7 @@ import type {
   ThreadSnippet,
   WindowQuery,
 } from './index-types';
-import type { MessageHeaders, OpenMode } from './reader-protocol';
+import type { MessageHeaders, OpenMode, ReaderMatch } from './reader-protocol';
 import type { SourceOutcome, SourcesView } from './sources';
 
 export const IPC = {
@@ -87,8 +87,14 @@ export type MessageOpenResult =
       /** Why only part of the body is shown: its size, or its number of parts; null if whole. */
       cut: 'size' | 'parts' | null;
       headers: MessageHeaders;
+      /** The plain body is the indexed text with the search's matches marked. */
+      highlighted: boolean;
+      /** For an open from search: how the message matched; null otherwise. */
+      match: ReaderMatch | null;
     }
-  | { ok: true; openId: number; outcome: 'fallback' }
+  | { ok: true; openId: number; outcome: 'fallback'; match: ReaderMatch | null }
+  /** A missing message file opened from search says how the message matched. */
+  | { ok: false; code: 'eml_missing'; match: ReaderMatch | null }
   | Rejected;
 
 /** What the shell reads from the open export's index. */
@@ -161,7 +167,16 @@ export interface PevApi {
   state(): Promise<StateResult>;
   ping(generation: number): Promise<PingResult>;
   openStub(id: string, generation: number): Promise<OpenResult>;
-  open(rowid: number, mode: OpenMode, generation: number): Promise<MessageOpenResult>;
+  /**
+   * Opens a message; with `queryId`, as part of that search's results, so its
+   * matches are marked or listed. Only the ID goes to main, never the text.
+   */
+  open(
+    rowid: number,
+    mode: OpenMode,
+    generation: number,
+    queryId?: number,
+  ): Promise<MessageOpenResult>;
   /** Closes the reader: its view and any open still under way are revoked. */
   closeView(generation: number): Promise<CloseViewResult>;
   log(

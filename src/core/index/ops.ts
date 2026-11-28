@@ -34,7 +34,7 @@ import {
   sidebar,
   threadOfMessage,
 } from './queries';
-import { searchPage, searchSnippets } from './search';
+import { matchInfo, searchPage, searchSnippets } from './search';
 import {
   META,
   createSchema,
@@ -441,8 +441,12 @@ export class QueryState {
         return listWindow(db, call);
       case 'cards':
         return cardsWindow(db, call);
-      case 'eml':
-        return emlFile(db, call.rowid);
+      case 'eml': {
+        // With a search, the match comes from the same snapshot as the file.
+        const file = emlFile(db, call.rowid);
+        if (file && call.search !== undefined) file.match = matchInfo(db, call.rowid, call.search);
+        return file;
+      }
       case 'search':
         return searchPage(db, call);
       case 'snippets':
@@ -697,13 +701,21 @@ export function threadHandler(role: ThreadRole): (op: string, args: unknown) => 
     };
   }
   return (op, args) => {
-    const a = args as { root: string; items?: MetaJobItem[]; ref?: FileRef; item?: BodyJobItem };
+    const a = args as {
+      root: string;
+      items?: MetaJobItem[];
+      ref?: FileRef;
+      item?: BodyJobItem;
+      stall?: boolean;
+    };
     switch (op) {
       case 'meta':
         return parseMetaJob(a.root, a.items ?? []);
       case 'labels':
         return parseLabelsJob(a.root, a.ref as FileRef);
       case 'body':
+        // Test builds: a body job that never ends, to run past its limit.
+        if (__PEV_TEST_HOOKS__ && a.stall) return new Promise<never>(() => undefined);
         return bodyJob(a.root, a.item as BodyJobItem);
     }
     throw new Error('UNKNOWN_OP');

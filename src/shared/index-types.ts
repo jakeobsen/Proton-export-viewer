@@ -3,6 +3,8 @@
 // conversation list pages and the details of the rows on screen, plus where
 // indexing stands. Shared by core, main and the shell.
 
+import type { ReaderMatch, StoredBody } from './reader-protocol';
+
 export type FolderKind = 'system' | 'folder' | 'label';
 
 export interface FolderRow {
@@ -301,7 +303,7 @@ export type IndexQuery =
   | { op: 'details'; threadIds: number[] }
   | { op: 'resolve'; rowid: number }
   | { op: 'totals' }
-  | { op: 'eml'; rowid: number }
+  | { op: 'eml'; rowid: number; search?: string }
   | WindowQuery
   | SearchQuery
   | SnippetsQuery
@@ -332,6 +334,15 @@ export interface EmlFile {
   dev: string;
   ino: string;
   bodyState: number;
+  /** With a search: how the message matched it, or null if it didn't match or has nothing to mark. */
+  match?: IndexMatch | null;
+}
+
+/** How a message matched a search, with its stored body and ranges when the body matched. Core only. */
+export interface IndexMatch extends ReaderMatch {
+  body: StoredBody | null;
+  /** Columns whose marks failed the range check and were dropped. */
+  dropped: number;
 }
 
 /**

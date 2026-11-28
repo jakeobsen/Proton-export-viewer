@@ -35,6 +35,7 @@
 import { mkdirSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import type {
+  EmlFile,
   IndexAnswer,
   IndexCondition,
   IndexOpened,
@@ -159,6 +160,8 @@ export interface IndexOptions {
    * writes, at most; TXN_INPUT_BYTES otherwise.
    */
   txnBytes?: number;
+  /** Builds with test hooks only: this message's body job never ends, so it runs past its limit. */
+  stallBodyOf?: string;
 }
 
 export interface IndexServiceDeps {
@@ -519,9 +522,12 @@ export class IndexService {
     try {
       await this.openQuery();
       const answer = await this.query!.call<IndexAnswer>('query', { call });
-      if (call.op === 'search' || call.op === 'snippets') {
-        // A snippet whose match ranges failed the check is given as plain text.
-        const dropped = (answer as SearchPage | SearchSnippets | null)?.dropped ?? 0;
+      if (call.op === 'search' || call.op === 'snippets' || call.op === 'eml') {
+        // Snippets and match columns whose ranges failed the check are given without marks.
+        const dropped =
+          call.op === 'eml'
+            ? ((answer as EmlFile | null)?.match?.dropped ?? 0)
+            : ((answer as SearchPage | SearchSnippets | null)?.dropped ?? 0);
         if (dropped > 0) this.deps.log.warn('search.ranges_dropped', { count: dropped }, this.src);
       }
       return answer;
@@ -862,7 +868,12 @@ export class IndexService {
     let result: BodyJobResult;
     try {
       const item: BodyJobItem = { protonId: todo.protonId, rev: todo.rev, ref };
-      result = await pool.run<BodyJobResult>('body', { root: this.deps.root, item }, this.jobMs);
+      const stall = __PEV_TEST_HOOKS__ && this.deps.options?.stallBodyOf === todo.protonId;
+      result = await pool.run<BodyJobResult>(
+        'body',
+        { root: this.deps.root, item, ...(stall ? { stall: true } : {}) },
+        this.jobMs,
+      );
     } catch (err) {
       const code = err instanceof ThreadError ? err.code : 'FAILED';
       // The pool ended: indexing stops here.
