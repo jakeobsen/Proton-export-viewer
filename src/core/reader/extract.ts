@@ -113,7 +113,51 @@ interface ActivePart {
   chunks: Buffer[];
 }
 
-type SplitChunk = MimeNode | { type: 'data' | 'body' | 'none'; value?: Buffer };
+export type SplitChunk = MimeNode | { type: 'data' | 'body' | 'none'; value?: Buffer };
+
+/**
+ * Runs `consume` over the chunks `splitter` makes of `input`. Resolves true
+ * when the splitter stopped at one of its limits (more than MAX_MIME_PARTS
+ * parts, or a header block over MAX_HEAD_BYTES): `consume` saw what came
+ * before, and its own end-of-message steps did not run. Resolves false at
+ * the message's end. Any other error rejects.
+ */
+export async function splitWithinLimits(
+  input: Readable,
+  splitter: Splitter,
+  consume: (source: AsyncIterable<SplitChunk>) => Promise<void>,
+): Promise<boolean> {
+  // Only the splitter's own limit error ends the read early. The input's
+  // errors and the reader's own reach the splitter too, as the pipeline
+  // passes them on, so each is told apart by where it was raised first.
+  const raisedElsewhere = new WeakSet<object>();
+  const noteElsewhere = (err: unknown) => {
+    if (typeof err === 'object' && err !== null) raisedElsewhere.add(err);
+  };
+  input.on('error', noteElsewhere);
+  let splitterLimit: unknown = null;
+  // The splitter's types name only its data events; it is a Transform stream.
+  (splitter as Transform).on('error', (err: unknown) => {
+    const code = (err as { code?: unknown } | null)?.code;
+    if (splitterLimit === null && code === 'EMAXLEN' && !raisedElsewhere.has(err as object)) {
+      splitterLimit = err;
+    }
+  });
+  try {
+    await pipeline(input, splitter, async (source: AsyncIterable<SplitChunk>) => {
+      try {
+        await consume(source);
+      } catch (err) {
+        noteElsewhere(err);
+        throw err;
+      }
+    });
+    return false;
+  } catch (err) {
+    if (splitterLimit === null || err !== splitterLimit) throw err;
+    return true;
+  }
+}
 
 /** Which body a leaf part belongs to, or null if it is not a body part (mailparser's rules). */
 export function bodyKind(node: MimeNode): Kind | null {
@@ -248,23 +292,6 @@ export async function extractMessage(
     listed.push({ part: c.part, size: c.size, head: Buffer.concat(c.head) });
   };
 
-  // Only the splitter's own limit error ends the read early. The input's
-  // errors and the reader's own reach the splitter too, as the pipeline
-  // passes them on, so each is told apart by where it was raised first.
-  const raisedElsewhere = new WeakSet<object>();
-  const noteElsewhere = (err: unknown) => {
-    if (typeof err === 'object' && err !== null) raisedElsewhere.add(err);
-  };
-  input.on('error', noteElsewhere);
-  let splitterLimit: unknown = null;
-  // The splitter's types name only its data events; it is a Transform stream.
-  (splitter as Transform).on('error', (err: unknown) => {
-    const code = (err as { code?: unknown } | null)?.code;
-    if (splitterLimit === null && code === 'EMAXLEN' && !raisedElsewhere.has(err as object)) {
-      splitterLimit = err;
-    }
-  });
-
   async function consume(source: AsyncIterable<SplitChunk>): Promise<void> {
     for await (const chunk of source) {
       if (chunk.type === 'node') {
@@ -300,20 +327,8 @@ export async function extractMessage(
     await finishCount();
   }
 
-  const read = pipeline(input, splitter, async (source: AsyncIterable<SplitChunk>) => {
-    try {
-      await consume(source);
-    } catch (err) {
-      noteElsewhere(err);
-      throw err;
-    }
-  });
-  let stopped = false;
-  try {
-    await read;
-  } catch (err) {
-    if (splitterLimit === null || err !== splitterLimit) throw err;
-    stopped = true;
+  const stopped = await splitWithinLimits(input, splitter, consume);
+  if (stopped) {
     // The limit is met in a part's header block, after the parts before it
     // ended: they are kept, and listed.
     await finish();

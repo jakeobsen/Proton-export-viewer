@@ -29,6 +29,7 @@ import { WorkerThread, type ThreadRole } from './index/pool';
 import type { IndexOptions } from './index/service';
 import { READER_RETIRE_MB, ReaderLane } from './reader/lane';
 import { OpenTracker } from './reader/opens';
+import { readSource } from './reader/source-read';
 import type { LocatedFile, ReaderSource } from './reader/source';
 import { SourceSession, type ReaderFile } from './source';
 
@@ -58,10 +59,11 @@ const lane = new ReaderLane<WorkerRequest, WorkerMessage>({
     log?.warn(breach === 'timeout' ? 'reader.timeout' : 'reader.limit', { ms }),
   // A large message can leave the worker holding hundreds of MB: a new worker gives it back.
   retire: (message) =>
-    message.type === 'rendered' && message.heldBytes > READER_RETIRE_MB * 1024 * 1024,
+    (message.type === 'rendered' || message.type === 'sourced') &&
+    message.heldBytes > READER_RETIRE_MB * 1024 * 1024,
   onRetire: (message) =>
     log?.info('reader.worker_retired', {
-      bytes: message.type === 'rendered' ? message.heldBytes : 0,
+      bytes: message.type === 'rendered' || message.type === 'sourced' ? message.heldBytes : 0,
     }),
   onOther: (message) => {
     if (message.type === 'log') workerLog?.log(message.level, message.code, message.data);
@@ -142,7 +144,7 @@ const opens = new OpenTracker();
 
 /** The message to read: from the test source if a test set one, else from the open export. */
 async function openForRead(
-  request: ReadRequest,
+  request: Pick<ReadRequest, 'rowid' | 'generation' | 'search'>,
   stale: () => boolean,
 ): Promise<ReaderFile | { ok: false; code: 'no_source' }> {
   if (__PEV_TEST_HOOKS__ && readerSource) {
@@ -331,6 +333,13 @@ function handle(request: CoreRequest): void {
       return;
     case 'locate':
       void locate(request);
+      return;
+    case 'source':
+      void readSource(request, {
+        open: (r) => openForRead(r, () => false),
+        job: (message, slot) => lane.job(message, slot),
+        reply,
+      });
       return;
     case 'identify':
     case 'scan':

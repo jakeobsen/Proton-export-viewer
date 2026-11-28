@@ -192,6 +192,82 @@ export interface ReadRequest {
   search?: { text: string };
 }
 
+/** The most of one header block the source view shows. */
+export const SOURCE_HEADER_BYTES = 256 * 1024;
+
+/** What the source view reads from a message. */
+export type SourceWhat =
+  { kind: 'headers' } | { kind: 'structure' } | { kind: 'part'; path: string };
+
+/** A dotted part path: `1`, `1.2`, `1.2.10`… */
+export const PART_PATH_RE = /^1(?:\.[1-9]\d{0,6}){0,64}$/;
+
+/** One part of a message, as the source view's tree shows it. */
+export interface SourcePart {
+  /** Dotted path: `1` is the message, `1.2` its second child. */
+  path: string;
+  /** The parent's index in the list, or -1 for the message. */
+  parent: number;
+  /** The Content-Type's type and subtype as the splitter read it, lower case; '' if none. */
+  contentType: string;
+  /** The Content-Type's charset parameter, or null. */
+  charset: string | null;
+  /** The cleaned file name, or '' when the part names none. */
+  name: string;
+  /** Content-Disposition: inline. */
+  inline: boolean;
+  /** Decoded bytes: a leaf's from its transfer decoder, a container's the sum of its parts'. */
+  size: number;
+  /** The read stopped before the part's end: `size` is only what was read. */
+  cut: boolean;
+}
+
+/** A raw header block, at most the source view's cap. */
+export interface SourceHeaders {
+  bytes: Uint8Array;
+  /** More of the block was there than `bytes` holds. */
+  truncated: boolean;
+}
+
+/**
+ * main -> core: read for the source view of a window's message. `file` is
+ * the identity of the file the view was read from; null when the open failed
+ * and there is no view, as for the reader's fallback.
+ */
+export interface SourceRequest {
+  type: 'source';
+  reqId: number;
+  openId: number;
+  generation: number;
+  rowid: number;
+  file: FileIdentity | null;
+  what: SourceWhat;
+  /** The window it is for. */
+  lane: number;
+  /** For a part: newer selections of the window drop this one while it waits. */
+  order?: number;
+}
+
+/** core -> reader worker: read for the source view. */
+export interface WorkerSource {
+  type: 'source';
+  reqId: number;
+  input: ReaderInput;
+  what: SourceWhat;
+}
+
+/** reader worker -> core. `headers` is null for a part the message doesn't have. */
+export type WorkerSourced =
+  | {
+      type: 'sourced';
+      reqId: number;
+      heldBytes: number;
+      ok: true;
+      headers?: SourceHeaders | null;
+      parts?: SourcePart[];
+    }
+  | { type: 'sourced'; reqId: number; heldBytes: number; ok: false };
+
 /** core -> reader worker: render one message. */
 export interface WorkerRender {
   type: 'render';
