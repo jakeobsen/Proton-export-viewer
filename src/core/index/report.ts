@@ -102,6 +102,7 @@ export function indexReport(db: Db, systemIds: readonly string[], limit = REPORT
     failed: {},
     timeouts: 0,
     capped: {},
+    cappedMessages: 0,
     hiddenLabelIds: side.hiddenIds,
     fullText: { indexed: 0, total: 0, truncated: 0, skipped: 0, skippedBy: {} },
     attention: 0,
@@ -147,6 +148,7 @@ export function indexReport(db: Db, systemIds: readonly string[], limit = REPORT
       if (n > 0) report.capped[list] = n;
     }
   }
+  report.cappedMessages = cappedMessages;
   rowCount += cappedMessages;
 
   // The text of listed messages: indexed and total as search counts them;

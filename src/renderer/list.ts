@@ -18,7 +18,7 @@ import {
 } from '../shared/index-types';
 
 /** Every row has this height, in pixels, so a position maps to an offset. */
-export const ROW_HEIGHT = 82;
+export const ROW_HEIGHT = 102;
 /** Rows read above the anchor, for scrolling up. */
 export const READ_ABOVE = 50;
 /** Rows beyond the screen that must be held before more are read. */
@@ -91,6 +91,16 @@ export class ListModel {
   rowAt(index: number): Row | null {
     const i = index - this.snap.start;
     return i >= 0 && i < this.snap.rows.length ? this.snap.rows[i]! : null;
+  }
+
+  /** The message each row on screen shows the date of, top first. */
+  visibleRowids(): number[] {
+    const rowids: number[] = [];
+    for (let i = this.first; i <= this.last; i += 1) {
+      const row = this.rowAt(i);
+      if (row) rowids.push(row.anchorRowid);
+    }
+    return rowids;
   }
 
   /** Shows a folder from its top, with nothing selected. */

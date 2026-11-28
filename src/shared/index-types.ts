@@ -4,6 +4,7 @@
 // indexing stands. Shared by core, main and the shell.
 
 import type { CAPPED_LIST_NAMES } from './log/codes';
+import type { ReaderMatch, StoredBody } from './reader-protocol';
 import type { RejectKind } from './sources';
 
 export type FolderKind = 'system' | 'folder' | 'label';
@@ -240,6 +241,8 @@ export interface CardRow {
   spam: boolean;
   /** The message is in Trash (label ID 3). */
   trash: boolean;
+  /** With a search: the message matches it. */
+  matched?: boolean;
 }
 
 /** Where a card stands in its conversation, oldest first: by date, then by rowid. */
@@ -265,6 +268,16 @@ export const CARDS_AFTER = 200;
 /** The most messages a cards query may name to follow. */
 export const CARDS_FOLLOW = 4;
 
+/** The search a conversation was opened from, for its cards. */
+export interface CardsSearch {
+  /** One of the window's searches, by its query ID. */
+  queryId: number;
+  /** The revision of the matching count the header shows; null while it shows none. */
+  countRev: number | null;
+  /** The search's text: main puts it in from the search the query ID names, never the shell. */
+  text?: string;
+}
+
 export interface CardsQuery {
   op: 'cards';
   /**
@@ -277,6 +290,8 @@ export interface CardsQuery {
   anchor: CardsAnchor;
   before: number;
   after: number;
+  /** The search the conversation was opened from: which cards match, and how many messages do. */
+  search?: CardsSearch;
 }
 
 /** A stretch of one conversation's cards, oldest first, read from one snapshot. */
@@ -289,6 +304,8 @@ export interface CardsWindow {
   subject: string;
   /** Messages in the conversation, from every folder. */
   total: number;
+  /** Its folder and label IDs: the same as its list row's. */
+  labelIds: string[];
   /** The position of the first card. */
   start: number;
   cards: CardRow[];
@@ -296,6 +313,51 @@ export interface CardsWindow {
   anchor: number | null;
   /** The anchor card is message `anchor.rowid` itself. */
   anchorFound: boolean;
+  /**
+   * The revision of the snapshot the window was read from. It rises with
+   * every change the index's readers can see, and never goes back while the
+   * export stays open in this generation.
+   */
+  rev: number;
+  /** The query's search applied: each card says whether it matches. */
+  searched: boolean;
+  /**
+   * With a search whose count was behind this snapshot: the conversation's
+   * messages that match, counted in the same snapshot as the window.
+   */
+  matching?: number;
+}
+
+/** The most messages one lead-lines request covers. */
+export const MAX_LEAD_ROWIDS = 50;
+/** The longest lead line, in UTF-16 units. */
+export const LEAD_UNITS = 200;
+
+/** The lead lines of messages on screen, by rowid. */
+export interface LeadsQuery {
+  op: 'leads';
+  rowids: number[];
+  /**
+   * The text of the search the messages were opened from, put in by main: a
+   * message that matches it gets the search's snippet in place of its lead.
+   */
+  text?: string;
+}
+
+/** A message's lead line: the first words of its stored body, cleaned for one line. */
+export interface Lead {
+  rowid: number;
+  /** Null when the body isn't indexed, the message is gone, or nothing is left once cleaned. */
+  text: string | null;
+  /** With a search with words: the snippet of a message that matches it. */
+  snippet: MarkedSnippet | null;
+}
+
+export interface LeadsAnswer {
+  /** One per message asked for, in the order asked. */
+  leads: Lead[];
+  /** Snippets whose match ranges failed the check and were given without them. */
+  dropped: number;
 }
 
 export type IndexQuery =
@@ -304,12 +366,13 @@ export type IndexQuery =
   | { op: 'details'; threadIds: number[] }
   | { op: 'resolve'; rowid: number }
   | { op: 'totals' }
-  | { op: 'eml'; rowid: number }
+  | { op: 'eml'; rowid: number; search?: string }
   | { op: 'report' }
   | WindowQuery
   | SearchQuery
   | SnippetsQuery
-  | CardsQuery;
+  | CardsQuery
+  | LeadsQuery;
 
 export type IndexAnswer =
   | Sidebar
@@ -323,6 +386,7 @@ export type IndexAnswer =
   | EmlFile
   | SearchPage
   | SearchSnippets
+  | LeadsAnswer
   | IndexReport;
 
 /**
@@ -337,6 +401,15 @@ export interface EmlFile {
   dev: string;
   ino: string;
   bodyState: number;
+  /** With a search: how the message matched it, or null if it didn't match or has nothing to mark. */
+  match?: IndexMatch | null;
+}
+
+/** How a message matched a search, with its stored body and ranges when the body matched. Core only. */
+export interface IndexMatch extends ReaderMatch {
+  body: StoredBody | null;
+  /** Columns whose marks failed the range check and were dropped. */
+  dropped: number;
 }
 
 /** A list of a message whose entries were cut to a limit when it was indexed. */
@@ -425,6 +498,8 @@ export interface IndexReport {
   timeouts: number;
   /** Messages with a list cut to its limit, by list. */
   capped: Partial<Record<CappedListName, number>>;
+  /** Messages with at least one list cut to its limit, each counted once. */
+  cappedMessages: number;
   /** Label IDs on messages that labels.json doesn't name; they aren't shown. */
   hiddenLabelIds: number;
   fullText: FullTextReport;
@@ -450,10 +525,12 @@ export type IndexCondition = 'ok' | 'verifying' | 'rebuilding' | 'damaged';
 /**
  * Where indexing stands. During phase 1, list pages hold the rows loaded so
  * far; during phase 2, searches find the text of the messages read so far.
+ * 'scanning': the run's folder is being read, before its index is open;
+ * `loaded` counts the entries looked at and `total` the entries listed.
  * 'unavailable': the export can't be read, and the index shows what it holds.
  */
 export interface IndexProgress {
-  phase: 'opening' | 'loading' | 'done' | 'failed' | 'unavailable';
+  phase: 'scanning' | 'opening' | 'loading' | 'done' | 'failed' | 'unavailable';
   /** Metadata files handled so far (indexed or failed). */
   loaded: number;
   /** Metadata files the scan found. */

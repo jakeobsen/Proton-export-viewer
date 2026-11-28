@@ -7,6 +7,7 @@ import type {
   CardsWindow,
   IndexProgress,
   IndexReport,
+  Lead,
   ListWindow,
   SearchDateKey,
   SearchPage,
@@ -16,7 +17,8 @@ import type {
   WindowQuery,
 } from './index-types';
 import type { RasterFormat } from './attachment-types';
-import type { MessageDetails, MessageHeaders, OpenMode } from './reader-protocol';
+import type { MessageDetails, MessageHeaders, OpenMode, ReaderMatch } from './reader-protocol';
+import type { AppSettings, SettingKey } from './settings';
 import type { SourceOutcome, SourcesView } from './sources';
 
 export const IPC = {
@@ -41,9 +43,24 @@ export const IPC = {
   indexChanged: 'pev:index-changed',
   search: 'pev:search',
   searchSnippets: 'pev:search-snippets',
+  leads: 'pev:leads',
   showInFolder: 'pev:show-in-folder',
   copyMessageId: 'pev:copy-message-id',
   copyReport: 'pev:copy-report',
+  settings: 'pev:settings',
+  setSetting: 'pev:set-setting',
+  settingsChanged: 'pev:settings-changed',
+  showSettings: 'pev:show-settings',
+  appReset: 'pev:app-reset',
+  rebuildIndex: 'pev:rebuild-index',
+  resetApp: 'pev:reset-app',
+  openLogs: 'pev:open-logs',
+  copyDiagnostics: 'pev:copy-diagnostics',
+  viewSource: 'pev:source',
+  sourceTree: 'pev:source-tree',
+  sourcePart: 'pev:source-part',
+  copyHeaders: 'pev:copy-headers',
+  sourceBack: 'pev:source-back',
 } as const;
 
 export type RejectCode =
@@ -62,7 +79,10 @@ export type RejectCode =
   | 'eml_missing'
   | 'offline'
   | 'changed'
-  | 'unknown_dialog';
+  | 'unknown_dialog'
+  | 'refused'
+  | 'not_deleted'
+  | 'failed';
 
 export type Rejected = { ok: false; code: RejectCode };
 
@@ -88,6 +108,32 @@ export interface AttachmentItem {
 /** The outcome of an action on the open message, such as Show in folder. */
 export type ReaderActionResult = { ok: true } | Rejected;
 
+/** One part of the open message in the source view's tree. Main has checked every field. */
+export interface SourceNode {
+  /** Dotted path: `1` is the message. A part is named to main only by it. */
+  path: string;
+  /** The parent's index in the list, or -1 for the message. */
+  parent: number;
+  /** A lower-case `type/subtype`, or "unknown type". */
+  type: string;
+  charset: string | null;
+  /** The cleaned file name, or ''. */
+  name: string;
+  inline: boolean;
+  /** Decoded bytes; a container's is the sum of its parts'. */
+  size: number;
+  /** The read stopped inside this part: `size` is only what was read. */
+  cut: boolean;
+  risky: boolean;
+}
+
+/** A header block shown in the body frame: the URL to load there. */
+export type SourceResult = { ok: true; url: string; truncated: boolean } | Rejected;
+/** The tree, or null when the message's structure couldn't be read within the limits. */
+export type SourceTreeResult = { ok: true; parts: SourceNode[] | null } | Rejected;
+/** Back to the message: its body URL, or null for a message the reader couldn't render. */
+export type SourceBackResult = { ok: true; url: string | null } | Rejected;
+
 /**
  * The outcome of opening a message: its body view, or the fallback when the
  * reader couldn't render it.
@@ -110,8 +156,21 @@ export type MessageOpenResult =
       /** The attachments, by their index in this view's list; never their place in the message. */
       attachments: AttachmentItem[];
       details: MessageDetails;
+      /** The plain body is the indexed text with the search's matches marked. */
+      highlighted: boolean;
+      /** For an open from search: how the message matched; null otherwise. */
+      match: ReaderMatch | null;
     }
-  | { ok: true; openId: number; outcome: 'fallback' }
+  | {
+      ok: true;
+      openId: number;
+      outcome: 'fallback';
+      match: ReaderMatch | null;
+      /** The message file itself couldn't be opened, so no other view of it opens either. */
+      fileRefused: boolean;
+    }
+  /** A missing message file opened from search says how the message matched. */
+  | { ok: false; code: 'eml_missing'; match: ReaderMatch | null }
   | Rejected;
 
 /** What the shell reads from the open export's index. */
@@ -169,7 +228,46 @@ export interface SnippetsRequest {
 export type SnippetsResult =
   { ok: true; generation: number; queryId: number; snippets: ThreadSnippet[] } | Rejected;
 
+/**
+ * Lead lines for messages on screen, asked for by the list or by the cards.
+ * The cards of a conversation opened from a result name that search by its
+ * query ID, so the messages that match it get its snippet.
+ */
+export interface LeadsRequest {
+  requester: 'list' | 'cards';
+  rowids: number[];
+  queryId?: number;
+}
+
+export type LeadsResult = { ok: true; generation: number; leads: Lead[] } | Rejected;
+
 export type CloseViewResult = { ok: true } | Rejected;
+/** The open export's index, as Settings shows it. Paths have home as `~`. */
+export interface SettingsIndex {
+  sourceKey: string;
+  account: string | null;
+  runName: string;
+  /** The index database's full path. */
+  location: string;
+  /** The database and its sidecars. */
+  bytes: number;
+  /** When the index last changed, in ms since the epoch. */
+  updatedAt: number | null;
+}
+
+/** What Settings shows. */
+export interface SettingsView {
+  settings: AppSettings;
+  /** Null when no export is open. */
+  index: SettingsIndex | null;
+  /** The logs folder. */
+  logsLocation: string;
+}
+
+export type SettingsResult = { ok: true; generation: number; view: SettingsView } | Rejected;
+export type SetSettingResult = { ok: true; settings: AppSettings } | Rejected;
+/** An action that leaves no outcome but the generation it left. */
+export type DoneResult = { ok: true; generation: number } | Rejected;
 
 export type ErrorKind = 'uncaught' | 'rejection' | 'error';
 
@@ -184,13 +282,35 @@ export interface PevApi {
   state(): Promise<StateResult>;
   ping(generation: number): Promise<PingResult>;
   openStub(id: string, generation: number): Promise<OpenResult>;
-  open(rowid: number, mode: OpenMode, generation: number): Promise<MessageOpenResult>;
+  /**
+   * Opens a message; with `queryId`, as part of that search's results, so its
+   * matches are marked or listed. Only the ID goes to main, never the text.
+   */
+  open(
+    rowid: number,
+    mode: OpenMode,
+    generation: number,
+    queryId?: number,
+  ): Promise<MessageOpenResult>;
   /** Closes the reader: its view and any open still under way are revoked. */
   closeView(generation: number): Promise<CloseViewResult>;
   /** Shows the open message's file in Finder. */
   showInFolder(openId: number, generation: number): Promise<ReaderActionResult>;
   /** Copies the open message's Message-ID. */
   copyMessageId(openId: number, generation: number): Promise<ReaderActionResult>;
+  /**
+   * Shows the source of the open `openId`, or of its fallback: the message's
+   * raw headers in the body frame.
+   */
+  viewSource(openId: number, generation: number): Promise<SourceResult>;
+  /** The message's parts for the source view's tree. */
+  sourceTree(openId: number, generation: number): Promise<SourceTreeResult>;
+  /** Shows the raw headers of one part, by its path from the tree; null for the message's. */
+  sourcePart(openId: number, path: string | null, generation: number): Promise<SourceResult>;
+  /** Copies the header block the source view shows. */
+  copyHeaders(openId: number, generation: number): Promise<ReaderActionResult>;
+  /** Leaves the source view. */
+  sourceBack(openId: number, generation: number): Promise<SourceBackResult>;
   log(
     level: 'error' | 'warn' | 'info',
     code: string,
@@ -236,4 +356,35 @@ export interface PevApi {
    * made; one of an older search is answered as 'superseded'.
    */
   searchSnippets(request: SnippetsRequest, generation: number): Promise<SnippetsResult>;
+  /**
+   * Lead lines for messages on screen. A request waits while this window's
+   * previous one runs, and a newer one from the same requester answers it as
+   * 'superseded'.
+   */
+  leads(request: LeadsRequest, generation: number): Promise<LeadsResult>;
+  /** What Settings shows, for the current generation. */
+  settings(generation: number): Promise<SettingsResult>;
+  /** Changes one setting; main checks the value. */
+  setSetting<K extends SettingKey>(
+    key: K,
+    value: AppSettings[K],
+    generation: number,
+  ): Promise<SetSettingResult>;
+  /** Called with the new settings when one changes, from any window. */
+  onSettingsChanged(listener: (settings: AppSettings) => void): () => void;
+  /** Called when the app menu's "Settings…" is chosen in this window. */
+  onShowSettings(listener: () => void): () => void;
+  /** Called when the app's data was deleted by a reset, in every window. */
+  onAppReset(listener: () => void): () => void;
+  /**
+   * Deletes the open export's index and builds it again. The key and
+   * generation are the ones Settings showed; a stale one changes nothing.
+   */
+  rebuildIndex(sourceKey: string, generation: number): Promise<SourceActionResult>;
+  /** Deletes all the app's data; the export files stay as they are. */
+  resetApp(generation: number): Promise<DoneResult>;
+  /** Shows the logs folder in the file manager. */
+  openLogs(generation: number): Promise<DoneResult>;
+  /** Copies the diagnostics summary; main builds it, and the shell never sees it. */
+  copyDiagnostics(generation: number): Promise<DoneResult>;
 }

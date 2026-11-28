@@ -13,7 +13,7 @@
 // later, such as the outcome of a check, are looked at again under the lock
 // and dropped if their index is no longer the current one.
 
-import { closeSync } from 'node:fs';
+import { closeSync, fstatSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import type {
@@ -27,7 +27,8 @@ import type {
   ResetRequest,
   ScanRequest,
 } from '../shared/core-protocol';
-import type { EmlFile, IndexOpened, IndexReport } from '../shared/index-types';
+import type { EmlFile, IndexMatch, IndexOpened, IndexReport } from '../shared/index-types';
+import { errorClassOf } from '../shared/log/schema';
 import type { FileIdentity } from '../shared/reader-protocol';
 import type { Logger } from '../shared/log/writer';
 import type { ScanSummary } from '../shared/sources';
@@ -40,6 +41,7 @@ import {
   openWithRescan,
   pairCounts,
   resolveRoot,
+  type FileRef,
   type Rejection,
   type RunScan,
 } from './containment';
@@ -49,15 +51,53 @@ import { FamilyInUse, deleteFamily } from './index/family';
 import type { CheckResult } from './index/ops';
 import { ThreadError, type IndexThread, type ThreadRole } from './index/pool';
 import { BODY_STATE, mismatchOf, probeIdentity } from './index/schema';
+import { IndexBusy } from './index/sql';
 import type { LocatedFile, OpenedMessage } from './reader/source';
 import { overlaps } from '../shared/overlap';
-import { ConnectionRegistry, IndexService, type IndexOptions } from './index/service';
+import {
+  ConnectionRegistry,
+  IndexService,
+  failureReason,
+  type IndexOptions,
+} from './index/service';
 import { withScan } from './index/report';
 
 /** Entries scanned between yields, so core keeps answering during a long scan. */
 const SCAN_SLICE = 2000;
+/** The shortest time between two reports of a scan's progress, in milliseconds. */
+const SCAN_REPORT_MS = 250;
+
+/**
+ * How long the look at a damaged index's file waits for another connection's
+ * lock. It runs on core's main thread, so it waits briefly: busy means the
+ * open is refused, never that the file is damaged.
+ */
+const DAMAGED_PROBE_BUSY_MS = 100;
 
 const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+/**
+ * The open file is the one the index read: same device, inode, size and
+ * modification time. A file rewritten in place keeps its inode, so the size
+ * and time are what tell it apart.
+ */
+function isIndexedFile(fd: number, indexed: FileRef): boolean {
+  const st = fstatSync(fd, { bigint: true });
+  return (
+    st.dev === indexed.dev &&
+    st.ino === indexed.ino &&
+    Number(st.size) === indexed.size &&
+    st.mtimeNs === indexed.mtimeNs
+  );
+}
+
+/**
+ * A match whose stored body belongs to an older version of the file: the
+ * body's matches go, and the other columns stay, until the file is indexed again.
+ */
+function unindexedBody(match: IndexMatch): IndexMatch {
+  return { ...match, body: null, bodyMatches: 0, changed: true };
+}
 
 /**
  * The reader's open of a message file, or why there is none: no source or a
@@ -65,10 +105,12 @@ const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
  * missing, or a file the checks refused.
  */
 export type ReaderFile =
-  | { ok: true; opened: OpenedMessage }
+  | { ok: true; opened: OpenedMessage; match?: IndexMatch | null }
   | {
       ok: false;
       code: 'no_source' | 'superseded' | 'unavailable' | 'not_found' | 'eml_missing' | 'refused';
+      /** For `eml_missing` or `refused` from search: how the message matched. */
+      match?: IndexMatch | null;
     };
 
 /** What the writer keeps about the open source until the index takes it over. */
@@ -116,10 +158,16 @@ export class SourceSession {
   readonly lock = new LifecycleLock();
   private root: string | null = null;
   private readonly writer: Writer<RunScan>;
-  /** The last scan the writer accepted. */
-  private lastScan: RunScan | null = null;
+  /** The run's scan, made once for this core's source and shared by whoever asks for it. */
+  private scanning: Promise<RunScan | null> | null = null;
+  /** Indexes whose phase 1 was started. */
+  private readonly phase1Started = new WeakSet<IndexService>();
+  /** The work the last index open left running: the scan, then phase 1's start. */
+  private indexing: Promise<void> | null = null;
   /** The open source's index, once main asked for it. */
   index: IndexService | null = null;
+  /** Main was told that this generation's index is damaged. */
+  private damageReported = false;
   private opened: IndexOpened | null = null;
   /** Sources forgotten while core runs: nothing of theirs opens or is created again. */
   private readonly retired = new Set<string>();
@@ -140,7 +188,6 @@ export class SourceSession {
       this.records.scans += 1;
       this.records.rejected = scan.rejected;
       this.records.summary = summarize(scan);
-      this.lastScan = scan;
     });
     if (!source) return;
     this.gate.set({ sourceKey: source.sourceKey, generation: source.generation });
@@ -188,7 +235,16 @@ export class SourceSession {
           : request.type === 'index'
             ? this.openIndex(request, root, stamp)
             : this.query(request, stamp);
-    work.catch(() => {
+    work.catch((err: unknown) => {
+      // Only the class and, for a thread's error, its reason: never a message.
+      this.log.warn(
+        'source.request_failed',
+        {
+          errorClass: errorClassOf(err),
+          ...(err instanceof ThreadError ? { reason: failureReason(err.code) } : {}),
+        },
+        { src: stamp.sourceKey },
+      );
       this.send({ type: 'result', reqId: request.reqId, ok: false, code: 'unavailable', stamp });
     });
   }
@@ -245,26 +301,32 @@ export class SourceSession {
 
   /**
    * Opens the run's index (creating it if need be), answers with its identity
-   * and starts phase 1 for the messages it doesn't have yet. While the run is
+   * and starts phase 1 for the messages it doesn't have yet once the run is
+   * scanned. It answers before the scan, so a stored list shows at once; the
+   * scan runs outside the lock, so reads and a teardown don't wait for it.
+   * While the run is
    * unavailable, only an existing index with the expected identity opens, for
    * browsing; nothing is created or indexed. One there that isn't this index
    * is damaged: it is deleted, and rebuilt once the run is back. One of
    * another schema version is kept as it is until then.
    */
-  private openIndex(request: IndexRequest, root: string | null, stamp: Stamp): Promise<void> {
-    const fail = (code: 'invalid' | 'stale' | 'closed' | 'damaged' | 'unavailable') =>
+  private async openIndex(request: IndexRequest, root: string | null, stamp: Stamp): Promise<void> {
+    const failed = (code: 'invalid' | 'stale' | 'closed' | 'damaged' | 'unavailable') => {
       this.send({ type: 'result', reqId: request.reqId, ok: false, code, stamp });
-    return this.lock.run(async () => {
+      return false;
+    };
+    if (__PEV_TEST_HOOKS__) await this.indexSetup?.options?.beforeIndexOpen?.();
+    const answered = await this.lock.run(async (): Promise<boolean> => {
       const setup = this.indexSetup;
-      if (!setup) return fail('invalid');
-      if (!this.admitting || this.retired.has(stamp.sourceKey)) return fail('closed');
-      if (!this.gate.isCurrent(stamp)) return fail('stale');
+      if (!setup) return failed('invalid');
+      if (!this.admitting || this.retired.has(stamp.sourceKey)) return failed('closed');
+      if (!this.gate.isCurrent(stamp)) return failed('stale');
       let service = this.index;
       if (!service) {
         // Opening can make or replace the index's files.
         if (this.overlapsIndex()) {
           this.log.warn('index.open_refused', { reason: 'overlap' }, { src: stamp.sourceKey });
-          return fail('closed');
+          return failed('closed');
         }
         const fresh = this.newService(setup, stamp, root);
         let opened: IndexOpened;
@@ -277,11 +339,24 @@ export class SourceSession {
           if (err instanceof ThreadError && err.code === 'INDEX_OVERLAP') {
             // The writer found the overlap after the check above.
             this.log.warn('index.open_refused', { reason: 'overlap' }, { src: stamp.sourceKey });
-            return fail('closed');
+            return failed('closed');
           }
+          // Another connection held the index past the busy timeout: it may be
+          // fine, so it is neither deleted nor rebuilt. The next open tries again.
+          const busy = () => {
+            this.log.warn('index.open_refused', { reason: 'busy' }, { src: stamp.sourceKey });
+            return failed('unavailable');
+          };
+          if (err instanceof ThreadError && err.code === 'INDEX_BUSY') return busy();
           if (err instanceof ThreadError && err.code === 'INDEX_DAMAGED') {
             const dbPath = this.dbPathOf(stamp.sourceKey);
-            const found = dbPath ? probeIdentity(dbPath) : null;
+            let found: ReturnType<typeof probeIdentity>;
+            try {
+              found = dbPath ? probeIdentity(dbPath, DAMAGED_PROBE_BUSY_MS) : null;
+            } catch (probeErr) {
+              if (probeErr instanceof IndexBusy) return busy();
+              throw probeErr;
+            }
             const reason = (dbPath && mismatchOf(found, request.dbUuid)) || 'identity';
             if (reason === 'schema' && root === null) {
               // An index of another schema version is no damage: it stays as
@@ -292,12 +367,12 @@ export class SourceSession {
                 { schemaVersion: found?.version ?? 0 },
                 { src: stamp.sourceKey },
               );
-              return fail('unavailable');
+              return failed('unavailable');
             }
             this.log.warn('index.damaged', { reason }, { src: stamp.sourceKey });
             this.removeFamily(stamp.sourceKey, true);
             this.sendEvent(stamp, { ...fresh.progress, condition: 'damaged' }, true);
-            return fail('damaged');
+            return failed('damaged');
           }
           throw err;
         }
@@ -305,19 +380,6 @@ export class SourceSession {
         this.opened = opened;
         service = fresh;
       }
-      if (root === null) {
-        this.send({
-          type: 'result',
-          reqId: request.reqId,
-          ok: true,
-          stamp,
-          index: this.opened!,
-          progress: { ...service.progress },
-        });
-        return;
-      }
-      const scan = this.lastScan ?? (await this.scanNow(root, stamp));
-      if (!this.gate.isCurrent(stamp) || !scan) return fail('stale');
       this.send({
         type: 'result',
         reqId: request.reqId,
@@ -326,6 +388,29 @@ export class SourceSession {
         index: this.opened!,
         progress: { ...service.progress },
       });
+      return true;
+    });
+    if (!answered || root === null) return;
+    this.indexing = (async () => {
+      // A failed scan is answered to main's scan request, which reports it.
+      const scan = await this.scanOnce(root, stamp).catch(() => null);
+      if (scan) await this.startPhase1(stamp, scan);
+    })();
+    await this.indexing;
+  }
+
+  /** Resolves once what the last index open left running has ended: its scan, then phase 1. */
+  async settled(): Promise<void> {
+    await this.indexing;
+    await this.index?.settled();
+  }
+
+  /** Starts indexing once both the index and the scan are there, and only once for an index. */
+  private startPhase1(stamp: Stamp, scan: RunScan): Promise<void> {
+    return this.lock.run(() => {
+      const service = this.index;
+      if (!service || !this.isLive(service, stamp) || this.phase1Started.has(service)) return;
+      this.phase1Started.add(service);
       void service.startIndexing(scan);
     });
   }
@@ -410,7 +495,15 @@ export class SourceSession {
     return true;
   }
 
+  /**
+   * Main hears of a damaged index once, and that is the last it hears of this
+   * generation's index: main rebuilds it under a new generation. A scan still
+   * running here then reports nothing, so the damage isn't followed by
+   * progress that shows the index as fine.
+   */
   private sendEvent(stamp: Stamp, progress: IndexService['progress'], damaged: boolean): void {
+    if (this.damageReported) return;
+    if (damaged) this.damageReported = true;
     this.emit({ type: 'event', event: 'index', stamp, progress: { ...progress }, damaged });
   }
 
@@ -491,11 +584,14 @@ export class SourceSession {
    * changed since the scan is examined again and opened once more with its new
    * identity; a link, a FIFO or another file type is never opened. `stale`
    * tells whether a newer open has come in since, so nothing is opened for it.
+   * With a search, the answer also says how the message matched it; when the
+   * file opened isn't the one indexed, its stored body isn't used.
    */
   async openForReader(
     rowid: number,
     generation: number,
     stale: () => boolean,
+    search?: string,
   ): Promise<ReaderFile> {
     const current = this.gate.current;
     if (!current) return { ok: false, code: 'no_source' };
@@ -504,32 +600,53 @@ export class SourceSession {
     if (root === null) return { ok: false, code: 'unavailable' };
     const service = this.index;
     if (!service || service.isDamaged) return { ok: false, code: 'not_found' };
-    const file = (await service.ask({ op: 'eml', rowid })) as EmlFile | null;
+    const file = (await service.ask(
+      search === undefined ? { op: 'eml', rowid } : { op: 'eml', rowid, search },
+    )) as EmlFile | null;
     // Nothing is opened for a generation, an index or an open that moved on meanwhile.
     if (!this.gate.isCurrent(current) || this.index !== service || service.isDamaged || stale()) {
       return { ok: false, code: 'superseded' };
     }
     if (!file) return { ok: false, code: 'not_found' };
+    // Only an open from search has a match, and only then does the answer carry one.
+    const match = file.match;
+    const withMatch = match === undefined ? {} : { match };
     if (file.rel === null || file.bodyState === BODY_STATE.emlMissing) {
-      return { ok: false, code: 'eml_missing' };
+      return { ok: false, code: 'eml_missing', ...withMatch };
     }
-    const opened = openWithRescan(root, {
+    const indexed: FileRef = {
       rel: file.rel,
       kind: 'eml',
       dev: BigInt(file.dev),
       ino: BigInt(file.ino),
       size: file.size,
       mtimeNs: BigInt(file.mtimeNs),
-    });
+    };
+    const opened = openWithRescan(root, indexed);
     if (!opened.ok) {
       this.log.info('open.file_refused', {
         reason: opened.gone ? 'eml_missing' : opened.rejection.kind,
       });
-      return { ok: false, code: opened.gone ? 'eml_missing' : 'refused' };
+      return { ok: false, code: opened.gone ? 'eml_missing' : 'refused', ...withMatch };
     }
     const fd = opened.fd;
+    let indexedFile: boolean;
+    try {
+      indexedFile = !match || isIndexedFile(fd, indexed);
+    } catch {
+      // The open file can't be checked: it is closed, and refused like one that can't be opened.
+      try {
+        closeSync(fd);
+      } catch {
+        // Closed already.
+      }
+      this.log.info('open.file_refused', { reason: 'unreadable' });
+      return { ok: false, code: 'refused', ...withMatch };
+    }
+    const changed = match && !indexedFile;
     return {
       ok: true,
+      ...(changed ? { match: unindexedBody(match) } : withMatch),
       opened: {
         input: { kind: 'fd', fd },
         file: { dev: opened.ref.dev.toString(), ino: opened.ref.ino.toString() },
@@ -585,15 +702,82 @@ export class SourceSession {
     return { ok: true, path: join(root, file.rel) };
   }
 
-  /** Scans the run for the index when no scan was accepted yet. */
-  private async scanNow(root: string, stamp: Stamp): Promise<RunScan | null> {
+  /**
+   * Looks at every entry of the run folder, and reports how far it got: once
+   * the folder is listed, then at most every SCAN_REPORT_MS, and at the end.
+   */
+  private async scanEntries(root: string, stamp: Stamp): Promise<RunScan> {
+    if (__PEV_TEST_HOOKS__) await this.indexSetup?.options?.beforeScan?.();
     const names = await readdir(root);
     const scan = emptyScan(root);
+    let reported = 0;
+    const report = (done: number) => {
+      reported = performance.now();
+      this.sendEvent(
+        stamp,
+        {
+          phase: 'scanning',
+          loaded: done,
+          total: names.length,
+          failed: 0,
+          timeouts: 0,
+          capped: 0,
+          // An index opened first keeps its own condition, e.g. while it is rebuilt.
+          condition: this.index?.progress.condition ?? 'ok',
+          // Phase 2 waits for phase 1, which waits for this scan.
+          bodyPhase: 'waiting',
+          bodiesBefore: 0,
+          bodiesDone: 0,
+          bodiesTotal: 0,
+          bodiesFailed: 0,
+          bodiesTruncated: 0,
+        },
+        false,
+      );
+    };
+    report(0);
     for (let i = 0; i < names.length; i += 1) {
       addEntry(scan, names[i]!);
-      if (i % SCAN_SLICE === SCAN_SLICE - 1) await yieldToLoop();
+      if (i % SCAN_SLICE === SCAN_SLICE - 1) {
+        if (performance.now() - reported >= SCAN_REPORT_MS) report(i + 1);
+        await yieldToLoop();
+      }
     }
-    return this.writer.submit(stamp, scan) ? scan : null;
+    report(names.length);
+    // Test builds can hold the scan here too, with everything listed.
+    if (__PEV_TEST_HOOKS__) await this.indexSetup?.options?.beforeScan?.();
+    return scan;
+  }
+
+  /**
+   * The run's scan: made once, by whichever of the index open and main's scan
+   * request comes first, and logged once. Null when the generation moved on.
+   */
+  private scanOnce(root: string, stamp: Stamp): Promise<RunScan | null> {
+    this.scanning ??= (async () => {
+      const started = performance.now();
+      const scan = await this.scanEntries(root, stamp);
+      if (!this.writer.submit(stamp, scan)) {
+        this.log.info(
+          'writer.stale_dropped',
+          { generation: stamp.generation, count: 1 },
+          { src: stamp.sourceKey },
+        );
+        return null;
+      }
+      const summary = summarize(scan);
+      this.log.info(
+        'scan.done',
+        { count: summary.pairs, ms: Math.round(performance.now() - started) },
+        { src: stamp.sourceKey },
+      );
+      for (const [kind, count] of Object.entries(summary.rejected)) {
+        if (count > 0)
+          this.log.info('scan.rejected', { reason: kind, count }, { src: stamp.sourceKey });
+      }
+      return scan;
+    })();
+    return this.scanning;
   }
 
   /** Tears the index down, under the lock. */
@@ -607,33 +791,14 @@ export class SourceSession {
   }
 
   private async scan(request: ScanRequest, root: string, stamp: Stamp): Promise<void> {
-    const started = performance.now();
-    const names = await readdir(root);
-    const scan = emptyScan(root);
-    for (let i = 0; i < names.length; i += 1) {
-      addEntry(scan, names[i]!);
-      if (i % SCAN_SLICE === SCAN_SLICE - 1) await yieldToLoop();
-    }
-    if (!this.writer.submit(stamp, scan)) {
-      this.log.info(
-        'writer.stale_dropped',
-        { generation: stamp.generation, count: 1 },
-        { src: stamp.sourceKey },
-      );
+    const scan = await this.scanOnce(root, stamp);
+    if (!scan) {
       this.send({ type: 'result', reqId: request.reqId, ok: false, code: 'stale', stamp });
       return;
     }
-    const summary = summarize(scan);
-    this.log.info(
-      'scan.done',
-      { count: summary.pairs, ms: Math.round(performance.now() - started) },
-      { src: stamp.sourceKey },
-    );
-    for (const [kind, count] of Object.entries(summary.rejected)) {
-      if (count > 0)
-        this.log.info('scan.rejected', { reason: kind, count }, { src: stamp.sourceKey });
-    }
-    this.send({ type: 'result', reqId: request.reqId, ok: true, stamp, scan: summary });
+    this.send({ type: 'result', reqId: request.reqId, ok: true, stamp, scan: summarize(scan) });
+    // Phase 1 starts here if the index opened first.
+    await this.startPhase1(stamp, scan);
   }
 
   private send(result: CoreResult): void {

@@ -5,10 +5,12 @@ import { describe, expect, it } from 'vitest';
 import type { FolderRow, IndexProgress } from '../../src/shared/index-types';
 import { sidebarModel } from '../../src/renderer/folders';
 import {
+  changedAt,
   formatCount,
   fullDate,
   fullTextLine,
   fullTextShare,
+  fullTextStatus,
   listDate,
   loadingText,
   participantsText,
@@ -44,6 +46,16 @@ describe('list text', () => {
       ]),
     ).toBe('Theo Martins, billing@example.com, x@example.org');
   });
+
+  it('cleans each sender for display, and uses the address when the name cleans to nothing', () => {
+    expect(
+      participantsText([
+        { name: '\u202eEve\u0007\tMallory', address: 'eve@example.com' },
+        { name: '\u200b\u2066\u2069', address: '\u202ebob@example.org' },
+        { name: '', address: '\u200b' },
+      ]),
+    ).toBe('Eve␇ Mallory, bob@example.org');
+  });
 });
 
 const row = (id: string, kind: FolderRow['kind'], extra: Partial<FolderRow> = {}): FolderRow => ({
@@ -55,6 +67,68 @@ const row = (id: string, kind: FolderRow['kind'], extra: Partial<FolderRow> = {}
   conversations: 0,
   unread: 0,
   ...extra,
+});
+
+describe("Settings' Last updated", () => {
+  const ms = (y: number, mo: number, d: number, h: number, mi: number, s = 0) =>
+    new Date(y, mo - 1, d, h, mi, s).getTime();
+  const now = new Date(2026, 10, 28, 9, 30);
+
+  it('says Today or Yesterday with the time, else the date, in local time', () => {
+    expect(changedAt(ms(2026, 11, 28, 9, 5), now)).toBe('Today, 09:05');
+    expect(changedAt(ms(2026, 11, 27, 18, 20), now)).toBe('Yesterday, 18:20');
+    expect(changedAt(ms(2026, 11, 26, 23, 59), now)).toBe('26 Nov 2026, 23:59');
+    expect(changedAt(ms(2025, 1, 3, 7, 0), now)).toBe('3 Jan 2025, 07:00');
+  });
+
+  it('turns the day at local midnight', () => {
+    const justAfter = new Date(2026, 10, 28, 0, 0, 30);
+    expect(changedAt(ms(2026, 11, 28, 0, 0), justAfter)).toBe('Today, 00:00');
+    expect(changedAt(ms(2026, 11, 27, 23, 59, 59), justAfter)).toBe('Yesterday, 23:59');
+    expect(changedAt(ms(2026, 11, 27, 0, 0), new Date(2026, 10, 28, 23, 59))).toBe(
+      'Yesterday, 00:00',
+    );
+    expect(changedAt(ms(2026, 11, 26, 23, 59), justAfter)).toBe('26 Nov 2026, 23:59');
+  });
+
+  it('is empty for a time that is no date', () => {
+    expect(changedAt(Number.NaN, now)).toBe('');
+  });
+});
+
+describe("Settings' Status", () => {
+  const progress = (p: Partial<IndexProgress>): IndexProgress => ({
+    phase: 'done',
+    loaded: 10,
+    total: 10,
+    failed: 0,
+    timeouts: 0,
+    capped: 0,
+    condition: 'ok',
+    bodyPhase: 'indexing',
+    bodiesDone: 0,
+    bodiesTotal: 0,
+    bodiesFailed: 0,
+    ...p,
+  });
+
+  it('gives the full text share of this run, rounded down, until it is done', () => {
+    expect(fullTextStatus(progress({ bodyPhase: 'waiting', phase: 'loading' }))).toBe(
+      'Full text 0%',
+    );
+    expect(fullTextStatus(progress({ bodiesDone: 1, bodiesTotal: 3 }))).toBe('Full text 33%');
+    expect(fullTextStatus(progress({ bodiesDone: 999, bodiesTotal: 1000 }))).toBe('Full text 99%');
+    expect(fullTextStatus(progress({ bodyPhase: 'failed', bodiesDone: 5, bodiesTotal: 10 }))).toBe(
+      'Full text 50%',
+    );
+  });
+
+  it('says Complete once the text is indexed, also when this run had nothing to read', () => {
+    expect(fullTextStatus(progress({ bodyPhase: 'done', bodiesDone: 10, bodiesTotal: 10 }))).toBe(
+      'Complete',
+    );
+    expect(fullTextStatus(progress({ bodyPhase: 'done' }))).toBe('Complete');
+  });
 });
 
 describe('the sidebar model', () => {

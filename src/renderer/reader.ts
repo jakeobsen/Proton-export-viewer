@@ -1,14 +1,38 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Reader state: the message in the reader pane and how it is shown. Every
 // open, a switch between plain text and HTML included, is a new open in main
-// with its own token. The old body frame goes as soon as an open starts.
+// with its own token. The old body frame goes as soon as an open starts. The
+// source view of the message shows in the pane in its place, under the same
+// open. While the conversation shown came from a search result, every open
+// carries that search's ID, so main can say how the message matched it.
 
 import { useSyncExternalStore } from 'react';
-import type { MessageOpenResult, ReaderActionResult, RejectCode } from '../shared/api';
-import type { OpenMode } from '../shared/reader-protocol';
+import type {
+  MessageOpenResult,
+  ReaderActionResult,
+  RejectCode,
+  SourceNode,
+  SourceResult,
+} from '../shared/api';
+import type { OpenMode, ReaderMatch } from '../shared/reader-protocol';
 import { clearLink, getShellState, refreshGeneration } from './shell';
 
 export type ReaderView = Extract<MessageOpenResult, { outcome: 'view' }>;
+
+/** The source view of the pane's message. */
+export interface SourceState {
+  /** The body frame's URL for the header block shown; null until the first arrives. */
+  url: string | null;
+  /** The block shown was cut to the cap. */
+  truncated: boolean;
+  /** The tree; null while it loads, or when the structure couldn't be read. */
+  parts: SourceNode[] | null;
+  tree: 'loading' | 'ready' | 'none';
+  /** The part whose headers show, by path; '1' is the message. */
+  selected: string;
+  /** Main refused the source view. */
+  refused: RejectCode | null;
+}
 
 export interface ReaderState {
   /** The message in the pane, or null when the pane is closed. */
@@ -20,8 +44,18 @@ export interface ReaderState {
   view: ReaderView | null;
   /** The reader couldn't render the message. */
   fallback: boolean;
+  /** On the fallback: the message file itself couldn't be opened. */
+  fileRefused: boolean;
   /** Main refused the open. */
   refused: RejectCode | null;
+  /** The open the pane shows, a view or a fallback; actions on it name it. */
+  openId: number | null;
+  /** Set while the source view shows. */
+  source: SourceState | null;
+  /** The search the latest open was made from; null outside search. */
+  queryId: number | null;
+  /** How the message matched that search: on a view, the fallback or a missing file. */
+  match: ReaderMatch | null;
 }
 
 const CLOSED: ReaderState = {
@@ -30,12 +64,30 @@ const CLOSED: ReaderState = {
   pending: false,
   view: null,
   fallback: false,
+  fileRefused: false,
   refused: null,
+  openId: null,
+  source: null,
+  queryId: null,
+  match: null,
 };
 
 let state: ReaderState = CLOSED;
 let latest = 0;
 let openGeneration: number | null = null;
+/** Counts source views opened and left, so a late answer for an old one is dropped. */
+let sourceSession = 0;
+/** Counts part selections, so a late answer for an older one is dropped. */
+let selection = 0;
+let searchQueryId: number | null = null;
+
+/**
+ * The search whose result showed the conversation in the reader, or null
+ * once the reader no longer shows a result's conversation. Later opens carry it.
+ */
+export function setReaderSearch(queryId: number | null): void {
+  searchQueryId = queryId;
+}
 const listeners = new Set<() => void>();
 
 function update(patch: Partial<ReaderState>): void {
@@ -57,15 +109,29 @@ export function useReaderState(): ReaderState {
   );
 }
 
-/** Opens a message in the reader pane; HTML unless another mode is asked for. */
+/** Opens a message in the reader pane, in the default view unless another mode is asked for. */
 export async function openInReader(
   rowid: number,
-  mode: OpenMode = 'html',
+  mode: OpenMode = getShellState().settings.messageView,
 ): Promise<MessageOpenResult> {
   latest += 1;
   const mine = latest;
+  const queryId = searchQueryId;
   clearLink();
-  update({ rowid, mode, pending: true, view: null, fallback: false, refused: null });
+  sourceSession += 1;
+  update({
+    rowid,
+    mode,
+    pending: true,
+    view: null,
+    fallback: false,
+    fileRefused: false,
+    refused: null,
+    openId: null,
+    source: null,
+    queryId,
+    match: null,
+  });
   const generation = getShellState().generation ?? (await refreshGeneration().catch(() => null));
   if (generation === null) {
     if (mine === latest) update({ pending: false, refused: 'stale_generation' });
@@ -74,7 +140,9 @@ export async function openInReader(
   openGeneration = generation;
   let result: MessageOpenResult;
   try {
-    result = await window.pev.open(rowid, mode, generation);
+    result = await (queryId === null
+      ? window.pev.open(rowid, mode, generation)
+      : window.pev.open(rowid, mode, generation, queryId));
   } catch {
     // The call itself failed: the pane ends refused, not pending.
     result = { ok: false, code: 'core_unavailable' };
@@ -82,14 +150,124 @@ export async function openInReader(
   // A newer open owns the pane now.
   if (mine !== latest) return result;
   if (!result.ok) {
-    update({ pending: false, refused: result.code });
+    const match = 'match' in result ? result.match : null;
+    update({ pending: false, refused: result.code, match });
     if (result.code === 'stale_generation') await refreshGeneration();
   } else if (result.outcome === 'fallback') {
-    update({ pending: false, fallback: true });
+    update({
+      pending: false,
+      fallback: true,
+      fileRefused: result.fileRefused,
+      match: result.match,
+      openId: result.openId,
+    });
   } else {
-    update({ pending: false, view: result });
+    update({ pending: false, view: result, match: result.match, openId: result.openId });
   }
   return result;
+}
+
+async function guardedCall<T extends { ok: boolean }>(
+  call: () => Promise<T>,
+): Promise<T | { ok: false; code: RejectCode }> {
+  try {
+    return await call();
+  } catch {
+    return { ok: false, code: 'core_unavailable' };
+  }
+}
+
+/**
+ * Shows the source view of the pane's message, a view or a fallback: the
+ * message's raw headers first, then the tree, which the headers never wait for.
+ */
+export async function openSource(): Promise<void> {
+  const { openId } = state;
+  const generation = openGeneration;
+  if (openId === null || generation === null || state.source !== null) return;
+  sourceSession += 1;
+  selection += 1;
+  const session = sourceSession;
+  const mine = selection;
+  update({
+    source: {
+      url: null,
+      truncated: false,
+      parts: null,
+      tree: 'loading',
+      selected: '1',
+      refused: null,
+    },
+  });
+  const shown = await guardedCall(() => window.pev.viewSource(openId, generation));
+  const afterShow = sourceNow();
+  if (session !== sourceSession || !afterShow) return;
+  if (!shown.ok) {
+    update({ source: { ...afterShow, refused: shown.code, tree: 'none' } });
+    return;
+  }
+  if (mine === selection) {
+    update({ source: { ...afterShow, url: shown.url, truncated: shown.truncated } });
+  }
+  const tree = await guardedCall(() => window.pev.sourceTree(openId, generation));
+  const afterTree = sourceNow();
+  if (session !== sourceSession || !afterTree) return;
+  const parts = tree.ok ? tree.parts : null;
+  update({ source: { ...afterTree, parts, tree: parts ? 'ready' : 'none' } });
+}
+
+/** The source view as it is now, read again after each wait. */
+function sourceNow(): SourceState | null {
+  return state.source;
+}
+
+/** Shows one part's raw headers in the source view; '1' is the message. */
+export async function selectPart(path: string): Promise<SourceResult | null> {
+  const { openId } = state;
+  const generation = openGeneration;
+  if (openId === null || generation === null || !state.source) return null;
+  if (state.source.selected === path && state.source.url !== null) return null;
+  selection += 1;
+  const session = sourceSession;
+  const mine = selection;
+  update({ source: { ...state.source, selected: path } });
+  const shown = await guardedCall(() =>
+    window.pev.sourcePart(openId, path === '1' ? null : path, generation),
+  );
+  if (session !== sourceSession || mine !== selection || !state.source) return shown;
+  if (shown.ok) {
+    update({
+      source: { ...state.source, url: shown.url, truncated: shown.truncated, refused: null },
+    });
+  } else if (shown.code !== 'superseded') {
+    update({ source: { ...state.source, url: null, refused: shown.code } });
+  }
+  return shown;
+}
+
+/** Copies the header block the source view shows. */
+export async function copyHeaders(): Promise<ReaderActionResult> {
+  const { openId } = state;
+  const generation = openGeneration;
+  if (openId === null || generation === null || !state.source) {
+    return { ok: false, code: 'superseded' };
+  }
+  return guardedCall(() => window.pev.copyHeaders(openId, generation));
+}
+
+/**
+ * Leaves the source view. Main authorizes the message's body again first;
+ * only then does the pane show it.
+ */
+export async function leaveSource(): Promise<void> {
+  const { openId } = state;
+  const generation = openGeneration;
+  if (!state.source || openId === null || generation === null) return;
+  sourceSession += 1;
+  selection += 1;
+  const session = sourceSession;
+  await guardedCall(() => window.pev.sourceBack(openId, generation));
+  if (session === sourceSession && state.openId === openId) update({ source: null });
 }
 
 /** An action on the message the pane shows, such as Show in folder, by its view's open. */
@@ -117,6 +295,14 @@ export function copyMessageId(): Promise<ReaderActionResult> {
 
 /** Closes the pane and any link dialog that came from its body. */
 export function closeReader(): void {
+  // A source view still showing is left in main too, so nothing more is authorized for it.
+  const { openId, source } = state;
+  const generation = openGeneration;
+  if (source !== null && openId !== null && generation !== null) {
+    void guardedCall(() => window.pev.sourceBack(openId, generation));
+  }
+  sourceSession += 1;
+  selection += 1;
   latest += 1;
   openGeneration = null;
   clearLink();

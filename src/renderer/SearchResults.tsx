@@ -4,7 +4,8 @@
 
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useCallback, useEffect, useLayoutEffect, useRef, type KeyboardEvent } from 'react';
-import { MAX_QUERY_LENGTH, type MarkedSnippet, type SearchSort } from '../shared/index-types';
+import { displayText } from '../shared/header-text';
+import { MAX_QUERY_LENGTH, type SearchSort } from '../shared/index-types';
 import type { SidebarModel } from './folders';
 import { formatCount, fullDate, listDate, participantsText } from './format';
 import {
@@ -16,14 +17,9 @@ import {
   useMailbox,
   useSearch,
 } from './mailbox-state';
-import { Chips } from './Mailbox';
-import {
-  RESULT_ROW_HEIGHT,
-  conversationsText,
-  partialText,
-  snippetParts,
-  type ResultRow,
-} from './search';
+import { Chips } from './Chips';
+import { Snippet } from './Lead';
+import { RESULT_ROW_HEIGHT, conversationsText, partialText, type ResultRow } from './search';
 
 export function SearchBox() {
   const { text } = useSearch();
@@ -45,16 +41,6 @@ export function SearchBox() {
   );
 }
 
-function Snippet({ snippet }: { snippet: MarkedSnippet }) {
-  return (
-    <>
-      {snippetParts(snippet).map((part, i) =>
-        part.mark ? <mark key={i}>{part.text}</mark> : <span key={i}>{part.text}</span>,
-      )}
-    </>
-  );
-}
-
 function ResultItem({
   row,
   index,
@@ -70,6 +56,7 @@ function ResultItem({
 }) {
   const unread = row.unread > 0;
   const who = participantsText(row.details?.participants ?? []);
+  const subject = displayText(row.details?.subject ?? '');
   return (
     <div
       className={`conv result${unread ? ' unread' : ''}${selected ? ' selected' : ''}`}
@@ -97,8 +84,8 @@ function ResultItem({
         </span>
       </div>
       <div className="subj">
-        <span className="t" title={row.details?.subject}>
-          {row.details?.subject ?? ''}
+        <span className="t" title={subject || undefined}>
+          {subject}
         </span>
         {row.matching > 1 && (
           <span className="match-n">{`${formatCount(row.matching)} matching`}</span>

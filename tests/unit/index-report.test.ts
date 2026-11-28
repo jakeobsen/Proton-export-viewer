@@ -29,6 +29,8 @@ import type { Logger } from '../../src/shared/log/writer';
 import {
   LIST_LIMITS,
   fieldText,
+  fileCounts,
+  filesText,
   reasonText,
   reportText,
   tookText,
@@ -164,7 +166,10 @@ describe('the index report', () => {
     expect(report.failed).toEqual({ meta_json: 2, meta_shape: 1, meta_id: 1 });
     expect(report.timeouts).toBe(1);
     expect(report.capped).toEqual({ to: 2 });
+    expect(report.cappedMessages).toBe(2);
     expect(report.hiddenLabelIds).toBe(1);
+    // By result: the 13 files less the one listed with no message file only.
+    expect(fileCounts(report)).toEqual({ skipped: 10, truncated: 2 });
     // 14 rows for 13 files: the message with no file and a cut list has two.
     expect(report.attention).toBe(13);
     expect(report.more).toBe(0);
@@ -456,6 +461,36 @@ describe('the index report', () => {
     await s.close();
   });
 
+  it('counts a message with several lists cut once among the truncated files', async () => {
+    const dir = testDir('report-capped');
+    const written = writeExport(join(dir, 'export'), { seed: 8, messages: 6 });
+    const run = realpathSync(written.run);
+    const ids = readdirSync(run)
+      .filter((n) => n.endsWith('.eml'))
+      .map((n) => n.slice(0, -'.eml'.length))
+      .sort();
+    const many = (tag: string) =>
+      Array.from({ length: MAX_RECIPIENTS + 1 }, (_, i) => ({
+        Name: '',
+        Address: `${tag}${i}@example.com`,
+      }));
+    editMeta(run, ids[0]!, (p) => {
+      p.ToList = many('t');
+      p.CCList = many('c');
+    });
+    editMeta(run, ids[1]!, (p) => (p.ToList = many('u')));
+    rmSync(join(run, `${ids[2]}.metadata.json`));
+    const scan = scanRun(run);
+    const s = service(run, join(dir, 'index'));
+    await s.open(null);
+    await s.startIndexing(scan);
+    const report = withScan((await s.ask({ op: 'report' })) as IndexReport, scan.rejected, s.took);
+    expect(report.capped).toEqual({ to: 2, cc: 1 });
+    expect(report.cappedMessages).toBe(2);
+    expect(fileCounts(report)).toEqual({ skipped: 1, truncated: 2 });
+    expect(filesText(report)).toBe('1 skipped, 2 truncated');
+  });
+
   it('carries at most a fixed number of rows, and counts the rest', () => {
     const refused = Array.from({ length: REPORT_ROWS + 5 }, (_, i) => ({
       rel: `l${String(i).padStart(4, '0')}.eml`,
@@ -470,6 +505,7 @@ describe('the index report', () => {
       failed: {},
       timeouts: 0,
       capped: {},
+      cappedMessages: 0,
       hiddenLabelIds: 0,
       fullText: { indexed: 0, total: 0, truncated: 0, skipped: 0, skippedBy: {} },
       attention: 1,
@@ -505,6 +541,7 @@ describe('the index report', () => {
       failed: {},
       timeouts: 0,
       capped: {},
+      cappedMessages: 0,
       hiddenLabelIds: 0,
       fullText: { indexed: 0, total: 0, truncated: 0, skipped: 0, skippedBy: {} },
       attention: 1,

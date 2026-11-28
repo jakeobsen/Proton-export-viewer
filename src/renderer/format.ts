@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Display text for the list: counts, dates and participants.
+// Display text for the list and Settings: counts, dates and participants.
 
+import { displayText } from '../shared/header-text';
 import type { IndexProgress, Participant } from '../shared/index-types';
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -38,12 +39,20 @@ export function fullDate(time: number): string {
   return `${DAYS[date.getDay()]!} ${date.getDate()} ${MONTHS[date.getMonth()]!} ${date.getFullYear()}, ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-/** A conversation's senders, oldest first: each by name, or by address when it has none. */
+/**
+ * A conversation's senders, oldest first: each by name, or by address when it
+ * has none, each cleaned for display.
+ */
 export function participantsText(participants: readonly Participant[]): string {
   return participants
-    .map((p) => p.name.trim() || p.address)
+    .map((p) => displayText(p.name) || displayText(p.address))
     .filter((s) => s !== '')
     .join(', ');
+}
+
+/** "Reading export… 42,000 of 300,000 files". */
+export function readingText(read: number, total: number): string {
+  return `Reading export… ${formatCount(read)} of ${formatCount(total)} files`;
 }
 
 /** "Loading 4,100 of 20,000…". */
@@ -68,4 +77,35 @@ export function fullTextShare(progress: IndexProgress): number | null {
 /** "Full text 40% · search is partial". */
 export function fullTextLine(share: number): string {
   return `Full text ${share}% · search is partial`;
+}
+
+/** A conversation's header count: "4 messages", or from a result "4 messages · 2 matching". */
+export function countText(total: number, matching: number | null): string {
+  const messages = `${formatCount(total)} ${total === 1 ? 'message' : 'messages'}`;
+  return matching === null ? messages : `${messages} · ${formatCount(matching)} matching`;
+}
+
+/**
+ * When something last changed, in local time: "Today, 09:58",
+ * "Yesterday, 18:20", "24 Nov 2026, 09:58". `time` is in milliseconds.
+ */
+export function changedAt(time: number, now: Date = new Date()): string {
+  const date = new Date(time);
+  if (Number.isNaN(date.getTime())) return '';
+  const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  const days = Math.round((startOfDay(now) - startOfDay(date)) / 86_400_000);
+  if (days === 0) return `Today, ${clock}`;
+  if (days === 1) return `Yesterday, ${clock}`;
+  return `${date.getDate()} ${MONTHS[date.getMonth()]!} ${date.getFullYear()}, ${clock}`;
+}
+
+/**
+ * The index's Status in Settings: "Complete" once the text of every message
+ * file is indexed, else "Full text N%" of this run's files, rounded down.
+ */
+export function fullTextStatus(progress: IndexProgress): string {
+  if (progress.bodyPhase === 'done') return 'Complete';
+  const { bodiesDone, bodiesTotal } = progress;
+  const percent = bodiesTotal > 0 ? Math.floor((bodiesDone / bodiesTotal) * 100) : 0;
+  return `Full text ${percent}%`;
 }

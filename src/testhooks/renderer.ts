@@ -2,7 +2,7 @@
 // Shell test hooks, reached by tests as window.__pevTest.
 
 import { reportError } from '../renderer/errors';
-import { cards, list, search } from '../renderer/mailbox-state';
+import { cardLeads, cards, list, listLeads, search } from '../renderer/mailbox-state';
 import {
   chooseFolder,
   clearLink,
@@ -131,6 +131,11 @@ export function install(): void {
     },
     /** The conversation's cards: which one is expanded, and what is held. */
     cards: () => cards.snapshot,
+    /** Reads the cards again, as a scroll past the cards held does. */
+    refreshCards: () => cards.refresh(),
+    /** The lead lines held for the list's rows and for the cards, by message. */
+    leads: (which: 'list' | 'cards') =>
+      Object.fromEntries(which === 'list' ? listLeads.snapshot : cardLeads.snapshot),
     /** Body frames in the shell's own tree, with their URLs. */
     readerFrames: () =>
       [...document.querySelectorAll<HTMLIFrameElement>('iframe.rp-frame')].map((f) => f.src),
@@ -170,6 +175,11 @@ export function install(): void {
       });
     },
     error: (markers: string) => reportError('error', new Error(markers)),
+    /** Makes the shell throw on each render while on; the sources are read again to render. */
+    renderFault: async (on: boolean) => {
+      (window as unknown as { __pevTestRenderFault?: boolean }).__pevTestRenderFault = on;
+      await refreshSources();
+    },
     throwUncaught: (markers: string) => {
       setTimeout(() => {
         throw new Error(markers);

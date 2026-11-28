@@ -234,6 +234,14 @@ export function listWindow(db: Db, query: Omit<WindowQuery, 'op'>): ListWindow {
   };
 }
 
+/** A conversation's folder and label IDs, as its list row and its header show them. */
+function threadLabelIds(db: Db): (threadId: number) => string[] {
+  const labels = db.stmt(
+    'SELECT label_id FROM thread_labels WHERE thread_id = ? ORDER BY label_id',
+  );
+  return (threadId) => labels.all(threadId).map((r) => String(r.label_id));
+}
+
 /** Subject, participants and labels of the conversations on screen. */
 export function rowDetails(
   db: Db,
@@ -247,9 +255,7 @@ export function rowDetails(
     `SELECT sender_name, sender_addr FROM messages WHERE thread_id = ?
      ORDER BY time ASC, rowid ASC LIMIT ${PARTICIPANT_SCAN}`,
   );
-  const labels = db.stmt(
-    'SELECT label_id FROM thread_labels WHERE thread_id = ? ORDER BY label_id',
-  );
+  const labelIds = threadLabelIds(db);
   return threadIds.slice(0, max).map((threadId) => {
     const seen = new Set<string>();
     const participants: Participant[] = [];
@@ -266,7 +272,7 @@ export function rowDetails(
       threadId,
       subject: String(subject.get(threadId)?.subject ?? ''),
       participants,
-      labelIds: labels.all(threadId).map((r) => String(r.label_id)),
+      labelIds: labelIds(threadId),
     };
   });
 }
@@ -321,15 +327,16 @@ function cardsThread(
  * `anchor.index`. Cards are found by their (date, rowid) key on the
  * conversation's index; only the last case seeks by position.
  */
-export function cardsWindow(db: Db, query: Omit<CardsQuery, 'op'>): CardsWindow {
+export function cardsWindow(db: Db, query: Omit<CardsQuery, 'op'>): CardsStretch {
   const before = clampCount(query.before, CARDS_BEFORE);
   const after = Math.max(1, clampCount(query.after, CARDS_AFTER));
   const named = cardsThread(db, query.follow, query.threadId);
-  const empty: CardsWindow = {
+  const empty: CardsStretch = {
     threadId: null,
     followed: null,
     subject: '',
     total: 0,
+    labelIds: [],
     start: 0,
     cards: [],
     anchor: null,
@@ -387,7 +394,8 @@ export function cardsWindow(db: Db, query: Omit<CardsQuery, 'op'>): CardsWindow 
         .get(threadId, index),
     );
   }
-  if (!key) return { ...empty, threadId, followed, subject, total };
+  const labelIds = threadLabelIds(db)(threadId);
+  if (!key) return { ...empty, threadId, followed, subject, total, labelIds };
   const index = scalar(
     db,
     'SELECT count(*) FROM messages WHERE thread_id = ? AND (time, rowid) < (?, ?)',
@@ -415,12 +423,16 @@ export function cardsWindow(db: Db, query: Omit<CardsQuery, 'op'>): CardsWindow 
     followed,
     subject,
     total,
+    labelIds,
     start: index - older.length,
     cards: [...older, ...newer].map(toCard),
     anchor: index,
     anchorFound: found,
   };
 }
+
+/** A cards window as the index holds it, before the query thread adds what it reads it from. */
+export type CardsStretch = Omit<CardsWindow, 'rev' | 'searched' | 'matching'>;
 
 /** The conversation a message is in now, or null if the message is gone. */
 export function threadOfMessage(db: Db, rowid: number): number | null {

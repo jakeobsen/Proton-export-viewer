@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// The selected conversation: its subject and message count, then one card per
-// message from every folder, oldest first. One card is expanded, with the
-// open message and its body frame; the others show the sender, the date and
-// a Spam or Trash badge. The cards are a virtual list, so a conversation of
-// any length draws only what is on screen.
+// The selected conversation: its subject, its folders and labels and its
+// message count (and, opened from a result, how many of its messages match),
+// then one card per message from every folder, oldest first. One card is
+// expanded, with the open message and its body frame; the others show the
+// sender, the date, a Spam or Trash badge and the message's lead line, or the
+// search's snippet for a message that matches it. The cards are a virtual
+// list, so a conversation of any length draws only what is on screen.
 
 import {
   defaultRangeExtractor,
@@ -11,10 +13,22 @@ import {
   useVirtualizer,
 } from '@tanstack/react-virtual';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { displayText } from '../shared/header-text';
 import type { CardRow } from '../shared/index-types';
 import { CARD_HEIGHT } from './cards';
-import { formatCount } from './format';
-import { cards, expandCard, useCards } from './mailbox-state';
+import { FolderChip, LabelChip } from './Chips';
+import { folderChips, labelChips } from './chips-model';
+import { countText } from './format';
+import { LeadText } from './Lead';
+import type { LeadLine } from './leads';
+import {
+  cards,
+  expandCard,
+  setCardsViewport,
+  useCardLeads,
+  useCards,
+  useMailbox,
+} from './mailbox-state';
 import { useReaderState } from './reader';
 import { avatarColor, initialsOf, shortDate } from './reader-format';
 import { MessageBody } from './ReaderPane';
@@ -28,13 +42,23 @@ function cardDate(time: number): string {
   return Number.isNaN(date.getTime()) ? '' : shortDate(date.toISOString());
 }
 
-function Card({ card, expanded }: { card: CardRow; expanded: boolean }) {
+function Card({
+  card,
+  expanded,
+  line,
+}: {
+  card: CardRow;
+  expanded: boolean;
+  line: LeadLine | undefined;
+}) {
   const reader = useReaderState();
-  const name = card.senderName || card.senderAddress;
+  const address = displayText(card.senderAddress);
+  const name = displayText(card.senderName) || address;
   return (
     <article
       className={expanded ? 'card expanded' : 'card'}
       data-rowid={card.rowid}
+      data-match={card.matched === undefined ? undefined : card.matched ? '1' : '0'}
       aria-busy={expanded && reader.pending}
     >
       <button
@@ -50,13 +74,20 @@ function Card({ card, expanded }: { card: CardRow; expanded: boolean }) {
         >
           {initialsOf(name)}
         </span>
-        <span className="ch-l1">
-          <span className="ch-name" title={card.senderAddress || undefined}>
-            {name}
+        <span className="ch-main">
+          <span className="ch-l1">
+            <span className="ch-name" title={address || undefined}>
+              {name}
+            </span>
+            {card.spam && <span className="pill">Spam</span>}
+            {card.trash && <span className="pill">Trash</span>}
+            <span className="ch-date">{cardDate(card.time)}</span>
           </span>
-          {card.spam && <span className="pill">Spam</span>}
-          {card.trash && <span className="pill">Trash</span>}
-          <span className="ch-date">{cardDate(card.time)}</span>
+          {!expanded && (
+            <span className="ch-snip">
+              <LeadText line={line} />
+            </span>
+          )}
         </span>
       </button>
       {expanded && reader.rowid === card.rowid && (
@@ -70,6 +101,8 @@ function Card({ card, expanded }: { card: CardRow; expanded: boolean }) {
 
 export function Conversation() {
   const snap = useCards();
+  const leads = useCardLeads();
+  const { sidebar } = useMailbox();
   const scrollRef = useRef<HTMLDivElement>(null);
   const [paneHeight, setPaneHeight] = useState(0);
   const expandedIndex = cards.expandedIndex();
@@ -109,7 +142,7 @@ export function Conversation() {
     const last = virtualizer.getVirtualItemForOffset(
       el.scrollTop + Math.max(el.clientHeight, 1) - 1,
     );
-    if (first && last) cards.setViewport(first.index, last.index);
+    if (first && last) setCardsViewport(first.index, last.index);
   }, [virtualizer]);
 
   const scrollTo = useCallback(
@@ -171,11 +204,17 @@ export function Conversation() {
   return (
     <div className="rp cv">
       <div className="cv-head">
-        <h1 className="rp-subject">{snap.subject}</h1>
+        <h1 className="rp-subject">{displayText(snap.subject)}</h1>
         {snap.ready && (
           <div className="chips">
-            <span className="chip">
-              {`${formatCount(snap.total)} ${snap.total === 1 ? 'message' : 'messages'}`}
+            {folderChips(snap.labelIds, sidebar).map((folder) => (
+              <FolderChip key={folder.id} folder={folder} />
+            ))}
+            {labelChips(snap.labelIds, sidebar).map((label) => (
+              <LabelChip key={label.id} label={label} focusable />
+            ))}
+            <span className="chip count">
+              {countText(snap.count?.total ?? snap.total, snap.count?.matching ?? null)}
             </span>
           </div>
         )}
@@ -193,7 +232,11 @@ export function Conversation() {
                 style={{ transform: `translateY(${item.start}px)` }}
               >
                 {card ? (
-                  <Card card={card} expanded={card.rowid === snap.expanded} />
+                  <Card
+                    card={card}
+                    expanded={card.rowid === snap.expanded}
+                    line={leads.get(card.rowid)}
+                  />
                 ) : (
                   <div className="card placeholder" aria-hidden="true" />
                 )}

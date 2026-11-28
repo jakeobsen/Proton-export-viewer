@@ -33,6 +33,7 @@ const REPORT: IndexReport = {
   failed: {},
   timeouts: 0,
   capped: {},
+  cappedMessages: 0,
   hiddenLabelIds: 0,
   fullText: { indexed: 0, total: 0, truncated: 0, skipped: 0, skippedBy: {} },
   attention: 0,

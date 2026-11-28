@@ -9,6 +9,7 @@ import type {
   CardKeyName,
   IndexResult,
   IndexUpdate,
+  LeadsRequest,
   SearchRequest,
   SnippetsRequest,
 } from '../shared/api';
@@ -16,14 +17,16 @@ import type {
   CardRow,
   IndexProgress,
   IndexReport,
+  Lead,
   SearchSort,
   Sidebar,
   ThreadSnippet,
 } from '../shared/index-types';
 import { INBOX, sidebarModel, type SidebarModel } from './folders';
 import { CardsModel } from './cards';
+import { LeadsModel } from './leads';
 import { ListModel, type Row } from './list';
-import { closeReaderAndView, getReaderState, openInReader } from './reader';
+import { closeReaderAndView, getReaderState, openInReader, setReaderSearch } from './reader';
 import { SearchModel, type ResultRow } from './search';
 import { getShellState, refreshGeneration } from './shell';
 
@@ -106,15 +109,62 @@ function setProgress(next: IndexProgress): void {
   update({ progress: next });
 }
 
+function notify(): void {
+  for (const listener of listeners) listener();
+}
+
+/** Lead lines; null if the answer isn't for the current export. */
+async function askLeads(request: LeadsRequest): Promise<Lead[] | null> {
+  try {
+    const generation = getShellState().generation;
+    if (generation === null) return null;
+    const result = await window.pev.leads(request, generation);
+    if (!result.ok || state.key === null || keyOf(result.generation) !== state.key) return null;
+    return result.leads;
+  } catch {
+    return null;
+  }
+}
+
+/** The lead lines of the list's rows. */
+export const listLeads = new LeadsModel('list', askLeads, notify);
+/** The lead lines of the cards, or a result's snippets on the cards that match its search. */
+export const cardLeads = new LeadsModel('cards', askLeads, notify);
+
+/** Whether the list is on screen: a search's results show in its place. */
+let listShown = false;
+
+/** Asks for the lead lines of the list's rows on screen, if the list is. */
+function showListLeads(): void {
+  listLeads.show(listShown ? list.visibleRowids() : []);
+}
+
 export const list = new ListModel(
   (query) => ask((generation) => window.pev.listWindow(query, generation)),
   () => {
-    for (const listener of listeners) listener();
+    notify();
+    showListLeads();
   },
 );
 
 export function useList() {
   return useSyncExternalStore(subscribe, () => list.snapshot);
+}
+
+export function useListLeads() {
+  return useSyncExternalStore(subscribe, () => listLeads.snapshot);
+}
+
+/** The rows on screen changed: more rows may be read, and their lead lines asked for. */
+export function setListViewport(first: number, last: number): void {
+  list.setViewport(first, last);
+  showListLeads();
+}
+
+/** The list came on screen, or left it: out of sight, no row's line is asked for. */
+export function setListShown(shown: boolean): void {
+  listShown = shown;
+  showListLeads();
 }
 
 /** Snippets for rows of the shown search; null if the answer isn't for the current export. */
@@ -164,6 +214,7 @@ let resultShowing: number | null = null;
 function leaveSearch(drop: () => void): void {
   const owned = resultShowing;
   resultShowing = null;
+  setReaderSearch(null);
   drop();
   if (owned !== null && cards.showing === owned) {
     cards.hide();
@@ -189,11 +240,13 @@ export function clearSearch(): void {
 /**
  * Selects a result and shows its conversation's cards, with its newest
  * matching message expanded in the reader. The list's selection goes: the
- * reader no longer shows it.
+ * reader no longer shows it. Opens in that conversation are made from the
+ * search, so the reader shows how each message matched it.
  */
 export function selectResult(row: ResultRow): void {
   search.select(row);
   list.clearSelection();
+  setReaderSearch(search.currentQueryId);
   const reader = getReaderState();
   const shown = cards.snapshot;
   if (
@@ -202,11 +255,17 @@ export function selectResult(row: ResultRow): void {
     reader.rowid === row.anchorRowid &&
     reader.refused === null
   ) {
-    // Shown already; with the list's selection gone, the result owns it.
+    // Shown already; with the list's selection gone, the result owns it. Its
+    // next open, by a card, a key or the body switch, is made from the search,
+    // and its header counts the messages that match.
+    cards.setSearch(search.currentQueryId);
     resultShowing = cards.showing;
+    // Opened from the folder or for another search, it opens again for this
+    // one, so the reader shows how it matched.
+    if (reader.queryId !== search.currentQueryId) void openInReader(row.anchorRowid);
     return;
   }
-  cards.show(row.anchorRowid, row.threadId);
+  cards.show(row.anchorRowid, row.threadId, search.currentQueryId);
   resultShowing = cards.showing;
 }
 
@@ -214,7 +273,8 @@ export function selectResult(row: ResultRow): void {
 export const cards = new CardsModel(
   (query) => ask((generation) => window.pev.cards(query, generation)),
   () => {
-    for (const listener of listeners) listener();
+    notify();
+    cardLeads.show(cards.visibleRowids(), cards.snapshot.queryId);
   },
   {
     open: (rowid) => void openInReader(rowid),
@@ -224,6 +284,16 @@ export const cards = new CardsModel(
 
 export function useCards() {
   return useSyncExternalStore(subscribe, () => cards.snapshot);
+}
+
+export function useCardLeads() {
+  return useSyncExternalStore(subscribe, () => cardLeads.snapshot);
+}
+
+/** The cards on screen changed: more cards may be read, and their lead lines asked for. */
+export function setCardsViewport(first: number, last: number): void {
+  cards.setViewport(first, last);
+  cardLeads.show(cards.visibleRowids(), cards.snapshot.queryId);
 }
 
 const keyOf = (generation: number | null): string | null => {
@@ -264,6 +334,8 @@ export function syncMailbox(): void {
       void readSidebar();
       list.refresh();
       cards.refresh();
+      listLeads.changed();
+      cardLeads.changed();
       refreshReport();
     }
     return;
@@ -276,7 +348,10 @@ export function syncMailbox(): void {
   reportStamp = '';
   list.reset(key === null ? null : folder);
   // A new export or generation: main revoked the reader's view, and nothing is selected.
+  setReaderSearch(null);
   cards.hide();
+  listLeads.reset();
+  cardLeads.reset();
   if (key !== null) void readSidebar();
 }
 
@@ -284,9 +359,13 @@ export function syncMailbox(): void {
 export function indexChanged(update_: IndexUpdate): void {
   if (keyOf(update_.generation) !== state.key || state.key === null) return;
   setProgress(update_.progress);
+  // A scan's progress changes nothing in the index, so nothing is read again for it.
+  if (update_.progress.phase === 'scanning') return;
   void readSidebar();
   list.refresh();
   cards.refresh();
+  listLeads.changed();
+  cardLeads.changed();
   refreshReport();
 }
 
@@ -390,6 +469,8 @@ export function showFolder(id: string): void {
  */
 export function selectRow(row: Row): void {
   list.select(row);
+  // A row of the folder's list: its opens aren't from a search.
+  setReaderSearch(null);
   const reader = getReaderState();
   const shown = cards.snapshot;
   if (
@@ -398,6 +479,8 @@ export function selectRow(row: Row): void {
     reader.rowid === row.newestRowid &&
     reader.refused === null
   ) {
+    // Picked from the list: no longer shown from a search.
+    cards.setSearch(null);
     return;
   }
   cards.show(row.newestRowid, row.threadId);
@@ -414,10 +497,11 @@ export function expandCard(card: CardRow): void {
 /**
  * `n` expands the next newer card, `p` the next older one, stopping at either
  * end; the list selection stays. Nothing moves while the link dialog is open
- * or the index report shows, whether the key was typed in the shell or
- * passed on by main from the body frame.
+ * or the index report or Settings shows, whether the key was typed in the
+ * shell or passed on by main from the body frame.
  */
 export function moveCard(key: CardKeyName): void {
-  if (getShellState().link !== null || state.reportOpen) return;
+  const shell = getShellState();
+  if (shell.link !== null || state.reportOpen || shell.screen === 'settings') return;
   cards.move(key === 'n' ? 1 : -1);
 }
