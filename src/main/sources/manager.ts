@@ -1012,16 +1012,15 @@ export class SourceManager {
    * false if an export overlaps it (nothing is deleted), RESET_FAILED if a
    * file of the app's couldn't be deleted.
    *
-   * One made for a generation is checked again when its turn comes: if an
-   * operation before it moved the generation on (another Reset too), it is
-   * stale, nothing is deleted, and opens are admitted again.
+   * The generation it is made for is checked again when its turn comes: if
+   * an operation before it moved the generation on (another Reset too), it is
+   * stale, nothing is deleted, and opens are admitted again. Null skips that
+   * check.
    */
-  reset(): Promise<boolean | ResetFailed>;
-  reset(expected: number): Promise<boolean | Stale | ResetFailed>;
-  reset(expected?: number): Promise<boolean | Stale | ResetFailed> {
+  reset(expected: number | null): Promise<boolean | Stale | ResetFailed> {
     this.admitting = false;
     return this.serial(async () => {
-      if (expected !== undefined && this.deps.generation() !== expected) {
+      if (expected !== null && this.deps.generation() !== expected) {
         if (!this.closed) this.admitting = true;
         return STALE;
       }

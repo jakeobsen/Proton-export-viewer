@@ -500,8 +500,8 @@ export async function install(ctx: AppContext): Promise<boolean> {
       return result.ok ? (result.value ?? 0) : 0;
     },
     indexDir: () => join(app.getPath('userData'), 'index'),
-    /** Resets the app's data, as Settings does. */
-    resetApp: () => ctx.sources.reset(),
+    /** Resets the app's data, as Settings does, without its generation check. */
+    resetApp: () => ctx.sources.reset(null),
     /**
      * Sends the first app window a card key as main does for one typed in the
      * body frame, whatever has the focus: the shell's own handling is tested

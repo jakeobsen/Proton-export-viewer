@@ -976,7 +976,7 @@ describe('core exiting on its own', () => {
     const forgetting = t.manager.forget(after.sourceKey, t.generation());
     t.manager.coreExited(after);
     await forgetting;
-    await t.manager.reset();
+    await t.manager.reset(null);
     t.manager.coreExited(after);
     await settle();
     expect(restarts(t)).toBe(0);
@@ -1621,7 +1621,7 @@ describe('Rebuild by hand', () => {
     const t = await opened('mgr-rebuild-reset');
     const stamp = t.manager.stamp()!;
     const generation = t.generation();
-    const resetting = t.manager.reset();
+    const resetting = t.manager.reset(null);
     expect(await t.manager.rebuildIndex(stamp.sourceKey, generation)).toBe(STALE);
     expect(await resetting).toBe(true);
     expect(t.core.forgets).toEqual([]);
@@ -1631,7 +1631,7 @@ describe('Rebuild by hand', () => {
     const t = await opened('mgr-rebuild-then-reset');
     const stamp = t.manager.stamp()!;
     const rebuilding = t.manager.rebuildIndex(stamp.sourceKey, t.generation());
-    const resetting = t.manager.reset();
+    const resetting = t.manager.reset(null);
     // The Reset closed the app to opens first, so the rebuild doesn't reopen.
     expect(await rebuilding).toBe('closed');
     expect(await resetting).toBe(true);
@@ -1712,7 +1712,7 @@ describe('an export overlapping the app’s data folder', () => {
     const manager = t.make();
     expect(manager.view().recent).toHaveLength(1);
     expect(manager.exportRoots()).toEqual([join(pickPath, 'acct', 'mail_20250630_120000')]);
-    await manager.reset();
+    await manager.reset(null);
     expect(t.lines.map((l) => JSON.parse(l) as { code: string; data: unknown })).toContainEqual({
       code: 'app.reset_refused',
       data: { reason: 'overlap' },
@@ -1751,7 +1751,7 @@ describe('Reset', () => {
     // Its dialog is up.
     await vi.waitFor(() => expect(pick).toBeDefined(), WAIT);
     const queuedBefore = t.manager.openRecent(key, t.generation());
-    const reset = t.manager.reset();
+    const reset = t.manager.reset(null);
     const queuedAfter = t.manager.chooseFolder(null, t.generation());
     pick!({ path: root, bookmark: 'bm2' });
     expect(await inProgress).toBe('closed');
@@ -1788,7 +1788,7 @@ describe('Reset', () => {
     const starts = t.core.started.length;
     // The app quits while core tears the source down for the Reset.
     t.core.onReset = () => t.manager.close();
-    expect(await t.manager.reset()).toBe(true);
+    expect(await t.manager.reset(null)).toBe(true);
     await settle();
     expect(t.core.running).toBe(false);
     expect(t.core.started).toHaveLength(starts);
@@ -1866,7 +1866,7 @@ describe('Reset', () => {
       scopes: { start: () => ({ release: () => {} }) },
     });
     writeFileSync(join(t.userData, 'settings.json'), '{}');
-    expect(await manager.reset()).toBe(true);
+    expect(await manager.reset(null)).toBe(true);
     expect(seen).toEqual(['stop:true', 'after:false', 'notify']);
   });
 
@@ -1883,7 +1883,7 @@ describe('Reset', () => {
     const calls = t.core.indexCalls.length;
     t.manager.handleCoreEvent(damaged(stamp));
     const other = t.manager.openRecent(first.sourceKey, t.generation());
-    await t.manager.reset();
+    await t.manager.reset(null);
     expect(await other).toBe('closed');
     await settle();
     expect(t.core.indexCalls).toHaveLength(calls);
