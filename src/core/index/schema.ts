@@ -5,7 +5,7 @@
 import { randomUUID } from 'node:crypto';
 import { statSync } from 'node:fs';
 import { CRISIS_MERGE } from './limits';
-import { openDb, type Db } from './sql';
+import { INDEX_BUSY_MS, IndexBusy, isBusy, openDb, setBusyTimeout, type Db } from './sql';
 
 export const SCHEMA_VERSION = 3;
 
@@ -149,14 +149,18 @@ export function setMeta(db: Db, key: string, value: string | number): void {
   ).run(key, value);
 }
 
-/** The database's schema version and identity, for the checks an open makes. */
+/**
+ * The database's schema version and identity, for the checks an open makes.
+ * Throws IndexBusy when another connection's lock kept it from reading them.
+ */
 export function identityOf(db: Db): { version: number; uuid: string | null } {
   const version = Number(db.stmt('PRAGMA user_version').get()?.user_version ?? 0);
   let uuid: string | null = null;
   try {
     const value = metaValue(db, META.dbUuid);
     uuid = typeof value === 'string' ? value : null;
-  } catch {
+  } catch (err) {
+    if (isBusy(err)) throw new IndexBusy();
     // No source_meta table: not one of ours.
   }
   return { version, uuid };
@@ -167,16 +171,22 @@ export function identityOf(db: Db): { version: number; uuid: string | null } {
  * anything on disk. With both its WAL and shared-memory files present, a
  * read-only connection creates nothing and sees committed rows still in the
  * WAL; otherwise the file is read as immutable, so no sidecar is created.
- * Null if it can't be read as one of these databases.
+ * Null if it can't be read as one of these databases. Throws IndexBusy when
+ * another connection's lock outlasts `busyMs`: the file may be fine.
  */
-export function probeIdentity(dbPath: string): { version: number; uuid: string | null } | null {
+export function probeIdentity(
+  dbPath: string,
+  busyMs: number = INDEX_BUSY_MS,
+): { version: number; uuid: string | null } | null {
   if (!isFile(dbPath)) return null;
   const withSidecars = isFile(`${dbPath}-wal`) && isFile(`${dbPath}-shm`);
   let db: Db | null = null;
   try {
     db = withSidecars ? openDb(dbPath, true) : openDb(dbPath, true, true);
+    setBusyTimeout(db, busyMs);
     return identityOf(db);
-  } catch {
+  } catch (err) {
+    if (err instanceof IndexBusy || isBusy(err)) throw new IndexBusy();
     return null;
   } finally {
     try {
@@ -204,14 +214,25 @@ export function mismatchOf(
   return found.uuid === expectedUuid && expectedUuid !== null ? null : 'identity';
 }
 
-/** How the database file differs from this schema version and identity; null if it doesn't. */
-export function probeMismatch(dbPath: string, expectedUuid: string | null): Mismatch | null {
-  return mismatchOf(probeIdentity(dbPath), expectedUuid);
+/**
+ * How the database file differs from this schema version and identity; null
+ * if it doesn't. Throws IndexBusy, as probeIdentity does.
+ */
+export function probeMismatch(
+  dbPath: string,
+  expectedUuid: string | null,
+  busyMs: number = INDEX_BUSY_MS,
+): Mismatch | null {
+  return mismatchOf(probeIdentity(dbPath, busyMs), expectedUuid);
 }
 
 /** True if the file holds a database with this schema version and this identity. */
-export function probeSame(dbPath: string, expectedUuid: string): boolean {
-  return probeMismatch(dbPath, expectedUuid) === null;
+export function probeSame(
+  dbPath: string,
+  expectedUuid: string,
+  busyMs: number = INDEX_BUSY_MS,
+): boolean {
+  return probeMismatch(dbPath, expectedUuid, busyMs) === null;
 }
 
 function isFile(path: string): boolean {

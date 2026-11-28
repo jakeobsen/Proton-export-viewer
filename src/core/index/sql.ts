@@ -71,13 +71,21 @@ export function openDb(path: string, readOnly = false, immutable = false): Db {
   };
 }
 
+/** How long a connection waits for another one's lock before it gives up as busy. */
+export const INDEX_BUSY_MS = 5000;
+
+/** Sets how long `db` waits for another connection's lock, in whole milliseconds. */
+export function setBusyTimeout(db: Db, busyMs: number = INDEX_BUSY_MS): void {
+  db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.trunc(busyMs))}`);
+}
+
 /**
  * Connection settings. The writer keeps a small cache, which bounds how much
  * one unit of work can leave unwritten (see limits.ts); the query thread keeps
  * a larger one.
  */
-export function configure(db: Db, role: 'writer' | 'reader'): void {
-  db.exec('PRAGMA busy_timeout = 5000');
+export function configure(db: Db, role: 'writer' | 'reader', busyMs: number = INDEX_BUSY_MS): void {
+  setBusyTimeout(db, busyMs);
   if (role === 'writer') {
     db.exec('PRAGMA journal_mode = WAL');
     db.exec('PRAGMA synchronous = NORMAL');
@@ -102,6 +110,28 @@ export function sqliteCode(err: unknown): number | null {
   return typeof code === 'number' ? code & 0xff : null;
 }
 
+export const SQLITE_BUSY = 5;
+export const SQLITE_LOCKED = 6;
 export const SQLITE_FULL = 13;
 export const SQLITE_CORRUPT = 11;
 export const SQLITE_NOTADB = 26;
+
+/**
+ * Whether an error says another connection holds a lock the operation needs:
+ * SQLITE_BUSY or SQLITE_LOCKED, with any extended code (such as
+ * BUSY_RECOVERY or BUSY_SNAPSHOT).
+ */
+export function isBusy(err: unknown): boolean {
+  const code = sqliteCode(err);
+  return code === SQLITE_BUSY || code === SQLITE_LOCKED;
+}
+
+/**
+ * The index can't be read yet: another connection held a lock past the busy
+ * timeout. That says nothing about the file, so it is never taken as damage.
+ */
+export class IndexBusy extends Error {
+  constructor() {
+    super('INDEX_BUSY');
+  }
+}

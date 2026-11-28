@@ -175,6 +175,11 @@ export interface IndexOptions {
    * writes, at most; TXN_INPUT_BYTES otherwise.
    */
   txnBytes?: number;
+  /**
+   * Builds with test hooks only: how long an open waits for another
+   * connection's lock; INDEX_BUSY_MS otherwise.
+   */
+  busyMs?: number;
   /** Builds with test hooks only: this message's body job never ends, so it runs past its limit. */
   stallBodyOf?: string;
 }
@@ -435,6 +440,7 @@ export class IndexService {
       capBytes: this.capBytes,
       exportRoots: this.deps.exportRoots ?? [],
       cancel: this.cancel,
+      ...this.busyArg(),
     });
     this.writerEntry = this.connections.add({ role: 'writer', dbPath: this.dbPath });
     this.opened = opened;
@@ -488,11 +494,18 @@ export class IndexService {
     };
   }
 
+  /** A test's busy timeout for the opens, if it set one. */
+  private busyArg(): { busyMs?: number } {
+    const busyMs = __PEV_TEST_HOOKS__ ? this.deps.options?.busyMs : undefined;
+    return busyMs === undefined ? {} : { busyMs };
+  }
+
   private openQuery(): Promise<void> {
     const query = this.query;
     const uuid = this.opened?.uuid;
     if (!query || !uuid || this.closed) return Promise.reject(new ThreadError('NOT_OPEN'));
-    this.queryReady ??= query.call('open', { dbPath: this.dbPath, expectedUuid: uuid }).then(
+    const args = { dbPath: this.dbPath, expectedUuid: uuid, ...this.busyArg() };
+    this.queryReady ??= query.call('open', args).then(
       () => {
         this.queryEntry = this.connections.add({ role: 'query', dbPath: this.dbPath });
       },

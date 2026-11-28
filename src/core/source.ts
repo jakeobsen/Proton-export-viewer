@@ -51,6 +51,7 @@ import { FamilyInUse, deleteFamily } from './index/family';
 import type { CheckResult } from './index/ops';
 import { ThreadError, type IndexThread, type ThreadRole } from './index/pool';
 import { BODY_STATE, mismatchOf, probeIdentity } from './index/schema';
+import { IndexBusy } from './index/sql';
 import type { LocatedFile, OpenedMessage } from './reader/source';
 import { overlaps } from '../shared/overlap';
 import {
@@ -65,6 +66,13 @@ import { withScan } from './index/report';
 const SCAN_SLICE = 2000;
 /** The shortest time between two reports of a scan's progress, in milliseconds. */
 const SCAN_REPORT_MS = 250;
+
+/**
+ * How long the look at a damaged index's file waits for another connection's
+ * lock. It runs on core's main thread, so it waits briefly: busy means the
+ * open is refused, never that the file is damaged.
+ */
+const DAMAGED_PROBE_BUSY_MS = 100;
 
 const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -333,9 +341,22 @@ export class SourceSession {
             this.log.warn('index.open_refused', { reason: 'overlap' }, { src: stamp.sourceKey });
             return failed('closed');
           }
+          // Another connection held the index past the busy timeout: it may be
+          // fine, so it is neither deleted nor rebuilt. The next open tries again.
+          const busy = () => {
+            this.log.warn('index.open_refused', { reason: 'busy' }, { src: stamp.sourceKey });
+            return failed('unavailable');
+          };
+          if (err instanceof ThreadError && err.code === 'INDEX_BUSY') return busy();
           if (err instanceof ThreadError && err.code === 'INDEX_DAMAGED') {
             const dbPath = this.dbPathOf(stamp.sourceKey);
-            const found = dbPath ? probeIdentity(dbPath) : null;
+            let found: ReturnType<typeof probeIdentity>;
+            try {
+              found = dbPath ? probeIdentity(dbPath, DAMAGED_PROBE_BUSY_MS) : null;
+            } catch (probeErr) {
+              if (probeErr instanceof IndexBusy) return busy();
+              throw probeErr;
+            }
             const reason = (dbPath && mismatchOf(found, request.dbUuid)) || 'identity';
             if (reason === 'schema' && root === null) {
               // An index of another schema version is no damage: it stays as
