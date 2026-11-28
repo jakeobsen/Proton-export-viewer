@@ -12,7 +12,8 @@
 // still be reading. Past `max`, no new open starts until one is closed, so
 // repeated timeouts on a slow disk can't pile descriptors up. A thread stuck
 // in a syscall that never returns keeps its file open until it returns; at
-// most `max` files are held that way.
+// most `max` files are held that way, and a drain waits for them only as long
+// as it is told to.
 
 import { close } from 'node:fs';
 
@@ -99,9 +100,24 @@ export class BodyFiles {
     this.wake();
   }
 
-  /** Resolves once every descriptor is closed and every open has ended. */
-  async drain(): Promise<void> {
-    while (this.held > 0) await new Promise<void>((resolve) => this.emptied.push(resolve));
+  /**
+   * Resolves with 0 once every descriptor is closed and every open has ended,
+   * or with the number still held after `ms`. Those close when their thread
+   * exits or their open completes, as before.
+   */
+  async drain(ms: number): Promise<number> {
+    if (this.held === 0) return 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<void>((resolve) => (timer = setTimeout(resolve, Math.max(0, ms))));
+    try {
+      while (this.held > 0) {
+        const emptied = new Promise<boolean>((resolve) => this.emptied.push(() => resolve(true)));
+        if (!(await Promise.race([emptied, late.then(() => false)]))) break;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    return this.held;
   }
 
   private free(): void {

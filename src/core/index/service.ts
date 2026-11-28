@@ -15,7 +15,8 @@
 // newest message first: one file per pool job, with the same time limit, so a
 // file past it fails alone. Core opens each file itself, without blocking and
 // under the same limit, lends the descriptor to the job and closes it whatever
-// becomes of the job (see body-files.ts). The text is written in transactions
+// becomes of the job (see body-files.ts); a teardown waits no longer than the
+// job limit for a thread stuck in a read. The text is written in transactions
 // of at most 500 bodies and 4 MiB of text, counted after reading. A message
 // whose file changed since the scan waits for the next reconcile; one
 // interrupted by a close waits for the next open.
@@ -32,8 +33,8 @@
 // corrupt at any time, is reported once, for the source's lifecycle to act on.
 // Closing is the index's part of the teardown: queued jobs are cancelled, the
 // write in flight rolls back, the check is ended and joined, every file phase
-// 2 opened is closed once no thread can read it, and every connection is
-// closed.
+// 2 opened is closed once no thread can read it (waiting no longer than the
+// job limit for a thread stuck in a read), and every connection is closed.
 
 import { mkdirSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
@@ -313,6 +314,8 @@ export class IndexService {
   private readonly textBudget: number;
   /** The descriptors phase 2 has open, opening, or lent to a thread. */
   private readonly bodyFiles: BodyFiles;
+  /** The monotonic time until which a close waits for the pool's threads and their files. */
+  private closeBy: number | null = null;
 
   constructor(private readonly deps: IndexServiceDeps) {
     this.dbPath = join(deps.indexDir, `${deps.stamp.sourceKey}.sqlite`);
@@ -561,9 +564,14 @@ export class IndexService {
     try {
       if (await this.runPhase1(scan)) await this.runPhase2(scan);
     } finally {
-      await this.stopPool();
-      // No file phase 2 opened stays open once indexing has ended.
-      await this.bodyFiles.drain();
+      // The threads and the files they read get one job limit, from here or
+      // from the start of a close, whichever comes first.
+      const until = Math.min(this.closeBy ?? Infinity, performance.now() + this.jobMs);
+      await this.stopPool(until);
+      // A file a thread still reads after that is left to it: it is closed
+      // when the thread exits, or by the system when core does.
+      const held = await this.bodyFiles.drain(until - performance.now());
+      if (held > 0) this.deps.log.warn('index.files_held', { count: held }, this.src);
       this.touch();
     }
   }
@@ -605,10 +613,26 @@ export class IndexService {
     return this.pool;
   }
 
-  private async stopPool(): Promise<void> {
+  /**
+   * Ends the pool's threads, waiting for them until `until` (the monotonic
+   * clock) at most: a thread stuck in a read on a dead disk exits whenever
+   * that read ends.
+   */
+  private async stopPool(until = Infinity): Promise<void> {
     const pool = this.pool;
     this.pool = null;
-    await pool?.stop();
+    if (!pool) return;
+    const stopped = pool.stop();
+    if (until === Infinity) return stopped;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, Math.max(0, until - performance.now()));
+    });
+    try {
+      await Promise.race([stopped, late]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /** Phase 1; resolves true if it ended with every pair handled. */
@@ -1168,7 +1192,8 @@ export class IndexService {
    * The index's part of a teardown: no new work starts, queued jobs are
    * cancelled, the write in flight stops and rolls back, the check is ended
    * and joined, every file phase 2 opened is closed once the thread it was
-   * lent to has exited, and every connection is closed. Resolves once all of
+   * lent to has exited (waiting no longer than the job limit for a thread
+   * stuck in a read), and every connection is closed. Resolves once all of
    * that has happened.
    */
   async close(): Promise<void> {
@@ -1180,8 +1205,9 @@ export class IndexService {
     if (this.idleTimer) clearInterval(this.idleTimer);
     this.idleTimer = null;
     this.bodyFiles.stop();
-    await this.stopPool();
-    // A run ends only once every file it opened is closed.
+    this.closeBy = performance.now() + this.jobMs;
+    await this.stopPool(this.closeBy);
+    // A run ends once every file it opened is closed, or the wait for them is over.
     await this.running;
     await this.verifier?.stop();
     await this.checking;

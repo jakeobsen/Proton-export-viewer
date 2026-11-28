@@ -103,7 +103,7 @@ describe('the descriptor ledger', () => {
     await late;
     await until(() => files.count === 0);
     expect(openOn(fd, file)).toBe(false);
-    await files.drain();
+    expect(await files.drain(1000)).toBe(0);
   });
 
   it('closes a lent descriptor once `after` settles, never before, and drains then', async () => {
@@ -113,11 +113,27 @@ describe('the descriptor ledger', () => {
     if (typeof opened !== 'object') throw new Error('not opened');
     let exit: () => void = () => {};
     files.close(opened.fd, new Promise<void>((resolve) => (exit = resolve)));
-    const drained = files.drain();
+    const drained = files.drain(10_000);
     expect(await settledWithin(drained, 200)).toBe(false);
     expect(openOn(opened.fd, file)).toBe(true);
     exit();
-    await drained;
+    expect(await drained).toBe(0);
+    expect(openOn(opened.fd, file)).toBe(false);
+  });
+
+  it('drains for as long as it is told to, then leaves the files held to close later', async () => {
+    const file = plainFile('body-files-drain-limit');
+    const files = new BodyFiles(4);
+    const opened = await files.open(() => Promise.resolve(openSync(file.path, 'r')), 1000);
+    if (typeof opened !== 'object') throw new Error('not opened');
+    let exit: () => void = () => {};
+    files.close(opened.fd, new Promise<void>((resolve) => (exit = resolve)));
+    const started = performance.now();
+    expect(await files.drain(200)).toBe(1);
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(openOn(opened.fd, file)).toBe(true);
+    exit();
+    expect(await files.drain(10_000)).toBe(0);
     expect(openOn(opened.fd, file)).toBe(false);
   });
 
@@ -135,7 +151,7 @@ describe('the descriptor ledger', () => {
     expect(await third).toEqual({ fd: fds[2] });
     files.close(fds[1]!);
     files.close(fds[2]!);
-    await files.drain();
+    expect(await files.drain(10_000)).toBe(0);
   });
 
   it('frees the slot of a refused open, and rejects as the open did', async () => {
@@ -169,7 +185,7 @@ describe('the descriptor ledger', () => {
       'stopped',
     );
     arrive();
-    await files.drain();
+    expect(await files.drain(10_000)).toBe(0);
     expect(openOn(fd, file)).toBe(false);
   });
 });
@@ -181,17 +197,21 @@ describe('the descriptor ledger', () => {
  * ID: 'read' answers at once from the lent descriptor; 'inflight' starts a
  * read of the FIFO that answers only once the test writes to it, and never
  * replies; 'blocked' waits for the FIFO in a synchronous read, then replies.
+ * `inflightNth` makes a thread's nth job 'inflight'.
  */
 const BODY_SCRIPT = `
 const { parentPort, workerData } = require('node:worker_threads');
 const fs = require('node:fs');
+let jobs = 0;
 parentPort.on('message', (r) => {
   const { fd, item } = r.args;
   const reply = () => parentPort.postMessage({ id: r.id, ok: true, data: {
     protonId: item.protonId, rev: item.rev, ok: true, body: 'lent ' + fs.fstatSync(fd).size,
     truncated: false, attachments: [], attachmentText: '', attachmentsCapped: false, inputBytes: 0,
   } });
-  const mode = workerData.modes[item.protonId] || workerData.mode;
+  jobs += 1;
+  const mode =
+    jobs === workerData.inflightNth ? 'inflight' : workerData.modes[item.protonId] || workerData.mode;
   if (mode === 'inflight') return fs.read(workerData.fifo, Buffer.alloc(1), 0, 1, null, () => {});
   if (mode === 'blocked') fs.readSync(workerData.fifo, Buffer.alloc(1), 0, 1, null);
   reply();
@@ -231,6 +251,9 @@ function phase2(
   setup: {
     mode?: string;
     modes?: (ids: string[]) => Record<string, string>;
+    inflightNth?: number;
+    /** Each phase 2 write takes this long. */
+    slowWrites?: number;
     options?: IndexOptions;
     openFile?: (root: string, ref: FileRef) => Promise<number>;
     wrap?: (thread: IndexThread) => IndexThread;
@@ -246,8 +269,14 @@ function phase2(
   const pipe = fifo(dir);
   const modes = setup.modes?.(ids) ?? {};
   const opened: Opened[] = [];
-  const quiet = () => {};
-  const log: Logger = { log: quiet, error: quiet, warn: quiet, info: quiet };
+  const logs: Array<{ code: string; data: Record<string, unknown> }> = [];
+  const push = (code: string, data: Record<string, unknown> = {}) => logs.push({ code, data });
+  const log: Logger = {
+    log: (_level, code, data) => push(code, data),
+    error: push,
+    warn: push,
+    info: push,
+  };
   const service = new IndexService({
     indexDir: join(dir, 'index'),
     stamp: STAMP,
@@ -262,12 +291,32 @@ function phase2(
     },
     thread: (role: ThreadRole) => {
       const inline = new InlineThread(role);
+      if (role === 'writer' && setup.slowWrites) {
+        const ms = setup.slowWrites;
+        const slow: IndexThread = {
+          get respawns() {
+            return inline.respawns;
+          },
+          onRespawn: null,
+          stop: () => inline.stop(),
+          call: async <T>(op: string, args?: unknown, timeoutMs?: number): Promise<T> => {
+            if (op === 'phase2') await delay(ms);
+            return inline.call<T>(op, args, timeoutMs);
+          },
+        };
+        return slow;
+      }
       if (role !== 'parse') return inline;
       const worker = new WorkerThread(
         () =>
           new Worker(BODY_SCRIPT, {
             eval: true,
-            workerData: { fifo: pipe.fd, mode: setup.mode ?? 'read', modes },
+            workerData: {
+              fifo: pipe.fd,
+              mode: setup.mode ?? 'read',
+              modes,
+              inflightNth: setup.inflightNth ?? 0,
+            },
           }),
       );
       const thread = new BodyOnWorker(inline, worker);
@@ -292,14 +341,14 @@ function phase2(
     }
   };
   const fdOf = (id: string) => opened.find((o) => o.id === id)!;
-  return { run, ids, pipe, opened, service, states, fdOf, scan: () => scanRun(run) };
+  return { run, ids, pipe, opened, logs, service, states, fdOf, scan: () => scanRun(run) };
 }
 
 describe('phase 2 descriptors', () => {
   it('keeps a timed-out file open until its thread has exited mid-read, and ends indexing after', async () => {
     let slow = '';
     const p = phase2('body-fd-timeout', 6, {
-      options: { jobMs: 300 },
+      options: { jobMs: 800 },
       modes: (ids) => ({ [(slow = ids[2]!)]: 'inflight' }),
     });
     await p.service.open(null);
@@ -308,7 +357,7 @@ describe('phase 2 descriptors', () => {
     expect(p.service.progress).toMatchObject({ bodiesDone: 6, bodiesFailed: 1, timeouts: 1 });
     // The thread that had it was told to end, but its read is still under way.
     const held = p.fdOf(slow);
-    expect(await settledWithin(indexing, 400)).toBe(false);
+    expect(await settledWithin(indexing, 300)).toBe(false);
     expect(openOn(held.fd, held.ref)).toBe(true);
     for (const o of p.opened) if (o.id !== slow) expect(openOn(o.fd, o.ref), o.id).toBe(false);
     p.pipe.release();
@@ -316,19 +365,42 @@ describe('phase 2 descriptors', () => {
     expect(openOn(held.fd, held.ref)).toBe(false);
     expect(p.states()[slow]).toEqual([BODY_STATE.failed, 'BODY_TIMEOUT']);
     expect(p.opened.map((o) => o.id).sort()).toEqual(p.ids);
+    expect(p.logs.map((l) => l.code)).not.toContain('index.files_held');
+  });
+
+  it('waits no longer than the job limit for a thread stuck in a read, logs it, and leaves its file to it', async () => {
+    let slow = '';
+    const p = phase2('body-fd-stuck', 6, {
+      options: { jobMs: 300 },
+      modes: (ids) => ({ [(slow = ids[2]!)]: 'inflight' }),
+    });
+    await p.service.open(null);
+    const indexing = p.service.startIndexing(p.scan());
+    await until(() => p.service.progress.bodyPhase === 'done');
+    const started = performance.now();
+    await indexing;
+    expect(performance.now() - started).toBeLessThan(300 + 700);
+    // The file stays with the thread still reading it, and closes when that read ends.
+    const held = p.fdOf(slow);
+    expect(openOn(held.fd, held.ref)).toBe(true);
+    expect(p.logs.filter((l) => l.code === 'index.files_held')).toEqual([
+      { code: 'index.files_held', data: { count: 1 } },
+    ]);
+    p.pipe.release();
+    await until(() => !openOn(held.fd, held.ref));
   });
 
   it('holds a close that follows a timeout until the old thread has exited, then closes its file', async () => {
     let slow = '';
     const p = phase2('body-fd-close', 8, {
-      options: { jobMs: 300 },
+      options: { jobMs: 800 },
       modes: (ids) => ({ [(slow = ids[0]!)]: 'inflight' }),
     });
     await p.service.open(null);
     const indexing = p.service.startIndexing(p.scan());
     await until(() => p.service.progress.timeouts === 1);
     const closing = p.service.close();
-    expect(await settledWithin(closing, 400)).toBe(false);
+    expect(await settledWithin(closing, 300)).toBe(false);
     const held = p.fdOf(slow);
     expect(openOn(held.fd, held.ref)).toBe(true);
     p.pipe.release();
@@ -359,6 +431,54 @@ describe('phase 2 descriptors', () => {
     for (const o of p.opened) expect(openOn(o.fd, o.ref), o.id).toBe(false);
   });
 
+  it('finishes a close during a read stuck past the job limit within it, and the file closes when the read ends', async () => {
+    let slow = '';
+    const p = phase2('body-fd-stop-stuck', 6, {
+      options: { jobMs: 1500 },
+      modes: (ids) => ({ [(slow = ids[1]!)]: 'inflight' }),
+    });
+    await p.service.open(null);
+    const indexing = p.service.startIndexing(p.scan());
+    await until(() => p.opened.some((o) => o.id === slow));
+    await delay(100);
+    const started = performance.now();
+    await p.service.close();
+    await indexing;
+    expect(performance.now() - started).toBeLessThan(1500 + 1000);
+    const held = p.fdOf(slow);
+    expect(openOn(held.fd, held.ref)).toBe(true);
+    expect(p.logs.filter((l) => l.code === 'index.files_held')).toEqual([
+      { code: 'index.files_held', data: { count: 1 } },
+    ]);
+    p.pipe.release();
+    await until(() => !openOn(held.fd, held.ref));
+  });
+
+  it('bounds a close by one job limit, even when the run ends after the close began', async () => {
+    // Each body is its own write, and each write takes a while: the run ends
+    // only once the write under way at the close is done.
+    const p = phase2('body-fd-close-late', 6, {
+      options: { jobMs: 1500, txnBytes: 1 },
+      slowWrites: 1000,
+      inflightNth: 3,
+    });
+    await p.service.open(null);
+    const indexing = p.service.startIndexing(p.scan());
+    await until(() => p.opened.length >= 3);
+    await delay(200);
+    const started = performance.now();
+    await p.service.close();
+    await indexing;
+    expect(performance.now() - started).toBeLessThan(1500 + 500);
+    // The third job's thread is stuck in its read: its file is left to it.
+    expect(p.opened.filter((o) => openOn(o.fd, o.ref))).toHaveLength(1);
+    expect(p.logs.filter((l) => l.code === 'index.files_held')).toEqual([
+      { code: 'index.files_held', data: { count: 1 } },
+    ]);
+    p.pipe.release();
+    await until(() => p.opened.every((o) => !openOn(o.fd, o.ref)));
+  });
+
   it('stops opening at the cap while timed-out threads hold their files, and goes on as they close', async () => {
     // One thread: two lanes, so at most four descriptors.
     let heldMax = 0;
@@ -385,7 +505,7 @@ describe('phase 2 descriptors', () => {
     expect(heldMax).toBeLessThanOrEqual(4);
     expect(p.service.progress).toMatchObject({ bodyPhase: 'done', bodiesDone: 10 });
     expect(p.service.progress.timeouts).toBeGreaterThanOrEqual(4);
-    for (const o of p.opened) expect(openOn(o.fd, o.ref), o.id).toBe(false);
+    await until(() => p.opened.every((o) => !openOn(o.fd, o.ref)));
   });
 
   it('closes the file of a job no thread took at once', async () => {
@@ -425,7 +545,7 @@ describe('phase 2 descriptors', () => {
       modes: (ids) => ((late = ids[1]!), {}),
       openFile: async (root, ref) => {
         if (!ref.rel.startsWith(late)) return openContainedAsync(root, ref);
-        await delay(600);
+        await delay(2500);
         const fd = await openContainedAsync(root, ref);
         lateFd = { fd, ref };
         setTimeout(() => (openAfterArrival = openOn(fd, ref)), 50);
@@ -436,8 +556,13 @@ describe('phase 2 descriptors', () => {
     await p.service.startIndexing(p.scan());
     expect(p.states()[late]).toEqual([BODY_STATE.failed, 'BODY_TIMEOUT']);
     expect(p.service.progress).toMatchObject({ bodiesDone: 5, bodiesFailed: 1, timeouts: 1 });
-    expect(lateFd).not.toBeNull();
+    // Indexing didn't wait past the limit for the open still under way.
+    expect(lateFd).toBeNull();
+    expect(p.logs.filter((l) => l.code === 'index.files_held')).toEqual([
+      { code: 'index.files_held', data: { count: 1 } },
+    ]);
     await until(() => openAfterArrival !== null);
+    expect(lateFd).not.toBeNull();
     expect(openAfterArrival).toBe(false);
   });
 
