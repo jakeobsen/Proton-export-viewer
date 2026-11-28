@@ -17,7 +17,12 @@ import type {
 } from '../shared/core-protocol';
 import { errorData } from '../shared/log/schema';
 import { LogWriter, type Logger } from '../shared/log/writer';
-import type { LocateRequest, ReadRequest, ReaderFailure } from '../shared/reader-protocol';
+import type {
+  LocateRequest,
+  ReadRequest,
+  ReaderFailure,
+  SourceRequest,
+} from '../shared/reader-protocol';
 import { WorkerThread, type ThreadRole } from './index/pool';
 import type { IndexOptions } from './index/service';
 import { READER_RETIRE_MB, ReaderLane } from './reader/lane';
@@ -51,10 +56,11 @@ const lane = new ReaderLane<WorkerRequest, WorkerMessage>({
     log?.warn(breach === 'timeout' ? 'reader.timeout' : 'reader.limit', { ms }),
   // A large message can leave the worker holding hundreds of MB: a new worker gives it back.
   retire: (message) =>
-    message.type === 'rendered' && message.heldBytes > READER_RETIRE_MB * 1024 * 1024,
+    (message.type === 'rendered' || message.type === 'sourced') &&
+    message.heldBytes > READER_RETIRE_MB * 1024 * 1024,
   onRetire: (message) =>
     log?.info('reader.worker_retired', {
-      bytes: message.type === 'rendered' ? message.heldBytes : 0,
+      bytes: message.type === 'rendered' || message.type === 'sourced' ? message.heldBytes : 0,
     }),
   onOther: (message) => {
     if (message.type === 'log') workerLog?.log(message.level, message.code, message.data);
@@ -131,7 +137,7 @@ const opens = new OpenTracker();
 
 /** The message to read: from the test source if a test set one, else from the open export. */
 async function openForRead(
-  request: ReadRequest,
+  request: Pick<ReadRequest, 'rowid' | 'generation'>,
   stale: () => boolean,
 ): Promise<ReaderFile | { ok: false; code: 'no_source' }> {
   if (__PEV_TEST_HOOKS__ && readerSource) {
@@ -222,6 +228,64 @@ async function readOpen(request: ReadRequest, stale: () => boolean, fail: ReadFa
   }
 }
 
+/**
+ * Reads for the source view in the reader lane: the message's header block,
+ * its parts, or one part's header block. Only from the file the view was read
+ * from, when main names one: a file changed since is refused. A part's read
+ * gives way to a newer selection in the same window while it waits.
+ */
+async function readSource(request: SourceRequest): Promise<void> {
+  const { reqId } = request;
+  const fail = (
+    code:
+      | 'no_source'
+      | 'not_found'
+      | 'superseded'
+      | 'unavailable'
+      | 'eml_missing'
+      | 'changed'
+      | 'reader_failed',
+    reason?: ReaderFailure,
+  ) => reply({ type: 'result', reqId, ok: false, code, ...(reason ? { reason } : {}) });
+  const found = await openForRead(request, () => false);
+  if (!found.ok) return found.code === 'refused' ? fail('reader_failed', 'file') : fail(found.code);
+  const opened = found.opened;
+  try {
+    const expected = request.file;
+    if (
+      expected &&
+      (!opened.file || opened.file.dev !== expected.dev || opened.file.ino !== expected.ino)
+    ) {
+      return fail('changed');
+    }
+    const slot =
+      request.what.kind === 'part' && request.order !== undefined
+        ? { key: -request.lane, order: request.order }
+        : null;
+    const outcome = await lane.job(
+      { type: 'source', reqId, input: opened.input, what: request.what },
+      slot,
+    );
+    if (!outcome.ok) {
+      return outcome.reason === 'superseded'
+        ? fail('superseded')
+        : fail('reader_failed', outcome.reason);
+    }
+    const message = outcome.message;
+    if (message.type !== 'sourced') return fail('reader_failed', 'crash');
+    if (!message.ok) return fail('reader_failed', 'parse');
+    reply({
+      type: 'result',
+      reqId,
+      ok: true,
+      ...(message.headers !== undefined ? { headers: message.headers } : {}),
+      ...(message.parts ? { parts: message.parts } : {}),
+    });
+  } finally {
+    await opened.close().catch(() => undefined);
+  }
+}
+
 function startOpen(request: OpenRequest | ReadRequest): void {
   if (request.type === 'open') build(request);
   else void read(request);
@@ -282,6 +346,9 @@ function handle(request: CoreRequest): void {
       return;
     case 'locate':
       void locate(request);
+      return;
+    case 'source':
+      void readSource(request);
       return;
     case 'identify':
     case 'scan':

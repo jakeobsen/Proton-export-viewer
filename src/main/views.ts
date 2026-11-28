@@ -41,6 +41,25 @@ export interface ViewMessage {
   attachments: ViewAttachment[];
 }
 
+/**
+ * The source view of a window's message: the header block it shows, under a
+ * URL of the view's own token that changes with each block.
+ */
+export interface SourceState {
+  /** Counts the blocks shown; part of the URL, so each one loads afresh. */
+  n: number;
+  /** The shell's latest selection; the answer to an older one is dropped. */
+  seq: number;
+  /** The block's document and text, once its first answer is in. */
+  doc: string | null;
+  text: string | null;
+  /** The parts core read for the tree: a part is named only by one of these paths. */
+  paths: ReadonlySet<string> | null;
+  /** The message, and the file the view was read from (null for a fallback, which has none). */
+  rowid: number;
+  file: FileIdentity | null;
+}
+
 export interface View {
   token: string;
   openId: number;
@@ -51,6 +70,21 @@ export interface View {
   links: Map<string, ViewLink>;
   /** The message a reader view shows; none for the test hooks' fixed bodies. */
   message: ViewMessage | null;
+  /** Set while the source view shows. */
+  source: SourceState | null;
+  /**
+   * Only a source view, for an open the reader couldn't render: it has no
+   * body, and its body URL is never authorized or served.
+   */
+  sourceOnly: boolean;
+}
+
+/** An open that ended with the reader's fallback: its message, for View source. */
+interface Fallback {
+  openId: number;
+  token: string;
+  generation: number;
+  rowid: number;
 }
 
 export interface ViewBody {
@@ -69,11 +103,17 @@ export function bodyUrl(token: string): string {
   return `${BODY_SCHEME}://${VIEW_HOST}/${token}`;
 }
 
+/** The URL of a view's `n`th source document. */
+export function sourceUrl(token: string, n: number): string {
+  return `${BODY_SCHEME}://${VIEW_HOST}/${token}/source/${n}`;
+}
+
 export class ViewRegistry {
   private readonly live = new Map<string, View>();
   private latestOpenId = 0;
   private pendingToken: string | null = null;
   private authorized: string | null = null;
+  private fallback: Fallback | null = null;
 
   constructor(private readonly newToken: () => string = () => randomBytes(16).toString('hex')) {}
 
@@ -109,6 +149,8 @@ export class ViewRegistry {
       ),
       links: new Map((body.links ?? []).map((l) => [l.id, { url: l.url, text: l.text }])),
       message: body.message ?? null,
+      source: null,
+      sourceOnly: false,
     };
     this.live.set(token, view);
     this.pendingToken = null;
@@ -121,12 +163,119 @@ export class ViewRegistry {
     if (openId === this.latestOpenId) this.pendingToken = null;
   }
 
+  /**
+   * Records that the latest open ended with the reader's fallback. Its
+   * reserved token is kept, for a source view of that message only.
+   */
+  markFallback(openId: number, generation: number, rowid: number): void {
+    if (openId !== this.latestOpenId || this.pendingToken === null) return;
+    this.fallback = { openId, token: this.pendingToken, generation, rowid };
+    this.pendingToken = null;
+  }
+
+  /** The fallback of the open `openId`, while it is the window's latest. */
+  fallbackFor(openId: number): { generation: number; rowid: number } | null {
+    const f = this.fallback;
+    return f && f.openId === openId && openId === this.latestOpenId
+      ? { generation: f.generation, rowid: f.rowid }
+      : null;
+  }
+
+  /**
+   * Starts the source view for the open `openId`: of its live view, or of its
+   * fallback, which becomes a view of its own with no body. Null when that
+   * open is no longer the window's latest.
+   */
+  beginSource(openId: number): View | null {
+    let view = this.byOpenId(openId) ?? null;
+    let from: { rowid: number; file: FileIdentity | null } | null = view?.message
+      ? { rowid: view.message.rowid, file: view.message.file }
+      : null;
+    if (!view && openId === this.latestOpenId) {
+      const f = this.fallback;
+      if (f && f.openId === openId) {
+        from = { rowid: f.rowid, file: null };
+        view = {
+          token: f.token,
+          openId,
+          generation: f.generation,
+          html: '',
+          assets: new Map(),
+          links: new Map(),
+          message: null,
+          source: null,
+          sourceOnly: true,
+        };
+        this.live.set(f.token, view);
+        this.fallback = null;
+      }
+    }
+    if (!view || !from) return null;
+    view.source ??= { n: 0, seq: 0, doc: null, text: null, paths: null, ...from };
+    return view;
+  }
+
+  /** True while `view` is live and showing its source. */
+  inSource(view: View): view is View & { source: SourceState } {
+    return this.live.get(view.token) === view && view.source !== null;
+  }
+
+  /** A new selection in the source view; answers for older ones are then dropped. */
+  select(view: View): number | null {
+    if (!this.inSource(view)) return null;
+    view.source.seq += 1;
+    return view.source.seq;
+  }
+
+  /**
+   * Shows a header block as the view's next source document, if `seq` is still
+   * the latest selection and the view still shows its source. Its URL becomes
+   * the only one the body frame may load. Null if the answer came too late.
+   */
+  showSource(view: View, seq: number, doc: string, text: string): string | null {
+    if (!this.inSource(view) || view.source.seq !== seq) return null;
+    view.source.n += 1;
+    view.source.doc = doc;
+    view.source.text = text;
+    this.authorized = sourceUrl(view.token, view.source.n);
+    return this.authorized;
+  }
+
+  /** The text of the block the source view shows, while it shows one. */
+  shownText(view: View): string | null {
+    return this.inSource(view) ? view.source.text : null;
+  }
+
+  /**
+   * Leaves the source view. A view with a body gets its body URL back as the
+   * only one the frame may load; a source-only view is revoked.
+   */
+  leaveSource(view: View): string | null {
+    if (this.live.get(view.token) !== view) return null;
+    view.source = null;
+    if (view.sourceOnly) {
+      this.live.delete(view.token);
+      this.authorized = null;
+      return null;
+    }
+    this.authorized = bodyUrl(view.token);
+    return this.authorized;
+  }
+
+  /** The source document `n` of a live view, while it is the one shown. */
+  sourceDoc(token: string, n: number): string | null {
+    const view = this.lookup(token);
+    const source = view?.source;
+    return source && source.n === n && source.doc !== null ? source.doc : null;
+  }
+
   /** Revokes the live view and any pending open. Returns how many views were live. */
   revokeAll(): number {
     const count = this.live.size;
     this.live.clear();
     this.pendingToken = null;
     this.authorized = null;
+    this.fallback = null;
     return count;
   }
 

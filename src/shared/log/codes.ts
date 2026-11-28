@@ -42,6 +42,8 @@ export const LOG_CODES = [
   'view.installed',
   'reader.show_in_folder',
   'reader.copy_message_id',
+  'reader.source',
+  'reader.copy_headers',
   'view.revoked',
   'open.stale',
   'sources.invalid',

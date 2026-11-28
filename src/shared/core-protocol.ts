@@ -9,8 +9,13 @@ import type {
   ReadRequest,
   ReaderFailure,
   RenderedMessage,
+  SourceHeaders,
+  SourcePart,
+  SourceRequest,
   WorkerRender,
   WorkerRendered,
+  WorkerSource,
+  WorkerSourced,
 } from './reader-protocol';
 import type { RunIdentity, ScanSummary, Stamp } from './sources';
 
@@ -222,6 +227,7 @@ export type CoreRequest =
   | ScanRequest
   | ReadRequest
   | LocateRequest
+  | SourceRequest
   | IndexRequest
   | IndexQueryRequest
   | ForgetRequest
@@ -247,6 +253,10 @@ export type CoreResult =
       file?: FileIdentity | null;
       /** The path a `locate` found. */
       path?: string;
+      /** A header block for the source view; null for a part the message doesn't have. */
+      headers?: SourceHeaders | null;
+      /** The message's parts for the source view. */
+      parts?: SourcePart[];
       index?: IndexOpened;
       answer?: IndexAnswer;
       progress?: IndexProgress;
@@ -298,10 +308,12 @@ export interface WorkerProofRead {
   paths: string[];
 }
 
-export type WorkerRequest = WorkerBuild | WorkerTest | WorkerProofRead | WorkerRender;
+export type WorkerRequest =
+  WorkerBuild | WorkerTest | WorkerProofRead | WorkerRender | WorkerSource;
 
 export type WorkerMessage =
   | WorkerRendered
+  | WorkerSourced
   | { type: 'result'; reqId: number; ok: true; body: StubBodyMessage }
   | { type: 'proof-read'; reqId: number; reads: ProofFileRead[] }
   | { type: 'result'; reqId: number; ok: false; code: 'unknown_stub' }

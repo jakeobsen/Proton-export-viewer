@@ -16,6 +16,9 @@ import {
   type LinkActionResult,
   type MessageOpenResult,
   type ReaderActionResult,
+  type SourceBackResult,
+  type SourceResult,
+  type SourceTreeResult,
   type OpenResult,
   type PingResult,
   type Rejected,
@@ -43,7 +46,14 @@ import type { SourceOutcome } from '../shared/sources';
 import { STALE, type Stale } from './sources/manager';
 import { APP_ORIGIN, LINK_ACTIONS } from '../shared/constants';
 import { isRendererLogCode } from '../shared/log/codes';
-import { OPEN_MODES, type RenderedMessage } from '../shared/reader-protocol';
+import {
+  OPEN_MODES,
+  PART_PATH_RE,
+  SOURCE_HEADER_BYTES,
+  type RenderedMessage,
+  type SourcePart,
+  type SourceWhat,
+} from '../shared/reader-protocol';
 import { CoreUnavailableError } from './core-host';
 import type { AppContext, AppWindow } from './context';
 import { DIALOG_ID_RE } from './link-dialog';
@@ -51,7 +61,9 @@ import { sameFrame } from './navigation';
 import { OPEN_GAP_MS, OpenPacer } from './open-pacer';
 import { PLACEHOLDER } from '../shared/placeholder';
 import { SUPERSEDED, SearchLanes } from './search-lane';
-import { bodyUrl, type ViewBody } from './views';
+import { headerDocument } from './source-doc';
+import { sourceNodes } from './source-parts';
+import { bodyUrl, type View, type ViewBody } from './views';
 
 const Generation = z
   .number()
@@ -82,6 +94,35 @@ const ViewActionArgs = z.tuple([
     })
     .strict(),
 ]);
+// A part is named by its dotted path only, and only one from main's own tree.
+const SourcePartArgs = z.tuple([
+  z
+    .object({
+      openId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      path: z.string().regex(PART_PATH_RE).nullable(),
+      generation: Generation,
+    })
+    .strict(),
+]);
+// The parts core read, checked before any of it reaches the shell.
+const MAX_SOURCE_PARTS = 200_000;
+const SourcePartsReply = z
+  .array(
+    z
+      .object({
+        path: z.string().regex(PART_PATH_RE),
+        parent: z.number().int().min(-1),
+        contentType: z.string().max(1024),
+        charset: z.string().max(1024).nullable(),
+        name: z.string().max(1024),
+        inline: z.boolean(),
+        size: z.number().int().nonnegative(),
+        cut: z.boolean(),
+      })
+      .strict(),
+  )
+  .max(MAX_SOURCE_PARTS)
+  .refine((parts) => parts.every((p, i) => p.parent < i && (i === 0) === (p.parent === -1)));
 // The shell names the dialog and the choice; main keeps the URL.
 const LinkActionArgs = z.tuple([
   z
@@ -413,6 +454,8 @@ export function registerIpc(ctx: AppContext): void {
         openId,
         windowId: appWin.id,
       });
+      // View source still works for it: the open's token is kept for that.
+      appWin.views.markFallback(openId, generation, rowid);
       return { ok: true, openId, outcome: 'fallback' };
     }
     const message = result.read;
@@ -518,6 +561,143 @@ export function registerIpc(ctx: AppContext): void {
     clipboard.writeText(message.messageId);
     ctx.log.info('reader.copy_message_id', { windowId: appWin.id });
     return { ok: true };
+  });
+
+  // --- The source view ----------------------------------------------------------
+
+  /** Asks core to read for the source view of `view`; null when core isn't up for the source. */
+  const askSource = async (appWin: AppWindow, view: View, what: SourceWhat, order?: number) => {
+    const source = view.source;
+    if (!source) return null;
+    try {
+      return await ctx.core.requestRunning(
+        {
+          type: 'source',
+          openId: view.openId,
+          generation: ctx.generation,
+          rowid: source.rowid,
+          file: source.file,
+          what,
+          lane: appWin.id,
+          ...(order !== undefined ? { order } : {}),
+        },
+        ctx.sources.stamp(),
+      );
+    } catch (err) {
+      if (!(err instanceof CoreUnavailableError)) throw err;
+      return null;
+    }
+  };
+
+  /** True while `view` is live in a window still there, for the current generation, showing its source. */
+  const stillShowing = (appWin: AppWindow, view: View) =>
+    !appWin.win.isDestroyed() && view.generation === ctx.generation && appWin.views.inSource(view);
+
+  /** The view in the source view for an action on it, or why there is none. */
+  const sourceView = (appWin: AppWindow, openId: number, generation: number) => {
+    if (generation !== ctx.generation) return 'stale_generation' as const;
+    const view = appWin.views.byOpenId(openId);
+    if (!view || !stillShowing(appWin, view)) return 'superseded' as const;
+    return view;
+  };
+
+  /** Reads a header block and shows it as the view's next source document, for selection `seq`. */
+  const showBlock = async (
+    appWin: AppWindow,
+    view: View,
+    seq: number,
+    what: SourceWhat,
+  ): Promise<SourceResult> => {
+    const result = await askSource(appWin, view, what, what.kind === 'part' ? seq : undefined);
+    if (!stillShowing(appWin, view)) return reject('superseded', appWin);
+    if (!result) return reject('core_unavailable', appWin);
+    if (!result.ok) {
+      const known = ['changed', 'eml_missing', 'not_found', 'superseded'] as const;
+      const code = known.find((c) => c === result.code);
+      return reject(result.code === 'unavailable' ? 'offline' : (code ?? 'not_found'), appWin);
+    }
+    const headers = result.headers;
+    if (!headers) return reject('not_found', appWin);
+    if (!(headers.bytes instanceof Uint8Array) || headers.bytes.length > SOURCE_HEADER_BYTES) {
+      return reject('invalid', appWin);
+    }
+    const { html, text } = headerDocument(headers.bytes, headers.truncated === true);
+    const url = appWin.views.showSource(view, seq, html, text);
+    if (url === null) return reject('superseded', appWin);
+    return { ok: true, url, truncated: headers.truncated === true };
+  };
+
+  guarded<SourceResult>(IPC.viewSource, async (appWin, raw) => {
+    const args = ViewActionArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ openId, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    if (ctx.sources.isOffline()) return reject('offline', appWin);
+    const view = appWin.views.beginSource(openId);
+    if (!view || view.generation !== ctx.generation) return reject('superseded', appWin);
+    const seq = appWin.views.select(view);
+    if (seq === null) return reject('superseded', appWin);
+    ctx.log.info('reader.source', { windowId: appWin.id });
+    return showBlock(appWin, view, seq, { kind: 'headers' });
+  });
+
+  guarded<SourceTreeResult>(IPC.sourceTree, async (appWin, raw) => {
+    const args = ViewActionArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ openId, generation }] = args.data;
+    const view = sourceView(appWin, openId, generation);
+    if (typeof view === 'string') return reject(view, appWin);
+    const result = await askSource(appWin, view, { kind: 'structure' });
+    if (!stillShowing(appWin, view)) return reject('superseded', appWin);
+    if (!result) return reject('core_unavailable', appWin);
+    if (!result.ok) {
+      if (result.code === 'changed') return reject('changed', appWin);
+      if (result.code === 'superseded') return reject('superseded', appWin);
+      // The structure couldn't be read within the limits: the headers stand alone.
+      return { ok: true, parts: null };
+    }
+    const parts = SourcePartsReply.safeParse(result.parts);
+    if (!parts.success || parts.data.length === 0) return { ok: true, parts: null };
+    const read: SourcePart[] = parts.data;
+    if (view.source) view.source.paths = new Set(read.map((p) => p.path));
+    return { ok: true, parts: sourceNodes(read) };
+  });
+
+  guarded<SourceResult>(IPC.sourcePart, async (appWin, raw) => {
+    const args = SourcePartArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ openId, path, generation }] = args.data;
+    const view = sourceView(appWin, openId, generation);
+    if (typeof view === 'string') return reject(view, appWin);
+    // The message's own block is read as it is, without a parse.
+    const message = path === null || path === '1';
+    if (!message && !view.source?.paths?.has(path)) return reject('invalid', appWin);
+    const seq = appWin.views.select(view);
+    if (seq === null) return reject('superseded', appWin);
+    return showBlock(appWin, view, seq, message ? { kind: 'headers' } : { kind: 'part', path });
+  });
+
+  guarded<ReaderActionResult>(IPC.copyHeaders, (appWin, raw) => {
+    const args = ViewActionArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ openId, generation }] = args.data;
+    const view = sourceView(appWin, openId, generation);
+    if (typeof view === 'string') return reject(view, appWin);
+    const text = appWin.views.shownText(view);
+    if (text === null) return reject('superseded', appWin);
+    clipboard.writeText(text);
+    ctx.log.info('reader.copy_headers', { windowId: appWin.id });
+    return { ok: true };
+  });
+
+  guarded<SourceBackResult>(IPC.sourceBack, (appWin, raw) => {
+    const args = ViewActionArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ openId, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    const view = appWin.views.byOpenId(openId);
+    if (!view || view.source === null) return reject('superseded', appWin);
+    return { ok: true, url: appWin.views.leaveSource(view) };
   });
 
   guarded<LinkActionResult>(IPC.linkAction, async (appWin, raw) => {
