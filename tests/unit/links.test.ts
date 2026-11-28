@@ -156,6 +156,8 @@ describe('linkPrompt', () => {
       host: { start: 8, end: 20 },
       mismatch: false,
       lookalike: false,
+      mail: false,
+      unclear: false,
     });
     expect(prompt('https://www.shop.example/a', 'shop.example')).toMatchObject({
       mismatch: false,
@@ -298,5 +300,148 @@ describe('linkPrompt', () => {
     const long = displayTitle('x'.repeat(MAX_TITLE + 50));
     expect(long).toHaveLength(MAX_TITLE);
     expect(long.endsWith('…')).toBe(true);
+  });
+});
+
+describe('linkPrompt for mailto: links', () => {
+  const prompt = (url: string, text: string) => linkPrompt('d'.repeat(32), { url, text });
+  const marked = (p: ReturnType<typeof prompt>) =>
+    p.host === null ? null : p.url.slice(p.host.start, p.host.end);
+
+  it('goes to the mail app; a web link goes to the browser', () => {
+    expect(prompt('mailto:help@shop.example', 'help')).toMatchObject({
+      mail: true,
+      unclear: false,
+    });
+    expect(prompt('https://shop.example/', 'shop')).toMatchObject({ mail: false, unclear: false });
+    expect(prompt('MAILTO:help@shop.example', 'help').mail).toBe(true);
+  });
+
+  it('checks the recipients in the to, cc and bcc fields as well as the path', () => {
+    // Every recipient must be the host the title names.
+    for (const url of [
+      'mailto:help@paypal.com?bcc=x@evil.test',
+      'mailto:help@paypal.com?cc=x@evil.test&subject=Hi',
+      'mailto:help@paypal.com?To=a@paypal.com,x@evil.test',
+      'mailto:?to=x@evil.test',
+      'mailto:?to=help%40paypal.com%2Cx%40evil.test',
+    ]) {
+      expect(prompt(url, 'paypal.com'), url).toMatchObject({ mismatch: true, unclear: false });
+    }
+    for (const url of [
+      'mailto:help@paypal.com?cc=billing@paypal.com',
+      'mailto:?to=help@paypal.com&bcc=a@www.paypal.com',
+      'mailto:help@paypal.com?subject=x@evil.test&body=evil.test',
+    ]) {
+      expect(prompt(url, 'paypal.com'), url).toMatchObject({ mismatch: false, unclear: false });
+    }
+    // The fields stay in the URL as written; only the path's first domain is marked.
+    const fields = prompt('mailto:help@shop.example?cc=x@evil.test', 'Write');
+    expect(fields.url).toBe('mailto:help@shop.example?cc=x@evil.test');
+    expect(marked(fields)).toBe('shop.example');
+    expect(marked(prompt('mailto:?to=help@shop.example', 'Write'))).toBeNull();
+  });
+
+  it('flags IDN and mixed-script domains in the path and the fields', () => {
+    const mixed = prompt(new URL('mailto:help@pаypal.com').href, 'paypal.com');
+    expect(mixed).toMatchObject({
+      url: 'mailto:help@xn--pypal-4ve.com',
+      mismatch: true,
+      lookalike: true,
+      unclear: false,
+    });
+    expect(marked(mixed)).toBe('xn--pypal-4ve.com');
+    for (const url of [
+      new URL('mailto:help@shop.example?cc=x@аpple.test').href,
+      'mailto:help@shop.example?bcc=x%40xn--pple-43d.test',
+      new URL('mailto:?to=x@Exämple.test').href,
+    ]) {
+      expect(prompt(url, 'Write to us'), url).toMatchObject({
+        mismatch: false,
+        lookalike: true,
+        unclear: false,
+      });
+    }
+    expect(prompt('mailto:help@shop.example?cc=x@other.example', 'Write').lookalike).toBe(false);
+  });
+
+  it('calls an address with an encoded comma or a second @ in its local part unclear', () => {
+    for (const url of [
+      'mailto:a@evil.test%2C@paypal.com',
+      'mailto:a%40evil.test@paypal.com',
+      'mailto:a%2Cb@paypal.com',
+      'mailto:help@shop.example,a@evil.test%2C@paypal.com',
+    ]) {
+      const p = prompt(url, 'paypal.com');
+      expect(p, url).toMatchObject({ url, unclear: true, mismatch: true });
+    }
+    // An unclear first address is not marked, and matches no host the title names.
+    expect(marked(prompt('mailto:a@evil.test%2C@paypal.com', 'paypal.com'))).toBeNull();
+    expect(prompt('mailto:a@evil.test%2C@paypal.com', 'Write')).toMatchObject({
+      mismatch: false,
+      unclear: true,
+    });
+  });
+
+  it('decodes the fields once, and keeps a + as a +', () => {
+    // An encoded list is two clear recipients.
+    const list = prompt('mailto:?to=a%40x.test%2Cb%40y.test', 'x.test');
+    expect(list).toMatchObject({ unclear: false, mismatch: true });
+    expect(prompt('mailto:?to=a%40x.test%2Cb%40x.test', 'x.test')).toMatchObject({
+      unclear: false,
+      mismatch: false,
+    });
+    // A + is part of the address: decoded as a space, it would make it unclear.
+    expect(prompt('mailto:?to=a+b@x.test', 'x.test')).toMatchObject({
+      unclear: false,
+      mismatch: false,
+    });
+    expect(prompt('mailto:?to=a%20b@x.test', 'x.test')).toMatchObject({ unclear: true });
+    // Decoded once: %2540 is the text %40, not an @.
+    expect(prompt('mailto:?to=a%2540evil.test@paypal.com', 'paypal.com')).toMatchObject({
+      unclear: false,
+      mismatch: false,
+    });
+    // A value that can't be decoded is unclear.
+    expect(prompt('mailto:?to=a%E0%A4@x.test', 'Write')).toMatchObject({ unclear: true });
+  });
+
+  it('calls a quoted local part, a display name, a comment or a group unclear', () => {
+    for (const url of [
+      // Quoted, with a comma that is no separator: one address at bank.com.
+      'mailto:?to=%22evil%40attacker.com%2C%22%40bank.com',
+      new URL('mailto:?to="evil@attacker.com,"@bank.com').href,
+      'mailto:%22a%2Cb%22@bank.com',
+      new URL('mailto:?to=Bank <x@evil.test>').href,
+      new URL('mailto:?cc=x@evil.test (bank.com)').href,
+      new URL('mailto:?bcc=Friends: a@x.test, b@y.test;').href,
+      'mailto:a%5C@bank.com',
+    ]) {
+      expect(prompt(url, 'Write'), url).toMatchObject({ unclear: true, mismatch: false });
+      expect(prompt(url, 'bank.com'), url).toMatchObject({ unclear: true, mismatch: true });
+    }
+    // Spaces around the list's commas are not part of an address.
+    expect(prompt('mailto:?to=a@x.test,%20b@x.test', 'x.test')).toMatchObject({
+      unclear: false,
+      mismatch: false,
+    });
+  });
+
+  it('calls an address with no domain, or one that is not a plain host name, unclear', () => {
+    for (const url of [
+      'mailto:nobody',
+      'mailto:a@',
+      'mailto:a@paypal.com%2Fx.evil.test',
+      'mailto:a@ex%2Cample.test',
+      'mailto:help@shop.example?bcc=x@evil.test%2F',
+    ]) {
+      expect(prompt(url, 'Write'), url).toMatchObject({ unclear: true });
+    }
+    expect(prompt('mailto:?subject=Hi', 'Write')).toMatchObject({
+      unclear: false,
+      mismatch: false,
+      host: null,
+    });
+    expect(prompt('mailto:?subject=Hi', 'paypal.com').mismatch).toBe(true);
   });
 });
