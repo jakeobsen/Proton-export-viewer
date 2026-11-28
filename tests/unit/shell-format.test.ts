@@ -8,6 +8,8 @@ import {
   changedAt,
   formatCount,
   fullDate,
+  fullTextLine,
+  fullTextShare,
   fullTextStatus,
   listDate,
   loadingText,
@@ -104,18 +106,24 @@ describe("Settings' Status", () => {
     capped: 0,
     condition: 'ok',
     bodyPhase: 'indexing',
+    bodiesBefore: 0,
     bodiesDone: 0,
     bodiesTotal: 0,
     bodiesFailed: 0,
+    bodiesTruncated: 0,
     ...p,
   });
 
-  it('gives the full text share of this run, rounded down, until it is done', () => {
+  it('gives the full-text share of the whole export, rounded down, until it is done', () => {
     expect(fullTextStatus(progress({ bodyPhase: 'waiting', phase: 'loading' }))).toBe(
       'Full text 0%',
     );
     expect(fullTextStatus(progress({ bodiesDone: 1, bodiesTotal: 3 }))).toBe('Full text 33%');
     expect(fullTextStatus(progress({ bodiesDone: 999, bodiesTotal: 1000 }))).toBe('Full text 99%');
+    // Files handled in an earlier run count too, as in the sidebar.
+    expect(fullTextStatus(progress({ bodiesBefore: 8, bodiesDone: 0, bodiesTotal: 2 }))).toBe(
+      'Full text 80%',
+    );
     expect(fullTextStatus(progress({ bodyPhase: 'failed', bodiesDone: 5, bodiesTotal: 10 }))).toBe(
       'Full text 50%',
     );
@@ -202,5 +210,39 @@ describe('the sidebar model', () => {
     const model = sidebarModel({ folders: chain, hiddenIds: 0 });
     expect(model.folders).toHaveLength(20_000);
     expect(model.folders.at(-1)?.depth).toBe(19_999);
+  });
+});
+
+describe('the full-text share', () => {
+  const at = (bodiesBefore: number, bodiesDone: number, bodiesTotal: number): IndexProgress => ({
+    phase: 'done',
+    loaded: 0,
+    total: 0,
+    failed: 0,
+    timeouts: 0,
+    capped: 0,
+    condition: 'ok',
+    bodyPhase: 'indexing',
+    bodiesBefore,
+    bodiesDone,
+    bodiesTotal,
+    bodiesFailed: 0,
+    bodiesTruncated: 0,
+  });
+
+  it('counts files handled before this run and in it, over all, rounded down', () => {
+    expect(fullTextShare(at(0, 0, 3))).toBe(0);
+    expect(fullTextShare(at(0, 1, 3))).toBe(33);
+    expect(fullTextShare(at(0, 2, 3))).toBe(66);
+    expect(fullTextShare(at(100_000, 0, 50_000))).toBe(66);
+    expect(fullTextShare(at(60_000, 1_000, 92_000))).toBe(40);
+    expect(fullTextShare(at(0, 3, 3))).toBe(100);
+    expect(fullTextLine(40)).toBe('Full text 40% · search is partial');
+  });
+
+  it('stays within 0 and 100, and is none with no file to read', () => {
+    expect(fullTextShare(at(0, 0, 0))).toBeNull();
+    expect(fullTextShare(at(0, 5, 3))).toBe(100);
+    expect(fullTextShare(at(2, -9, 3))).toBe(0);
   });
 });

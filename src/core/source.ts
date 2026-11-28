@@ -726,9 +726,11 @@ export class SourceSession {
           condition: this.index?.progress.condition ?? 'ok',
           // Phase 2 waits for phase 1, which waits for this scan.
           bodyPhase: 'waiting',
+          bodiesBefore: 0,
           bodiesDone: 0,
           bodiesTotal: 0,
           bodiesFailed: 0,
+          bodiesTruncated: 0,
         },
         false,
       );
