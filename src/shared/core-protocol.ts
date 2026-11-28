@@ -4,6 +4,8 @@
 import type { IndexAnswer, IndexOpened, IndexProgress, IndexQuery } from './index-types';
 import type {
   BodyLink,
+  FileIdentity,
+  LocateRequest,
   ReadRequest,
   ReaderFailure,
   RenderedMessage,
@@ -219,6 +221,7 @@ export type CoreRequest =
   | IdentifyRequest
   | ScanRequest
   | ReadRequest
+  | LocateRequest
   | IndexRequest
   | IndexQueryRequest
   | ForgetRequest
@@ -240,6 +243,10 @@ export type CoreResult =
       scan?: ScanSummary;
       /** The rendered message of a `read`. */
       read?: RenderedMessage;
+      /** The identity of the file a `read` came from; null for a test input. */
+      file?: FileIdentity | null;
+      /** The path a `locate` found. */
+      path?: string;
       index?: IndexOpened;
       answer?: IndexAnswer;
       progress?: IndexProgress;
@@ -258,6 +265,7 @@ export type CoreResult =
         | 'not_found'
         | 'eml_missing'
         | 'superseded'
+        | 'changed'
         | 'reader_failed'
         | 'no_index'
         | 'damaged'

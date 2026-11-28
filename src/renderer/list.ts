@@ -219,6 +219,11 @@ export class ListModel {
     this.set({ selected: { rowid: row.anchorRowid, threadId: row.threadId } });
   }
 
+  /** Nothing selected. */
+  clearSelection(): void {
+    if (this.snap.selected !== null) this.set({ selected: null });
+  }
+
   /** The position of the selected row, if it is held. */
   selectedIndex(): number | null {
     const selected = this.snap.selected;

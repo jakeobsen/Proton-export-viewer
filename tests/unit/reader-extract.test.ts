@@ -4,7 +4,7 @@
 
 import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
-import { extractMessage } from '../../src/core/reader/extract';
+import { HEAD_BYTES, extractMessage } from '../../src/core/reader/extract';
 import { MAX_MIME_PARTS } from '../../src/core/mime-limits';
 import { bodiesAfter, bodiesAround } from '../mime-parts';
 
@@ -176,6 +176,44 @@ describe('the part limit', () => {
     expect(message.html.content).toContain('HTML before the parts.');
     expect(message.html.content).not.toContain('after the parts');
     expect(message.headers?.get('subject')).toBe('Many parts');
+  });
+
+  it('lists every attachment read before the limit, each whole', async () => {
+    const message = await extractMessage(stream(bodiesAround(MAX_MIME_PARTS + 10)));
+    expect(message.stopped).toBe(true);
+    // The root, the alternative and its two bodies come first; every part after
+    // them is a one-byte attachment, the last one read included.
+    const parts = message.tree.parts.length;
+    expect(message.listed.map((p) => p.part)).toEqual(
+      Array.from({ length: parts - 4 }, (_, i) => i + 4),
+    );
+    expect(message.listed.every((p) => p.size === 1 && p.head.toString() === 'x')).toBe(true);
+  });
+
+  it('lists the attachment that ends where a header block over the limit starts', async () => {
+    const data = Buffer.from(Array.from({ length: 3000 }, (_, i) => i % 251));
+    const eml = [
+      'Subject: Long header',
+      'Content-Type: multipart/mixed; boundary="m"',
+      '',
+      '--m',
+      'Content-Type: application/octet-stream',
+      'Content-Disposition: attachment; filename="a.bin"',
+      'Content-Transfer-Encoding: base64',
+      '',
+      ...(data.toString('base64').match(/.{1,76}/g) ?? []),
+      '--m',
+      'Content-Type: application/octet-stream',
+      'Content-Disposition: attachment; filename="b.bin"',
+      `X-Long: ${'h'.repeat(3 * 1024 * 1024)}`,
+      '',
+      'After it.',
+      '--m--',
+      '',
+    ].join('\r\n');
+    const message = await extractMessage(stream(eml));
+    expect(message.stopped).toBe(true);
+    expect(message.listed).toEqual([{ part: 1, size: 3000, head: data.subarray(0, HEAD_BYTES) }]);
   });
 
   it('stops at a header block over the limit and keeps what came before', async () => {

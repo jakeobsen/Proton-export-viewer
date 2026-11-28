@@ -8,6 +8,7 @@ import type { ReaderLane } from '../core/reader/lane';
 import type { ReaderSource } from '../core/reader/source';
 import type {
   CoreResult,
+  IndexQueryRequest,
   OpenRequest,
   TestRequest,
   WorkerMessage,
@@ -37,6 +38,9 @@ export interface CoreTestDeps {
     held: Array<OpenRequest | ReadRequest>;
     fileOpens: number;
     unsanitized: boolean;
+    searches: number;
+    holdingSearches: boolean;
+    heldSearches: IndexQueryRequest[];
     holdingOpened: boolean;
     heldOpened: Array<() => void>;
     holdCardsAt: number | null;
@@ -53,6 +57,8 @@ export interface CoreTestDeps {
   setReaderSource: (source: ReaderSource) => void;
   readerSource: () => ReaderSource | null;
   writeGate: WriteGate | null;
+  /** Runs a search that was held. */
+  runSearch: (request: IndexQueryRequest) => void;
 }
 
 /** Holds phase 1's writes, while holding, until a test lets them through. */
@@ -151,6 +157,23 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
       return;
     case 'file-opens':
       ok(deps.state.fileOpens);
+      return;
+    case 'searches':
+      ok(deps.state.searches);
+      return;
+    case 'hold-searches':
+      deps.state.holdingSearches = true;
+      ok();
+      return;
+    case 'release-searches': {
+      deps.state.holdingSearches = false;
+      const held = deps.state.heldSearches.splice(0);
+      for (const search of held) deps.runSearch(search);
+      ok(held.length);
+      return;
+    }
+    case 'held-searches':
+      ok(deps.state.heldSearches.length);
       return;
     case 'hold-cards': {
       // Holds the cards queries anchored at a message; null lets the held ones go.
