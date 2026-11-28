@@ -5,7 +5,7 @@
 import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { BrowserWindow, Menu, app, clipboard, dialog, shell } from 'electron';
+import { BrowserWindow, Menu, app, clipboard, dialog, nativeTheme, shell } from 'electron';
 import { bumpGeneration, notifySources, type AppContext } from '../main/context';
 import type { PolicyObserver } from '../main/harden';
 import { PROD_SWITCHES } from '../main/switches';
@@ -502,23 +502,36 @@ export async function install(ctx: AppContext): Promise<boolean> {
     indexDir: () => join(app.getPath('userData'), 'index'),
     /** Resets the app's data, as Settings does, without its generation check. */
     resetApp: () => ctx.sources.reset(null),
+    /** The theme Electron gives every frame: `system`, `light` or `dark`. */
+    themeSource: () => nativeTheme.themeSource,
     /**
-     * Sends the first app window a card key as main does for one typed in the
-     * body frame, whatever has the focus: the shell's own handling is tested
-     * apart from main's.
+     * Sends the first app window a key as main does for one typed in the body
+     * frame, whatever has the focus: the shell's own handling is tested apart
+     * from main's.
      */
-    cardKeyFromMain: (key: string) => {
+    frameKeyFromMain: (key: string) => {
       const contents = [...ctx.windows.values()][0]?.win.webContents;
       if (!contents) throw new Error('no window');
-      contents.send(IPC.cardKey, key);
+      contents.send(IPC.frameKey, key);
     },
     /**
      * Runs main's own keyboard handler for a key press in the first app
      * window, as if typed while its focused frame has the focus. Keys the
      * test driver sends skip that handler (the browser never pre-handles
-     * them), so the tests call it here. Returns which frame had the focus.
+     * them), so the tests call it here, with any modifiers or a repeat in
+     * `more`. Returns which frame had the focus.
      */
-    keyInFocusedFrame: (key: string) => {
+    keyInFocusedFrame: (
+      key: string,
+      more: {
+        shift?: boolean;
+        control?: boolean;
+        alt?: boolean;
+        meta?: boolean;
+        isAutoRepeat?: boolean;
+        code?: string;
+      } = {},
+    ) => {
       const contents = [...ctx.windows.values()][0]?.win.webContents;
       if (!contents) return 'no window';
       const frame = contents.focusedFrame;
@@ -544,6 +557,7 @@ export async function install(ctx: AppContext): Promise<boolean> {
           meta: false,
           location: 0,
           modifiers: [],
+          ...more,
         },
       );
       return focused;

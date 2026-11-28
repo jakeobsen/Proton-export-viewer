@@ -18,6 +18,7 @@ import {
   useSearch,
 } from './mailbox-state';
 import { Chips } from './Chips';
+import { setListStep } from './shortcut-actions';
 import {
   RESULT_ROW_HEIGHT,
   conversationsText,
@@ -153,19 +154,30 @@ export function SearchResults() {
     return () => observer.disconnect();
   }, [reportViewport]);
 
+  // The next or previous result, from the selected one, or with none
+  // selected from the first row on screen: the arrow keys, and `j`/`k` anywhere.
+  const step = useCallback(
+    (delta: 1 | -1) => {
+      const at =
+        search.selectedIndex() ??
+        Math.floor((scrollRef.current?.scrollTop ?? 0) / RESULT_ROW_HEIGHT);
+      const next = Math.max(0, Math.min(search.snapshot.rows.length - 1, at + delta));
+      const row = search.rowAt(next);
+      if (!row) return;
+      selectResult(row);
+      virtualizer.scrollToIndex(next);
+      scrollRef.current
+        ?.querySelector<HTMLElement>(`[data-thread="${row.threadId}"]`)
+        ?.focus({ preventScroll: true });
+    },
+    [virtualizer],
+  );
+  useEffect(() => setListStep(step), [step]);
+
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
     e.preventDefault();
-    const at =
-      search.selectedIndex() ?? Math.floor((scrollRef.current?.scrollTop ?? 0) / RESULT_ROW_HEIGHT);
-    const next = Math.max(0, Math.min(snap.rows.length - 1, at + (e.key === 'ArrowDown' ? 1 : -1)));
-    const row = search.rowAt(next);
-    if (!row) return;
-    selectResult(row);
-    virtualizer.scrollToIndex(next);
-    scrollRef.current
-      ?.querySelector<HTMLElement>(`[data-thread="${row.threadId}"]`)
-      ?.focus({ preventScroll: true });
+    step(e.key === 'ArrowDown' ? 1 : -1);
   };
 
   const selectedThread = snap.selected?.threadId ?? null;
