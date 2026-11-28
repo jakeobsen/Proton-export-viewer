@@ -18,11 +18,18 @@ import { expectedExports } from './scripts/folder-proof-exports.mjs';
 // system folder picker, so it is never part of the test runs. It accepts only
 // the two exports named in PEV_FOLDER_PROOF_EXPORTS (see
 // scripts/folder-proof-exports.mjs).
+// PEV_FOLDER_PROOF_STEP=fetcher (with PEV_FOLDER_PROOF=1) builds the fetcher's
+// proof instead: one launch, one pick, and PEV_FOLDER_PROOF_EXPORTS names one
+// export.
 const testHooks = process.env.PEV_TEST_HOOKS === '1';
 const folderProof = process.env.PEV_FOLDER_PROOF === '1';
 if (folderProof && !testHooks) throw new Error('PEV_FOLDER_PROOF=1 needs PEV_TEST_HOOKS=1');
+const proofStep =
+  folderProof && process.env.PEV_FOLDER_PROOF_STEP === 'fetcher' ? 'fetcher' : 'folders';
 const outRoot = folderProof ? 'out-proof' : testHooks ? 'out-test' : 'out';
-const proofExports = folderProof ? expectedExports(process.env.PEV_FOLDER_PROOF_EXPORTS) : [];
+const proofExports = folderProof
+  ? expectedExports(process.env.PEV_FOLDER_PROOF_EXPORTS, proofStep === 'fetcher' ? 1 : 2)
+  : [];
 
 export default defineConfig(({ command }) => {
   const name = appName();
@@ -30,6 +37,7 @@ export default defineConfig(({ command }) => {
     __PEV_TEST_HOOKS__: JSON.stringify(testHooks),
     __PEV_FOLDER_PROOF__: JSON.stringify(folderProof),
     __PEV_FOLDER_PROOF_EXPORTS__: JSON.stringify(JSON.stringify(proofExports)),
+    __PEV_FOLDER_PROOF_STEP__: JSON.stringify(proofStep),
     __PEV_DEV__: JSON.stringify(command === 'serve'),
     __PEV_APP_NAME__: JSON.stringify(name),
   };
@@ -52,6 +60,7 @@ export default defineConfig(({ command }) => {
             core: resolve('src/core/index.ts'),
             'core-worker': resolve('src/core/worker.ts'),
             'index-worker': resolve('src/core/index/thread.ts'),
+            fetcher: resolve('src/fetcher/index.ts'),
             // The index bench's worker threads exist only in builds with test hooks.
             ...(testHooks ? { 'bench-worker': resolve('src/testhooks/bench/worker.ts') } : {}),
           },

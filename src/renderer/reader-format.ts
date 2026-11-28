@@ -111,6 +111,14 @@ export function blockedImages(count: number): string {
   return count === 1 ? '1 external image blocked' : `${count} external images blocked`;
 }
 
+/** The banner once a view's remote images are allowed: counts only when they aren't zero. */
+export function loadedImages(insecure: number, refused: number): string {
+  let text = 'External images loaded';
+  if (insecure > 0) text += ` · ${insecure} not secure`;
+  if (refused > 0) text += ` · ${refused} couldn't load`;
+  return text;
+}
+
 /** A file size as the attachment list shows it, in decimal units: "182 KB", "1.2 MB". */
 export function fileSize(bytes: number): string {
   if (bytes < 1000) return bytes === 1 ? '1 byte' : `${bytes} bytes`;

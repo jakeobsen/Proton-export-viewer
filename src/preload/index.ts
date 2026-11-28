@@ -9,6 +9,7 @@ import {
   type IndexUpdate,
   type LinkPrompt,
   type PevApi,
+  type RemoteStatusUpdate,
 } from '../shared/api';
 import { MESSAGE_VIEWS, THEMES, type AppSettings } from '../shared/settings';
 
@@ -28,6 +29,15 @@ function isPrompt(value: unknown): value is LinkPrompt {
     (host === null ||
       (typeof host === 'object' && typeof host.start === 'number' && typeof host.end === 'number'))
   );
+}
+
+const isCount = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
+
+/** True for a remote-image status as main sends it. */
+function isRemoteStatus(value: unknown): value is RemoteStatusUpdate {
+  if (typeof value !== 'object' || value === null) return false;
+  const u = value as Record<string, unknown>;
+  return isCount(u.generation) && isCount(u.openId) && isCount(u.insecure) && isCount(u.refused);
 }
 
 /** True for settings as main sends them. */
@@ -50,6 +60,16 @@ const api: PevApi = {
       queryId === undefined ? { rowid, mode, generation } : { rowid, mode, generation, queryId },
     ),
   closeView: (generation) => ipcRenderer.invoke(IPC.closeView, { generation }),
+  allowRemote: (openId, generation) => ipcRenderer.invoke(IPC.allowRemote, { openId, generation }),
+  onRemoteStatus: (listener) => {
+    const handler = (_event: unknown, update: unknown) => {
+      if (isRemoteStatus(update)) listener(update);
+    };
+    ipcRenderer.on(IPC.remoteStatus, handler);
+    return () => {
+      ipcRenderer.off(IPC.remoteStatus, handler);
+    };
+  },
   showInFolder: (openId, generation) =>
     ipcRenderer.invoke(IPC.showInFolder, { openId, generation }),
   copyMessageId: (openId, generation) =>

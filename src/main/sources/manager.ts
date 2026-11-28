@@ -54,7 +54,13 @@ import { Registry, type PickRecord, type SourceRecord } from './registry';
 /** One step of opening or closing a source, in the order it happened. */
 export interface OrderStep {
   step:
-    'scope.start' | 'scope.keep' | 'scope.release' | 'scope.failed' | 'core.stop' | 'core.spawn';
+    | 'scope.start'
+    | 'scope.keep'
+    | 'scope.release'
+    | 'scope.failed'
+    | 'core.stop'
+    | 'core.spawn'
+    | 'fetcher.spawn';
   pickId: string | null;
   sourceKey: string | null;
   generation: number;
@@ -475,7 +481,7 @@ export class SourceManager {
     this.record('core.spawn', fields);
   }
 
-  private releaseScope(generation: number, reason: 'switch' | 'quit' = 'switch'): void {
+  private releaseScope(generation: number, reason: 'switch' | 'quit' | 'fetcher' = 'switch'): void {
     const scope = this.scope;
     if (!scope) return;
     this.scope = null;
@@ -483,8 +489,97 @@ export class SourceManager {
     this.record('scope.release', { pickId: scope.pickId, generation });
     this.deps.log.info('scope.released', {
       generation,
-      reason: reason === 'quit' ? 'quit' : 'replaced',
+      reason: reason === 'switch' ? 'replaced' : reason,
     });
+  }
+
+  /**
+   * Runs `spawn` with the open export's folder access released, so the
+   * process it starts never holds it. It runs in the queue every source
+   * operation uses, so no switch, Forget, Locate, Reset or core restart comes
+   * in between. Core keeps running. The access held when its turn comes is
+   * the one released, and it is started again afterwards whatever happened
+   * to the spawn. If it can't be (the export went away meanwhile), the open
+   * source goes unavailable as an open would show it: core restarts without
+   * a root. With no access held, it only spawns.
+   */
+  withScopeReleased(spawn: () => Promise<void>): Promise<void> {
+    return this.serial(async () => {
+      const held = this.scope;
+      const generation = this.deps.generation();
+      const sourceKey = this.active?.source.sourceKey ?? null;
+      if (!held) {
+        this.record('fetcher.spawn', { pickId: null, sourceKey, generation });
+        await spawn();
+        return;
+      }
+      const pick =
+        this.active?.pick.pickId === held.pickId
+          ? this.active.pick
+          : this.registry.pick(held.pickId);
+      this.releaseScope(generation, 'fetcher');
+      this.record('fetcher.spawn', { pickId: held.pickId, sourceKey, generation });
+      try {
+        await spawn();
+      } finally {
+        await this.restartScope(held.pickId, pick, generation);
+      }
+    });
+  }
+
+  /**
+   * Starts a released scope again; the open source goes unavailable if that
+   * fails. Once the app is quitting, nothing is started again: quit has let
+   * go of the access, and no core may start.
+   */
+  private async restartScope(
+    pickId: string,
+    pick: PickRecord | undefined,
+    generation: number,
+  ): Promise<void> {
+    if (!this.admitting) return;
+    let started = false;
+    if (pick) {
+      try {
+        this.scope = { pickId, handle: this.deps.scopes.start(pick.bookmark) };
+        this.record('scope.start', { pickId, generation });
+        started = true;
+      } catch (err) {
+        if (!(err instanceof ScopeError)) throw err;
+      }
+    }
+    if (!started) {
+      this.record('scope.failed', { pickId, generation });
+      this.deps.log.warn('scope.failed', { generation });
+    }
+    const active = this.active;
+    if (!active || active.pick.pickId !== pickId || !active.online) return;
+    if (started && (await isRunFolder(join(active.pick.path, active.source.rel)))) return;
+    if (started) this.releaseScope(generation);
+    const source = this.registry.source(active.source.sourceKey);
+    if (source) await this.goOffline(active, source);
+  }
+
+  /** The open source's folder can't be reached any more: it shows unavailable, from its index. */
+  private async goOffline(active: Active, source: SourceRecord): Promise<void> {
+    const generation = this.deps.bumpGeneration();
+    await this.stopCore(generation);
+    const stamp: Stamp = { sourceKey: source.sourceKey, generation };
+    await this.spawnCore({ ...stamp, root: null }, active.pick.pickId);
+    await this.settle(
+      {
+        pick: active.pick,
+        run: runOf(source),
+        known: source,
+        verify: false,
+        onMismatch: 'offline',
+        runs: active.runs,
+        again: true,
+      },
+      source,
+      stamp,
+      false,
+    );
   }
 
   /**

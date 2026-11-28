@@ -5,12 +5,15 @@
 // source view of the message shows in the pane in its place, under the same
 // open. While the conversation shown came from a search result, every open
 // carries that search's ID, so main can say how the message matched it.
+// Remote images are per open: a new open shows placeholders again.
 
 import { useSyncExternalStore } from 'react';
 import type {
+  AllowRemoteResult,
   MessageOpenResult,
   ReaderActionResult,
   RejectCode,
+  RemoteStatusUpdate,
   SourceNode,
   SourceResult,
 } from '../shared/api';
@@ -18,6 +21,31 @@ import type { OpenMode, ReaderMatch } from '../shared/reader-protocol';
 import { clearLink, getShellState, refreshGeneration } from './shell';
 
 export type ReaderView = Extract<MessageOpenResult, { outcome: 'view' }>;
+
+/** The shown view's remote images. */
+export interface RemoteState {
+  /** A consent request is out; the button waits meanwhile. */
+  asking: boolean;
+  /** Main allowed the view's remote images. */
+  allowed: boolean;
+  /** The last request couldn't start the image loader. */
+  failed: boolean;
+  /** Consents main granted with a reload: part of the body frame's key. */
+  reloads: number;
+  /** Images loaded over plain http. */
+  insecure: number;
+  /** Images that couldn't load. */
+  refused: number;
+}
+
+const NO_REMOTE: RemoteState = {
+  asking: false,
+  allowed: false,
+  failed: false,
+  reloads: 0,
+  insecure: 0,
+  refused: 0,
+};
 
 /** The source view of the pane's message. */
 export interface SourceState {
@@ -48,6 +76,7 @@ export interface ReaderState {
   fileRefused: boolean;
   /** Main refused the open. */
   refused: RejectCode | null;
+  remote: RemoteState;
   /** The open the pane shows, a view or a fallback; actions on it name it. */
   openId: number | null;
   /** Set while the source view shows. */
@@ -66,6 +95,7 @@ const CLOSED: ReaderState = {
   fallback: false,
   fileRefused: false,
   refused: null,
+  remote: NO_REMOTE,
   openId: null,
   source: null,
   queryId: null,
@@ -127,6 +157,7 @@ export async function openInReader(
     fallback: false,
     fileRefused: false,
     refused: null,
+    remote: NO_REMOTE,
     openId: null,
     source: null,
     queryId,
@@ -165,6 +196,54 @@ export async function openInReader(
     update({ pending: false, view: result, match: result.match, openId: result.openId });
   }
   return result;
+}
+
+/**
+ * The body frame's key: a new view, or a consent main granted with a reload,
+ * mounts a new frame on the same URL; nothing else does.
+ */
+export function frameKey(view: ReaderView, remote: RemoteState): string {
+  return `${view.url}#${remote.reloads}`;
+}
+
+/** Asks main to load the shown view's remote images; the frame reloads once if it allows them. */
+export async function loadRemoteImages(): Promise<AllowRemoteResult | null> {
+  const view = state.view;
+  const generation = openGeneration;
+  const { remote } = state;
+  if (!view?.remoteLoadable || generation === null || remote.asking || remote.allowed) return null;
+  const mine = latest;
+  update({ remote: { ...remote, asking: true, failed: false } });
+  let result: AllowRemoteResult;
+  try {
+    result = await window.pev.allowRemote(view.openId, generation);
+  } catch {
+    result = { ok: false, code: 'unavailable' };
+  }
+  // A newer open owns the pane now.
+  if (mine !== latest || state.view !== view) return result;
+  const now = state.remote;
+  if (result.ok) {
+    update({
+      remote: {
+        ...now,
+        asking: false,
+        allowed: true,
+        reloads: now.reloads + (result.reload ? 1 : 0),
+      },
+    });
+  } else {
+    update({ remote: { ...now, asking: false, failed: result.code === 'unavailable' } });
+    if (result.code === 'stale_generation') await refreshGeneration();
+  }
+  return result;
+}
+
+/** Main's counts for a view's remote images; those of any other open are dropped. */
+export function remoteStatus(status: RemoteStatusUpdate): void {
+  const view = state.view;
+  if (!view || view.openId !== status.openId || status.generation !== openGeneration) return;
+  update({ remote: { ...state.remote, insecure: status.insecure, refused: status.refused } });
 }
 
 /**

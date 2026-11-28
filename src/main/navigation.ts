@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Navigation policy: nothing navigates, except the body frame loading the one
-// mail-body URL main last authorized for this window. Popups never open; a
-// link id of this window's live body view opens the link dialog instead.
+// mail-body URL main last authorized for this window, as many times as its
+// view allows: once, and once more after consent to its remote images.
+// Popups never open; a link id of this window's live body view opens the
+// link dialog instead.
 
 import type { WebContents, WebFrameMain } from 'electron';
 import type { Logger } from '../shared/log/writer';
@@ -35,11 +37,16 @@ export function guardNavigation(contents: WebContents, options: NavigationOption
     const frame = event.frame;
     const isBodyFrame =
       !event.isMainFrame && !!frame && sameFrame(frame.parent, contents.mainFrame);
-    if (isBodyFrame && event.url === views.authorizedUrl()) return;
+    const load = isBodyFrame ? views.spendLoad(event.url) : 'not_authorized';
+    if (load === 'load') return;
     if (__PEV_TEST_HOOKS__ && !event.isMainFrame && event.url === options.allowFrameUrl) return;
     event.preventDefault();
     log.warn('nav.denied', {
-      reason: event.isMainFrame ? 'main_frame' : 'not_authorized',
+      reason: event.isMainFrame
+        ? 'main_frame'
+        : load === 'spent'
+          ? 'reload_spent'
+          : 'not_authorized',
       scheme: schemeLabel(event.url),
       windowId,
     });

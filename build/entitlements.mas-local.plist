@@ -2,7 +2,8 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- The local build: read-only access to the folder the user picks, kept across
      launches by a bookmark, and its own app group. No Downloads write access, so
-     an export in Downloads stays read-only for the app. -->
+     an export in Downloads stays read-only for the app. Outgoing connections
+     are for the image fetcher, as in the store build. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -16,5 +17,7 @@
   <array>
     <string>com.example.pev.viewer</string>
   </array>
+  <key>com.apple.security.network.client</key>
+  <true/>
 </dict>
 </plist>

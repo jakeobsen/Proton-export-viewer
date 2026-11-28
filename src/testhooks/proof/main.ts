@@ -13,7 +13,9 @@ import { randomBytes } from 'node:crypto';
 import { basename } from 'node:path';
 import { app } from 'electron';
 import type { AppContext } from '../../main/context';
+import { FetcherHost } from '../../main/fetcher-host';
 import { markLoaded } from '../marker';
+import { runFetcherProof } from './fetcher-flow';
 import {
   runControl as runControlWith,
   runProofLaunch,
@@ -67,38 +69,70 @@ function startScope(bookmark: string): ProofScope {
   }
 }
 
-/** Runs the next launch of the proof, then quits the app. */
+/** Runs the next launch of the proof (or, in the fetcher-proof build, the fetcher's), then quits. */
 export async function runFolderProof(
   ctx: AppContext,
   open: OpenDialog,
   dialogCalls: () => string[],
 ): Promise<void> {
-  try {
-    await runProofLaunch({
-      dir: app.getPath('userData'),
-      expected: JSON.parse(__PEV_FOLDER_PROOF_EXPORTS__) as ExpectedExport[],
-      launch: {
-        id: randomBytes(8).toString('hex'),
-        mainPid: process.pid,
-        startedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
-        sandboxed: process.mas === true,
-      },
-      core: proofCore(ctx),
-      async pick(at) {
-        app.focus({ steal: true });
-        const picked = await open({
-          message: `Choose ${basename(at)}`,
-          defaultPath: at,
-          properties: ['openDirectory'],
-          securityScopedBookmarks: true,
-        });
-        const path = picked.filePaths[0];
-        const bookmark = picked.bookmarks?.[0];
-        return picked.canceled || !path || !bookmark ? null : { path, bookmark };
-      },
-      startScope,
-      otherDialogs: dialogCalls,
+  const expected = JSON.parse(__PEV_FOLDER_PROOF_EXPORTS__) as ExpectedExport[];
+  const launch = {
+    id: randomBytes(8).toString('hex'),
+    mainPid: process.pid,
+    startedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+    sandboxed: process.mas === true,
+  };
+  async function pick(at: string) {
+    app.focus({ steal: true });
+    const picked = await open({
+      message: `Choose ${basename(at)}`,
+      defaultPath: at,
+      properties: ['openDirectory'],
+      securityScopedBookmarks: true,
     });
+    const path = picked.filePaths[0];
+    const bookmark = picked.bookmarks?.[0];
+    return picked.canceled || !path || !bookmark ? null : { path, bookmark };
+  }
+  try {
+    if (__PEV_FOLDER_PROOF_STEP__ === 'fetcher') {
+      await runFetcherProof({
+        dir: app.getPath('userData'),
+        expected: expected[0]!,
+        launch,
+        core: proofCore(ctx),
+        // The app's own fetcher host and process; only the guard is the proof's.
+        fetcher(guard) {
+          const host = new FetcherHost({
+            fetcherPath: ctx.paths.fetcherPath,
+            log: ctx.log,
+            relay: ctx.log.forProc('fetcher'),
+            spawnGuard: guard,
+          });
+          return {
+            get pid() {
+              return host.pid;
+            },
+            start: () => host.ensure(),
+            read: (path) => host.testCall('read', path),
+            stop: () => host.stop(),
+          };
+        },
+        pick,
+        startScope,
+        otherDialogs: dialogCalls,
+      });
+    } else {
+      await runProofLaunch({
+        dir: app.getPath('userData'),
+        expected,
+        launch,
+        core: proofCore(ctx),
+        pick,
+        startScope,
+        otherDialogs: dialogCalls,
+      });
+    }
     ctx.log.info('test.folder_proof');
   } finally {
     app.exit(0);

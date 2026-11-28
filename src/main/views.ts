@@ -4,6 +4,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { BODY_SCHEME, VIEW_HOST } from '../shared/constants';
+import type { ImageResult } from './fetcher-host';
 import type { FileIdentity } from '../shared/reader-protocol';
 
 export interface ViewAsset {
@@ -15,6 +16,39 @@ export interface ViewAsset {
 export interface ViewLink {
   url: string;
   text: string;
+}
+
+/** Where a view's consent to remote images stands. */
+export type Consent = 'none' | 'pending' | 'allowed';
+
+export type ConsentOutcome =
+  { ok: true; reload: boolean } | { ok: false; code: 'not_live' | 'unavailable' };
+
+/** What the shell learns about a view's remote images: counts only. */
+export interface RemoteCounts {
+  /** Images loaded over plain http. */
+  insecure: number;
+  /** Images that couldn't load: refused, failed or out of budget. */
+  refused: number;
+}
+
+/** A view's remote images. The URLs stay in main; the shell never sees them. */
+export interface ViewRemote {
+  /**
+   * What each `r<n>` names, `refs[n - 1]`; null when the view has none, its
+   * list failed main's check, or the view was revoked.
+   */
+  refs: readonly string[] | null;
+  consent: Consent;
+  /** The one consent attempt under way, while `consent` is 'pending'. */
+  attempt: Promise<ConsentOutcome> | null;
+  /** The fetcher's name for this view: made at its first consent, never replaced, never its token. */
+  viewKey: string | null;
+  /** Each `r<n>` asked for since consent: its fetch, in flight or settled. */
+  images: Map<string, Promise<ImageResult>>;
+  counts: RemoteCounts;
+  /** Images served with their bytes. */
+  served: number;
 }
 
 /** What main keeps about one listed attachment; the shell knows it only by its index. */
@@ -74,6 +108,12 @@ export interface View {
   assets: Map<string, ViewAsset>;
   /** Kept apart from the assets: a link id is never served. */
   links: Map<string, ViewLink>;
+  /**
+   * Body-frame loads of this view's body URL still allowed: the first, one
+   * per granted consent, and one for each Back from the source view.
+   */
+  loads: number;
+  remote: ViewRemote;
   /** The message a reader view shows; none for the test hooks' fixed bodies. */
   message: ViewMessage | null;
   /** Set while the source view shows. */
@@ -106,11 +146,16 @@ export interface ViewBody {
   html: string;
   assets: Array<{ id: string; contentType: string; bytes: Uint8Array }>;
   links?: Array<{ id: string; url: string; text: string }>;
+  /** The checked list of remote URLs, `r1` first; null or absent when the view can't load them. */
+  remoteRefs?: readonly string[] | null;
   message?: ViewMessage;
 }
 
 export type InstallOutcome =
   { ok: true; view: View } | { ok: false; reason: 'open_id' | 'generation' };
+
+/** What a body-frame navigation to a URL may do. */
+export type LoadCheck = 'load' | 'spent' | 'not_authorized';
 
 export const TOKEN_RE = /^[0-9a-f]{32}$/;
 
@@ -123,6 +168,19 @@ export function sourceUrl(token: string, n: number): string {
   return `${BODY_SCHEME}://${VIEW_HOST}/${token}/source/${n}`;
 }
 
+/** A view's remote images before any consent; `refs` is its checked list, if any. */
+function viewRemote(refs: readonly string[] | null | undefined): ViewRemote {
+  return {
+    refs: refs && refs.length > 0 ? [...refs] : null,
+    consent: 'none',
+    attempt: null,
+    viewKey: null,
+    images: new Map(),
+    counts: { insecure: 0, refused: 0 },
+    served: 0,
+  };
+}
+
 export class ViewRegistry {
   private readonly live = new Map<string, View>();
   private latestOpenId = 0;
@@ -131,7 +189,11 @@ export class ViewRegistry {
   private fallback: Fallback | null = null;
   private sourceSessions = 0;
 
-  constructor(private readonly newToken: () => string = () => randomBytes(16).toString('hex')) {}
+  constructor(
+    private readonly newToken: () => string = () => randomBytes(16).toString('hex'),
+    /** Called for each view as it is revoked, after it stopped being live. */
+    private readonly onRevoke: (view: View) => void = () => undefined,
+  ) {}
 
   /**
    * Accepts a new open: revokes the live view right away and reserves a token
@@ -164,6 +226,8 @@ export class ViewRegistry {
         body.assets.map((a) => [a.id, { contentType: a.contentType, bytes: a.bytes }]),
       ),
       links: new Map((body.links ?? []).map((l) => [l.id, { url: l.url, text: l.text }])),
+      loads: 1,
+      remote: viewRemote(body.remoteRefs),
       message: body.message ?? null,
       source: null,
       sourceBlocks: 0,
@@ -219,6 +283,8 @@ export class ViewRegistry {
           html: '',
           assets: new Map(),
           links: new Map(),
+          loads: 0,
+          remote: viewRemote(null),
           message: null,
           source: null,
           sourceBlocks: 0,
@@ -297,6 +363,8 @@ export class ViewRegistry {
       if (f && f.openId === view.openId && f.token === view.token) f.token = this.newToken();
       return null;
     }
+    // Back shows the body again: the frame loads it once more.
+    view.loads = Math.max(view.loads, 1);
     this.authorized = bodyUrl(view.token);
     return this.authorized;
   }
@@ -310,12 +378,13 @@ export class ViewRegistry {
 
   /** Revokes the live view and any pending open. Returns how many views were live. */
   revokeAll(): number {
-    const count = this.live.size;
+    const gone = [...this.live.values()];
     this.live.clear();
     this.pendingToken = null;
     this.authorized = null;
     this.fallback = null;
-    return count;
+    for (const view of gone) this.onRevoke(view);
+    return gone.length;
   }
 
   /**
@@ -332,15 +401,46 @@ export class ViewRegistry {
     return TOKEN_RE.test(token) ? this.live.get(token) : undefined;
   }
 
+  /** True while `view` is this window's live view. */
+  isLive(view: View): boolean {
+    return this.live.get(view.token) === view;
+  }
+
   /** The live view, if it is the one the open `openId` installed. */
   byOpenId(openId: number): View | undefined {
     for (const view of this.live.values()) if (view.openId === openId) return view;
     return undefined;
   }
 
+  liveViews(): View[] {
+    return [...this.live.values()];
+  }
+
   /** The only body URL the body frame may navigate to. */
   authorizedUrl(): string | null {
     return this.authorized;
+  }
+
+  /**
+   * Checks a body-frame navigation to `url`, and spends one of the live
+   * view's loads when it may go ahead. A source document is header text
+   * with no images, and spends none.
+   */
+  spendLoad(url: string): LoadCheck {
+    if (this.authorized === null || url !== this.authorized) return 'not_authorized';
+    const view = this.live.get(url.slice(bodyUrl('').length).split('/')[0] ?? '');
+    if (!view) return 'not_authorized';
+    if (url !== bodyUrl(view.token)) return 'load';
+    if (view.loads <= 0) return 'spent';
+    view.loads -= 1;
+    return 'load';
+  }
+
+  /** Allows the live `view` one more load of its URL: the reload a granted consent needs. */
+  grantLoad(view: View): boolean {
+    if (!this.isLive(view)) return false;
+    view.loads += 1;
+    return true;
   }
 
   get liveCount(): number {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Main process entry: the broker. It never parses mail and holds no network code.
+// Main process entry: the broker. It never parses mail and holds no network
+// code: remote images are fetched by the fetcher process.
 
 import { dirname, join, sep } from 'node:path';
 import { app, clipboard, nativeTheme, protocol, shell } from 'electron';
@@ -14,14 +15,17 @@ import {
   notifySettings,
   notifySources,
   type AppContext,
+  type AppWindow,
   type DataDirs,
   type Paths,
 } from './context';
 import { CoreHost } from './core-host';
+import { FetcherHost } from './fetcher-host';
 import { systemPicker, systemScopes } from './sources/access';
 import { SourceManager } from './sources/manager';
 import { registerIpc } from './ipc';
 import { LinkDialog } from './link-dialog';
+import { RemoteImages } from './remote-images';
 import { SettingsStore } from './settings';
 import { applySwitches } from './switches';
 import { followTheme } from './theme';
@@ -43,6 +47,7 @@ const paths: Paths = {
   rendererDir: join(outRoot, 'renderer'),
   preloadPath: join(outRoot, 'preload', 'index.cjs'),
   corePath: join(mainDir, 'core.js'),
+  fetcherPath: join(mainDir, 'fetcher.js'),
 };
 
 if (__PEV_TEST_HOOKS__) {
@@ -145,14 +150,27 @@ async function start(): Promise<void> {
     picker: systemPicker,
     scopes: systemScopes,
   });
+  const fetcher = new FetcherHost({
+    fetcherPath: paths.fetcherPath,
+    log,
+    relay: log.forProc('fetcher'),
+    spawnGuard: (spawn) => sources.withScopeReleased(spawn),
+  });
+  const windows = new Map<number, AppWindow>();
   const ctx: AppContext = {
     paths,
     log,
     rendererLog,
     frameRoots,
     generation: 1,
-    windows: new Map(),
+    windows,
     core,
+    fetcher,
+    remote: new RemoteImages({
+      fetcher,
+      log,
+      liveViews: () => [...windows.values()].flatMap((appWin) => appWin.views.liveViews()),
+    }),
     sources,
     linkDialog: new LinkDialog(log),
     shellCsp: SHELL_CSP,
@@ -164,7 +182,10 @@ async function start(): Promise<void> {
   core.onEvent = (event) => sources.handleCoreEvent(event);
   core.onExit = (source) => sources.coreExited(source);
   core.exports = () => sources.exportRoots();
-  app.on('will-quit', () => sources.close());
+  app.on('will-quit', () => {
+    void ctx.fetcher.stop();
+    sources.close();
+  });
   registerIpc(ctx);
   installAppMenu(ctx);
   if (__PEV_TEST_HOOKS__) {

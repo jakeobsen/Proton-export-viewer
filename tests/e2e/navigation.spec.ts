@@ -217,13 +217,14 @@ test('main-frame navigation is denied', async ({ pev }) => {
   expect(pev.page.url()).toBe('app://shell/index.html');
 });
 
-test('the authorized reload of the current token works', async ({ pev }) => {
+test('the current token loads once: a reload is refused, and the body stays', async ({ pev }) => {
   const opened = await pev.open('sample');
   const url = opened.url as string;
   await pev.bodyFrame(url);
   expect(await bodyRequests(pev, url)).toBe(1);
   await pev.shell('setFrameSrc', [url]);
-  await expect.poll(() => bodyRequests(pev, url)).toBe(2);
+  await expect.poll(() => pev.hasLog('nav.denied', { reason: 'reload_spent' })).toBe(true);
+  expect(await bodyRequests(pev, url)).toBe(1);
   const frame = await pev.bodyFrame(url);
   expect(await frame.locator('#stub-title').textContent()).toBe('Sample message');
 });

@@ -11,6 +11,7 @@ import {
   firstMailbox,
   fullDate,
   initialsOf,
+  loadedImages,
   senderOf,
   shortDate,
 } from '../../src/renderer/reader-format';
@@ -103,6 +104,13 @@ describe('labels', () => {
   it('counts blocked images', () => {
     expect(blockedImages(1)).toBe('1 external image blocked');
     expect(blockedImages(7)).toBe('7 external images blocked');
+  });
+
+  it('says the external images loaded, with each count only when it is not zero', () => {
+    expect(loadedImages(0, 0)).toBe('External images loaded');
+    expect(loadedImages(2, 0)).toBe('External images loaded · 2 not secure');
+    expect(loadedImages(0, 3)).toBe("External images loaded · 3 couldn't load");
+    expect(loadedImages(1, 1)).toBe("External images loaded · 1 not secure · 1 couldn't load");
   });
 
   it('gives each address one color', () => {

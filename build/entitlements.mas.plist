@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Outgoing connections are for the image fetcher, which loads a message's
+     remote images when the user asks for them; the rest of the app is kept
+     off the network by its own request policy. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -14,6 +17,8 @@
     <string>com.example.pev</string>
   </array>
   <key>com.apple.security.files.downloads.read-write</key>
+  <true/>
+  <key>com.apple.security.network.client</key>
   <true/>
 </dict>
 </plist>

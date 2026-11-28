@@ -107,6 +107,22 @@ export const LOG_CODES = [
   'settings.write_failed',
   'logs.open_failed',
   'search.ranges_dropped',
+  'fetcher.spawn',
+  'fetcher.ready',
+  'fetcher.exit',
+  'fetcher.ready_timeout',
+  'fetcher.stop_timeout',
+  'fetcher.fetched',
+  'fetcher.refused',
+  'fetcher.uncaught',
+  'fetcher.rejection',
+  'fetcher.relay_dropped',
+  'fetcher.crash_limit',
+  'fetcher.stopped',
+  'remote.allowed',
+  'remote.refused',
+  'remote.served',
+  'remote.refs_invalid',
   'recent.recorded',
   'recent.dropped',
   'recent.wipe_failed',
@@ -229,6 +245,19 @@ export const REASONS = [
   'eml_missing',
   'offline',
   'file',
+  'userinfo',
+  'port',
+  'address',
+  'dns',
+  'network',
+  'tls',
+  'status',
+  'redirects',
+  'aborted',
+  'fetcher',
+  'not_live',
+  'reload_spent',
+  'idle',
   'manual',
   'refused',
   'not_deleted',
@@ -236,6 +265,10 @@ export const REASONS = [
   'unavailable',
   'closed',
 ] as const;
+
+/** HTTP status classes: the fetcher logs a response's class, never its exact status. */
+export const STATUS_CLASSES = ['1xx', '2xx', '3xx', '4xx', '5xx'] as const;
+export type StatusClass = (typeof STATUS_CLASSES)[number];
 
 /** The lists of a message whose entries can be cut to a limit when indexed. */
 export const CAPPED_LIST_NAMES = ['labels', 'attachments', 'to', 'cc', 'bcc', 'replyTo'] as const;

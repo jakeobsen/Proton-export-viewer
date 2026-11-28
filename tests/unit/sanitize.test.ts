@@ -14,6 +14,7 @@ import { JSDOM } from 'jsdom';
 import { simpleParser } from 'mailparser';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { cssProblems } from '../../src/core/reader/css';
+import { MAX_BODY_REFERENCES, MAX_REMOTE_URL_LENGTH } from '../../src/shared/constants';
 import {
   DROPPED_ATTRIBUTES,
   DROPPED_ELEMENTS,
@@ -332,6 +333,69 @@ describe('links and references', () => {
       `b{background:url(${BASE}/r${MAX_REFERENCES})}`,
     );
     expect(usedIds(doc, 'r')).toEqual(range('r', MAX_REFERENCES));
+  });
+
+  it('names each r<n> by its URL for main, in id order: src, srcset, poster, background and style', () => {
+    const out = sanitizeHtml(
+      [
+        '<body>',
+        '<img src="http://a.test/1.png">',
+        '<img srcset="https://a.test/2.png 1x, http://a.test/1.png 2x">',
+        '<video poster="HTTPS://Poster.Test/p.png"></video>',
+        '<table background="https://bg.test/b.png"><tr><td>x</td></tr></table>',
+        '<p style="background-image:url(https://css.test/c.png)">x</p>',
+        '<img src="ftp://x.test/no.png"><img src="http://a.test/1.png">',
+        '</body>',
+      ].join(''),
+      BASE,
+    );
+    // Repeats share one id; only http and https URLs get one, as resolved.
+    expect(out.remoteRefs).toEqual([
+      'http://a.test/1.png',
+      'https://a.test/2.png',
+      'https://poster.test/p.png',
+      'https://bg.test/b.png',
+      'https://css.test/c.png',
+    ]);
+    expect(out.remote).toBe(5);
+    const doc = parse(out.html);
+    const imgs = doc.querySelectorAll('img');
+    expect(imgs[0]?.getAttribute('src')).toBe(`${BASE}/r1`);
+    expect(imgs[1]?.getAttribute('srcset')).toBe(`${BASE}/r2 1x, ${BASE}/r1 2x`);
+    expect(doc.querySelector('video')?.getAttribute('poster')).toBe(`${BASE}/r3`);
+    expect(doc.querySelector('table')?.getAttribute('background')).toBe(`${BASE}/r4`);
+    expect(doc.querySelector('p')?.getAttribute('style')).toBe(`background-image:url(${BASE}/r5)`);
+    expect(imgs[imgs.length - 1]?.getAttribute('src')).toBe(`${BASE}/r1`);
+    expect(usedIds(doc, 'r')).toEqual(range('r', 5));
+  });
+
+  it('gives main at most MAX_REFERENCES remote URLs; the next reference is removed', () => {
+    expect(MAX_REFERENCES).toBe(MAX_BODY_REFERENCES);
+    const images = Array.from(
+      { length: MAX_REFERENCES + 1 },
+      (_, i) => `<img src="https://a.test/${i}.png">`,
+    ).join('');
+    const out = sanitizeHtml(`<body>${images}</body>`, BASE);
+    expect(out.remote).toBe(MAX_REFERENCES);
+    expect(out.remoteRefs).toHaveLength(MAX_REFERENCES);
+    expect(out.remoteRefs.at(-1)).toBe(`https://a.test/${MAX_REFERENCES - 1}.png`);
+    const imgs = parse(out.html).querySelectorAll('img');
+    expect(imgs[MAX_REFERENCES - 1]?.getAttribute('src')).toBe(`${BASE}/r${MAX_REFERENCES}`);
+    expect(imgs[MAX_REFERENCES]?.getAttribute('src') ?? null).toBeNull();
+  });
+
+  it('removes a remote reference whose resolved URL is longer than main accepts', () => {
+    // Written short enough, but percent-encoding makes the URL longer.
+    const prefix = 'https://a.test/';
+    const fits = prefix + 'a'.repeat(MAX_REMOTE_URL_LENGTH - prefix.length);
+    const grows = prefix + '\u00e9'.repeat(Math.ceil((MAX_REMOTE_URL_LENGTH - prefix.length) / 4));
+    expect(grows.length).toBeLessThan(MAX_REMOTE_URL_LENGTH);
+    expect(new URL(grows).href.length).toBeGreaterThan(MAX_REMOTE_URL_LENGTH);
+    const out = sanitizeHtml(`<body><img src="${fits}"><img src="${grows}"></body>`, BASE);
+    expect(out.remoteRefs).toEqual([fits]);
+    const imgs = parse(out.html).querySelectorAll('img');
+    expect(imgs[0]?.getAttribute('src')).toBe(`${BASE}/r1`);
+    expect(imgs[1]?.getAttribute('src') ?? null).toBeNull();
   });
 
   it('counts no ids for a declaration dropped because css-tree writes it with an escape or `</`', () => {

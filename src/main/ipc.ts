@@ -10,6 +10,7 @@ import { clipboard, ipcMain, shell, type IpcMainEvent, type IpcMainInvokeEvent }
 import { z } from 'zod';
 import {
   IPC,
+  type AllowRemoteResult,
   type CloseViewResult,
   type CopyResult,
   type DoneResult,
@@ -26,6 +27,7 @@ import {
   type PingResult,
   type Rejected,
   type RejectCode,
+  type RemoteStatusUpdate,
   type RecentSearchesResult,
   type SearchResult,
   type SnippetsResult,
@@ -78,6 +80,7 @@ import { DIALOG_ID_RE } from './link-dialog';
 import { sameFrame } from './navigation';
 import { OPEN_GAP_MS, OpenPacer } from './open-pacer';
 import { PLACEHOLDER } from '../shared/placeholder';
+import { checkRemoteRefs } from './remote-images';
 import { SUPERSEDED, SearchLanes } from './search-lane';
 import { diagnosticsSummary, settingsView } from './settings-view';
 import { headerDocument } from './source-doc';
@@ -145,6 +148,15 @@ const SourcePartsReply = z
   .max(MAX_SOURCE_PARTS)
   .refine((parts) => parts.every((p, i) => p.parent < i && (i === 0) === (p.parent === -1)));
 // The shell names the dialog and the choice; main keeps the URL.
+// The shell names the view by its open; main keeps the URLs.
+const AllowRemoteArgs = z.tuple([
+  z
+    .object({
+      openId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      generation: Generation,
+    })
+    .strict(),
+]);
 const LinkActionArgs = z.tuple([
   z
     .object({
@@ -566,10 +578,16 @@ export function registerIpc(ctx: AppContext): void {
     const message = result.read;
     if (!message) return reject('invalid', appWin);
 
+    // The view keeps the remote URLs for its life; only their count goes to the shell.
+    const remoteRefs = checkRemoteRefs(message.remoteRefs, message.remote);
+    if (message.remote > 0 && remoteRefs === null) {
+      ctx.log.warn('remote.refs_invalid', { openId, windowId: appWin.id });
+    }
     const outcome = appWin.views.install(openId, token, generation, ctx.generation, {
       html: message.html,
       assets: viewAssets(message),
       links: message.links,
+      remoteRefs,
       message: {
         rowid,
         file: result.file ?? null,
@@ -595,6 +613,7 @@ export function registerIpc(ctx: AppContext): void {
       format: message.format,
       hasHtml: message.hasHtml,
       remote: message.remote,
+      remoteLoadable: remoteRefs !== null,
       htmlTooLarge: message.htmlTooLarge,
       cut: message.cut,
       headers: message.headers,
@@ -611,6 +630,43 @@ export function registerIpc(ctx: AppContext): void {
       highlighted: message.highlighted,
       match,
     };
+  });
+
+  /**
+   * Consent to the remote images of this window's live view, named by its
+   * open. A stale generation or an open whose view isn't live can't consent.
+   */
+  guarded<AllowRemoteResult>(IPC.allowRemote, async (appWin, raw) => {
+    const args = AllowRemoteArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ openId, generation }] = args.data;
+    if (generation !== ctx.generation) {
+      ctx.log.info('remote.refused', { reason: 'stale', windowId: appWin.id });
+      return { ok: false, code: 'stale_generation' };
+    }
+    const view = appWin.views.byOpenId(openId);
+    if (!view) {
+      ctx.log.info('remote.refused', { reason: 'not_live', windowId: appWin.id });
+      return { ok: false, code: 'not_live' };
+    }
+    if (view.remote.refs === null) return reject('invalid', appWin);
+    const outcome = await ctx.remote.allow(
+      {
+        views: appWin.views,
+        windowId: appWin.id,
+        send: (shown, counts) => {
+          if (appWin.win.isDestroyed()) return;
+          const update: RemoteStatusUpdate = {
+            generation: shown.generation,
+            openId: shown.openId,
+            ...counts,
+          };
+          appWin.win.webContents.send(IPC.remoteStatus, update);
+        },
+      },
+      view,
+    );
+    return outcome.ok ? { ok: true, reload: outcome.reload } : { ok: false, code: outcome.code };
   });
 
   /** The live view an action names, by the open that installed it, or why there is none. */

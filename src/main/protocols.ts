@@ -7,6 +7,7 @@ import { extname, resolve, sep } from 'node:path';
 import { APP_HOST, BODY_CSP, VIEW_HOST } from '../shared/constants';
 import { checkRaster } from '../core/reader/raster';
 import type { Logger } from '../shared/log/writer';
+import type { RemoteImages } from './remote-images';
 import type { ViewRegistry } from './views';
 
 export interface RequestLike {
@@ -26,6 +27,7 @@ const CONTENT_TYPES: Record<string, string> = {
 
 const ASSET_ID_RE = /^[a-z0-9][a-z0-9.]{0,31}$/;
 const CID_RE = /^c\d{1,4}$/;
+const REMOTE_RE = /^r\d{1,4}$/;
 // A view's body, or its source document number n.
 const VIEW_PATH_RE = /^\/([0-9a-f]{32})(?:\/source\/([1-9]\d{0,8}))?$/;
 const ASSET_PATH_RE = /^\/([0-9a-f]{32})\/([^/]+)$/;
@@ -111,6 +113,8 @@ export interface ViewHandlerOptions {
   bodyCspEnabled?: (() => boolean) | undefined;
   /** Called for every request before the token check. */
   onRequest?: ((url: string) => void) | undefined;
+  /** Remote images after consent; without it, every `r<n>` is the placeholder. */
+  remote?: Pick<RemoteImages, 'serve'> | undefined;
 }
 
 /**
@@ -154,7 +158,11 @@ export function bodyHandler(options: ViewHandlerOptions): Handler {
 /**
  * Serves `mail-asset://v/<token>/<id>` for assets registered with a live view
  * of this window. An inline image (`c<n>`) passes the raster check again here,
- * and is served with the type of the format it found.
+ * and is served with the type of the format it found. A remote image (`r<n>`)
+ * is its registered placeholder until the view's images are allowed; then
+ * it is the fetched image, with the type main's own check found, or the
+ * placeholder when it couldn't load. A view revoked while its image was on
+ * the way gets nothing.
  */
 export function assetHandler(options: ViewHandlerOptions): Handler {
   const reject = (reason: string): Response => {
@@ -175,19 +183,28 @@ export function assetHandler(options: ViewHandlerOptions): Handler {
     const id = match[2];
     const asset = ASSET_ID_RE.test(id) ? view.assets.get(id) : undefined;
     if (!asset) return reject('unknown_asset');
+    if (REMOTE_RE.test(id) && options.remote) {
+      const served = await options.remote.serve(options.views, view, id);
+      if (served.kind === 'revoked') return reject('unknown_token');
+      if (served.kind === 'image') return image(served.bytes, served.contentType);
+    }
     let contentType = asset.contentType;
     if (CID_RE.test(id)) {
       const check = checkRaster(asset.bytes);
       if (!check.ok) return reject(check.reason);
       contentType = check.image.contentType;
     }
-    return new Response(new Uint8Array(asset.bytes), {
-      status: 200,
-      headers: {
-        'Content-Type': contentType,
-        'Cache-Control': 'no-store',
-        'X-Content-Type-Options': 'nosniff',
-      },
-    });
+    return image(asset.bytes, contentType);
   };
+}
+
+function image(bytes: Uint8Array, contentType: string): Response {
+  return new Response(new Uint8Array(bytes), {
+    status: 200,
+    headers: {
+      'Content-Type': contentType,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
 }

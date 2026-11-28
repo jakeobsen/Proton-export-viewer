@@ -10,13 +10,15 @@ import {
   PROCESS_TYPES,
   REASONS,
   SCHEMES,
+  STATUS_CLASSES,
   isLogCode,
+  type StatusClass,
 } from './codes';
 
 export const LEVELS = ['error', 'warn', 'info', 'debug'] as const;
 export type Level = (typeof LEVELS)[number];
 
-export const PROCS = ['main', 'core', 'worker', 'renderer'] as const;
+export const PROCS = ['main', 'core', 'worker', 'renderer', 'fetcher'] as const;
 export type Proc = (typeof PROCS)[number];
 
 export interface LogInput {
@@ -55,6 +57,12 @@ const oneOf =
   (v) =>
     typeof v === 'string' && values.includes(v);
 
+/** The class of an HTTP status, or null for none or one out of range. */
+export function statusClass(status: number | null): StatusClass | null {
+  if (status === null || !Number.isInteger(status) || status < 100 || status > 599) return null;
+  return STATUS_CLASSES[Math.floor(status / 100) - 1]!;
+}
+
 export const isErrorClass = (v: unknown): boolean =>
   typeof v === 'string' && (v === 'NonError' || ERROR_CLASS_RE.test(v));
 
@@ -73,6 +81,7 @@ const FIELDS: Record<string, Validator> = {
   windowId: isCount,
   exitCode: isInt,
   status: (v) => isInt(v) && (v as number) >= 100 && (v as number) <= 599,
+  statusClass: oneOf(STATUS_CLASSES),
   reason: oneOf(REASONS),
   list: oneOf(CAPPED_LIST_NAMES),
   scheme: oneOf(SCHEMES),

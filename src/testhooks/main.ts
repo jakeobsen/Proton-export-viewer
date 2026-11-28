@@ -164,6 +164,7 @@ export async function install(ctx: AppContext): Promise<boolean> {
   /** When each window's body requests came, in ms on main's clock. */
   const bodyTimes = new Map<number, number[]>();
   let bodyCsp = true;
+  let releaseConsent: (() => void) | null = null;
 
   const recordsFor = (windowId: number): WindowRequests => {
     let rec = requests.get(windowId);
@@ -530,6 +531,61 @@ export async function install(ctx: AppContext): Promise<boolean> {
     indexDir: () => join(app.getPath('userData'), 'index'),
     /** Resets the app's data, as Settings does, without its generation check. */
     resetApp: () => ctx.sources.reset(null),
+    /** The fetcher's test entry and connect record, for the next fetcher started. */
+    fetcherAllow: (address: string, port: number) => {
+      ctx.fetcher.testInit = { loopbackAllow: { address, port }, recordConnects: true };
+    },
+    /** Fetches one image through the fetcher, as consent will; the bytes come back as a count. */
+    fetcherFetch: async (viewKey: string, ref: string, url: string) => {
+      const result = await ctx.fetcher.fetch(viewKey, ref, url);
+      return result.ok
+        ? {
+            ok: true,
+            format: result.format,
+            contentType: result.contentType,
+            insecure: result.insecure,
+            bytes: result.bytes.length,
+          }
+        : result;
+    },
+    fetcherAbort: (viewKey: string) => ctx.fetcher.abort(viewKey),
+    /** Starts the fetcher by the production path and has it open a file for reading. */
+    fetcherRead: async (path: string) => {
+      await ctx.fetcher.ensure();
+      return ctx.fetcher.testCall('read', path);
+    },
+    fetcherDestinations: () => ctx.fetcher.testCall('destinations'),
+    fetcherPid: () => ctx.fetcher.pid ?? null,
+    fetcherStop: () => ctx.fetcher.stop(),
+    /** Holds every consent attempt before it starts the fetcher, until released. */
+    holdRemoteConsent: () => {
+      if (ctx.remote.testHold) return;
+      ctx.remote.testHold = new Promise<void>((resolve) => {
+        releaseConsent = resolve;
+      });
+    },
+    releaseRemoteConsent: () => {
+      ctx.remote.testHold = null;
+      releaseConsent?.();
+      releaseConsent = null;
+    },
+    remoteAttempts: () => ctx.remote.attempts,
+    /** The live view's remote state, without its URLs. */
+    remoteView: (windowId: number) => {
+      const view = byId(windowId).views.liveViews()[0];
+      if (!view) return null;
+      const { consent, viewKey, counts, served } = view.remote;
+      return {
+        openId: view.openId,
+        consent,
+        hasKey: viewKey !== null,
+        keyIsToken: viewKey === view.token,
+        loads: view.loads,
+        refs: view.remote.refs?.length ?? 0,
+        ...counts,
+        served,
+      };
+    },
     /** The theme Electron gives every frame: `system`, `light` or `dark`. */
     themeSource: () => nativeTheme.themeSource,
     /**
@@ -635,7 +691,7 @@ export async function install(ctx: AppContext): Promise<boolean> {
 
   const selfTest = process.argv.includes('--pev-selftest');
   if (selfTest) {
-    await runSelfTest(ctx, process.argv, windowEvents, api.queuePick);
+    await runSelfTest(ctx, process.argv, windowEvents, api.queuePick, api.sourceOrder);
     return true;
   }
   return false;

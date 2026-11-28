@@ -30,11 +30,12 @@ import type { BodyLink } from '../../shared/reader-protocol';
 import { filterStyleAttribute, filterStyleSheet, type UrlRewriter } from './css';
 import type { CidTarget } from './parts';
 import { MAX_LINKS, MAX_URL_LENGTH, linkUrl } from './plain';
+import { MAX_BODY_REFERENCES, MAX_REMOTE_URL_LENGTH } from '../../shared/constants';
 
 /** The longest link text kept for the link dialog, in characters. */
 export const MAX_LINK_TEXT = 1000;
 /** The most remote or cid references one body gets; further ones are removed. */
-export const MAX_REFERENCES = 5000;
+export const MAX_REFERENCES = MAX_BODY_REFERENCES;
 
 /** Elements removed with everything in them. */
 export const DROPPED_ELEMENTS = [
@@ -116,6 +117,8 @@ export interface SanitizedBody {
   links: BodyLink[];
   /** How many distinct remote references became `r<n>`. */
   remote: number;
+  /** What each `r<n>` names, `remoteRefs[n - 1]`: its absolute `http` or `https` URL. */
+  remoteRefs: string[];
   /** How many distinct `cid:` references became `c<n>`. */
   cids: number;
   /** What each `c<n>` names, `cidTargets[n - 1]`, when inline images were given. */
@@ -158,6 +161,11 @@ class References {
     return this.remote.size;
   }
 
+  /** The remote URLs in id order: `r<n>`'s is at n - 1. */
+  remoteRefs(): string[] {
+    return [...this.remote.keys()];
+  }
+
   get cidCount(): number {
     return this.cids.size;
   }
@@ -194,6 +202,8 @@ class References {
       return null;
     }
     if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.hostname === '') return null;
+    // Percent-encoding can make the resolved URL longer than what was written.
+    if (url.href.length > MAX_REMOTE_URL_LENGTH) return null;
     return { map: this.remote, key: url.href, prefix: 'r' };
   }
 
@@ -455,6 +465,7 @@ export function sanitizeHtml(
     html: `<!doctype html>${outer}`,
     links: refs.links,
     remote: refs.remoteCount,
+    remoteRefs: refs.remoteRefs(),
     cids: refs.cidCount,
     cidTargets: refs.cidTargets(),
   };

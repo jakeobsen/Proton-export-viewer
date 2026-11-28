@@ -18,5 +18,5 @@ export const READER_UNSANITIZED_ACTION = 'pev-reader-unsanitized';
  */
 export function unsanitized(sources: readonly HtmlSource[]): SanitizedBody {
   const html = sources.map((source) => source.html).join('<br/>\n');
-  return { html, links: [], remote: 0, cids: 0, cidTargets: [] };
+  return { html, links: [], remote: 0, remoteRefs: [], cids: 0, cidTargets: [] };
 }

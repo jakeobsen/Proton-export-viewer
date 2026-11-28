@@ -47,3 +47,17 @@ export type LinkAction = (typeof LINK_ACTIONS)[number];
 
 export const LOG_FILE_MAX_BYTES = 5 * 1024 * 1024;
 export const LOG_FILE_COUNT = 5;
+
+/**
+ * The most distinct remote references, and the most `cid:` references, one
+ * message body gets; further ones are removed. Main checks a view's remote
+ * list against the same number.
+ */
+export const MAX_BODY_REFERENCES = 5000;
+
+/**
+ * The longest remote reference a body keeps, as its resolved URL (ASCII, so
+ * characters are bytes); a longer one is removed. Main checks a view's remote
+ * list against the same number.
+ */
+export const MAX_REMOTE_URL_LENGTH = 8192;
