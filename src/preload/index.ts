@@ -34,6 +34,10 @@ const api: PevApi = {
   openStub: (id, generation) => ipcRenderer.invoke(IPC.openStub, { id, generation }),
   open: (rowid, mode, generation) => ipcRenderer.invoke(IPC.open, { rowid, mode, generation }),
   closeView: (generation) => ipcRenderer.invoke(IPC.closeView, { generation }),
+  showInFolder: (openId, generation) =>
+    ipcRenderer.invoke(IPC.showInFolder, { openId, generation }),
+  copyMessageId: (openId, generation) =>
+    ipcRenderer.invoke(IPC.copyMessageId, { openId, generation }),
   log: (level, code, generation, data) =>
     ipcRenderer.send(
       IPC.log,

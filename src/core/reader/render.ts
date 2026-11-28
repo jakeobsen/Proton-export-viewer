@@ -14,11 +14,22 @@
 
 import type { Readable } from 'node:stream';
 import type { AddressObject, HeaderLines, HeaderValue, Headers } from 'mailparser';
-import type { MessageHeaders, OpenMode, RenderedMessage } from '../../shared/reader-protocol';
+import { isRisky, typeLabel } from '../../shared/attachment-types';
+import { cleanFilename } from '../../shared/filename';
+import { headerText } from '../../shared/header-text';
+import {
+  MAX_REFERENCES,
+  type AttachmentEntry,
+  type MessageDetails,
+  type MessageHeaders,
+  type OpenMode,
+  type RenderedMessage,
+} from '../../shared/reader-protocol';
 import { htmlTextParser } from '../text/html-to-text';
-import { KEEP_BYTES, extractMessage, type Body } from './extract';
+import { KEEP_BYTES, extractMessage, type Body, type ExtractedMessage } from './extract';
 import { InlineImages, type ImageRefusal, type Reread } from './images';
 import { plainBody } from './plain';
+import { rasterFormat } from './raster';
 import { sanitizeHtml, type HtmlSource, type ImageResolver, type SanitizedBody } from './sanitize';
 
 /** HTML bodies larger than this, in encoded bytes, open as plain text unless asked for anyway. */
@@ -98,6 +109,82 @@ export function headerFields(headers: Headers | null, lines: HeaderLines | null)
   };
 }
 
+/**
+ * The attachment list of a view: every part the index lists as an attachment,
+ * in message order, except the parts the shown body displays as images. It
+ * has no cap of its own: it holds every attachment read, so each one can be
+ * saved, and can be longer than the index's rows, which stop at
+ * MAX_ATTACHMENTS. The two agree on the rows the index keeps.
+ */
+export function attachmentList(
+  extracted: Pick<ExtractedMessage, 'tree' | 'listed'>,
+  shown: ReadonlySet<number>,
+): AttachmentEntry[] {
+  const out: AttachmentEntry[] = [];
+  for (const { part, size, head } of extracted.listed) {
+    const record = extracted.tree.parts[part];
+    if (!record || shown.has(part)) continue;
+    const name = cleanFilename(record.filename ?? '');
+    const imageFormat = rasterFormat(head);
+    out.push({
+      path: record.path,
+      name,
+      contentType: record.contentType,
+      label: typeLabel(name, imageFormat),
+      size,
+      risky: isRisky(name),
+      imageFormat,
+    });
+  }
+  return out;
+}
+
+/** The ids of a Message-ID or References value, each in its angle brackets. */
+function messageIds(value: HeaderValue | undefined): string[] {
+  const text = (Array.isArray(value) ? value : [value])
+    .filter((v): v is string => typeof v === 'string')
+    .join(' ');
+  return text.match(/<[^<>]*>/g) ?? (text.trim() === '' ? [] : [text.trim()]);
+}
+
+/** The structure line of Details, e.g. "multipart/mixed · HTML and plain text · 3 attachments". */
+export function formatLine(
+  contentType: string,
+  bodies: { hasHtml: boolean; hasText: boolean },
+  attachments: number,
+): string {
+  const kinds =
+    bodies.hasHtml && bodies.hasText
+      ? 'HTML and plain text'
+      : bodies.hasHtml
+        ? 'HTML'
+        : bodies.hasText
+          ? 'Plain text'
+          : 'No text';
+  const count =
+    attachments === 0 ? null : attachments === 1 ? '1 attachment' : `${attachments} attachments`;
+  return [headerText(contentType) || 'text/plain', kinds, count].filter(Boolean).join(' · ');
+}
+
+/** What Details shows beyond the header lines, each value cleaned for display. */
+export function detailsOf(
+  headers: Headers | null,
+  bodies: { hasHtml: boolean; hasText: boolean; attachments: number },
+): MessageDetails {
+  const contentType = headers?.get('content-type');
+  const type =
+    typeof contentType === 'object' && contentType !== null && 'value' in contentType
+      ? String((contentType as { value: unknown }).value)
+      : '';
+  const references = messageIds(headers?.get('references')).map(headerText);
+  return {
+    messageId: headerText(messageIds(headers?.get('message-id'))[0] ?? ''),
+    references: references.slice(0, MAX_REFERENCES),
+    moreReferences: Math.max(0, references.length - MAX_REFERENCES),
+    format: formatLine(type.toLowerCase(), bodies, bodies.attachments),
+  };
+}
+
 /** Tidies extracted HTML text for display: no trailing blanks, at most one empty line in a row. */
 function tidy(text: string): string {
   return text
@@ -159,6 +246,8 @@ export async function renderMessage(
   const { headers: parsedHeaders, lines, text, html, stopped } = extracted;
   const headers = headerFields(parsedHeaders, lines);
   const hasHtml = html.content.length > 0 || html.cut;
+  const hasText = text.content.length > 0 || text.cut;
+  const bodies = { hasHtml, hasText };
   const htmlLimit = options.mode === 'html-anyway' ? HTML_ANYWAY_BYTES : HTML_VIEW_BYTES;
   if (options.mode !== 'plain' && hasHtml && html.bytes <= htmlLimit) {
     const images = new InlineImages(extracted.tree);
@@ -169,8 +258,13 @@ export async function renderMessage(
     const body = (options.sanitize ?? sanitizeHtml)(sources, options.assetBase, images);
     const served = await images.load(body.cidTargets, options.reread ?? null);
     if (images.refused.size > 0) options.onImagesRefused?.(images.refused);
+    // A part the body shows as an image isn't listed again.
+    const attachments = attachmentList(extracted, images.shown);
+    const details = detailsOf(parsedHeaders, { ...bodies, attachments: attachments.length });
     return {
       headers,
+      attachments,
+      details,
       html: body.html,
       links: body.links,
       format: 'html',
@@ -185,8 +279,12 @@ export async function renderMessage(
   }
   const plain = plainText(text, html);
   const body = plainBody(plain.text, options.assetBase);
+  const attachments = attachmentList(extracted, new Set());
+  const details = detailsOf(parsedHeaders, { ...bodies, attachments: attachments.length });
   return {
     headers,
+    attachments,
+    details,
     html: body.html,
     links: body.links,
     format: 'plain',

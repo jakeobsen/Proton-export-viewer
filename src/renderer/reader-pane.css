@@ -266,3 +266,113 @@
      background. */
   background: var(--bg);
 }
+
+.rp-acts {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.rp-act {
+  height: 26px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.rp-act:hover:not(:disabled) {
+  background: var(--rp-hover);
+  color: inherit;
+}
+
+.rp-act:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.rp-note {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Mail data: shown as one isolated run of text, never reordering what is around it. */
+.rp-details dd {
+  unicode-bidi: isolate;
+}
+
+.rp-mono {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.rp-atts {
+  flex: none;
+  padding: 10px 22px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.rp-att-title {
+  margin-bottom: 8px;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--muted);
+}
+
+.rp-att-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rp-att-virtual {
+  display: block;
+  overflow-y: auto;
+}
+
+.rp-att {
+  box-sizing: border-box;
+  min-height: 50px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.rp-att-virtual .rp-att {
+  height: 50px;
+  overflow: hidden;
+}
+
+.rp-att-risky {
+  border-color: var(--rp-danger-border);
+  background: var(--rp-danger-soft);
+}
+
+.rp-att-name {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  unicode-bidi: isolate;
+}
+
+.rp-att-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.rp-att-warn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--rp-danger);
+  font-size: 12px;
+}

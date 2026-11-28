@@ -2,6 +2,8 @@
 // Opening one message in the reader: the messages between the shell and main,
 // main and core, and core and its reader worker.
 
+import type { RasterFormat } from './attachment-types';
+
 /**
  * What the shell asks for: the message's HTML body, its plain text, or its
  * HTML body even though it is too large to open as HTML by default.
@@ -40,8 +42,44 @@ export interface InlineImage {
 }
 
 /** A message rendered by the reader worker. */
+/** One attachment of a rendered message, in the order the message has its parts. */
+export interface AttachmentEntry {
+  /** The part's dotted path in the message: `1.2` is the second part of the first. */
+  path: string;
+  /** The cleaned file name. */
+  name: string;
+  /** The part's declared content type, lower-cased. Kept by main; never shown. */
+  contentType: string;
+  /** What kind of file it is, from a fixed list of labels. */
+  label: string;
+  /** The decoded size, in bytes. */
+  size: number;
+  /** The name's extension is one of a program or a script. */
+  risky: boolean;
+  /** The raster format the part's first bytes have, or null. Only a signature check. */
+  imageFormat: RasterFormat | null;
+}
+
+/** Details shows at most this many References ids. */
+export const MAX_REFERENCES = 20;
+
+/** What Details shows beyond the header lines. Every value is cleaned for display. */
+export interface MessageDetails {
+  /** The Message-ID, or '' when the message has none. */
+  messageId: string;
+  /** The first MAX_REFERENCES ids of References. */
+  references: string[];
+  /** How many more ids References holds. */
+  moreReferences: number;
+  /** The message's structure in a line, e.g. "multipart/mixed · HTML and plain text · 3 attachments". */
+  format: string;
+}
+
 export interface RenderedMessage {
   headers: MessageHeaders;
+  /** Its attachments, as listed in this view's mode. */
+  attachments: AttachmentEntry[];
+  details: MessageDetails;
   /** The body document that mail-body: serves. */
   html: string;
   links: BodyLink[];
@@ -91,6 +129,24 @@ export type ReaderInput = { kind: 'fd'; fd: number } | { kind: 'test'; input: Te
 /** Why a reader job gave no body. The reader then shows its fallback. */
 export const READER_FAILURES = ['timeout', 'limit', 'crash', 'parse', 'file'] as const;
 export type ReaderFailure = (typeof READER_FAILURES)[number];
+
+/** A file's identity as the reader opened it: its device and inode, as decimal strings. */
+export interface FileIdentity {
+  dev: string;
+  ino: string;
+}
+
+/**
+ * main -> core: the path of the file a view was read from, for Show in folder.
+ * Core answers only while the message's file is still that same file.
+ */
+export interface LocateRequest {
+  type: 'locate';
+  reqId: number;
+  generation: number;
+  rowid: number;
+  file: FileIdentity;
+}
 
 /** main -> core: open one message for a window. */
 export interface ReadRequest {

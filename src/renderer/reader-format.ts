@@ -110,3 +110,16 @@ export function fullDate(iso: string | null, timeZone?: string): string {
 export function blockedImages(count: number): string {
   return count === 1 ? '1 external image blocked' : `${count} external images blocked`;
 }
+
+/** A file size as the attachment list shows it, in decimal units: "182 KB", "1.2 MB". */
+export function fileSize(bytes: number): string {
+  if (bytes < 1000) return bytes === 1 ? '1 byte' : `${bytes} bytes`;
+  if (bytes < 999_500) return `${Math.round(bytes / 1000)} KB`;
+  if (bytes < 999_950_000) return `${(bytes / 1_000_000).toFixed(1)} MB`;
+  return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
+}
+
+/** "1 attachment", "3 attachments". */
+export function attachmentCount(n: number): string {
+  return n === 1 ? '1 attachment' : `${n} attachments`;
+}
