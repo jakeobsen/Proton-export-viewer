@@ -13,7 +13,14 @@
 //    container through the shell and the production source, opens messages,
 //    switches to plain text, clicks a link, opens a message whose file is
 //    missing and forgets the export. Nothing is logged as an error, and the
-//    export is removed afterwards.
+//    export is removed afterwards;
+// 5. save: the sandboxed self-test saves an attachment into a new folder of
+//    its own in the container, marked with the run's nonce, twice: once as a
+//    user would and once with the publish forced to its copy. Each publish
+//    reports how it ran, the bytes match, and the staged download and both
+//    published files carry macOS's quarantine attribute, read here from
+//    outside the app. The folder is removed afterwards, after its mark is
+//    checked. The real Downloads folder is never touched.
 
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -31,6 +38,7 @@ import { createConnection, createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { RUN_FOLDER, accountAddress, entries } from '../tools/gen-export/generator.mjs';
+import { removeWorkspace } from '../tools/bench/workspace.mjs';
 import { APP_ID, LOCAL_APP_ID, PRODUCT_NAME, appPath } from './package.mjs';
 import { bundleContents } from './bundle-contents.mjs';
 import { removeOutputDir, testOutputOf } from './test-output.mjs';
@@ -47,11 +55,13 @@ export const APP_ENTITLEMENTS = {
   'com.apple.security.files.downloads.read-write': true,
   'com.apple.security.files.user-selected.read-only': true,
 };
-// The local build: its own app group, and no Downloads write access.
+// The local build: the App Store build's set with its own app group, Downloads
+// write access included (saving attachments).
 export const LOCAL_APP_ENTITLEMENTS = {
   'com.apple.security.app-sandbox': true,
   'com.apple.security.application-groups': [LOCAL_APP_ID],
   'com.apple.security.files.bookmarks.app-scope': true,
+  'com.apple.security.files.downloads.read-write': true,
   'com.apple.security.files.user-selected.read-only': true,
 };
 const APP_ENTITLEMENTS_OF = {
@@ -176,10 +186,15 @@ function checkEntitlements(flavor) {
       canonical(actual) === canonical(expected),
       `${flavor}: ${executable} entitlements ${canonical(actual)}`,
     );
-    if (flavor === 'mas-local') {
+    if (flavor === 'mas-local' && executable === mainExecutable) {
+      // The same set as the App Store build, but for its own app group.
+      const GROUPS = 'com.apple.security.application-groups';
+      const withoutGroups = (set) =>
+        Object.fromEntries(Object.entries(set).filter(([k]) => k !== GROUPS));
       check(
-        !('com.apple.security.files.downloads.read-write' in actual),
-        `${flavor}: ${executable} has no Downloads write access`,
+        canonical(withoutGroups(actual)) === canonical(withoutGroups(APP_ENTITLEMENTS)) &&
+          JSON.stringify(actual[GROUPS]) === JSON.stringify([LOCAL_APP_ID]),
+        `${flavor}: ${executable} has the App Store set, Downloads write access included, with its own app group`,
       );
     }
   }
@@ -219,6 +234,20 @@ function run(executable, args, timeoutMs = 60_000) {
       done({ code, timedOut: false });
     });
   });
+}
+
+/** Whether `file` carries com.apple.quarantine, read with the system's xattr tool. */
+function quarantineOf(file) {
+  if (!file || !existsSync(file)) return { present: false, value: null };
+  try {
+    const value = execFileSync('/usr/bin/xattr', ['-p', 'com.apple.quarantine', file], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return { present: value !== '', value };
+  } catch {
+    return { present: false, value: null };
+  }
 }
 
 function readResult(file, nonce) {
@@ -366,6 +395,63 @@ async function main() {
     rmSync(smokeRoot, { recursive: true, force: true });
   }
   check(!existsSync(smokeRoot), 'smoke: the export is removed');
+
+  // Save: into the self-test's own marked folder in the container, never Downloads.
+  const saveNonce = randomBytes(8).toString('hex');
+  const saveFolder = join(appData, `save-check-${saveNonce}`);
+  try {
+    const logsDir = join(appData, 'logs');
+    const logsBefore = logSizes(logsDir);
+    const saveRun = await run(
+      join(app, 'Contents', 'MacOS', PRODUCT_NAME),
+      ['--pev-selftest', `--pev-selftest-nonce=${saveNonce}`, `--pev-selftest-save=${saveNonce}`],
+      120_000,
+    );
+    const saveResult = readResult(resultIn(saveNonce), saveNonce);
+    const saved = saveResult?.save ?? null;
+    check(
+      !saveRun.timedOut && saveRun.code === 0,
+      `save: self-test exited 0 (${JSON.stringify(saveRun)})`,
+    );
+    check(saved !== null && saved.error === null, `save: ran to the end (${saved?.error})`);
+    if (saved) {
+      check(saved.folder === saveFolder, `save: its folder is its own, in the container`);
+      const publishes = saved.saves.map((s) => s.publish);
+      check(
+        JSON.stringify(publishes) === '["link","copy"]',
+        `save: published by link, then by the forced copy (${JSON.stringify(publishes)})`,
+      );
+      saved.saves.forEach((one, i) => {
+        check(
+          typeof one.path === 'string' && dirname(one.path) === join(saveFolder, 'downloads'),
+          `save ${i + 1}: published in its own downloads folder`,
+        );
+        check(one.sha256 === saved.expectedSha256, `save ${i + 1}: the bytes match`);
+        for (const [label, file] of [
+          ['published', one.path],
+          ['staged', one.staged],
+        ]) {
+          const q = quarantineOf(file);
+          check(
+            q.present,
+            `save ${i + 1}: the ${label} file has com.apple.quarantine (${q.value})`,
+          );
+        }
+      });
+      check(
+        saveResult.shownWindows === 0 && noWindowEvents(saveResult),
+        'save: no window was shown or focused',
+      );
+    }
+    const errors = newLogLines(logsDir, logsBefore).filter((l) => l.level === 'error');
+    check(
+      errors.length === 0,
+      `save: nothing logged as an error (${errors.map((e) => e.code).join(', ') || 'none'})`,
+    );
+  } finally {
+    if (existsSync(saveFolder)) removeWorkspace(saveFolder, saveNonce);
+  }
+  check(!existsSync(saveFolder), 'save: its folder is removed');
 
   // Positive control: the same self-test, unsandboxed, from the e2e build.
   const userData = join(outDir, 'control-user-data');

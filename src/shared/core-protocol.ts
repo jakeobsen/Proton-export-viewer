@@ -5,6 +5,7 @@ import type { IndexAnswer, IndexOpened, IndexProgress, IndexQuery } from './inde
 import type {
   BodyLink,
   FileIdentity,
+  FileVersion,
   LocateRequest,
   ReadRequest,
   ReaderFailure,
@@ -18,6 +19,7 @@ import type {
   WorkerSource,
   WorkerSourced,
 } from './reader-protocol';
+import type { SaveRequest } from './save-protocol';
 import type { RecentAnswer, RecentJob } from './recent-search';
 import type { RunIdentity, ScanSummary, Stamp } from './sources';
 
@@ -250,7 +252,8 @@ export type CoreRequest =
   | IndexQueryRequest
   | RecentRequest
   | ForgetRequest
-  | ResetRequest;
+  | ResetRequest
+  | SaveRequest;
 
 export type CoreResult =
   | {
@@ -272,6 +275,17 @@ export type CoreResult =
       match?: ReaderMatch;
       /** The identity of the file a `read` came from; null for a test input. */
       file?: FileIdentity | null;
+      /**
+       * The size and time of that file, the same before and after the read;
+       * null when the file changed meanwhile, or for a test input.
+       */
+      version?: FileVersion | null;
+      /** The bytes a `save-open` will stream. */
+      size?: number;
+      /** The next bytes of a save, from `save-pull`. */
+      chunk?: Uint8Array;
+      /** `chunk` completes the save. */
+      done?: boolean;
       /** The path a `locate` found. */
       path?: string;
       /** A header block for the source view; null for a part the message doesn't have. */
@@ -303,7 +317,10 @@ export type CoreResult =
         | 'no_index'
         | 'damaged'
         | 'closed'
-        | 'busy';
+        | 'busy'
+        | 'unreadable'
+        | 'stalled'
+        | 'cancelled';
       /** Why the reader gave no body, for `reader_failed`. */
       reason?: ReaderFailure;
       /** For a `read` from search that failed as `reader_failed` or `eml_missing`: how the message matched. */

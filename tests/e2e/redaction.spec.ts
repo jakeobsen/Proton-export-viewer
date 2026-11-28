@@ -10,6 +10,7 @@ import {
   realpathSync,
   renameSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
@@ -313,6 +314,62 @@ test('no marker reaches a log file through the index text and its schema checks,
   const dir = third.logsDir();
   for (const file of readdirSync(dir)) {
     expect(findMarkers(readFileSync(join(dir, file), 'utf8')), file).toEqual([]);
+  }
+});
+
+test('no marker reaches a log file through saves, Show in Finder or a foreign download', async ({
+  pev,
+}) => {
+  // The attachment's name, the subject and the paths carry markers.
+  const root = realpathSync(testDir('redaction-save'));
+  writeFileSync(join(root, 'marked.eml'), markerMessage());
+  writeFileSync(join(root, 'changing.eml'), markerMessage());
+  const source = await pev.main<{ ok: boolean }>('readerSource', root, [
+    [1, { file: 'marked.eml' }],
+    [2, { file: 'changing.eml' }],
+  ]);
+  expect(source.ok).toBe(true);
+  const opened = await pev.shell<MessageOpenResult>('openInReader', [1, 'plain']);
+  expect(opened.ok).toBe(true);
+  await expect
+    .poll(async () => (await pev.shell<{ pending: boolean }>('reader')).pending)
+    .toBe(false);
+  // Each save's nonce, which only its own download request may carry.
+  const nonces: string[] = [];
+  expect(await pev.shell('saveAttachment', [0])).toMatchObject({ ok: true });
+  nonces.push((await pev.main<string | null>('saveLastNonce'))!);
+  expect(await pev.shell('saveMessageFile')).toMatchObject({ ok: true });
+  nonces.push((await pev.main<string | null>('saveLastNonce'))!);
+  expect(new Set(nonces).size).toBe(2);
+  for (const nonce of nonces) expect(nonce).toMatch(/^[0-9a-f]{32}$/);
+  await pev.page.locator('.rp-show-saved').dispatchEvent('click');
+  // A save that fails: the file changed since it was opened.
+  await pev.shell('openInReader', [2, 'plain']);
+  await expect
+    .poll(async () => (await pev.shell<{ pending: boolean }>('reader')).pending)
+    .toBe(false);
+  const later = new Date(Date.now() + 60_000);
+  utimesSync(join(root, 'changing.eml'), later, later);
+  expect(await pev.shell('saveAttachment', [0])).toMatchObject({ ok: false });
+  // A download the app didn't start, to a URL carrying a marker.
+  await pev.main('download', 1, `app://shell/${encodeURIComponent(MARKERS[5])}`);
+
+  for (const [proc, code] of [
+    ['main', 'save.started'],
+    ['main', 'save.done'],
+    ['main', 'save.failed'],
+    ['main', 'save.shown'],
+    ['main', 'download.cancelled'],
+  ] as const) {
+    await expect.poll(() => pev.hasLog(code, { proc }), { message: `${proc} ${code}` }).toBe(true);
+  }
+  const downloads = await pev.main<string>('downloadsDir');
+  for (const file of readdirSync(pev.logsDir())) {
+    const text = readFileSync(join(pev.logsDir(), file), 'utf8');
+    expect(findMarkers(text), file).toEqual([]);
+    expect(text, file).not.toContain(downloads);
+    expect(text, file).not.toContain(root);
+    for (const nonce of nonces) expect(text, file).not.toContain(nonce);
   }
 });
 

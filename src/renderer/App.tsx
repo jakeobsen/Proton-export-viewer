@@ -10,6 +10,7 @@ import { LinkDialog } from './LinkDialog';
 import { generationChanged, useReaderState } from './reader';
 import { ReaderPane } from './ReaderPane';
 import { ReportView } from './Report';
+import { DOWNLOADS_HINT } from './labels';
 import { Settings } from './Settings';
 import { frameKey, shortcutKey, useShortcutsOverlay } from './shortcut-actions';
 import { ShortcutsOverlay } from './ShortcutsOverlay';
@@ -148,6 +149,11 @@ export function App() {
       {banner !== undefined && (
         <div className="banner index-state" role="status">
           {banner}
+        </div>
+      )}
+      {active?.inDownloads && (
+        <div className="banner downloads-hint" role="status">
+          {DOWNLOADS_HINT}
         </div>
       )}
       <div className="stage">

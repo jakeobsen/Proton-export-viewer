@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Core utility process. It owns the reader lane and answers main over a MessagePort.
 
+import { fstatSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import type { MessagePortMain } from 'electron';
@@ -19,18 +20,21 @@ import type { IndexMatch } from '../shared/index-types';
 import { errorData } from '../shared/log/schema';
 import { LogWriter, type Logger } from '../shared/log/writer';
 import type {
+  FileVersion,
   LocateRequest,
   ReadRequest,
   ReaderFailure,
   ReaderMatch,
   StoredBody,
 } from '../shared/reader-protocol';
+import type { SaveOpenRequest } from '../shared/save-protocol';
 import { WorkerThread, type ThreadRole } from './index/pool';
 import type { IndexOptions } from './index/service';
 import { READER_RETIRE_MB, ReaderLane } from './reader/lane';
 import { OpenTracker } from './reader/opens';
 import { readSource } from './reader/source-read';
-import type { LocatedFile, ReaderSource } from './reader/source';
+import type { LocatedFile, ReaderSource, SaveOpen } from './reader/source';
+import { SaveLane, type SaveWorker } from './save/lane';
 import { SourceSession, type ReaderFile } from './source';
 
 process.umask(0o077);
@@ -91,7 +95,41 @@ const testState = {
   /** Holds the shell's cards queries anchored at this message, until a test lets them go. */
   holdCardsAt: null as number | null,
   heldCards: [] as Array<() => void>,
+  /** While set, a save waits there before the chunk that completes it. */
+  saveGate: null as Promise<void> | null,
+  releaseSaves: null as (() => void) | null,
+  /** Saves waiting at the gate. */
+  savesHeld: 0,
 };
+
+/** A file's size and modification time, as a save compares them. */
+function fileVersion(fd: number): FileVersion {
+  const st = fstatSync(fd, { bigint: true });
+  return { size: st.size.toString(), mtimeNs: st.mtimeNs.toString() };
+}
+
+const saves = new SaveLane({
+  spawn: () =>
+    new Worker(join(import.meta.dirname, 'save-worker.js'), {
+      resourceLimits: { maxOldGenerationSizeMb: SAVE_WORKER_HEAP_MB },
+    }) as unknown as SaveWorker,
+  version: fileVersion,
+  log: (level, code, data) => workerLog?.log(level, code, data),
+  ...(__PEV_TEST_HOOKS__
+    ? {
+        beforeLast: async () => {
+          const gate = testState.saveGate;
+          if (!gate) return;
+          testState.savesHeld += 1;
+          try {
+            await gate;
+          } finally {
+            testState.savesHeld -= 1;
+          }
+        },
+      }
+    : {}),
+});
 /** Test builds can hold phase 1's writes. */
 let writeGate: import('../testhooks/core').WriteGate | null = null;
 let scanGate: import('../testhooks/core').WriteGate | null = null;
@@ -109,6 +147,8 @@ function reply(result: CoreResult): void {
 
 /** Old-generation heap limit of the index's threads, in MB. */
 const INDEX_THREAD_HEAP_MB = 128;
+/** Old-generation heap limit of a save's worker, in MB: it holds a chunk or two at a time. */
+const SAVE_WORKER_HEAP_MB = 128;
 
 /** Starts one of the index's threads: the writer, the query thread or a pool thread. */
 function indexThread(role: ThreadRole): WorkerThread {
@@ -235,6 +275,9 @@ async function readOpen(request: ReadRequest, stale: () => boolean): Promise<voi
   if (__PEV_TEST_HOOKS__) testState.fileOpens += 1;
   const opened = found.opened;
   const stored = indexMatch?.body ?? null;
+  // The file's size and time before the read: a save from this view needs them
+  // unchanged, so a file that changes during the read gives a view that can't save.
+  const before = opened.input.kind === 'fd' ? versionOf(opened.input.fd) : null;
   try {
     if (__PEV_TEST_HOOKS__ && testState.holdingOpened) {
       await new Promise<void>((resolve) => testState.heldOpened.push(resolve));
@@ -259,17 +302,67 @@ async function readOpen(request: ReadRequest, stale: () => boolean): Promise<voi
     const message = outcome.message;
     if (message.type !== 'rendered') return fail('reader_failed', 'crash');
     if (!message.ok) return fail('reader_failed', 'parse');
+    const after = opened.input.kind === 'fd' ? versionOf(opened.input.fd) : null;
+    const version =
+      before && after && before.size === after.size && before.mtimeNs === after.mtimeNs
+        ? before
+        : null;
     reply({
       type: 'result',
       reqId,
       ok: true,
       read: message.message,
       file: opened.file,
+      version,
       ...(match ? { match } : {}),
     });
   } finally {
     await opened.close().catch(() => undefined);
   }
+}
+
+/** The size and time of an open file, or null if fstat fails. */
+function versionOf(fd: number): FileVersion | null {
+  try {
+    return fileVersion(fd);
+  } catch {
+    return null;
+  }
+}
+
+/** Opens a message's file for a save: from the test source or the open export. */
+async function openForSave(request: SaveOpenRequest): Promise<SaveOpen> {
+  if (__PEV_TEST_HOOKS__ && readerSource) {
+    return readerSource
+      .openForSave(request.rowid, request.file)
+      .catch((): SaveOpen => ({ ok: false, code: 'not_found' }));
+  }
+  if (!session) return { ok: false, code: 'no_source' };
+  return session
+    .openForSave(request.rowid, request.generation, request.file)
+    .catch((): SaveOpen => ({ ok: false, code: 'not_found' }));
+}
+
+/** Starts a save in the save lane, after its file is opened and checked. */
+async function saveOpen(request: SaveOpenRequest): Promise<void> {
+  const { reqId } = request;
+  if (saves.busy) {
+    reply({ type: 'result', reqId, ok: false, code: 'busy' });
+    return;
+  }
+  const found = await openForSave(request);
+  if (!found.ok) {
+    reply({ type: 'result', reqId, ok: false, code: found.code });
+    return;
+  }
+  const started = saves.open(
+    request.saveId,
+    { fd: found.fd, close: found.close },
+    request.version,
+    request.target,
+  );
+  if (started.ok) reply({ type: 'result', reqId, ok: true, size: started.size });
+  else reply({ type: 'result', reqId, ok: false, code: started.code });
 }
 
 function startOpen(request: OpenRequest | ReadRequest): void {
@@ -342,6 +435,29 @@ function handle(request: CoreRequest): void {
         job: (message, slot) => lane.job(message, slot),
         reply,
       });
+      return;
+    case 'save-open':
+      void saveOpen(request);
+      return;
+    case 'save-pull':
+      void saves.pull(request.saveId).then((pulled) =>
+        reply(
+          pulled.ok
+            ? {
+                type: 'result',
+                reqId: request.reqId,
+                ok: true,
+                chunk: pulled.chunk,
+                done: pulled.done,
+              }
+            : { type: 'result', reqId: request.reqId, ok: false, code: pulled.code },
+        ),
+      );
+      return;
+    case 'save-cancel':
+      void saves
+        .cancel(request.saveId)
+        .then(() => reply({ type: 'result', reqId: request.reqId, ok: true }));
       return;
     case 'identify':
     case 'scan':

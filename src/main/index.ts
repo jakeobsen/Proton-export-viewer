@@ -24,6 +24,9 @@ import { registerIpc } from './ipc';
 import { LinkDialog } from './link-dialog';
 import { SettingsStore } from './settings';
 import { applySwitches } from './switches';
+import { insideExport } from './saves/guard';
+import { SaveManager } from './saves/manager';
+import { Staging } from './saves/staging';
 import { followTheme } from './theme';
 import { createAppWindow } from './windows';
 
@@ -142,8 +145,24 @@ async function start(): Promise<void> {
       notifyAppReset(ctx);
     },
     indexChanged: (progress) => notifyIndex(ctx, progress),
+    inDownloads: (root) => insideExport(root, [app.getPath('downloads')]),
     picker: systemPicker,
     scopes: systemScopes,
+  });
+  // Whatever a save left from an earlier run goes before anything else starts.
+  const staging = new Staging(app.getPath('userData'));
+  staging.sweep(
+    (dir) => !insideExport(dir, sources.exportRoots()),
+    (reason) => log.warn('save.partial_kept', { reason }),
+    () => log.warn('save.staging_failed'),
+  );
+  const saves = new SaveManager({
+    log,
+    request: (call, stamp) => core.requestRunning(call, stamp),
+    stamp: () => sources.stamp(),
+    downloads: () => app.getPath('downloads'),
+    exportRoots: () => sources.exportRoots(),
+    staging,
   });
   const ctx: AppContext = {
     paths,
@@ -155,6 +174,7 @@ async function start(): Promise<void> {
     core,
     sources,
     linkDialog: new LinkDialog(log),
+    saves,
     shellCsp: SHELL_CSP,
     dirs,
     settings,
@@ -164,7 +184,10 @@ async function start(): Promise<void> {
   core.onEvent = (event) => sources.handleCoreEvent(event);
   core.onExit = (source) => sources.coreExited(source);
   core.exports = () => sources.exportRoots();
-  app.on('will-quit', () => sources.close());
+  app.on('will-quit', () => {
+    saves.quit();
+    sources.close();
+  });
   registerIpc(ctx);
   installAppMenu(ctx);
   if (__PEV_TEST_HOOKS__) {

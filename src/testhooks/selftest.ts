@@ -5,6 +5,7 @@
 // Arguments: --pev-selftest --pev-selftest-write=<file> --pev-selftest-port=<port>
 //            --pev-selftest-nonce=<hex value echoed into the result>
 //            --pev-selftest-smoke=<export folder inside the app's container>
+//            --pev-selftest-save=<16 hex digits: the save check's folder mark>
 //            --pev-selftest-timing=<export folder inside the app's container>
 //            --pev-selftest-timing-ms=<how long the timing waits for phase 1>
 //            --pev-selftest-timing-keep (the export stays known, for a reopen)
@@ -20,6 +21,10 @@
 // is missing, and forgets the export again (smoke, in the result). With a
 // timing folder, it opens that export and times what the shell shows, from
 // the pick to the end of phase 1, then forgets it (timing, in the result).
+//
+// With a save nonce, the self-test also saves an attachment of a synthetic
+// message into a folder of its own in the container, on both publish paths
+// (save, in the result; see selftest-save).
 //
 // Besides the end state (shownWindows), the result carries the record of every
 // show and focus event during the run (windowEvents, which must be empty), and
@@ -38,6 +43,7 @@ import type { AppContext, AppWindow } from '../main/context';
 import { bodyUrl } from '../main/views';
 import { createAppWindow } from '../main/windows';
 import { markLoaded } from './marker';
+import { runSaveCheck, type SaveCheck } from './selftest-save';
 import type { WindowEvent, WindowEventRecorder } from './window-events';
 
 markLoaded();
@@ -474,6 +480,7 @@ export async function runSelfTest(
     windowEvents: [] as WindowEvent[],
     recorderProbe: [] as WindowEvent[],
     smoke: null as Smoke | null,
+    save: null as SaveCheck | null,
     timing: null as Timing | null,
   };
   try {
@@ -503,6 +510,10 @@ export async function runSelfTest(
     result.connect = Number.isInteger(port) && port > 0 ? await tryConnect(port) : result.connect;
     const smokeRoot = argValue(argv, 'pev-selftest-smoke');
     if (smokeRoot) result.smoke = await runSmoke(ctx, appWin, smokeRoot, queuePick);
+    const saveNonce = argValue(argv, 'pev-selftest-save');
+    if (saveNonce !== undefined && /^[0-9a-f]{16}$/.test(saveNonce)) {
+      result.save = await runSaveCheck(ctx, appWin, saveNonce);
+    }
     const timingRoot = argValue(argv, 'pev-selftest-timing');
     if (timingRoot) {
       const limit = Number(argValue(argv, 'pev-selftest-timing-ms') ?? '600000');

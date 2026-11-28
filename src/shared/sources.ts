@@ -55,6 +55,11 @@ export interface ExportRow {
   sourceKey: string;
   account: string | null;
   runName: string;
+  /**
+   * The export lies in the Downloads folder, which the app may write to, so
+   * macOS doesn't keep it read-only there. The shell says so.
+   */
+  inDownloads: boolean;
 }
 
 export interface RunChoice {

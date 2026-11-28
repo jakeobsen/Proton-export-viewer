@@ -28,8 +28,12 @@ import {
   copyMessageId,
   openInReader,
   openSource,
+  saveAttachment,
+  saveMessageFile,
   showInFolder,
+  showSaved,
   useReaderState,
+  type ReaderState,
   viewChoices,
   type ReaderView,
 } from './reader';
@@ -56,6 +60,16 @@ function PlainIcon() {
       <line x1="21" y1="6" x2="3" y2="6" />
       <line x1="21" y1="14" x2="3" y2="14" />
       <line x1="17" y1="18" x2="3" y2="18" />
+    </svg>
+  );
+}
+
+function SaveIcon() {
+  return (
+    <svg className="rp-icon" {...ICON}>
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="7 10 12 15 17 10" />
+      <line x1="12" y1="15" x2="12" y2="3" />
     </svg>
   );
 }
@@ -278,6 +292,15 @@ function AttachmentRow({ item, top }: { item: AttachmentItem; top: number | null
           <span>Program file. It can harm your computer.</span>
         </div>
       )}
+      <div className="rp-att-btns">
+        <button
+          type="button"
+          className={item.risky ? 'rp-btn rp-att-save rp-danger' : 'rp-btn rp-att-save'}
+          onClick={() => void saveAttachment(item.index)}
+        >
+          Save
+        </button>
+      </div>
     </div>
   );
 }
@@ -331,6 +354,15 @@ function MessageActions({ view }: { view: ReaderView }) {
     <div className="rp-acts" role="group" aria-label="Message">
       <button
         type="button"
+        className="rp-act rp-save-eml"
+        title="Save .eml"
+        onClick={() => void saveMessageFile()}
+      >
+        <SaveIcon />
+        Save .eml
+      </button>
+      <button
+        type="button"
         className="rp-act rp-show"
         disabled={offline}
         title="Show in folder"
@@ -356,6 +388,28 @@ function MessageActions({ view }: { view: ReaderView }) {
           {note}
         </span>
       )}
+    </div>
+  );
+}
+
+/** How the last save from the shown view ended. */
+function SaveLine({ saved }: { saved: ReaderState['saved'] }) {
+  if (saved === null) return null;
+  if (saved === 'failed') {
+    return (
+      <div className="rp-line rp-save-line rp-save-failed" role="status">
+        <WarnIcon />
+        <b>Couldn&apos;t save</b>
+      </div>
+    );
+  }
+  return (
+    <div className="rp-line rp-save-line rp-saved" role="status">
+      <b>Saved to Downloads</b>
+      <span aria-hidden="true">·</span>
+      <button type="button" className="rp-btn rp-show-saved" onClick={() => void showSaved()}>
+        Show in Finder
+      </button>
     </div>
   );
 }
@@ -470,6 +524,7 @@ export function MessageBody() {
           indexedPart={indexedPartText(reader.match, view.highlighted)}
         />
       )}
+      {view && <SaveLine saved={reader.saved} />}
       {reader.fallback && (
         <div className="rp-line rp-fallback" role="alert">
           <WarnIcon />

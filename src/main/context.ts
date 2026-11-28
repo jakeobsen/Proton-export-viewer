@@ -7,6 +7,7 @@ import type { LogWriter } from '../shared/log/writer';
 import type { CoreHost } from './core-host';
 import type { PolicyObserver } from './harden';
 import type { LinkDialog } from './link-dialog';
+import type { SaveManager } from './saves/manager';
 import type { SettingsStore } from './settings';
 import type { SourceManager } from './sources/manager';
 import type { ViewRegistry } from './views';
@@ -46,6 +47,8 @@ export interface AppContext {
   /** The export sources: picks, runs, scopes and the open one. */
   sources: SourceManager;
   linkDialog: LinkDialog;
+  /** Saves to the downloads folder. Set by the app; absent where a test needs none. */
+  saves?: SaveManager | undefined;
   shellCsp: string;
   dirs: DataDirs;
   settings: SettingsStore;
@@ -89,9 +92,13 @@ export function notifyAppReset(ctx: AppContext): void {
   }
 }
 
-/** Moves to the next generation and revokes every view in every window. */
+/**
+ * Moves to the next generation, revokes every view in every window, and
+ * cancels every save.
+ */
 export function bumpGeneration(ctx: AppContext): number {
   ctx.generation += 1;
+  ctx.saves?.cancelAll('generation');
   for (const appWin of ctx.windows.values()) {
     const revoked = appWin.views.revokeAll();
     if (revoked > 0) {

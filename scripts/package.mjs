@@ -11,7 +11,8 @@
 //   mas-local     Mac App Store flavor, sandboxed, no test hooks       (from out/)
 //                 The build to run on one's own Mac outside the App Store:
 //                 its own bundle ID and app group, so its data never shares a
-//                 container with a test build, and no Downloads write access.
+//                 container with a test build. It saves to Downloads like the
+//                 App Store build.
 //                 Tests never launch it.
 
 import { existsSync, readdirSync, rmSync, rmdirSync } from 'node:fs';
