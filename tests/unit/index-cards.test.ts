@@ -3,14 +3,9 @@
 // oldest first, around an anchor, read from one snapshot.
 
 import { describe, expect, it } from 'vitest';
-import { cardsWindow, rowDetails } from '../../src/core/index/queries';
+import { cardsWindow, rowDetails, type CardsStretch } from '../../src/core/index/queries';
 import { asNumber, type Db } from '../../src/core/index/sql';
-import {
-  CARDS_AFTER,
-  CARDS_BEFORE,
-  type CardsAnchor,
-  type CardsWindow,
-} from '../../src/shared/index-types';
+import { CARDS_AFTER, CARDS_BEFORE, type CardsAnchor } from '../../src/shared/index-types';
 import { fresh, ingest, message } from '../index-helpers';
 
 const rowidOf = (db: Db, id: string) =>
@@ -25,7 +20,7 @@ const cards = (
   before = 3,
   after = 4,
   threadId: number | null = null,
-): CardsWindow => cardsWindow(db, { follow, threadId, anchor, before, after });
+): CardsStretch => cardsWindow(db, { follow, threadId, anchor, before, after });
 
 /**
  * One conversation of 12 messages at times 100..111 (two share time 105), in

@@ -45,6 +45,8 @@ import type {
   IndexOpened,
   IndexProgress,
   IndexQuery,
+  CardsWindow,
+  LeadsAnswer,
   SearchPage,
   SearchSnippets,
 } from '../../shared/index-types';
@@ -74,12 +76,14 @@ import {
   type IndexThread,
   type ThreadRole,
 } from './pool';
+import { reasonOf } from './report';
 import { BODY_STATE, CAPPED, CAPPED_LISTS } from './schema';
 import {
   BODY_TOO_LARGE,
   labelsStatOf,
   textBytes,
   type ApplyItem,
+  type BodyOrder,
   type BodyTodo,
   type FileStat,
   type PairFiles,
@@ -258,26 +262,6 @@ function chunk<T>(list: T[], size: number): T[][] {
   return out;
 }
 
-/** The log reason for a pair's code. */
-export function reasonOf(code: string): string {
-  if (code.startsWith('FILE_')) return code.slice('FILE_'.length).toLowerCase();
-  switch (code) {
-    case 'META_JSON':
-      return 'meta_json';
-    case 'META_SHAPE':
-      return 'meta_shape';
-    case 'META_ID':
-      return 'meta_id';
-    case 'META_TIMEOUT':
-    case 'BODY_TIMEOUT':
-      return 'timeout';
-    case BODY_TOO_LARGE:
-      return 'too_large';
-    default:
-      return 'worker_failed';
-  }
-}
-
 export class IndexService {
   readonly connections: ConnectionRegistry;
   readonly dbPath: string;
@@ -288,6 +272,11 @@ export class IndexService {
   private writerEntry: number | null = null;
   private queryEntry: number | null = null;
   private queryReady: Promise<void> | null = null;
+  /**
+   * The newest snapshot revision a cards answer carried. A query thread that
+   * replaces a failed one starts above it, so revisions never go back.
+   */
+  private revSeen = 0;
   private pool: Pool | null = null;
   private opened: WriterOpened | null = null;
   private running: Promise<void> | null = null;
@@ -307,9 +296,11 @@ export class IndexService {
     capped: 0,
     condition: 'ok',
     bodyPhase: 'waiting',
+    bodiesBefore: 0,
     bodiesDone: 0,
     bodiesTotal: 0,
     bodiesFailed: 0,
+    bodiesTruncated: 0,
   };
   /** How long phase 1 took when it last ran to the end, in ms. */
   took: number | null = null;
@@ -506,7 +497,12 @@ export class IndexService {
     const query = this.query;
     const uuid = this.opened?.uuid;
     if (!query || !uuid || this.closed) return Promise.reject(new ThreadError('NOT_OPEN'));
-    const args = { dbPath: this.dbPath, expectedUuid: uuid, ...this.busyArg() };
+    const args = {
+      dbPath: this.dbPath,
+      expectedUuid: uuid,
+      revFloor: this.revSeen,
+      ...this.busyArg(),
+    };
     this.queryReady ??= query.call('open', args).then(
       () => {
         this.queryEntry = this.connections.add({ role: 'query', dbPath: this.dbPath });
@@ -561,13 +557,21 @@ export class IndexService {
     try {
       await this.openQuery();
       const answer = await this.query!.call<IndexAnswer>('query', { call });
-      if (call.op === 'search' || call.op === 'snippets' || call.op === 'eml') {
+      if (
+        call.op === 'search' ||
+        call.op === 'snippets' ||
+        call.op === 'leads' ||
+        call.op === 'eml'
+      ) {
         // Snippets and match columns whose ranges failed the check are given without marks.
         const dropped =
           call.op === 'eml'
             ? ((answer as EmlFile | null)?.match?.dropped ?? 0)
-            : ((answer as SearchPage | SearchSnippets | null)?.dropped ?? 0);
+            : ((answer as SearchPage | SearchSnippets | LeadsAnswer | null)?.dropped ?? 0);
         if (dropped > 0) this.deps.log.warn('search.ranges_dropped', { count: dropped }, this.src);
+      }
+      if (call.op === 'cards') {
+        this.revSeen = Math.max(this.revSeen, (answer as CardsWindow).rev);
       }
       return answer;
     } catch (err) {
@@ -763,9 +767,14 @@ export class IndexService {
       if (!writer) throw new ThreadError('NOT_OPEN');
       const pool = this.startPool();
       if (!this.current()) throw new ThreadError('STALE');
-      const order = await writer.call<number[]>('bodyOrder');
+      const { order, before } = await writer.call<BodyOrder>('bodyOrder');
+      // Counts start again with each run; what earlier runs handled is in `before`.
       this.progress.bodyPhase = 'indexing';
+      this.progress.bodiesBefore = before;
       this.progress.bodiesTotal = order.length;
+      this.progress.bodiesDone = 0;
+      this.progress.bodiesFailed = 0;
+      this.progress.bodiesTruncated = 0;
       this.report(true);
       await this.readBodies(pool, writer, order, scan.eml);
       if (!this.current()) throw new ThreadError('STALE');
@@ -990,6 +999,7 @@ export class IndexService {
     this.touch();
     this.progress.bodiesDone += handled;
     this.progress.bodiesFailed += stats.failed.length;
+    this.progress.bodiesTruncated += stats.truncated;
     this.progress.capped += stats.cappedNew;
     this.report();
     for (const fileId of stats.capped) {

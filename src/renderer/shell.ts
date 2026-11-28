@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Shell state: the current generation, the pending link, and the exports main
-// knows about.
+// Shell state: the current generation, the pending link, the exports main
+// knows about, the settings, and which screen shows.
 
 import { useSyncExternalStore } from 'react';
-import type { LinkActionResult, LinkPrompt, SourceActionResult } from '../shared/api';
+import type { DoneResult, LinkActionResult, LinkPrompt, SourceActionResult } from '../shared/api';
 import type { LinkAction } from '../shared/constants';
+import { DEFAULT_SETTINGS, type AppSettings, type SettingKey } from '../shared/settings';
 import type { SourcesView } from '../shared/sources';
 
 export interface ShellState {
@@ -17,6 +18,10 @@ export interface ShellState {
   busy: boolean;
   /** A short warning from the last source action. */
   notice: string | null;
+  /** The defaults until main has answered. */
+  settings: AppSettings;
+  /** Mail, or Settings over it. */
+  screen: 'mail' | 'settings';
 }
 
 let state: ShellState = {
@@ -25,6 +30,8 @@ let state: ShellState = {
   sources: null,
   busy: false,
   notice: null,
+  settings: { ...DEFAULT_SETTINGS },
+  screen: 'mail',
 };
 const listeners = new Set<() => void>();
 
@@ -70,6 +77,50 @@ export async function refreshSources(): Promise<SourcesView | null> {
   return null;
 }
 
+/** Reads the settings from main, once at start. */
+export async function loadSettings(): Promise<void> {
+  let generation = state.generation ?? (await refreshGeneration());
+  for (let attempt = 0; attempt < 2 && generation !== null; attempt += 1) {
+    const result = await window.pev.settings(generation);
+    if (result.ok) {
+      update({ settings: result.view.settings });
+      return;
+    }
+    if (result.code !== 'stale_generation') return;
+    generation = await refreshGeneration();
+  }
+}
+
+export function showSettings(): void {
+  if (state.screen !== 'settings') update({ screen: 'settings', link: null });
+}
+
+/** Back to the mail as it was: the same folder, selection and message. */
+export function showMail(): void {
+  if (state.screen !== 'mail') update({ screen: 'mail' });
+}
+
+/** A reset deleted the app's data: every window goes back to the welcome screen. */
+export function appWasReset(): void {
+  update({ screen: 'mail', notice: null, link: null });
+}
+
+export function settingsChanged(settings: AppSettings): void {
+  update({ settings });
+}
+
+/** Changes one setting; main's answer is what the shell keeps. */
+export async function changeSetting<K extends SettingKey>(
+  key: K,
+  value: AppSettings[K],
+): Promise<void> {
+  const generation = state.generation ?? (await refreshGeneration());
+  if (generation === null) return;
+  const result = await window.pev.setSetting(key, value, generation);
+  if (result.ok) update({ settings: result.settings });
+  else if (result.code === 'stale_generation') await refreshGeneration();
+}
+
 const NOTICES: Partial<Record<string, string>> = {
   no_export: 'No export found',
   unavailable: 'Export not found.',
@@ -78,11 +129,16 @@ const NOTICES: Partial<Record<string, string>> = {
   app_data: "This folder is inside the app's data folder.",
 };
 
-/** Runs an open, a switch, a Locate or a Forget, then reloads the exports. */
+/**
+ * Runs an open, a switch, a Locate, a Forget or a Rebuild, then reloads the
+ * exports. `at` is the generation the action was offered under, when it isn't
+ * the shell's current one: Settings sends the one it was read under.
+ */
 async function sourceAction(
   run: (generation: number) => Promise<SourceActionResult>,
+  at?: number,
 ): Promise<SourceActionResult> {
-  const generation = state.generation ?? (await refreshGeneration());
+  const generation = at ?? state.generation ?? (await refreshGeneration());
   if (generation === null) return { ok: false, code: 'stale_generation' };
   update({ busy: true, notice: null, link: null });
   let result: SourceActionResult;
@@ -106,8 +162,29 @@ export const openExport = (sourceKey: string) =>
   sourceAction((g) => window.pev.openExport(sourceKey, g));
 export const switchRun = (runId: string) => sourceAction((g) => window.pev.switchRun(runId, g));
 export const locateExport = () => sourceAction((g) => window.pev.locateExport(g));
-export const forgetExport = (sourceKey: string) =>
-  sourceAction((g) => window.pev.forgetExport(sourceKey, g));
+export const forgetExport = (sourceKey: string, at?: number) =>
+  sourceAction((g) => window.pev.forgetExport(sourceKey, g), at);
+export const rebuildIndex = (sourceKey: string, at: number) =>
+  sourceAction((g) => window.pev.rebuildIndex(sourceKey, g), at);
+
+/** Deletes all the app's data, under the generation Settings was read under. */
+export async function resetApp(at: number): Promise<DoneResult> {
+  update({ busy: true, notice: null, link: null });
+  let result: DoneResult;
+  try {
+    result = await window.pev.resetApp(at);
+  } finally {
+    update({ busy: false });
+  }
+  if (result.ok) update({ generation: result.generation, screen: 'mail' });
+  else if (result.code === 'not_deleted') {
+    // The reset went ahead and every window is back at the start; this one says what stayed.
+    update({ screen: 'mail', notice: "Some app files couldn't be deleted." });
+    await refreshGeneration();
+  } else if (result.code === 'stale_generation') await refreshGeneration();
+  await refreshSources();
+  return result;
+}
 
 export function showLink(prompt: LinkPrompt): void {
   update({ link: prompt });

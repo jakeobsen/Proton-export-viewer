@@ -5,7 +5,7 @@
 import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { BrowserWindow, app, clipboard, dialog, shell } from 'electron';
+import { BrowserWindow, Menu, app, clipboard, dialog, shell } from 'electron';
 import { bumpGeneration, notifySources, type AppContext } from '../main/context';
 import type { PolicyObserver } from '../main/harden';
 import { PROD_SWITCHES } from '../main/switches';
@@ -463,6 +463,11 @@ export async function install(ctx: AppContext): Promise<boolean> {
       if (!result.ok) throw new Error('hold-cards');
       return result.value ?? 0;
     },
+    /** The shell's cards queries core holds now. */
+    heldCards: async () => {
+      const result = await core('held-cards');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
     /** Phase 1 writes waiting to be let through. */
     heldWrites: async () => {
       const result = await core('held-writes');
@@ -500,8 +505,8 @@ export async function install(ctx: AppContext): Promise<boolean> {
       return result.ok ? (result.value ?? 0) : 0;
     },
     indexDir: () => join(app.getPath('userData'), 'index'),
-    /** Resets the app's data, as Settings will. */
-    resetApp: () => ctx.sources.reset(),
+    /** Resets the app's data, as Settings does, without its generation check. */
+    resetApp: () => ctx.sources.reset(null),
     /**
      * Sends the first app window a card key as main does for one typed in the
      * body frame, whatever has the focus: the shell's own handling is tested
@@ -548,6 +553,31 @@ export async function install(ctx: AppContext): Promise<boolean> {
       );
       return focused;
     },
+    /** Chooses an app menu item by its id, as if from the given app window (the first one by default). */
+    clickMenuItem: (id: string, windowId?: number) => {
+      const item = Menu.getApplicationMenu()?.getMenuItemById(id);
+      if (!item) throw new Error('no such menu item');
+      const appWin = [...ctx.windows.values()].find(
+        (w) => windowId === undefined || w.id === windowId,
+      );
+      if (!appWin) throw new Error('no such window');
+      (item.click as (event: unknown, window: unknown, contents: unknown) => void)(
+        {},
+        appWin.win,
+        appWin.win.webContents,
+      );
+    },
+    /** The app menu: each item's id, label, role and accelerator, by submenu. */
+    appMenu: () =>
+      (Menu.getApplicationMenu()?.items ?? []).map((top) => ({
+        label: top.label,
+        items: (top.submenu?.items ?? []).map((item) => ({
+          id: item.id,
+          label: item.label,
+          role: item.role ?? null,
+          accelerator: item.accelerator ?? null,
+        })),
+      })),
   };
   (globalThis as { __pevTest?: typeof api }).__pevTest = api;
 

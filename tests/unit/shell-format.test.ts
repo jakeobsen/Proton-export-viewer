@@ -2,11 +2,15 @@
 // The shell's display text for the list, and the sidebar's model.
 
 import { describe, expect, it } from 'vitest';
-import type { FolderRow } from '../../src/shared/index-types';
+import type { FolderRow, IndexProgress } from '../../src/shared/index-types';
 import { sidebarModel } from '../../src/renderer/folders';
 import {
+  changedAt,
   formatCount,
   fullDate,
+  fullTextLine,
+  fullTextShare,
+  fullTextStatus,
   listDate,
   loadingText,
   participantsText,
@@ -63,6 +67,74 @@ const row = (id: string, kind: FolderRow['kind'], extra: Partial<FolderRow> = {}
   conversations: 0,
   unread: 0,
   ...extra,
+});
+
+describe("Settings' Last updated", () => {
+  const ms = (y: number, mo: number, d: number, h: number, mi: number, s = 0) =>
+    new Date(y, mo - 1, d, h, mi, s).getTime();
+  const now = new Date(2026, 10, 28, 9, 30);
+
+  it('says Today or Yesterday with the time, else the date, in local time', () => {
+    expect(changedAt(ms(2026, 11, 28, 9, 5), now)).toBe('Today, 09:05');
+    expect(changedAt(ms(2026, 11, 27, 18, 20), now)).toBe('Yesterday, 18:20');
+    expect(changedAt(ms(2026, 11, 26, 23, 59), now)).toBe('26 Nov 2026, 23:59');
+    expect(changedAt(ms(2025, 1, 3, 7, 0), now)).toBe('3 Jan 2025, 07:00');
+  });
+
+  it('turns the day at local midnight', () => {
+    const justAfter = new Date(2026, 10, 28, 0, 0, 30);
+    expect(changedAt(ms(2026, 11, 28, 0, 0), justAfter)).toBe('Today, 00:00');
+    expect(changedAt(ms(2026, 11, 27, 23, 59, 59), justAfter)).toBe('Yesterday, 23:59');
+    expect(changedAt(ms(2026, 11, 27, 0, 0), new Date(2026, 10, 28, 23, 59))).toBe(
+      'Yesterday, 00:00',
+    );
+    expect(changedAt(ms(2026, 11, 26, 23, 59), justAfter)).toBe('26 Nov 2026, 23:59');
+  });
+
+  it('is empty for a time that is no date', () => {
+    expect(changedAt(Number.NaN, now)).toBe('');
+  });
+});
+
+describe("Settings' Status", () => {
+  const progress = (p: Partial<IndexProgress>): IndexProgress => ({
+    phase: 'done',
+    loaded: 10,
+    total: 10,
+    failed: 0,
+    timeouts: 0,
+    capped: 0,
+    condition: 'ok',
+    bodyPhase: 'indexing',
+    bodiesBefore: 0,
+    bodiesDone: 0,
+    bodiesTotal: 0,
+    bodiesFailed: 0,
+    bodiesTruncated: 0,
+    ...p,
+  });
+
+  it('gives the full-text share of the whole export, rounded down, until it is done', () => {
+    expect(fullTextStatus(progress({ bodyPhase: 'waiting', phase: 'loading' }))).toBe(
+      'Full text 0%',
+    );
+    expect(fullTextStatus(progress({ bodiesDone: 1, bodiesTotal: 3 }))).toBe('Full text 33%');
+    expect(fullTextStatus(progress({ bodiesDone: 999, bodiesTotal: 1000 }))).toBe('Full text 99%');
+    // Files handled in an earlier run count too, as in the sidebar.
+    expect(fullTextStatus(progress({ bodiesBefore: 8, bodiesDone: 0, bodiesTotal: 2 }))).toBe(
+      'Full text 80%',
+    );
+    expect(fullTextStatus(progress({ bodyPhase: 'failed', bodiesDone: 5, bodiesTotal: 10 }))).toBe(
+      'Full text 50%',
+    );
+  });
+
+  it('says Complete once the text is indexed, also when this run had nothing to read', () => {
+    expect(fullTextStatus(progress({ bodyPhase: 'done', bodiesDone: 10, bodiesTotal: 10 }))).toBe(
+      'Complete',
+    );
+    expect(fullTextStatus(progress({ bodyPhase: 'done' }))).toBe('Complete');
+  });
 });
 
 describe('the sidebar model', () => {
@@ -138,5 +210,39 @@ describe('the sidebar model', () => {
     const model = sidebarModel({ folders: chain, hiddenIds: 0 });
     expect(model.folders).toHaveLength(20_000);
     expect(model.folders.at(-1)?.depth).toBe(19_999);
+  });
+});
+
+describe('the full-text share', () => {
+  const at = (bodiesBefore: number, bodiesDone: number, bodiesTotal: number): IndexProgress => ({
+    phase: 'done',
+    loaded: 0,
+    total: 0,
+    failed: 0,
+    timeouts: 0,
+    capped: 0,
+    condition: 'ok',
+    bodyPhase: 'indexing',
+    bodiesBefore,
+    bodiesDone,
+    bodiesTotal,
+    bodiesFailed: 0,
+    bodiesTruncated: 0,
+  });
+
+  it('counts files handled before this run and in it, over all, rounded down', () => {
+    expect(fullTextShare(at(0, 0, 3))).toBe(0);
+    expect(fullTextShare(at(0, 1, 3))).toBe(33);
+    expect(fullTextShare(at(0, 2, 3))).toBe(66);
+    expect(fullTextShare(at(100_000, 0, 50_000))).toBe(66);
+    expect(fullTextShare(at(60_000, 1_000, 92_000))).toBe(40);
+    expect(fullTextShare(at(0, 3, 3))).toBe(100);
+    expect(fullTextLine(40)).toBe('Full text 40% · search is partial');
+  });
+
+  it('stays within 0 and 100, and is none with no file to read', () => {
+    expect(fullTextShare(at(0, 0, 0))).toBeNull();
+    expect(fullTextShare(at(0, 5, 3))).toBe(100);
+    expect(fullTextShare(at(2, -9, 3))).toBe(0);
   });
 });

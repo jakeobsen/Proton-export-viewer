@@ -7,6 +7,7 @@ import type {
   CardsWindow,
   IndexProgress,
   IndexReport,
+  Lead,
   ListWindow,
   SearchDateKey,
   SearchPage,
@@ -17,6 +18,7 @@ import type {
 } from './index-types';
 import type { RasterFormat } from './attachment-types';
 import type { MessageDetails, MessageHeaders, OpenMode, ReaderMatch } from './reader-protocol';
+import type { AppSettings, SettingKey } from './settings';
 import type { SourceOutcome, SourcesView } from './sources';
 
 export const IPC = {
@@ -41,9 +43,19 @@ export const IPC = {
   indexChanged: 'pev:index-changed',
   search: 'pev:search',
   searchSnippets: 'pev:search-snippets',
+  leads: 'pev:leads',
   showInFolder: 'pev:show-in-folder',
   copyMessageId: 'pev:copy-message-id',
   copyReport: 'pev:copy-report',
+  settings: 'pev:settings',
+  setSetting: 'pev:set-setting',
+  settingsChanged: 'pev:settings-changed',
+  showSettings: 'pev:show-settings',
+  appReset: 'pev:app-reset',
+  rebuildIndex: 'pev:rebuild-index',
+  resetApp: 'pev:reset-app',
+  openLogs: 'pev:open-logs',
+  copyDiagnostics: 'pev:copy-diagnostics',
   viewSource: 'pev:source',
   sourceTree: 'pev:source-tree',
   sourcePart: 'pev:source-part',
@@ -67,7 +79,10 @@ export type RejectCode =
   | 'eml_missing'
   | 'offline'
   | 'changed'
-  | 'unknown_dialog';
+  | 'unknown_dialog'
+  | 'refused'
+  | 'not_deleted'
+  | 'failed';
 
 export type Rejected = { ok: false; code: RejectCode };
 
@@ -213,7 +228,46 @@ export interface SnippetsRequest {
 export type SnippetsResult =
   { ok: true; generation: number; queryId: number; snippets: ThreadSnippet[] } | Rejected;
 
+/**
+ * Lead lines for messages on screen, asked for by the list or by the cards.
+ * The cards of a conversation opened from a result name that search by its
+ * query ID, so the messages that match it get its snippet.
+ */
+export interface LeadsRequest {
+  requester: 'list' | 'cards';
+  rowids: number[];
+  queryId?: number;
+}
+
+export type LeadsResult = { ok: true; generation: number; leads: Lead[] } | Rejected;
+
 export type CloseViewResult = { ok: true } | Rejected;
+/** The open export's index, as Settings shows it. Paths have home as `~`. */
+export interface SettingsIndex {
+  sourceKey: string;
+  account: string | null;
+  runName: string;
+  /** The index database's full path. */
+  location: string;
+  /** The database and its sidecars. */
+  bytes: number;
+  /** When the index last changed, in ms since the epoch. */
+  updatedAt: number | null;
+}
+
+/** What Settings shows. */
+export interface SettingsView {
+  settings: AppSettings;
+  /** Null when no export is open. */
+  index: SettingsIndex | null;
+  /** The logs folder. */
+  logsLocation: string;
+}
+
+export type SettingsResult = { ok: true; generation: number; view: SettingsView } | Rejected;
+export type SetSettingResult = { ok: true; settings: AppSettings } | Rejected;
+/** An action that leaves no outcome but the generation it left. */
+export type DoneResult = { ok: true; generation: number } | Rejected;
 
 export type ErrorKind = 'uncaught' | 'rejection' | 'error';
 
@@ -302,4 +356,35 @@ export interface PevApi {
    * made; one of an older search is answered as 'superseded'.
    */
   searchSnippets(request: SnippetsRequest, generation: number): Promise<SnippetsResult>;
+  /**
+   * Lead lines for messages on screen. A request waits while this window's
+   * previous one runs, and a newer one from the same requester answers it as
+   * 'superseded'.
+   */
+  leads(request: LeadsRequest, generation: number): Promise<LeadsResult>;
+  /** What Settings shows, for the current generation. */
+  settings(generation: number): Promise<SettingsResult>;
+  /** Changes one setting; main checks the value. */
+  setSetting<K extends SettingKey>(
+    key: K,
+    value: AppSettings[K],
+    generation: number,
+  ): Promise<SetSettingResult>;
+  /** Called with the new settings when one changes, from any window. */
+  onSettingsChanged(listener: (settings: AppSettings) => void): () => void;
+  /** Called when the app menu's "Settings…" is chosen in this window. */
+  onShowSettings(listener: () => void): () => void;
+  /** Called when the app's data was deleted by a reset, in every window. */
+  onAppReset(listener: () => void): () => void;
+  /**
+   * Deletes the open export's index and builds it again. The key and
+   * generation are the ones Settings showed; a stale one changes nothing.
+   */
+  rebuildIndex(sourceKey: string, generation: number): Promise<SourceActionResult>;
+  /** Deletes all the app's data; the export files stay as they are. */
+  resetApp(generation: number): Promise<DoneResult>;
+  /** Shows the logs folder in the file manager. */
+  openLogs(generation: number): Promise<DoneResult>;
+  /** Copies the diagnostics summary; main builds it, and the shell never sees it. */
+  copyDiagnostics(generation: number): Promise<DoneResult>;
 }
