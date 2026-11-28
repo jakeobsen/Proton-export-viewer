@@ -53,10 +53,16 @@ const progress = async (pev: PevApp) => (await ask<IndexTotals>(pev, { op: 'tota
 
 /**
  * Opens `root` with no body indexed: writes are held, phase 1's go through
- * one at a time until it is done, and phase 2's stay held, one body each.
+ * one at a time until it is done, and phase 2's stay held. With `txnBytes`,
+ * a phase 2 write holds at most that much text.
  */
-async function openBodiesHeld(pev: PevApp, root: string, pairs: number): Promise<void> {
-  await pev.main('indexTestSettings', { holdWrites: true, txnBytes: 1 });
+async function openBodiesHeld(
+  pev: PevApp,
+  root: string,
+  pairs: number,
+  txnBytes?: number,
+): Promise<void> {
+  await pev.main('indexTestSettings', { holdWrites: true, ...(txnBytes ? { txnBytes } : {}) });
   await pev.main('queuePick', root, 'bm1');
   await pev.shell('chooseFolder', []);
   await expect
@@ -73,14 +79,41 @@ async function openBodiesHeld(pev: PevApp, root: string, pairs: number): Promise
   await pev.main('indexTestSettings', null);
 }
 
-/** Lets one more held body be written, and waits until it is. */
+/** Lets the held bodies be written, and waits until all are, as text. */
+async function releaseBodies(pev: PevApp, pairs: number): Promise<void> {
+  await pev.main('releaseWrites', null);
+  await expect
+    .poll(() => progress(pev), { timeout: 20_000 })
+    .toMatchObject({ bodyPhase: 'done', bodiesDone: pairs, bodiesTotal: pairs, bodiesFailed: 0 });
+}
+
+/**
+ * Each body of these messages is about 320 bytes of text, and its subject and
+ * names under 100 more: one fits in a write of this much text, two don't.
+ */
+const ONE_BODY = 500;
+const FILLER = 'notes '.repeat(50);
+
+/** Lets one more held write through, one body, and waits until it is written as text. */
 async function releaseBody(pev: PevApp, done: number): Promise<void> {
   await expect.poll(() => pev.main<number>('heldWrites'), { timeout: 20_000 }).toBeGreaterThan(0);
   await pev.main('releaseWrites', 1);
-  await expect.poll(async () => (await progress(pev))?.bodiesDone).toBe(done);
+  await expect.poll(() => progress(pev)).toMatchObject({ bodiesDone: done, bodiesFailed: 0 });
 }
 
 const press = (page: Page, selector: string) => page.locator(selector).dispatchEvent('click');
+
+/**
+ * Scrolls the cards to the top or the end, as the user does. Only the cards
+ * on screen get their lines, and a conversation opens scrolled to its
+ * expanded card, which fills the pane.
+ */
+function scrollCards(page: Page, to: 'top' | 'end'): Promise<void> {
+  return page.locator('.cv-scroll').evaluate((el, where) => {
+    el.scrollTop = where === 'top' ? 0 : el.scrollHeight;
+    el.dispatchEvent(new Event('scroll'));
+  }, to);
+}
 
 function typeText(page: Page, text: string): Promise<void> {
   return page.evaluate((t) => {
@@ -144,14 +177,16 @@ test('list rows and cards get their lead lines once phase 2 indexes the bodies, 
   // No body is indexed yet: no line.
   await expect(hike.locator('.snip')).toHaveText('');
   await expect(prices.locator('.snip')).toHaveText('');
-  // The conversation is open, with its two older cards collapsed.
+  // The conversation is open, with its two older cards collapsed, on screen.
   await press(pev.page, `.conv[data-thread="${await hike.getAttribute('data-thread')}"]`);
   const cards = pev.page.locator('.card');
   await expect(cards).toHaveCount(3);
+  await scrollCards(pev.page, 'top');
+  await expect(cards.nth(0).locator('.ch-snip')).toHaveText('');
   await expect(cards.nth(1).locator('.ch-snip')).toHaveText('');
 
-  // Each body that is indexed brings its lines, row and card, with no other step.
-  for (let done = 1; done <= pairs; done += 1) await releaseBody(pev, done);
+  // The indexed bodies bring their lines, row and card, with no other step.
+  await releaseBodies(pev, pairs);
   await expect(hike.locator('.snip')).toHaveText('See you at 8.');
   await expect(prices.locator('.snip')).toHaveText('Price <b>bold</b> list for May');
   await expect(prices.locator('.snip b')).toHaveCount(0);
@@ -181,11 +216,13 @@ test("a body that starts with an override shows cleaned and leaves its row's nam
     { id: 'B2', time: T0 + 60, subject: 'Re: Notice', body: 'No.', replyTo: 'B1', from: KIM },
   ]);
   await openBodiesHeld(pev, root, pairs);
-  for (let done = 1; done <= pairs; done += 1) await releaseBody(pev, done);
+  await releaseBodies(pev, pairs);
   const row = pev.page.locator('.conv:not(.result)').first();
   await expect(row.locator('.snip')).toHaveText('No.');
   await inOrder(row, ['.from', '.cnt-badge', '.date']);
   await press(pev.page, `.conv[data-thread="${await row.getAttribute('data-thread')}"]`);
+  await expect(pev.page.locator('.card')).toHaveCount(2);
+  await scrollCards(pev.page, 'top');
   const first = pev.page.locator('.card').first();
   await expect(first.locator('.ch-snip')).toHaveText('Pay␇ now, or else');
   const text = (await first.locator('.ch-snip').textContent()) ?? '';
@@ -213,7 +250,7 @@ test('from a result: "N messages · M matching" as the row says, snippets on mat
     { id: 'T2', time: T0 + 50, subject: 'Re: Tie', body: 'invoice two', replyTo: 'T1' },
   ]);
   await openBodiesHeld(pev, root, pairs);
-  for (let done = 1; done <= pairs; done += 1) await releaseBody(pev, done);
+  await releaseBodies(pev, pairs);
 
   await typeText(pev.page, 'invoice');
   const results = pev.page.locator('.conv.result');
@@ -231,11 +268,13 @@ test('from a result: "N messages · M matching" as the row says, snippets on mat
   expect(shown.count).toMatchObject({ total: 4, matching: 2 });
   // A matching card shows the search's snippet, marked; the others their lead.
   const card = (rowid: number | undefined) => pev.page.locator(`.card[data-rowid="${rowid}"]`);
+  await scrollCards(pev.page, 'top');
   await expect(card(i1).locator('.ch-snip mark')).toHaveText(['invoice']);
   await expect(card(i1).locator('.ch-snip')).toHaveText('Attached is the invoice for March.');
   await expect(card(i1)).toHaveAttribute('data-match', '1');
   await expect(card(i2).locator('.ch-snip')).toHaveText('Thanks!');
   await expect(card(i2).locator('.ch-snip mark')).toHaveCount(0);
+  await scrollCards(pev.page, 'end');
   await expect(card(i4).locator('.ch-snip')).toHaveText('Paid.');
   await expect(card(i4)).toHaveAttribute('data-match', '0');
 
@@ -266,11 +305,11 @@ test('a read held in core while a write lands brings N and M from its own snapsh
     id: `H${i}`,
     time: T0 + 100 * i,
     subject: i === 1 ? 'Studio' : 'Re: Studio',
-    body: `invoice number ${i}`,
+    body: `invoice number ${i} ${FILLER}`,
     ...(i === 1 ? {} : { replyTo: 'H1' }),
   }));
   const { root, pairs } = exportOf('snip-held', messages);
-  await openBodiesHeld(pev, root, pairs);
+  await openBodiesHeld(pev, root, pairs, ONE_BODY);
   await releaseBody(pev, 1);
   await releaseBody(pev, 2);
 
