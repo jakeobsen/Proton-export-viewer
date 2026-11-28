@@ -50,6 +50,11 @@ export function participantsText(participants: readonly Participant[]): string {
     .join(', ');
 }
 
+/** "Reading export… 42,000 of 300,000 files". */
+export function readingText(read: number, total: number): string {
+  return `Reading export… ${formatCount(read)} of ${formatCount(total)} files`;
+}
+
 /** "Loading 4,100 of 20,000…". */
 export function loadingText(loaded: number, total: number): string {
   return `Loading ${formatCount(loaded)} of ${formatCount(total)}…`;

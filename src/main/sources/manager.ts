@@ -32,6 +32,7 @@ import type {
   IndexProgress,
   IndexQuery,
 } from '../../shared/index-types';
+import { REASONS } from '../../shared/log/codes';
 import type { Logger } from '../../shared/log/writer';
 import { overlaps } from '../../shared/overlap';
 import {
@@ -628,13 +629,10 @@ export class SourceManager {
       { src: source.sourceKey },
     );
     this.deps.notify();
-    if (online) {
-      if (!target.runs) void this.listRuns(stamp);
-      void this.scan(stamp);
-    } else if (fresh.dbUuid) {
-      // An unavailable export can still be browsed from its index.
-      void this.openIndex(stamp);
-    }
+    if (online && !target.runs) void this.listRuns(stamp);
+    // The index first, so a stored list shows at once; the scan follows it.
+    // An unavailable export can still be browsed from its index.
+    if (online || fresh.dbUuid) void this.openIndex(stamp);
     return online ? 'opened' : 'offline';
   }
 
@@ -660,14 +658,27 @@ export class SourceManager {
     return false;
   }
 
+  /**
+   * The run's identity, from core; null if core couldn't give it, which is
+   * logged with core's answer. The open then shows the run as unavailable.
+   */
   private async identify(stamp: Stamp): Promise<RunIdentity | null> {
     let result: CoreResult;
+    const failed = (answer: string) => {
+      this.deps.log.warn(
+        'source.identify_failed',
+        { generation: stamp.generation, reason: reasonOf(answer) },
+        { src: stamp.sourceKey },
+      );
+      return null;
+    };
     try {
       result = await this.deps.core.requestRunning({ type: 'identify', stamp }, stamp);
     } catch {
-      return null;
+      return failed('core_unavailable');
     }
-    if (!result.ok || !result.identity) return null;
+    if (!result.ok) return failed(result.code);
+    if (!result.identity) return failed('invalid');
     return this.current(result, stamp, false) ? result.identity : null;
   }
 
@@ -690,24 +701,27 @@ export class SourceManager {
           { generation: stamp.generation, reason: 'stale_generation' },
           { src: stamp.sourceKey },
         );
+        return;
       }
+      this.failed(stamp, 'source.scan_failed', result.code);
       return;
     }
     const scan = result.scan;
-    if (!scan) return;
+    if (!scan) {
+      this.failed(stamp, 'source.scan_failed', 'invalid');
+      return;
+    }
     const accept = () => {
-      if (this.current(result, stamp, true) && this.active) {
-        this.active.scan = scan;
-        void this.openIndex(stamp);
-      }
+      if (this.current(result, stamp, true) && this.active) this.active.scan = scan;
     };
     if (this.deps.hold) this.deps.hold(accept);
     else accept();
   }
 
   /**
-   * Has core open the source's index; phase 1 starts there. A new index's
-   * identity goes into the source's registry entry.
+   * Has core open the source's index, then, for a run that is there, scan it:
+   * core starts phase 1 once it has both. A new index's identity goes into
+   * the source's registry entry.
    */
   private async openIndex(stamp: Stamp): Promise<void> {
     const source = this.active?.source;
@@ -725,9 +739,22 @@ export class SourceManager {
         stamp,
       );
     } catch {
+      // Core ended: its exit restarts the source, or closes it past the limit.
       return;
     }
-    if (!result.ok || !result.index || !this.current(result, stamp, true)) return;
+    if (!result.ok) {
+      // A damaged index comes with its own event and is rebuilt; a stale
+      // answer was for an open that a newer one replaced.
+      if (result.code !== 'damaged' && result.code !== 'stale') {
+        this.failed(stamp, 'index.open_failed', result.code);
+      }
+      return;
+    }
+    if (!result.index) {
+      this.failed(stamp, 'index.open_failed', 'invalid');
+      return;
+    }
+    if (!this.current(result, stamp, true)) return;
     if (rebuild && result.index.created) this.rebuilds.delete(source.sourceKey);
     if (result.index.dbUuid !== source.dbUuid) {
       this.registry.updateSource(source.sourceKey, { dbUuid: result.index.dbUuid });
@@ -739,6 +766,39 @@ export class SourceManager {
     if (this.active && result.progress) this.active.index = result.progress.condition;
     this.deps.log.info('index.opened', { generation: stamp.generation }, { src: stamp.sourceKey });
     this.deps.notify();
+    if (this.active?.online) void this.scan(stamp);
+  }
+
+  /**
+   * The open source's scan, index open or phase 1 failed. Nothing would show
+   * it, so the source is closed under a new generation, as when core keeps
+   * failing: the shell says so and offers to open it again. Core is stopped;
+   * the folder's scope stays for that. `code` logs core's answer, if any. An
+   * unavailable source, browsed from its index, shows that state instead.
+   */
+  private failed(
+    stamp: Stamp,
+    code: 'source.scan_failed' | 'index.open_failed' | null,
+    answer: string | null,
+  ): void {
+    void this.serial(async () => {
+      // An answer for an older generation is no longer about the open source.
+      if (!sameStamp(stamp, this.stamp())) return;
+      // Logged even when the source stays as it is: unavailable, or already closed.
+      if (code !== null) {
+        this.deps.log.warn(
+          code,
+          { generation: stamp.generation, reason: reasonOf(answer ?? '') },
+          { src: stamp.sourceKey },
+        );
+      }
+      const active = this.active;
+      if (!this.admitting || !active?.online || active.closed) return;
+      const generation = this.deps.bumpGeneration();
+      active.closed = true;
+      await this.stopCore(generation);
+      this.deps.notify();
+    });
   }
 
   /**
@@ -760,6 +820,8 @@ export class SourceManager {
     const changed = active.index !== event.progress.condition;
     active.index = event.progress.condition;
     this.deps.indexChanged?.(event.progress);
+    // Phase 1 stopped short (core logged why); a damaged index is rebuilt instead.
+    if (event.progress.phase === 'failed' && !event.damaged) this.failed(event.stamp, null, null);
     if (event.damaged) {
       const key = active.source.sourceKey;
       this.rebuilds.add(key);
@@ -1043,6 +1105,12 @@ export class SourceManager {
 
 function runOf(source: SourceRecord): FoundRun {
   return { rel: source.rel, runName: source.runName, accountName: source.accountName };
+}
+
+/** Core's answer code as a log reason: one the log knows, else 'unknown'. */
+function reasonOf(answer: string): string {
+  if (answer === 'stale') return 'stale_generation';
+  return (REASONS as readonly string[]).includes(answer) ? answer : 'unknown';
 }
 
 /**

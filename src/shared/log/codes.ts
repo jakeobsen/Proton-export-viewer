@@ -42,6 +42,8 @@ export const LOG_CODES = [
   'view.installed',
   'reader.show_in_folder',
   'reader.copy_message_id',
+  'reader.source',
+  'reader.copy_headers',
   'view.revoked',
   'open.stale',
   'sources.invalid',
@@ -51,6 +53,9 @@ export const LOG_CODES = [
   'source.no_runs',
   'source.not_same',
   'source.stale_result',
+  'source.identify_failed',
+  'source.scan_failed',
+  'source.request_failed',
   'scope.failed',
   'scope.released',
   'scan.done',
@@ -63,8 +68,10 @@ export const LOG_CODES = [
   'reader.parse_failed',
   'reader.worker_retired',
   'reader.images_refused',
+  'reader.marks_dropped',
   'index.created',
   'index.opened',
+  'index.open_failed',
   'index.phase1_done',
   'index.phase1_failed',
   'index.phase2_done',
@@ -217,6 +224,8 @@ export const REASONS = [
   'refused',
   'not_deleted',
   'failed',
+  'unavailable',
+  'closed',
 ] as const;
 
 /** The lists of a message whose entries can be cut to a limit when indexed. */
