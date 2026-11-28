@@ -177,9 +177,13 @@ test('a switch between separate picks releases the old scope before it starts th
   const one = twoRuns('src-picks-1');
   const two = realpathSync(testDir('src-picks-2'));
   const other = writeExport(two, { seed: 2, messages: 5 });
+  // Results from core wait in main, so the first pick's scan is still in
+  // flight when the switch happens. The scan follows the index open, so
+  // wait until it has reached main.
   await pev.main('holdSourceResults');
   await pev.main('queuePick', one.root, 'bm1');
   await act(pev, 'chooseFolder');
+  await expect.poll(() => pev.main<number>('heldSourceResults')).toBe(1);
   const first = await pev.main<Stamp>('sourceStamp');
   const firstPick = (await pev.main<Step[]>('sourceOrder')).find(
     (s) => s.step === 'scope.start',

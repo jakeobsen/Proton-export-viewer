@@ -3,6 +3,8 @@
 // the partition and aggregates computed from scratch, and threads that run the
 // index's operations in this process.
 
+import { spawn, type ChildProcess } from 'node:child_process';
+import { once } from 'node:events';
 import { closeSync, openSync, writeSync } from 'node:fs';
 import { createSchema } from '../src/core/index/schema';
 import { asNumber, openDb, type Db } from '../src/core/index/sql';
@@ -352,4 +354,58 @@ export function damageTablePage(dbPath: string, table: string): number {
     closeSync(fd);
   }
   return page;
+}
+
+// Opens the database at argv[1] and takes an exclusive lock on it, which
+// SQLite keeps in EXCLUSIVE locking mode: every other connection gets
+// SQLITE_BUSY. With argv[3] '1' it reads the database first as any connection
+// would, so its -wal and -shm files are there, as while the app runs. The
+// write rewrites the schema version with its own value. After argv[2] ms it
+// closes the database, which releases the lock.
+const LOCK_HOLDER = `
+const { DatabaseSync } = require('node:sqlite');
+const [path, holdMs, shm] = process.argv.slice(1);
+const db = new DatabaseSync(path);
+if (shm === '1') db.prepare('SELECT count(*) AS n FROM sqlite_schema').get();
+db.exec('PRAGMA locking_mode = EXCLUSIVE');
+const version = db.prepare('PRAGMA user_version').get().user_version;
+db.exec('PRAGMA user_version = ' + Number(version));
+process.stdout.write('held\\n');
+setTimeout(() => {
+  db.close();
+  process.stdout.write('released\\n');
+  process.exit(0);
+}, Number(holdMs));
+`;
+
+/**
+ * A child process holding an exclusive lock on the database at `path` for
+ * `holdMs`, then releasing it. Resolves once the lock is held. `released`
+ * resolves once the child has exited, whether it released the lock itself or
+ * was killed. A child is used because a connection waiting on a lock blocks
+ * its own thread.
+ */
+export async function holdIndexLock(
+  path: string,
+  holdMs: number,
+  options: { sidecars?: boolean } = {},
+): Promise<{ child: ChildProcess; released: Promise<void> }> {
+  const child = spawn(
+    process.execPath,
+    ['-e', LOCK_HOLDER, path, String(holdMs), options.sidecars === false ? '0' : '1'],
+    { stdio: ['ignore', 'pipe', 'inherit'] },
+  );
+  const released = once(child, 'exit').then(
+    () => undefined,
+    () => undefined,
+  );
+  let out = '';
+  await new Promise<void>((resolve, reject) => {
+    child.stdout!.on('data', (chunk: Buffer) => {
+      out += chunk.toString('utf8');
+      if (out.includes('held\n')) resolve();
+    });
+    void released.then(() => reject(new Error('holder exited before holding the lock')));
+  });
+  return { child, released };
 }

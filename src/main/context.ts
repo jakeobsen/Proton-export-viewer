@@ -8,6 +8,7 @@ import type { CoreHost } from './core-host';
 import type { PolicyObserver } from './harden';
 import type { LinkDialog } from './link-dialog';
 import type { SaveManager } from './saves/manager';
+import type { SettingsStore } from './settings';
 import type { SourceManager } from './sources/manager';
 import type { ViewRegistry } from './views';
 
@@ -17,6 +18,13 @@ export interface Paths {
   rendererDir: string;
   preloadPath: string;
   corePath: string;
+}
+
+/** The app's own data folders. */
+export interface DataDirs {
+  userData: string;
+  index: string;
+  logs: string;
 }
 
 export interface AppWindow {
@@ -42,6 +50,12 @@ export interface AppContext {
   /** Saves to the downloads folder. Set by the app; absent where a test needs none. */
   saves?: SaveManager | undefined;
   shellCsp: string;
+  dirs: DataDirs;
+  settings: SettingsStore;
+  /** Shows a folder in the file manager; '' on success. Test builds record it instead. */
+  openPath(path: string): Promise<string>;
+  /** Puts text on the clipboard. Test builds record it instead. */
+  writeClipboard(text: string): void;
   /** Set only in builds with test hooks: observes one window's session policy. */
   observerFor?: ((windowId: number) => PolicyObserver) | undefined;
   /** Set only in builds with test hooks: the least time between a window's opens. */
@@ -60,6 +74,21 @@ export function notifyIndex(ctx: AppContext, progress: IndexProgress): void {
   const update: IndexUpdate = { generation: ctx.generation, progress };
   for (const appWin of ctx.windows.values()) {
     if (!appWin.win.isDestroyed()) appWin.win.webContents.send(IPC.indexChanged, update);
+  }
+}
+
+/** Tells every shell window the settings now in force. */
+export function notifySettings(ctx: AppContext): void {
+  const settings = ctx.settings.get();
+  for (const appWin of ctx.windows.values()) {
+    if (!appWin.win.isDestroyed()) appWin.win.webContents.send(IPC.settingsChanged, settings);
+  }
+}
+
+/** Tells every shell window that a reset deleted the app's data. */
+export function notifyAppReset(ctx: AppContext): void {
+  for (const appWin of ctx.windows.values()) {
+    if (!appWin.win.isDestroyed()) appWin.win.webContents.send(IPC.appReset);
   }
 }
 

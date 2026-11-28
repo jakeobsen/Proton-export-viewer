@@ -35,7 +35,8 @@ const CONTENT_TYPES: Record<string, string> = {
 
 const ASSET_ID_RE = /^[a-z0-9][a-z0-9.]{0,31}$/;
 const CID_RE = /^c\d{1,4}$/;
-const VIEW_PATH_RE = /^\/([0-9a-f]{32})$/;
+// A view's body, or its source document number n.
+const VIEW_PATH_RE = /^\/([0-9a-f]{32})(?:\/source\/([1-9]\d{0,8}))?$/;
 const ASSET_PATH_RE = /^\/([0-9a-f]{32})\/([^/]+)$/;
 
 function notFound(): Response {
@@ -123,14 +124,26 @@ export interface ViewHandlerOptions {
   saves?: SaveAssets | undefined;
 }
 
-/** Serves `mail-body://v/<token>` for live views of this window only. */
+/**
+ * Serves `mail-body://v/<token>` for live views of this window only, and
+ * `mail-body://v/<token>/source/<n>` while that is the view's current source
+ * document. A source-only view has no body.
+ */
 export function bodyHandler(options: ViewHandlerOptions): Handler {
   return async (request) => {
     options.onRequest?.(request.url);
     const url = parse(request.url);
     const match = url && url.host === VIEW_HOST ? VIEW_PATH_RE.exec(url.pathname) : null;
     const view = match?.[1] ? options.views.lookup(match[1]) : undefined;
-    if (!view) {
+    const n = match?.[2];
+    const html = !view
+      ? null
+      : n !== undefined
+        ? options.views.sourceDoc(view.token, Number(n))
+        : view.sourceOnly
+          ? null
+          : view.html;
+    if (html === null) {
       options.log.info('protocol.not_found', {
         scheme: 'mail-body',
         reason: 'unknown_token',
@@ -145,7 +158,7 @@ export function bodyHandler(options: ViewHandlerOptions): Handler {
       'Referrer-Policy': 'no-referrer',
     };
     if (options.bodyCspEnabled?.() ?? true) headers['Content-Security-Policy'] = BODY_CSP;
-    return new Response(view.html, { status: 200, headers });
+    return new Response(html, { status: 200, headers });
   };
 }
 

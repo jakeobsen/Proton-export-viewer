@@ -3,6 +3,7 @@
 // main and core, and core and its reader worker.
 
 import type { RasterFormat } from './attachment-types';
+import type { SearchSpec } from './search-chips';
 
 /**
  * What the shell asks for: the message's HTML body, its plain text, or its
@@ -39,6 +40,33 @@ export interface InlineImage {
   id: string;
   contentType: string;
   bytes: Uint8Array;
+}
+
+/** The text columns, other than the body, that a search can match in a message. */
+export const MATCH_COLUMNS = ['subject', 'sender', 'recipients', 'attachments'] as const;
+export type MatchColumn = (typeof MATCH_COLUMNS)[number];
+
+/**
+ * How an open from search matched its message, for the reader's match line.
+ * Counts and column names only: never the search text or the matched words.
+ */
+export interface ReaderMatch {
+  /** Where the message's text stands in the index: 0 not read yet … 4 file missing. */
+  state: number;
+  /** For state 3: why its text couldn't be read. */
+  reason: 'timeout' | 'unreadable' | null;
+  /** The columns other than the body that matched, in index order. */
+  columns: MatchColumn[];
+  /** How many matches the stored body has; 0 when it has none or isn't used. */
+  bodyMatches: number;
+  /** The file opened isn't the one that was indexed, so its body isn't matched. */
+  changed: boolean;
+}
+
+/** A stored body with its match ranges, in UTF-16 code units, for the plain view. */
+export interface StoredBody {
+  text: string;
+  ranges: Array<[number, number]>;
 }
 
 /** One attachment of a rendered message, in the order the message has its parts. */
@@ -103,6 +131,8 @@ export interface RenderedMessage {
    * are read. Null when the body is shown whole.
    */
   cut: 'size' | 'parts' | null;
+  /** The plain body is the stored text with the search's matches marked. */
+  highlighted: boolean;
 }
 
 /** A large synthetic message, generated while a test runs (test builds only). */
@@ -168,7 +198,85 @@ export interface ReadRequest {
   mode: OpenMode;
   /** The window the open is for. Its newer opens, by openId, drop this one while it waits. */
   lane: number;
+  /** The search the message was opened from: its matches are marked or listed. */
+  search?: SearchSpec;
 }
+
+/** The most of one header block the source view shows. */
+export const SOURCE_HEADER_BYTES = 256 * 1024;
+
+/** What the source view reads from a message. */
+export type SourceWhat =
+  { kind: 'headers' } | { kind: 'structure' } | { kind: 'part'; path: string };
+
+/** A dotted part path: `1`, `1.2`, `1.2.10`… */
+export const PART_PATH_RE = /^1(?:\.[1-9]\d{0,6}){0,64}$/;
+
+/** One part of a message, as the source view's tree shows it. */
+export interface SourcePart {
+  /** Dotted path: `1` is the message, `1.2` its second child. */
+  path: string;
+  /** The parent's index in the list, or -1 for the message. */
+  parent: number;
+  /** The Content-Type's type and subtype as the splitter read it, lower case; '' if none. */
+  contentType: string;
+  /** The Content-Type's charset parameter, or null. */
+  charset: string | null;
+  /** The cleaned file name, or '' when the part names none. */
+  name: string;
+  /** Content-Disposition: inline. */
+  inline: boolean;
+  /** Decoded bytes: a leaf's from its transfer decoder, a container's the sum of its parts'. */
+  size: number;
+  /** The read stopped before the part's end: `size` is only what was read. */
+  cut: boolean;
+}
+
+/** A raw header block, at most the source view's cap. */
+export interface SourceHeaders {
+  bytes: Uint8Array;
+  /** More of the block was there than `bytes` holds. */
+  truncated: boolean;
+}
+
+/**
+ * main -> core: read for the source view of a window's message. `file` is
+ * the identity of the file the view was read from; null when the open failed
+ * and there is no view, as for the reader's fallback.
+ */
+export interface SourceRequest {
+  type: 'source';
+  reqId: number;
+  openId: number;
+  generation: number;
+  rowid: number;
+  file: FileIdentity | null;
+  what: SourceWhat;
+  /** The window it is for. */
+  lane: number;
+  /** For a part: newer selections of the window drop this one while it waits. */
+  order?: number;
+}
+
+/** core -> reader worker: read for the source view. */
+export interface WorkerSource {
+  type: 'source';
+  reqId: number;
+  input: ReaderInput;
+  what: SourceWhat;
+}
+
+/** reader worker -> core. `headers` is null for a part the message doesn't have. */
+export type WorkerSourced =
+  | {
+      type: 'sourced';
+      reqId: number;
+      heldBytes: number;
+      ok: true;
+      headers?: SourceHeaders | null;
+      parts?: SourcePart[];
+    }
+  | { type: 'sourced'; reqId: number; heldBytes: number; ok: false };
 
 /** core -> reader worker: render one message. */
 export interface WorkerRender {
@@ -180,6 +288,8 @@ export interface WorkerRender {
   assetBase: string;
   /** Test builds only: serve the HTML body without the sanitizer and the CSS filter. */
   unsanitized?: true;
+  /** The stored body with its matches: a plain view shows it, marked, instead of the file's text. */
+  stored?: StoredBody;
 }
 
 /**

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// The index report: how far loading the messages got, what was indexed, and
-// each file that needs attention. File names are relative to the export's
-// folder.
+// The index report: how far loading the messages and reading their text got,
+// what was indexed, and each file that needs attention. File names are
+// relative to the export's folder.
 
 import { useEffect, useRef, useState } from 'react';
 import type { IndexProgress, IndexReport } from '../shared/index-types';
 import { RESULT_TEXT, attentionText, count, reasonText, tookText } from '../shared/report-text';
 import type { ActiveExport } from '../shared/sources';
-import { loadingText } from './format';
+import { fullTextShare, loadingText } from './format';
 import { exportLabel } from './labels';
 import { closeReport, openReport, useMailbox } from './mailbox-state';
 import { getShellState } from './shell';
@@ -61,7 +61,7 @@ function Messages({
   const counted = progress !== null && progress.total > 0;
   const share = counted ? Math.min(1, progress.loaded / progress.total) : 0;
   return (
-    <div className="phase">
+    <div className="phase messages">
       <span className={`st ${done ? 'done' : 'run'}`} aria-hidden="true">
         {done ? '✓' : ''}
       </span>
@@ -116,6 +116,57 @@ function Messages({
   );
 }
 
+/**
+ * Phase 2: how far it has got over the whole export while it runs, then the
+ * bodies indexed as search counts them, and the files whose text was cut or
+ * couldn't be read. The two numbers differ when files failed or are missing.
+ */
+function FullText({ progress, report }: { progress: IndexProgress; report: IndexReport }) {
+  const done = progress.bodyPhase === 'done';
+  const share = progress.bodyPhase === 'indexing' ? fullTextShare(progress) : null;
+  const { fullText } = report;
+  return (
+    <div className="phase text">
+      <span className={`st ${done ? 'done' : 'run'}`} aria-hidden="true">
+        {done ? '✓' : ''}
+      </span>
+      <div className="phase-body">
+        <h3>
+          Full text
+          {done && <span className="pill ok">Done</span>}
+          {share !== null && <span className="pill accent">{share}%</span>}
+        </h3>
+        {share !== null && (
+          <div
+            className="progress"
+            role="progressbar"
+            aria-label="Full text"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={share}
+          >
+            <span style={{ width: `${share}%` }} />
+          </div>
+        )}
+        <div className="ix-stats">
+          <span>
+            <b>
+              {count(fullText.indexed)} / {count(fullText.total)}
+            </b>{' '}
+            bodies indexed
+          </span>
+          {(fullText.skipped > 0 || fullText.truncated > 0) && (
+            <span>
+              <b>{count(fullText.skipped)}</b> skipped · <b>{count(fullText.truncated)}</b>{' '}
+              truncated
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Files({ report }: { report: IndexReport }) {
   return (
     <div className="report">
@@ -156,6 +207,9 @@ export function ReportView({ active }: { active: ActiveExport }) {
   const { progress, report } = useMailbox();
   const [note, setNote] = useState('');
   const loading = progress?.phase === 'loading' || progress?.phase === 'opening';
+  // The full text comes once the messages are loaded; until it's read, indexing goes on.
+  const textShown = progress !== null && !loading && report !== null;
+  const indexing = loading || (progress?.phase === 'done' && progress.bodyPhase === 'indexing');
   const heading = useRef<HTMLHeadingElement>(null);
 
   // The control that opened the report is hidden under it: focus moves to the
@@ -177,11 +231,12 @@ export function ReportView({ active }: { active: ActiveExport }) {
       <section className="ix-card" aria-label="Index report">
         <div className="ix-head">
           <h1 ref={heading} tabIndex={-1}>
-            {loading ? 'Indexing' : 'Index report'}
+            {indexing ? 'Indexing' : 'Index report'}
           </h1>
           <div className="sub">{exportLabel(active.runName)}</div>
         </div>
         <Messages progress={progress} report={report} />
+        {textShown && <FullText progress={progress} report={report} />}
         {report !== null && report.attention > 0 && <Files report={report} />}
         <div className="ix-foot">
           <span className="note" role="status">

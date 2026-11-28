@@ -22,14 +22,22 @@ import { describe, expect, it } from 'vitest';
 import { scanRun, type RunScan } from '../../src/core/containment';
 import { parseMetadata, type MessageRow } from '../../src/core/index/metadata';
 import { QueryState, WriterState } from '../../src/core/index/ops';
-import { IndexService, type IndexOptions } from '../../src/core/index/service';
+import { IndexService, type IndexOptions, type RecentHooks } from '../../src/core/index/service';
 import { MAX_ATTACHMENTS } from '../../src/core/index/body';
 import { BODY_STATE, CAPPED, SCHEMA_VERSION } from '../../src/core/index/schema';
 import { validRanges } from '../../src/core/search/ranges';
 import { openDb } from '../../src/core/index/sql';
-import type { IndexThread, ThreadRole } from '../../src/core/index/pool';
-import type { IndexTotals, ListPage, SearchPage, Sidebar } from '../../src/shared/index-types';
+import { ThreadError, type IndexThread, type ThreadRole } from '../../src/core/index/pool';
+import type {
+  CardsWindow,
+  IndexTotals,
+  ListPage,
+  SearchPage,
+  Sidebar,
+} from '../../src/shared/index-types';
 import type { Logger } from '../../src/shared/log/writer';
+import type { RecentAnswer, RecentJob } from '../../src/shared/recent-search';
+import { searchKey } from '../../src/shared/search-chips';
 import { sanitizeEvent } from '../../src/shared/log/schema';
 import { digest } from '../../tools/gen-export/tree.mjs';
 import { writeExport } from '../exports';
@@ -55,6 +63,7 @@ function harness(
   options: IndexOptions = {},
   hang: (role: ThreadRole, op: string, args: unknown) => boolean = () => false,
   wrap: (role: ThreadRole, thread: IndexThread) => IndexThread = (_, thread) => thread,
+  hooks: { onChange?: () => void; onDamage?: (reason: string) => void } = {},
 ): Harness {
   const threads: InlineThread[] = [];
   const logs: Logged[] = [];
@@ -86,6 +95,7 @@ function harness(
     },
     isCurrent: () => current,
     options,
+    ...hooks,
   });
   return { service, threads, logs, setCurrent: (v) => (current = v) };
 }
@@ -394,6 +404,53 @@ describe('phase 1', () => {
     );
     expect(subjects.map((r) => Number(r.n))).toEqual([3145728, 3145728, 3145728]);
     await h.service.close();
+  });
+
+  it('reports phase 1 failing at once, but a damaged index only as damage', async () => {
+    for (const [code, reason] of [
+      ['WAL_STOP', 'wal'],
+      ['INDEX_CORRUPT', 'corrupt'],
+    ] as const) {
+      const { run, indexDir } = exportAt(`phase-fail-${code}`, 6);
+      const phases: string[] = [];
+      const damage: string[] = [];
+      // The writer fails phase 1's first write.
+      const failing = (thread: IndexThread): IndexThread => ({
+        call: <T>(op: string, args?: unknown, timeoutMs?: number) =>
+          op === 'phase1'
+            ? Promise.reject(new ThreadError(code))
+            : thread.call<T>(op, args, timeoutMs),
+        stop: () => thread.stop(),
+        get respawns() {
+          return thread.respawns;
+        },
+        onRespawn: null,
+      });
+      const h: Harness = harness(
+        run,
+        indexDir,
+        {},
+        () => false,
+        (role, thread) => (role === 'writer' ? failing(thread) : thread),
+        {
+          onChange: () => phases.push(h.service.progress.phase),
+          onDamage: (r) => damage.push(r),
+        },
+      );
+      await h.service.open(null);
+      await h.service.startIndexing(scanRun(run));
+      expect(h.service.progress.phase).toBe('failed');
+      expect(h.logs.find((l) => l.code === 'index.phase1_failed')?.data.reason).toBe(reason);
+      if (code === 'WAL_STOP') {
+        expect(phases.at(-1)).toBe('failed');
+        expect(damage).toEqual([]);
+      } else {
+        // Main rebuilds a damaged index; a 'failed' report first would close it instead.
+        expect(phases).not.toContain('failed');
+        expect(damage).toEqual(['corrupt']);
+      }
+      await h.service.close();
+    }
   });
 
   it('stops writing once the generation has moved on', async () => {
@@ -723,6 +780,46 @@ describe('the query thread', () => {
     expect(after.rows).toHaveLength(1);
     query.close();
     writer.close();
+  });
+
+  it('answers cards with a higher revision after a failed query thread is replaced', async () => {
+    const { run, indexDir } = exportAt('rev-replaced', 10);
+    let replace = (): void => undefined;
+    const wrap = (role: ThreadRole, first: IndexThread): IndexThread => {
+      if (role !== 'query') return first;
+      let current = first;
+      const thread: IndexThread = {
+        respawns: 0,
+        onRespawn: null,
+        stop: () => current.stop(),
+        call: <T>(op: string, args?: unknown, timeoutMs?: number) =>
+          current.call<T>(op, args, timeoutMs),
+      };
+      // The thread exits; a new one, with a new query state, takes its place.
+      replace = () => {
+        current = new InlineThread('query');
+        (thread as { respawns: number }).respawns += 1;
+        thread.onRespawn?.();
+      };
+      return thread;
+    };
+    const h = harness(run, indexDir, {}, undefined, wrap);
+    await h.service.open(null);
+    await h.service.startIndexing(scanRun(run));
+    const cards = async () =>
+      (await h.service.ask({
+        op: 'cards',
+        follow: [],
+        threadId: null,
+        anchor: { index: 0 },
+        before: 0,
+        after: 1,
+      })) as CardsWindow;
+    const before = await cards();
+    expect((await cards()).rev).toBe(before.rev);
+    replace();
+    expect((await cards()).rev).toBeGreaterThan(before.rev);
+    await h.service.close();
   });
 });
 
@@ -1132,5 +1229,150 @@ describe('phase 2', () => {
     expect(validRanges(snippet.text, snippet.ranges)).toBe(true);
     expect(snippet.ranges.map(([a, b]) => snippet.text.slice(a, b))).toEqual(['tangerine']);
     await second.service.close();
+  });
+});
+
+/** Recent-search hooks for one test: what reached the index, and the head held on request. */
+function recentHooks() {
+  const ran: string[] = [];
+  let holding = false;
+  let failNext = false;
+  let received = 0;
+  const waiting: Array<() => void> = [];
+  const name = (job: RecentJob) =>
+    job.op === 'record' ? `record ${(JSON.parse(job.q) as { text: string }).text}` : job.op;
+  const hooks: RecentHooks = {
+    received: (job) => {
+      if (job.op === 'record') received += 1;
+    },
+    before: (job) => {
+      ran.push(name(job));
+      return holding ? new Promise<void>((go) => waiting.push(go)) : Promise.resolve();
+    },
+    failWipe: () => {
+      const fail = failNext;
+      failNext = false;
+      return fail;
+    },
+  };
+  return {
+    hooks,
+    ran,
+    hold: () => (holding = true),
+    release: () => {
+      holding = false;
+      for (const go of waiting.splice(0)) go();
+    },
+    failNextWipe: () => (failNext = true),
+    held: () => waiting.length,
+    received: () => received,
+  };
+}
+
+const recentQ = (text: string) => searchKey({ text, chips: [] });
+const recentTexts = (answer: RecentAnswer) =>
+  answer.op === 'list' ? answer.rows.map((r) => (JSON.parse(r.q) as { text: string }).text) : [];
+
+describe('recent searches', () => {
+  it('run one at a time in the order they came, on the writer; a held head holds the rest', async () => {
+    const { run, indexDir } = exportAt('recent-fifo', 4);
+    const gate = recentHooks();
+    const h = harness(run, indexDir, { recentHooks: gate.hooks });
+    await h.service.open(null);
+    expect(recentTexts(await h.service.recent({ op: 'list' }))).toEqual([]);
+
+    gate.hold();
+    const first = h.service.recent({ op: 'record', q: recentQ('alpha'), at: 1 });
+    const wipe = h.service.recent({ op: 'wipe' });
+    const second = h.service.recent({ op: 'record', q: recentQ('beta'), at: 2 });
+    const list = h.service.recent({ op: 'list' });
+    await new Promise((r) => setTimeout(r, 20));
+    // Only the head waits; the others are behind it, and both recordings reached the index.
+    expect(gate.held()).toBe(1);
+    expect(gate.received()).toBe(2);
+    expect(gate.ran).toEqual(['list', 'record alpha']);
+    gate.release();
+    expect(await first).toEqual({ op: 'record', invalid: 0 });
+    expect(await wipe).toEqual({ op: 'wipe', deleted: 1 });
+    expect(await second).toEqual({ op: 'record', invalid: 0 });
+    expect(recentTexts(await list)).toEqual(['beta']);
+    expect(gate.ran).toEqual(['list', 'record alpha', 'wipe', 'record beta', 'list']);
+    // On the writer: no recent-only connection while the export is there.
+    expect(h.threads.map((t) => t.role)).not.toContain('recent');
+    expect(h.service.connections.list().map((c) => c.role)).not.toContain('recent');
+    await h.service.close();
+  });
+
+  it('fail a wipe once on request, deleting nothing, and run the jobs after it', async () => {
+    const { run, indexDir } = exportAt('recent-fail', 4);
+    const gate = recentHooks();
+    const h = harness(run, indexDir, { recentHooks: gate.hooks });
+    await h.service.open(null);
+    await h.service.recent({ op: 'record', q: recentQ('alpha'), at: 1 });
+    gate.failNextWipe();
+    const failed = h.service.recent({ op: 'wipe' });
+    const after = h.service.recent({ op: 'list' });
+    await expect(failed).rejects.toMatchObject({ code: 'RECENT_FAILED' });
+    expect(recentTexts(await after)).toEqual(['alpha']);
+    expect(await h.service.recent({ op: 'wipe' })).toEqual({ op: 'wipe', deleted: 1 });
+    expect(recentTexts(await h.service.recent({ op: 'list' }))).toEqual([]);
+    await h.service.close();
+  });
+
+  it('end a held job and those behind it when the index closes', async () => {
+    const { run, indexDir } = exportAt('recent-close', 4);
+    const gate = recentHooks();
+    const h = harness(run, indexDir, { recentHooks: gate.hooks });
+    await h.service.open(null);
+    gate.hold();
+    const held = h.service.recent({ op: 'record', q: recentQ('alpha'), at: 1 });
+    const behind = h.service.recent({ op: 'list' });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(gate.held()).toBe(1);
+    await h.service.close();
+    await expect(held).rejects.toMatchObject({ code: 'NOT_OPEN' });
+    await expect(behind).rejects.toMatchObject({ code: 'NOT_OPEN' });
+    await expect(h.service.recent({ op: 'list' })).rejects.toMatchObject({ code: 'NOT_OPEN' });
+    gate.release();
+  });
+
+  it('are kept for an unavailable export on a recent-only connection, closed with the index', async () => {
+    const { run, indexDir } = exportAt('recent-offline', 6);
+    const first = harness(run, indexDir);
+    const opened = await first.service.open(null);
+    await first.service.startIndexing(scanRun(run));
+    await first.service.recent({ op: 'record', q: recentQ('alpha'), at: 1 });
+    await first.service.close();
+    const dbPath = join(indexDir, `${STAMP.sourceKey}.sqlite`);
+    const messages = () => dbRows(dbPath, 'SELECT count(*) AS n FROM messages');
+    const before = messages();
+
+    const browse = harness('', indexDir);
+    await browse.service.open(opened.dbUuid, false);
+    await browse.service.checkEnded();
+    // Nothing opens for the recent searches until a job comes.
+    expect(browse.threads.map((t) => t.role)).toEqual(['query', 'verify']);
+    expect(recentTexts(await browse.service.recent({ op: 'list' }))).toEqual(['alpha']);
+    await browse.service.recent({ op: 'record', q: recentQ('beta'), at: 2 });
+    expect(recentTexts(await browse.service.recent({ op: 'list' }))).toEqual(['beta', 'alpha']);
+    // One recent-only connection, opened once, beside the read-only query connection.
+    expect(browse.threads.map((t) => t.role)).toEqual(['query', 'verify', 'recent']);
+    expect(browse.service.connections.list().map((c) => c.role)).toEqual(['query', 'recent']);
+    const recentThread = browse.threads.find((t) => t.role === 'recent')!;
+    expect(recentThread.calls.filter((c) => c === 'open')).toHaveLength(1);
+
+    await browse.service.close();
+    expect(recentThread.calls.at(-1)).toBe('close');
+    expect(browse.service.connections.size).toBe(0);
+    await expect(browse.service.recent({ op: 'list' })).rejects.toMatchObject({ code: 'NOT_OPEN' });
+    // Only the recent searches changed.
+    expect(messages()).toEqual(before);
+    expect(dbRows(dbPath, 'SELECT count(*) AS n FROM recent_searches')).toEqual([{ n: 2 }]);
+
+    // The run back: the full writer opens on the index the recent-only connection left.
+    const back = harness(run, indexDir);
+    await back.service.open(opened.dbUuid);
+    expect(recentTexts(await back.service.recent({ op: 'list' }))).toEqual(['beta', 'alpha']);
+    await back.service.close();
   });
 });

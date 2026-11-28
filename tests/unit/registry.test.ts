@@ -85,6 +85,38 @@ describe('Registry', () => {
     });
   });
 
+  it('loads a file written without the recent-search fields, and keeps them once set', () => {
+    const dir = realpathSync(testDir('registry-recent'));
+    const { log } = logSpy();
+    const registry = Registry.load(dir, log);
+    const pick = registry.addPick('/exports/tool', null);
+    const source = registry.addSource(fields(pick.pickId, 'acct/mail_x', 1));
+    registry.save();
+    // The file has neither field, as one written before them.
+    const file = join(dir, REGISTRY_FILE);
+    const written = JSON.parse(readFileSync(file, 'utf8')) as { sources: object[] };
+    expect(Object.keys(written.sources[0]!)).not.toContain('keepRecentSearches');
+    expect(Object.keys(written.sources[0]!)).not.toContain('recentWipePending');
+    const loaded = Registry.load(dir, log).source(source.sourceKey);
+    expect(loaded).toEqual(source);
+    expect(loaded?.keepRecentSearches).toBeUndefined();
+    expect(loaded?.recentWipePending).toBeUndefined();
+
+    const again = Registry.load(dir, log);
+    again.updateSource(source.sourceKey, { keepRecentSearches: false, recentWipePending: true });
+    again.save();
+    expect(Registry.load(dir, log).source(source.sourceKey)).toMatchObject({
+      keepRecentSearches: false,
+      recentWipePending: true,
+    });
+    // Any other field is still refused: the file starts empty.
+    writeFileSync(
+      file,
+      readFileSync(file, 'utf8').replace('"recentWipePending"', '"recentWipeOwed"'),
+    );
+    expect(Registry.load(dir, log).sources()).toEqual([]);
+  });
+
   it('starts empty from an invalid file, and logs only a code', () => {
     const dir = realpathSync(testDir('registry-invalid'));
     writeFileSync(join(dir, REGISTRY_FILE), '{"version":1,"picks":[{"path":"/secret.account@x"}]');

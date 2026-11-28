@@ -82,13 +82,50 @@ body,
   font-weight: 600;
 }
 
-/* The mail and, while it shows, the index report over it. */
+/* A screen and, while it shows, what covers it: the index report over the
+   mail, and Settings over the mail or the welcome screen. */
 .stage {
   position: relative;
   display: flex;
   flex-direction: column;
   flex: 1;
   min-height: 0;
+}
+
+.bar-actions {
+  display: flex;
+  margin-left: auto;
+}
+
+.icon-btn {
+  display: inline-grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--fg-2);
+  cursor: pointer;
+}
+
+.icon-btn:hover,
+.icon-btn[aria-pressed='true'] {
+  background: var(--hover);
+  color: var(--fg);
+}
+
+.mail-screen {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* Under Settings the mail keeps its layout, so its lists, cards and open
+   message come back as they were; it is only unseen. */
+.mail-screen[hidden] {
+  visibility: hidden;
 }
 
 .content {
@@ -103,7 +140,8 @@ body,
   visibility: hidden;
 }
 
-.stage > .center {
+.stage > .center,
+.stage > .settings {
   position: absolute;
   inset: 0;
 }
@@ -515,6 +553,7 @@ body,
   min-width: 0;
 }
 
+/* Names and subjects are mail data: each an isolated run of text. */
 .conv .from,
 .conv .subj .t {
   flex: 1;
@@ -523,6 +562,7 @@ body,
   color: var(--fg-2);
   text-overflow: ellipsis;
   white-space: nowrap;
+  unicode-bidi: isolate;
 }
 
 .conv .date {
@@ -612,6 +652,7 @@ body,
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  unicode-bidi: isolate;
 }
 
 .chip .dot {
@@ -629,11 +670,18 @@ body,
   }
 }
 
-.search-box {
+.search-wrap {
+  position: relative;
+  display: flex;
   flex: 0 1 560px;
   min-width: 0;
-  height: 28px;
   margin-left: 24px;
+}
+
+.search-box {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
   padding: 0 10px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -659,6 +707,141 @@ body,
   flex: 1;
   min-width: 0;
   margin-top: 0;
+}
+
+.search-chips {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  min-width: 0;
+}
+
+.search-chip {
+  gap: 3px;
+  padding-right: 2px;
+  background: var(--accent-soft);
+  color: var(--fg);
+}
+
+.chip-remove {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: var(--fg-2);
+  font: inherit;
+  line-height: 16px;
+  cursor: pointer;
+}
+
+.chip-remove:hover {
+  background: var(--hover);
+}
+
+.chip-add {
+  height: 19px;
+  padding: 0 7px;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  background: none;
+  color: var(--fg-2);
+  font: inherit;
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.chip-field {
+  width: 150px;
+  height: 21px;
+  padding: 0 6px;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  outline: none;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+}
+
+.chip-choices,
+.recent-menu {
+  position: absolute;
+  z-index: 20;
+  top: 100%;
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 180px;
+  max-width: 100%;
+  max-height: 260px;
+  margin-top: 4px;
+  padding: 4px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 14%);
+}
+
+.chip-choice {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 5px 8px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chip-choice:hover,
+.chip-choice:focus-visible,
+.recent-entry:hover,
+.recent-entry.active {
+  background: var(--hover);
+}
+
+.recent-menu {
+  right: 0;
+}
+
+.recent-head {
+  padding: 4px 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.recent-entry {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.recent-part {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  unicode-bidi: isolate;
+}
+
+.recent-part + .recent-part::before {
+  content: '· ';
+  color: var(--muted);
 }
 
 .results-head .sort {
@@ -692,6 +875,7 @@ body,
   font-size: 11.5px;
 }
 
+/* A snippet is mail data: an isolated run of text. */
 .conv .snip {
   height: 18px;
   margin-top: 2px;
@@ -701,9 +885,11 @@ body,
   line-height: 18px;
   text-overflow: ellipsis;
   white-space: nowrap;
+  unicode-bidi: isolate;
 }
 
-/* Text buttons: the loading line and the list header's report link. */
+/* Text buttons: the loading line, and the report links in the list header
+   and in Settings. */
 .link {
   padding: 0;
   border: 0;

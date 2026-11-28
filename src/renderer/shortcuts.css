@@ -1,0 +1,68 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* Below the link dialog and the confirmations, which open above everything. */
+.shortcuts-scrim {
+  --shortcuts-scrim: rgba(20, 18, 32, 0.38);
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: var(--shortcuts-scrim);
+}
+
+@media (prefers-color-scheme: dark) {
+  .shortcuts-scrim {
+    --shortcuts-scrim: rgba(0, 0, 0, 0.55);
+  }
+}
+
+.shortcuts-dialog {
+  width: min(400px, 100%);
+  padding: 14px 16px 18px 20px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--bg);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+}
+
+.shortcuts-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.shortcuts-head h3 {
+  flex: 1;
+  margin: 0;
+  font-size: 16px;
+}
+
+.shortcuts-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 9px 18px;
+  align-items: center;
+  color: var(--fg-2);
+}
+
+.shortcuts-grid .keys {
+  white-space: nowrap;
+}
+
+.shortcuts-grid kbd {
+  padding: 2px 5px;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--fg-2);
+  font:
+    11px/1 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+}

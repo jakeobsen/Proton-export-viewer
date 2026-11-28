@@ -3,6 +3,7 @@
 // folders only once they are empty. Anything else there stays.
 
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -31,6 +32,7 @@ function appFiles(userData: string): void {
   writeFileSync(join(userData, 'sources.json'), '{}');
   writeFileSync(join(userData, 'sources.json.tmp'), '{}');
   writeFileSync(join(userData, 'settings.json'), '{}');
+  writeFileSync(join(userData, 'settings.json.tmp'), '{}');
 }
 
 describe('removeAppData', () => {
@@ -38,7 +40,7 @@ describe('removeAppData', () => {
     const userData = realpathSync(testDir('appdata-all'));
     appFiles(userData);
     mkdirSync(join(userData, 'session'));
-    removeAppData(userData);
+    expect(removeAppData(userData)).toBe(0);
     expect(readdirSync(userData)).toEqual(['session']);
   });
 
@@ -60,7 +62,7 @@ describe('removeAppData', () => {
     mkdirSync(join(userData, 'settings.json.d'));
     const before = [digest(inIndex), digest(inLogs)];
 
-    removeAppData(userData);
+    expect(removeAppData(userData)).toBe(0);
     expect([digest(inIndex), digest(inLogs)]).toEqual(before);
     expect(readdirSync(join(userData, 'index')).sort()).toEqual(
       [
@@ -85,8 +87,38 @@ describe('removeAppData', () => {
     mkdirSync(join(userData, 'index'));
     symlinkSync(elsewhere, join(userData, 'index', `${KEY}.sqlite`));
     symlinkSync(elsewhere, join(userData, 'logs'));
-    removeAppData(userData);
+    expect(removeAppData(userData)).toBe(0);
     expect(readdirSync(userData)).toEqual(['logs']);
     expect(digest(elsewhere)).toBe(before);
+  });
+
+  it('counts the app’s files it can’t delete and the folders of its own it can’t read', () => {
+    const userData = realpathSync(testDir('appdata-left'));
+    appFiles(userData);
+    writeFileSync(join(userData, 'notes.txt'), 'kept');
+    // The data folder itself can't be changed: its four app files stay, and count.
+    chmodSync(userData, 0o555);
+    try {
+      expect(removeAppData(userData)).toBe(4);
+    } finally {
+      chmodSync(userData, 0o755);
+    }
+    expect(existsSync(join(userData, 'sources.json'))).toBe(true);
+    expect(existsSync(join(userData, 'settings.json'))).toBe(true);
+    expect(existsSync(join(userData, 'notes.txt'))).toBe(true);
+    // The files in its own folders, which can be changed, are gone; the folders stay.
+    expect(readdirSync(join(userData, 'index'))).toEqual([]);
+    expect(readdirSync(join(userData, 'logs'))).toEqual([]);
+
+    // A folder of its own that can't be read counts once; the rest goes.
+    appFiles(userData);
+    chmodSync(join(userData, 'logs'), 0o000);
+    try {
+      expect(removeAppData(userData)).toBe(1);
+    } finally {
+      chmodSync(join(userData, 'logs'), 0o755);
+    }
+    expect(readdirSync(join(userData, 'logs'))).toHaveLength(4);
+    expect(readdirSync(userData).sort()).toEqual(['logs', 'notes.txt']);
   });
 });

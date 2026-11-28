@@ -2,20 +2,32 @@
 // Main process entry: the broker. It never parses mail and holds no network code.
 
 import { dirname, join, sep } from 'node:path';
-import { app, protocol } from 'electron';
+import { app, clipboard, nativeTheme, protocol, shell } from 'electron';
 import { SHELL_CSP } from '../shared/constants';
 import { errorData } from '../shared/log/schema';
 import { LogWriter } from '../shared/log/writer';
-import { bumpGeneration, notifyIndex, notifySources, type AppContext, type Paths } from './context';
+import { installAppMenu } from './app-menu';
+import {
+  bumpGeneration,
+  notifyAppReset,
+  notifyIndex,
+  notifySettings,
+  notifySources,
+  type AppContext,
+  type DataDirs,
+  type Paths,
+} from './context';
 import { CoreHost } from './core-host';
 import { systemPicker, systemScopes } from './sources/access';
 import { SourceManager } from './sources/manager';
 import { registerIpc } from './ipc';
 import { LinkDialog } from './link-dialog';
+import { SettingsStore } from './settings';
 import { applySwitches } from './switches';
 import { insideExport } from './saves/guard';
 import { SaveManager } from './saves/manager';
 import { Staging } from './saves/staging';
+import { followTheme } from './theme';
 import { createAppWindow } from './windows';
 
 process.umask(0o077);
@@ -98,16 +110,24 @@ log.info('app.start', {
 });
 
 async function start(): Promise<void> {
+  const dirs: DataDirs = {
+    userData: app.getPath('userData'),
+    index: join(app.getPath('userData'), 'index'),
+    logs: logsDir,
+  };
+  const settings = SettingsStore.load(dirs.userData, log);
+  // Before the first window, so it never shows in the wrong theme.
+  followTheme(settings, nativeTheme);
   const core = new CoreHost({
     corePath: paths.corePath,
     logsDir,
-    indexDir: join(app.getPath('userData'), 'index'),
+    indexDir: dirs.index,
     appRoot: outRoot,
     log,
   });
   // The manager calls back into the context only after start() has built it.
   const sources = new SourceManager({
-    userData: app.getPath('userData'),
+    userData: dirs.userData,
     log,
     core,
     generation: () => ctx.generation,
@@ -116,6 +136,13 @@ async function start(): Promise<void> {
     stopLogs: () => {
       log.stop();
       rendererLog.stop();
+    },
+    afterReset: () => {
+      log.resume();
+      rendererLog.resume();
+      settings.clear();
+      notifySettings(ctx);
+      notifyAppReset(ctx);
     },
     indexChanged: (progress) => notifyIndex(ctx, progress),
     inDownloads: (root) => insideExport(root, [app.getPath('downloads')]),
@@ -149,6 +176,10 @@ async function start(): Promise<void> {
     linkDialog: new LinkDialog(log),
     saves,
     shellCsp: SHELL_CSP,
+    dirs,
+    settings,
+    openPath: (path) => shell.openPath(path),
+    writeClipboard: (text) => clipboard.writeText(text),
   };
   core.onEvent = (event) => sources.handleCoreEvent(event);
   core.onExit = (source) => sources.coreExited(source);
@@ -158,6 +189,7 @@ async function start(): Promise<void> {
     sources.close();
   });
   registerIpc(ctx);
+  installAppMenu(ctx);
   if (__PEV_TEST_HOOKS__) {
     const hooks = await import('../testhooks/main');
     if (await hooks.install(ctx)) return;

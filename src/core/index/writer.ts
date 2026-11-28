@@ -35,7 +35,7 @@ import {
   type MessageRow,
 } from './metadata';
 import { BODY_STATE, CAPPED, META, META_STATE } from './schema';
-import { asNumber, type Db, type Row, type SqlValue } from './sql';
+import { asNumber, scalar, type Db, type Row, type SqlValue } from './sql';
 import { stripMarks } from '../search/ranges';
 
 /** One file of a pair as the scan saw it. */
@@ -139,6 +139,15 @@ export interface ApplyStats extends GroupStats {
   refreshed: number;
   /** Items left alone because the index no longer matched what the plan saw. */
   skipped: number;
+}
+
+/**
+ * The messages phase 2 still has to read, newest first, as rowids, and how
+ * many message files it handled before: both from the same state.
+ */
+export interface BodyOrder {
+  order: number[];
+  before: number;
 }
 
 /** A message whose file phase 2 is to read, with the file as reconcile last saw it. */
@@ -760,6 +769,20 @@ export class IndexWriter {
       )
       .all(BODY_STATE.pending)
       .map((r) => asNumber(r.rowid));
+  }
+
+  /**
+   * Message files phase 2 handled before: their text indexed, cut to the
+   * limit, or not readable. Files it never reads (a message without a message
+   * file, or whose metadata isn't indexed) aren't counted.
+   */
+  bodyBefore(): number {
+    return scalar(
+      this.db,
+      `SELECT count(*) FROM messages m JOIN pairs p ON p.proton_id = m.proton_id
+       WHERE p.body_state IN (${BODY_STATE.indexed}, ${BODY_STATE.truncated}, ${BODY_STATE.failed})
+         AND p.eml_rel IS NOT NULL`,
+    );
   }
 
   /** Of these messages, in this order, the ones that still wait for their body, with their files. */

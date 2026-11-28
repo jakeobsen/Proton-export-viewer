@@ -42,12 +42,15 @@
   padding: 16px 22px 4px;
 }
 
+/* The subject, names, addresses and recipients are mail data: each an
+   isolated run of text. */
 .rp-subject {
   margin: 0;
   font-size: 18px;
   font-weight: 650;
   line-height: 1.3;
   overflow-wrap: anywhere;
+  unicode-bidi: isolate;
 }
 
 .rp-sender {
@@ -76,6 +79,7 @@
   font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
+  unicode-bidi: isolate;
 }
 
 .rp-date {
@@ -158,6 +162,7 @@
 
 .rp-addr {
   overflow-wrap: anywhere;
+  unicode-bidi: isolate;
 }
 
 .rp-to {
@@ -166,6 +171,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  unicode-bidi: isolate;
 }
 
 .rp-linkish {

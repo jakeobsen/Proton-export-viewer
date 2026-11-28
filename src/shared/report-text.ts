@@ -60,6 +60,9 @@ const REASON_TEXT: Record<Exclude<ReportReason, 'capped'>, string> = {
   meta_id: "ID doesn't match the file name. Not listed.",
   timeout: 'Took too long to read. Not listed.',
   failed: "Couldn't be read. Not listed.",
+  body_timeout: 'Timed out',
+  body_failed: "Couldn't read text",
+  body_truncated: 'Over the 1 MB search limit',
 };
 
 /** "Over 200 labels. First 200 kept." for each list that was cut. */
@@ -88,6 +91,31 @@ export function attentionText(n: number): string {
 
 const sum = (counts: Partial<Record<string, number>>): number =>
   Object.values(counts).reduce<number>((a, b) => a + (b ?? 0), 0);
+
+/**
+ * The files that need attention, by what became of them: a skipped metadata
+ * file isn't listed, and a skipped message file's text isn't searchable; a
+ * truncated message has a list cut to its limit, and a truncated message
+ * file has only its first part searchable. A listed message whose message
+ * file is missing is neither.
+ */
+export function fileCounts(report: IndexReport): { skipped: number; truncated: number } {
+  return {
+    skipped:
+      sum(report.rejected) +
+      report.metaMissing +
+      sum(report.failed) +
+      report.timeouts +
+      report.fullText.skipped,
+    truncated: report.cappedMessages + report.fullText.truncated,
+  };
+}
+
+/** "2 skipped, 1 truncated". */
+export function filesText(report: IndexReport): string {
+  const { skipped, truncated } = fileCounts(report);
+  return `${count(skipped)} skipped, ${count(truncated)} truncated`;
+}
 
 /** "2 (fifo 1, symlink 1)", codes in name order; or "0". */
 function byCode<K extends string>(counts: Partial<Record<K, number>>): string {
@@ -133,11 +161,17 @@ export function reportText(report: IndexReport): string {
     `Timeouts: ${count(report.timeouts)}`,
     `Lists cut to their limit: ${byCode<CappedListName>(report.capped)}`,
     `Unknown label IDs hidden: ${count(report.hiddenLabelIds)}`,
+    `Bodies indexed: ${count(report.fullText.indexed)} of ${count(report.fullText.total)}`,
+    `Text not read: ${byCode(report.fullText.skippedBy)}`,
+    `Text over the limit: ${count(report.fullText.truncated)}`,
     '',
     attentionText(report.attention),
   );
   for (const row of report.rows) {
-    const code = row.reason === 'capped' ? `capped: ${(row.lists ?? []).join(', ')}` : row.reason;
+    const code =
+      row.reason === 'capped'
+        ? `capped: ${(row.lists ?? []).join(', ')}`
+        : (row.code ?? row.reason);
     lines.push(`${RESULT_TEXT[row.result]}\t${fieldText(row.file)}\t${reasonText(row)} (${code})`);
   }
   if (report.more > 0) lines.push(`and ${count(report.more)} more`);
