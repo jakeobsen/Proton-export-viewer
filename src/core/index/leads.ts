@@ -63,7 +63,9 @@ export function leads(db: Db, query: Omit<LeadsQuery, 'op'>): LeadsAnswer {
     found.set(asNumber(r.rowid), indexed && typeof r.lead === 'string' ? leadText(r.lead) : null);
   }
   let snipped = { byRowid: new Map<number, MarkedSnippet>(), dropped: 0 };
-  if (query.text !== undefined) snipped = matchedSnippets(db, query.text, [...found.keys()]);
+  if (query.text !== undefined) {
+    snipped = matchedSnippets(db, query.text, [...found.keys()], query.chips);
+  }
   const answer: Lead[] = rowids.map((rowid) => ({
     rowid,
     text: found.get(rowid) ?? null,

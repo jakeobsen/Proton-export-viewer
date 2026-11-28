@@ -6,8 +6,10 @@
 // parser is pure: it never builds full-text syntax or SQL, only terms.
 
 import { MAX_QUERY_LENGTH } from '../../shared/index-types';
+import { cleanQuery, wordsOf } from '../../shared/query-text';
+import { normalizeSearch, type Chip } from '../../shared/search-chips';
 
-export { MAX_QUERY_LENGTH };
+export { MAX_QUERY_LENGTH, cleanQuery, wordsOf };
 /** The most terms and operators a query keeps; later ones are ignored. */
 export const MAX_TERMS = 32;
 
@@ -34,11 +36,14 @@ export interface AddressTerm {
   negated: boolean;
 }
 
-/** label: or folder:, by exact name or path, in any case. */
+/** label: or folder:, by exact name or path in any case; or, from a chip, by ID. */
 export interface LabelTerm {
   kind: 'label';
   scope: 'label' | 'folder';
+  /** The name or path typed; empty for a chip's term. */
   name: string;
+  /** A chip's folder or label ID: matched as it is, never by name. */
+  id?: string;
   negated: boolean;
 }
 
@@ -88,40 +93,7 @@ const OPERATORS = new Set([
   'smaller',
 ]);
 
-/**
- * Characters the full-text tokenizer keeps in a word: letters, digits,
- * combining marks and private-use characters. Everything else separates words.
- */
-const WORD_CHARS = /[\p{L}\p{N}\p{M}\p{Co}]+/gu;
 const MARK = /\p{M}/gu;
-
-/**
- * Query text as it is read: at most MAX_QUERY_LENGTH units, cut without
- * splitting a surrogate pair. Control characters, unpaired surrogates and the
- * two characters snippets mark matches with become spaces.
- */
-export function cleanQuery(raw: string): string {
-  let text = raw;
-  if (text.length > MAX_QUERY_LENGTH) {
-    let end = MAX_QUERY_LENGTH;
-    const last = text.charCodeAt(end - 1);
-    if (last >= 0xd800 && last <= 0xdbff) end -= 1;
-    text = text.slice(0, end);
-  }
-  return text.replace(
-    // eslint-disable-next-line no-control-regex
-    /[\u0000-\u001f\u007f-\u009f\ue000\ue001]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g,
-    ' ',
-  );
-}
-
-/**
- * The words the tokenizer would find in `text`. A run of combining marks
- * alone is no word: the tokenizer removes the marks and leaves nothing to match.
- */
-export function wordsOf(text: string): string[] {
-  return (text.match(WORD_CHARS) ?? []).filter((word) => word.replace(MARK, '') !== '');
-}
 
 /**
  * A text term for these words, or null if they hold no word. A bare last word
@@ -161,8 +133,11 @@ export function sizeOf(value: string): number | null {
   return Number(m[1]) * (unit === 'k' ? 1024 : unit === 'm' ? 1024 * 1024 : 1);
 }
 
-/** The term an operator and its value give, or null when the value isn't one it takes. */
-function operatorTerm(
+/**
+ * The term an operator and its value give: null when the value holds no word
+ * to match, 'plain' when the value isn't one the operator takes.
+ */
+export function operatorTerm(
   op: string,
   value: string,
   quoted: boolean,
@@ -265,4 +240,36 @@ export function parseQuery(raw: string): ParsedQuery {
     add(textTerm(run, false, null, negated));
   }
   return { terms, ignored };
+}
+
+/**
+ * The term a chip makes, with the parser's own constructors: From is what
+ * `from:<value>` gives (an address with "@", otherwise sender words, matched
+ * whole when the value has a space, as `from:"…"` is), After is `after:<day>`,
+ * the toggles are `has:attachment` and `is:unread`, and Label and Folder match
+ * their ID. Null for a value that makes no term.
+ */
+export function chipTerm(chip: Chip): Term | null {
+  const made = (term: Term | null | 'plain') => (term === 'plain' ? null : term);
+  switch (chip.k) {
+    case 'from':
+      return made(operatorTerm('from', chip.v, SPACE.test(chip.v.trim()), false));
+    case 'attachment':
+      return made(operatorTerm('has', 'attachment', false, false));
+    case 'after':
+      return made(operatorTerm('after', chip.d, false, false));
+    case 'label':
+    case 'folder':
+      return { kind: 'label', scope: chip.k, name: '', id: chip.id, negated: false };
+    case 'unread':
+      return made(operatorTerm('is', 'unread', false, false));
+  }
+}
+
+/** A search's terms: its text's, then one per chip. Chips don't count against MAX_TERMS. */
+export function searchTerms(spec: { text: string; chips?: Chip[] }): ParsedQuery {
+  const parsed = parseQuery(spec.text);
+  const chips = normalizeSearch({ text: '', chips: spec.chips ?? [] }).chips;
+  const terms = chips.map(chipTerm).filter((term): term is Term => term !== null);
+  return { terms: [...parsed.terms, ...terms], ignored: parsed.ignored };
 }

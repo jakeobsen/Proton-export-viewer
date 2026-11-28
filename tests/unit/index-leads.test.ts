@@ -21,6 +21,7 @@ import {
   type CardsWindow,
   type LeadsAnswer,
 } from '../../src/shared/index-types';
+import type { Chip } from '../../src/shared/search-chips';
 import { STAMP, fresh, ingest, item, message, newPair } from '../index-helpers';
 import { testDir } from '../paths';
 
@@ -68,7 +69,7 @@ function thread(): { db: Db; ids: number[] } {
 const cardsQuery = (
   db: Db,
   rowid: number,
-  search?: { text: string; countRev: number | null },
+  search?: { text: string; chips?: Chip[]; countRev: number | null },
   before = 100,
   after = 200,
 ): CardsQuery => ({
@@ -81,8 +82,8 @@ const cardsQuery = (
   ...(search ? { search: { queryId: 1, ...search } } : {}),
 });
 
-const searchRow = (db: Db, text: string) =>
-  searchPage(db, { op: 'search', queryId: 1, text, sort: 'date', after: null }).rows.find(
+const searchRow = (db: Db, text: string, chips: Chip[] = []) =>
+  searchPage(db, { op: 'search', queryId: 1, text, chips, sort: 'date', after: null }).rows.find(
     (r) => r.threadId === threadOf(db, 'c1'),
   );
 
@@ -213,6 +214,30 @@ describe('lead lines', () => {
     expect(answer.leads.every((l) => l.snippet === null && l.text !== null)).toBe(true);
     db.close();
   });
+
+  it("matches the search's chips as the typed operators: a chip that leaves a message out gives it no snippet", () => {
+    const { db, ids } = thread();
+    const snipped = (text: string, chips?: Chip[]) =>
+      leads(db, { rowids: ids, text, ...(chips ? { chips } : {}) }).leads.map(
+        (l) => l.snippet !== null,
+      );
+    // c1 and c3 say "invoice"; the After chip leaves c1 out, as after: does.
+    expect(snipped('invoice', [{ k: 'after', d: '2026-02-01' }])).toEqual([
+      false,
+      false,
+      true,
+      false,
+    ]);
+    expect(snipped('invoice after:2026-02-01')).toEqual([false, false, true, false]);
+    // A search of chips only gives every message its plain lead.
+    const chipsOnly = leads(db, {
+      rowids: ids,
+      text: '',
+      chips: [{ k: 'from', v: 'lee@example.com' }],
+    });
+    expect(chipsOnly.leads.every((l) => l.snippet === null && l.text !== null)).toBe(true);
+    db.close();
+  });
 });
 
 describe('cards from a search', () => {
@@ -270,6 +295,31 @@ describe('cards from a search', () => {
     );
     expect(filters.matching).toBe(2);
     expect(filters.cards.map((c) => c.matched)).toEqual([false, true, false, true]);
+    db.close();
+  });
+
+  it("marks and counts with the search's chips, as the result row does, also with chips only", () => {
+    const { db, ids } = thread();
+    const after: Chip[] = [{ k: 'after', d: '2026-02-01' }];
+    const narrowed = cardsAnswer(
+      db,
+      cardsQuery(db, ids[3]!, { text: 'invoice', chips: after, countRev: null }),
+      1,
+    );
+    expect(narrowed.cards.map((c) => c.matched)).toEqual([false, false, true, false]);
+    expect(narrowed.matching).toBe(1);
+    expect(narrowed.matching).toBe(searchRow(db, 'invoice', after)!.matching);
+    // Chips with no text still make it a search.
+    const lee: Chip[] = [{ k: 'from', v: 'lee@example.com' }];
+    const chipsOnly = cardsAnswer(
+      db,
+      cardsQuery(db, ids[3]!, { text: '', chips: lee, countRev: null }),
+      1,
+    );
+    expect(chipsOnly.searched).toBe(true);
+    expect(chipsOnly.cards.map((c) => c.matched)).toEqual([true, false, true, false]);
+    expect(chipsOnly.matching).toBe(2);
+    expect(chipsOnly.matching).toBe(searchRow(db, '', lee)!.matching);
     db.close();
   });
 

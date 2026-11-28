@@ -31,7 +31,9 @@ import {
   type CoreControl,
   type OrderStep,
 } from '../../src/main/sources/manager';
+import { REGISTRY_FILE } from '../../src/main/sources/registry';
 import { ScopeError, type Picked, type Scopes } from '../../src/main/sources/scope';
+import { searchKey } from '../../src/shared/search-chips';
 import { digest } from '../../tools/gen-export/tree.mjs';
 import { testDir } from '../paths';
 
@@ -85,6 +87,11 @@ class FakeCore implements CoreControl {
   readonly heldQueries: Array<() => void> = [];
   /** Index opens, with what main asked for. */
   readonly indexCalls: Array<{ stamp: Stamp; dbUuid: string | null; rebuild: boolean }> = [];
+  /** The recent searches' jobs core got, with the stamp each was sent for. */
+  readonly recentJobs: Array<{ stamp: Stamp; op: string }> = [];
+  /** Recent jobs held until the test lets them go; a crashed core never answers them. */
+  holdRecent = false;
+  readonly heldRecent: Array<() => void> = [];
   readonly forgets: string[] = [];
   /** Sources whose index core can't delete yet. */
   readonly busy = new Set<string>();
@@ -179,6 +186,23 @@ class FakeCore implements CoreControl {
       this.resets += 1;
       this.onReset?.();
       return { type: 'result', reqId: 0, ok: true };
+    }
+    if (call.type === 'recent' && src) {
+      const job = call.job;
+      this.recentJobs.push({ stamp: call.stamp, op: job.op });
+      if (this.holdRecent) await new Promise<void>((go) => this.heldRecent.push(go));
+      return {
+        type: 'result',
+        reqId: 0,
+        ok: true,
+        stamp: call.stamp,
+        recent:
+          job.op === 'wipe'
+            ? { op: 'wipe', deleted: 0 }
+            : job.op === 'list'
+              ? { op: 'list', rows: [], invalid: 0 }
+              : { op: 'record', invalid: 0 },
+      };
     }
     if (!src?.root) return fail('unavailable');
     const stamp = { sourceKey: src.sourceKey, generation: src.generation };
@@ -1893,5 +1917,154 @@ describe('Reset', () => {
     expect(t.core.current).toBeNull();
     expect(existsSync(join(t.userData, 'sources.json'))).toBe(false);
     expect(existsSync(join(t.userData, 'index'))).toBe(false);
+  });
+});
+
+describe('recent searches', () => {
+  const ops = (t: ReturnType<typeof setup>, generation: number) =>
+    t.core.recentJobs.filter((j) => j.stamp.generation === generation).map((j) => j.op);
+  const open = async (name: string) => {
+    const t = setup(name);
+    t.picks.push({ path: tool(`${name}-tool`), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    return t;
+  };
+  const q = (text: string) => searchKey({ text, chips: [] });
+
+  it('turned off: saves the switch and the owed wipe in one save, then wipes', async () => {
+    const t = await open('mgr-recent-off');
+    const stamp = t.manager.stamp()!;
+    const file = join(t.userData, REGISTRY_FILE);
+    expect(t.manager.setKeepRecent(stamp.sourceKey, false, stamp.generation)).toBe(true);
+    // Saved before the wipe went anywhere.
+    const saved = JSON.parse(readFileSync(file, 'utf8')).sources[0];
+    expect(saved).toMatchObject({ keepRecentSearches: false, recentWipePending: true });
+    await vi.waitFor(() => expect(ops(t, stamp.generation)).toEqual(['wipe']), WAIT);
+    // The wipe committed and was the last one: nothing is owed any more.
+    await vi.waitFor(
+      () => expect(t.manager.registry.source(stamp.sourceKey)!.recentWipePending).toBe(false),
+      WAIT,
+    );
+    expect(t.manager.registry.source(stamp.sourceKey)!.keepRecentSearches).toBe(false);
+    // A recording while off never reaches core.
+    t.manager.recordSearch(q('x'), 1);
+    expect(await t.manager.recentSearches()).toEqual([]);
+    await settle();
+    expect(ops(t, stamp.generation)).toEqual(['wipe']);
+  });
+
+  it('turned on: saves only the switch, and a wipe still owed stays owed', async () => {
+    const t = await open('mgr-recent-on');
+    const stamp = t.manager.stamp()!;
+    t.manager.registry.updateSource(stamp.sourceKey, {
+      keepRecentSearches: false,
+      recentWipePending: true,
+    });
+    expect(t.manager.setKeepRecent(stamp.sourceKey, true, stamp.generation)).toBe(true);
+    const source = t.manager.registry.source(stamp.sourceKey)!;
+    expect(source.keepRecentSearches).toBe(true);
+    expect(source.recentWipePending).toBe(true);
+  });
+
+  it('refuses a stale export or generation from Settings, and changes nothing', async () => {
+    const t = await open('mgr-recent-stale');
+    const stamp = t.manager.stamp()!;
+    const other = '00000000-0000-4000-8000-0000000000cc';
+    expect(t.manager.setKeepRecent(stamp.sourceKey, false, stamp.generation - 1)).toBe(STALE);
+    expect(t.manager.setKeepRecent(other, false, stamp.generation)).toBe(STALE);
+    expect(await t.manager.clearRecent(stamp.sourceKey, stamp.generation - 1)).toBe(STALE);
+    expect(await t.manager.clearRecent(other, stamp.generation)).toBe(STALE);
+    expect(t.manager.registry.source(stamp.sourceKey)!.keepRecentSearches).toBeUndefined();
+    await settle();
+    expect(t.core.recentJobs).toEqual([]);
+    expect(await t.manager.clearRecent(stamp.sourceKey, stamp.generation)).toBe('ok');
+    expect(ops(t, stamp.generation)).toEqual(['wipe']);
+  });
+
+  it('wipes first at every activation while off or owed: a restart, a rebuild and a relaunch', async () => {
+    const t = await open('mgr-recent-activations');
+    const key = t.manager.stamp()!.sourceKey;
+    t.manager.registry.updateSource(key, { keepRecentSearches: true, recentWipePending: true });
+    // The restart path after a crash.
+    const next = t.manager.stamp()!.generation + 1;
+    t.manager.coreExited(t.core.crash());
+    await indexOpened(t, next);
+    await vi.waitFor(() => expect(ops(t, next)).toEqual(['wipe']), WAIT);
+    await vi.waitFor(
+      () => expect(t.manager.registry.source(key)!.recentWipePending).toBe(false),
+      WAIT,
+    );
+    // Off: every later activation wipes too, and the switch survives damage recovery.
+    t.manager.registry.updateSource(key, { keepRecentSearches: false });
+    t.manager.registry.save();
+    const stamp = t.manager.stamp()!;
+    t.manager.handleCoreEvent(damaged(stamp));
+    await indexOpened(t, stamp.generation + 1);
+    await vi.waitFor(() => expect(ops(t, stamp.generation + 1)).toEqual(['wipe']), WAIT);
+    expect(t.manager.registry.source(key)!.keepRecentSearches).toBe(false);
+    // On: no wipe at the next activation.
+    t.manager.registry.updateSource(key, { keepRecentSearches: true });
+    t.manager.registry.save();
+    const manager = await t.relaunch(t.manager);
+    await manager.restore();
+    const launched = manager.stamp()!;
+    await indexOpened(t, launched.generation);
+    expect(manager.keepsRecent(key)).toBe(true);
+    manager.recordSearch(q('kept'), 5);
+    await vi.waitFor(() => expect(ops(t, launched.generation)).toEqual(['record']), WAIT);
+  });
+
+  it('answers a Clear held in core when core exits as stale, and pays an Off held there at the restart', async () => {
+    const t = await open('mgr-recent-exit');
+    const stamp = t.manager.stamp()!;
+    t.core.holdRecent = true;
+    const clear = t.manager.clearRecent(stamp.sourceKey, stamp.generation);
+    await vi.waitFor(() => expect(t.core.heldRecent).toHaveLength(1), WAIT);
+    t.core.holdRecent = false;
+    t.manager.coreExited(t.core.crash());
+    expect(await clear).toBe(STALE);
+    await indexOpened(t, stamp.generation + 1);
+
+    // Off, its wipe held, then core exits: still owed, and the restart wipes first.
+    const now = t.manager.stamp()!;
+    t.core.holdRecent = true;
+    expect(t.manager.setKeepRecent(now.sourceKey, false, now.generation)).toBe(true);
+    await vi.waitFor(() => expect(t.core.heldRecent).toHaveLength(2), WAIT);
+    expect(t.manager.setKeepRecent(now.sourceKey, true, now.generation)).toBe(true);
+    t.core.holdRecent = false;
+    t.manager.coreExited(t.core.crash());
+    await indexOpened(t, now.generation + 1);
+    await vi.waitFor(() => expect(ops(t, now.generation + 1)).toEqual(['wipe']), WAIT);
+    await vi.waitFor(
+      () => expect(t.manager.registry.source(now.sourceKey)!.recentWipePending).toBe(false),
+      WAIT,
+    );
+    expect(t.manager.keepsRecent(now.sourceKey)).toBe(true);
+  });
+
+  it("settles a Clear held in core at the restart limit's bump: nothing waits for a core that won't come back", async () => {
+    const t = await open('mgr-recent-gave-up');
+    for (let i = 0; i < 3; i += 1) {
+      const next = t.manager.stamp()!.generation + 1;
+      t.manager.coreExited(t.core.crash());
+      await indexOpened(t, next);
+    }
+    const stamp = t.manager.stamp()!;
+    t.core.holdRecent = true;
+    const clear = t.manager.clearRecent(stamp.sourceKey, stamp.generation);
+    await vi.waitFor(() => expect(t.core.heldRecent).toHaveLength(1), WAIT);
+    t.manager.coreExited(t.core.crash());
+    const hung = new Promise((r) => setTimeout(() => r('still waiting'), 2000));
+    expect(await Promise.race([clear, hung])).toBe(STALE);
+    expect(t.manager.recent.size).toBe(0);
+  });
+
+  it('keeps the switch off across a relaunch', async () => {
+    const t = await open('mgr-recent-relaunch');
+    const stamp = t.manager.stamp()!;
+    t.manager.setKeepRecent(stamp.sourceKey, false, stamp.generation);
+    const manager = await t.relaunch(t.manager);
+    expect(manager.keepsRecent(stamp.sourceKey)).toBe(false);
   });
 });

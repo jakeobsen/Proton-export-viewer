@@ -96,6 +96,7 @@ const testState = {
 let writeGate: import('../testhooks/core').WriteGate | null = null;
 let scanGate: import('../testhooks/core').WriteGate | null = null;
 let indexGate: import('../testhooks/core').WriteGate | null = null;
+let recentGate: import('../testhooks/core').RecentGate | null = null;
 
 process.on('uncaughtException', (err) => log?.error('core.uncaught', errorData(err, roots)));
 process.on('unhandledRejection', (reason) =>
@@ -153,7 +154,7 @@ async function openForRead(
   }
   if (!session) return { ok: false, code: 'no_source' };
   return session
-    .openForReader(request.rowid, request.generation, stale, request.search?.text)
+    .openForReader(request.rowid, request.generation, stale, request.search)
     .catch((): ReaderFile => ({ ok: false, code: 'not_found' }));
 }
 
@@ -309,6 +310,7 @@ function handle(request: CoreRequest): void {
             writeGate,
             scanGate,
             indexGate,
+            recentGate,
             runSearch: (held) => {
               if (session) session.handle(held);
               else reply({ type: 'result', reqId: held.reqId, ok: false, code: 'no_source' });
@@ -345,6 +347,7 @@ function handle(request: CoreRequest): void {
     case 'scan':
     case 'index':
     case 'index-query':
+    case 'recent':
       if (__PEV_TEST_HOOKS__ && request.type === 'index-query') {
         const { op } = request.query;
         if (op === 'search') testState.searches += 1;
@@ -404,6 +407,11 @@ async function init(event: Electron.MessageEvent): Promise<void> {
       beforeScan: scanGate.beforeWrite,
       beforeIndexOpen: indexGate.beforeWrite,
     };
+  }
+  if (__PEV_TEST_HOOKS__) {
+    const hooks = await import('../testhooks/core');
+    recentGate = new hooks.RecentGate();
+    options = { ...options, recentHooks: recentGate.hooks };
   }
   session = new SourceSession(
     init.source,

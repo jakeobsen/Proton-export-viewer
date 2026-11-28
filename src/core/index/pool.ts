@@ -8,7 +8,7 @@
 
 import type { Worker } from 'node:worker_threads';
 
-export type ThreadRole = 'writer' | 'query' | 'parse' | 'verify';
+export type ThreadRole = 'writer' | 'query' | 'parse' | 'verify' | 'recent';
 
 export interface ThreadRequest {
   id: number;

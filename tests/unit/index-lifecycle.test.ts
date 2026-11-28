@@ -1101,7 +1101,10 @@ describe("the reader's open of a message file", () => {
     expect(plain.ok && 'match' in plain).toBe(false);
     if (plain.ok) await plain.opened.close();
 
-    const found = await c.session.openForReader(1, generation, () => false, word);
+    const found = await c.session.openForReader(1, generation, () => false, {
+      text: word,
+      chips: [],
+    });
     expect(found).toMatchObject({ ok: true, match: { changed: false } });
     if (found.ok) {
       expect(found.match!.columns).toContain('subject');
@@ -1111,7 +1114,10 @@ describe("the reader's open of a message file", () => {
     // The file is rewritten in place after the scan (same inode): it opens without the stored body.
     const original = readFileSync(path);
     writeFileSync(path, Buffer.concat([original, Buffer.from('\r\nmore text\r\n')]));
-    const changed = await c.session.openForReader(1, generation, () => false, word);
+    const changed = await c.session.openForReader(1, generation, () => false, {
+      text: word,
+      chips: [],
+    });
     expect(changed).toMatchObject({
       ok: true,
       match: { changed: true, bodyMatches: 0, body: null },
@@ -1123,14 +1129,20 @@ describe("the reader's open of a message file", () => {
     // Replaced by another file (a new inode): examined again, and opened the same way.
     rmSync(path);
     writeFileSync(path, original);
-    const replaced = await c.session.openForReader(1, generation, () => false, word);
+    const replaced = await c.session.openForReader(1, generation, () => false, {
+      text: word,
+      chips: [],
+    });
     expect(replaced).toMatchObject({ ok: true, match: { changed: true, body: null } });
     if (replaced.ok) await replaced.opened.close();
 
     // Refused (a link took the file's place): the fallback still says how the message matched.
     rmSync(path);
     symlinkSync(join(e.run, (await eml(c, 2))!.rel!), path);
-    const refused = await c.session.openForReader(1, generation, () => false, word);
+    const refused = await c.session.openForReader(1, generation, () => false, {
+      text: word,
+      chips: [],
+    });
     expect(refused).toMatchObject({ ok: false, code: 'refused', match: { changed: false } });
     expect(await c.session.openForReader(1, generation, () => false)).toEqual({
       ok: false,
@@ -1139,7 +1151,10 @@ describe("the reader's open of a message file", () => {
 
     // Removed after indexing: the refusal still says how the message matched.
     rmSync(path);
-    const gone = await c.session.openForReader(1, generation, () => false, word);
+    const gone = await c.session.openForReader(1, generation, () => false, {
+      text: word,
+      chips: [],
+    });
     expect(gone).toMatchObject({
       ok: false,
       code: 'eml_missing',

@@ -167,6 +167,30 @@ export const forgetExport = (sourceKey: string, at?: number) =>
 export const rebuildIndex = (sourceKey: string, at: number) =>
   sourceAction((g) => window.pev.rebuildIndex(sourceKey, g), at);
 
+/**
+ * Settings' recent-search actions for the export it showed, under the
+ * generation it was read under: "Clear recent searches", and the "Keep
+ * recent searches" switch.
+ */
+async function recentAction(run: () => Promise<DoneResult>): Promise<DoneResult> {
+  update({ busy: true, notice: null, link: null });
+  let result: DoneResult;
+  try {
+    result = await run();
+  } catch {
+    result = { ok: false, code: 'core_unavailable' };
+  } finally {
+    update({ busy: false });
+  }
+  if (!result.ok && result.code === 'stale_generation') await refreshGeneration();
+  return result;
+}
+
+export const clearRecentSearches = (sourceKey: string, at: number) =>
+  recentAction(() => window.pev.clearRecent(sourceKey, at));
+export const setKeepRecentSearches = (sourceKey: string, keep: boolean, at: number) =>
+  recentAction(() => window.pev.setKeepRecent(sourceKey, keep, at));
+
 /** Deletes all the app's data, under the generation Settings was read under. */
 export async function resetApp(at: number): Promise<DoneResult> {
   update({ busy: true, notice: null, link: null });

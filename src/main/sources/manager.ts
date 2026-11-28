@@ -47,6 +47,8 @@ import {
 import { ScopeError, type Picker, type ScopeHandle, type Scopes } from './scope';
 import { appDataPaths, removeAppData } from './app-data';
 import { discoverRuns, type FoundRun } from './discovery';
+import type { SearchSpec } from '../../shared/search-chips';
+import { RecentJobs } from './recent-jobs';
 import { Registry, type PickRecord, type SourceRecord } from './registry';
 
 /** One step of opening or closing a source, in the order it happened. */
@@ -192,10 +194,31 @@ export class SourceManager {
   private readonly discover: typeof discoverRuns;
   private readonly now: () => number;
 
+  /** The open export's recent searches: one queue of recordings, reads and wipes. */
+  readonly recent: RecentJobs;
+
   constructor(private readonly deps: SourceManagerDeps) {
     this.registry = Registry.load(deps.userData, deps.log);
     this.discover = deps.discover ?? discoverRuns;
     this.now = deps.now ?? Date.now;
+    this.recent = new RecentJobs({
+      log: deps.log,
+      generation: () => this.deps.generation(),
+      send: (stamp, job) => this.deps.core.requestRunning({ type: 'recent', stamp, job }, stamp),
+      keeps: (sourceKey) => this.registry.source(sourceKey)?.keepRecentSearches !== false,
+      owes: (sourceKey) => this.registry.source(sourceKey)?.recentWipePending === true,
+      clearOwed: (sourceKey) => {
+        this.registry.updateSource(sourceKey, { recentWipePending: false });
+        this.registry.save();
+      },
+    });
+  }
+
+  /** Moves to the next generation; the recent searches' jobs of older ones end at once. */
+  private bump(): number {
+    const generation = this.deps.bumpGeneration();
+    this.recent.settle();
+    return generation;
   }
 
   /** Replaces the folder dialog and the scopes (test builds). */
@@ -478,7 +501,7 @@ export class SourceManager {
       return 'app_data';
     }
     if (!target.again) this.restarts = [];
-    const generation = this.deps.bumpGeneration();
+    const generation = this.bump();
     await this.stopCore(generation);
     const pickId = target.pick.pickId;
     let scoped = true;
@@ -546,7 +569,7 @@ export class SourceManager {
    * or else as a new one.
    */
   private async activateOther(target: Target, identity: RunIdentity): Promise<SourceOutcome> {
-    const generation = this.deps.bumpGeneration();
+    const generation = this.bump();
     await this.stopCore(generation);
     const pickId = target.pick.pickId;
     this.record('scope.keep', { pickId, generation });
@@ -595,6 +618,7 @@ export class SourceManager {
       this.releaseScope(stamp.generation);
       this.deps.core.setSource(null);
       this.active = null;
+      this.recent.deactivated();
       this.registry.setActive(null);
       this.registry.save();
       this.deps.notify();
@@ -628,11 +652,19 @@ export class SourceManager {
       { generation: stamp.generation },
       { src: source.sourceKey },
     );
+    // Every activation wipes the recent searches first while the switch is
+    // off or a wipe is owed: one that a crash, a switch or a core exit
+    // dropped is paid before anything is read or recorded.
+    this.recent.activated(stamp);
+    if (fresh.keepRecentSearches === false || fresh.recentWipePending === true) {
+      void this.recent.wipe(stamp);
+    }
     this.deps.notify();
     if (online && !target.runs) void this.listRuns(stamp);
     // The index first, so a stored list shows at once; the scan follows it.
     // An unavailable export can still be browsed from its index.
     if (online || fresh.dbUuid) void this.openIndex(stamp);
+    else this.recent.noIndex(stamp);
     return online ? 'opened' : 'offline';
   }
 
@@ -743,6 +775,7 @@ export class SourceManager {
       return;
     }
     if (!result.ok) {
+      if (result.code !== 'stale') this.recent.noIndex(stamp);
       // A damaged index comes with its own event and is rebuilt; a stale
       // answer was for an open that a newer one replaced.
       if (result.code !== 'damaged' && result.code !== 'stale') {
@@ -751,6 +784,7 @@ export class SourceManager {
       return;
     }
     if (!result.index) {
+      this.recent.noIndex(stamp);
       this.failed(stamp, 'index.open_failed', 'invalid');
       return;
     }
@@ -764,6 +798,7 @@ export class SourceManager {
       }
     }
     if (this.active && result.progress) this.active.index = result.progress.condition;
+    this.recent.ready(stamp);
     this.deps.log.info('index.opened', { generation: stamp.generation }, { src: stamp.sourceKey });
     this.deps.notify();
     if (this.active?.online) void this.scan(stamp);
@@ -794,7 +829,7 @@ export class SourceManager {
       }
       const active = this.active;
       if (!this.admitting || !active?.online || active.closed) return;
-      const generation = this.deps.bumpGeneration();
+      const generation = this.bump();
       active.closed = true;
       await this.stopCore(generation);
       this.deps.notify();
@@ -876,7 +911,7 @@ export class SourceManager {
       this.restarts = this.restarts.filter((t) => now - t < RESTART_WINDOW_MS);
       if (this.restarts.length >= RESTART_LIMIT) {
         // The open views go with the core that served them.
-        this.deps.bumpGeneration();
+        this.bump();
         active.closed = true;
         this.deps.log.warn('core.restart_gave_up', at, { src: source.sourceKey });
         this.deps.notify();
@@ -916,7 +951,7 @@ export class SourceManager {
       const source = this.registry.source(sourceKey);
       if (!active || !source || active.source.sourceKey !== sourceKey) return null;
       if (!active.online) return 'offline';
-      const generation = this.deps.bumpGeneration();
+      const generation = this.bump();
       this.deps.notify();
       // The index loses its identity before its files go, so an index found
       // after a crash in between is never taken for this one.
@@ -966,7 +1001,7 @@ export class SourceManager {
       const open = this.active?.source.sourceKey === sourceKey;
       let generation = this.deps.generation();
       if (open) {
-        generation = this.deps.bumpGeneration();
+        generation = this.bump();
         // From here no result of the open source is taken any more.
         this.active = null;
         this.deps.notify();
@@ -1037,7 +1072,7 @@ export class SourceManager {
 
   private async resetNow(): Promise<boolean | ResetFailed> {
     const exports = this.exportRoots();
-    const generation = this.deps.bumpGeneration();
+    const generation = this.bump();
     this.active = null;
     if (this.deps.core.running) {
       try {
@@ -1077,6 +1112,62 @@ export class SourceManager {
     }
     if (this.active) roots.push(join(this.active.pick.path, this.active.source.rel));
     return roots;
+  }
+
+  /** Whether the export that is open now; its sourceKey and generation are the ones given. */
+  private shown(sourceKey: string, expected: number): Stamp | null {
+    const stamp = this.stamp();
+    return stamp && stamp.sourceKey === sourceKey && stamp.generation === expected ? stamp : null;
+  }
+
+  /**
+   * Records a search committed in the open export, received at `at`. It is
+   * dropped at once while the export's switch is off, or while a wipe is
+   * owed and none is queued to pay it.
+   */
+  recordSearch(q: string, at: number): void {
+    const stamp = this.stamp();
+    if (stamp) this.recent.record(stamp, q, at);
+  }
+
+  /** The open export's recent searches, newest first; none while its switch is off or a wipe is owed. */
+  recentSearches(): Promise<SearchSpec[]> {
+    const stamp = this.stamp();
+    return stamp ? this.recent.list(stamp) : Promise.resolve([]);
+  }
+
+  /**
+   * "Keep recent searches" for the export Settings showed. Off saves the
+   * switch and the owed wipe in one save, then queues the wipe, in one
+   * synchronous step. On saves only the switch: a wipe still owed stays owed.
+   */
+  setKeepRecent(sourceKey: string, keep: boolean, expected: number): true | Stale {
+    const stamp = this.shown(sourceKey, expected);
+    if (!stamp) return STALE;
+    if (keep) {
+      this.registry.updateSource(sourceKey, { keepRecentSearches: true });
+      this.registry.save();
+      this.deps.notify();
+      return true;
+    }
+    this.registry.updateSource(sourceKey, { keepRecentSearches: false, recentWipePending: true });
+    this.registry.save();
+    void this.recent.wipe(stamp);
+    this.deps.notify();
+    return true;
+  }
+
+  /** "Clear recent searches" for the export Settings showed: resolves once the wipe has ended. */
+  async clearRecent(sourceKey: string, expected: number): Promise<'ok' | 'failed' | Stale> {
+    const stamp = this.shown(sourceKey, expected);
+    if (!stamp) return STALE;
+    const outcome = await this.recent.wipe(stamp);
+    return outcome === 'stale' ? STALE : outcome;
+  }
+
+  /** The "Keep recent searches" switch of a source the app knows: absent means on. */
+  keepsRecent(sourceKey: string): boolean {
+    return this.registry.source(sourceKey)?.keepRecentSearches !== false;
   }
 
   /**

@@ -56,24 +56,29 @@ describe('match info for the reader', () => {
       'Invoice for March',
       'Please pay the invoice. Invoices are due.',
     );
-    const match = matchInfo(db, rowid, 'invoice');
+    const match = matchInfo(db, rowid, { text: 'invoice', chips: [] });
     expect(match).toMatchObject({ state: 1, reason: null, columns: ['subject'], changed: false });
     expect(marked(match)).toEqual(['invoice', 'Invoices']);
     expect(match!.bodyMatches).toBe(2);
     expect(match!.dropped).toBe(0);
 
-    const subjectOnly = matchInfo(db, rowid, 'march');
+    const subjectOnly = matchInfo(db, rowid, { text: 'march', chips: [] });
     expect(subjectOnly).toMatchObject({ columns: ['subject'], bodyMatches: 0, body: null });
   });
 
   it('marks exact words, prefixes and phrases, and leaves negated words unmarked', () => {
     const { db, rowid } = oneMessage('Plans', 'red apple and green apples, not a pear');
-    expect(marked(matchInfo(db, rowid, '"apple"'))).toEqual(['apple']);
-    expect(marked(matchInfo(db, rowid, 'appl'))).toEqual(['apple', 'apples']);
-    expect(marked(matchInfo(db, rowid, '"green apples"'))).toEqual(['green apples']);
-    expect(marked(matchInfo(db, rowid, 'apple -banana'))).toEqual(['apple', 'apples']);
+    expect(marked(matchInfo(db, rowid, { text: '"apple"', chips: [] }))).toEqual(['apple']);
+    expect(marked(matchInfo(db, rowid, { text: 'appl', chips: [] }))).toEqual(['apple', 'apples']);
+    expect(marked(matchInfo(db, rowid, { text: '"green apples"', chips: [] }))).toEqual([
+      'green apples',
+    ]);
+    expect(marked(matchInfo(db, rowid, { text: 'apple -banana', chips: [] }))).toEqual([
+      'apple',
+      'apples',
+    ]);
     // The negated word doesn't stop the match here, and isn't marked either.
-    expect(marked(matchInfo(db, rowid, 'red -banana'))).toEqual(['red']);
+    expect(marked(matchInfo(db, rowid, { text: 'red -banana', chips: [] }))).toEqual(['red']);
   });
 
   it('marks only the column a filter names: subject: in the subject, filename: as attachments', () => {
@@ -82,11 +87,11 @@ describe('match info for the reader', () => {
     setBody(db, 'm1', 'The budget is final.');
     setAttachments(db, 'm1', ['budget-2024.pdf']);
     const rowid = rowidOf(db, 'm1');
-    const bySubject = matchInfo(db, rowid, 'subject:budget');
+    const bySubject = matchInfo(db, rowid, { text: 'subject:budget', chips: [] });
     expect(bySubject).toMatchObject({ columns: ['subject'], bodyMatches: 0, body: null });
-    const byName = matchInfo(db, rowid, 'filename:budget');
+    const byName = matchInfo(db, rowid, { text: 'filename:budget', chips: [] });
     expect(byName).toMatchObject({ columns: ['attachments'], bodyMatches: 0 });
-    const plain = matchInfo(db, rowid, 'budget');
+    const plain = matchInfo(db, rowid, { text: 'budget', chips: [] });
     expect(plain!.columns).toEqual(['subject', 'attachments']);
     expect(marked(plain)).toEqual(['budget']);
   });
@@ -105,12 +110,12 @@ describe('match info for the reader', () => {
     );
     setBody(db, 'm1', 'alice wrote this');
     const rowid = rowidOf(db, 'm1');
-    expect(matchInfo(db, rowid, 'from:alice@example.com')).toBeNull();
-    expect(matchInfo(db, rowid, '-zebra')).toBeNull();
-    expect(matchInfo(db, rowid, 'has:attachment')).toBeNull();
-    expect(matchInfo(db, rowid, 'is:unread -zebra')).toBeNull();
+    expect(matchInfo(db, rowid, { text: 'from:alice@example.com', chips: [] })).toBeNull();
+    expect(matchInfo(db, rowid, { text: '-zebra', chips: [] })).toBeNull();
+    expect(matchInfo(db, rowid, { text: 'has:attachment', chips: [] })).toBeNull();
+    expect(matchInfo(db, rowid, { text: 'is:unread -zebra', chips: [] })).toBeNull();
     // A name after from: is a word in the sender: it marks the sender, and not the body.
-    expect(matchInfo(db, rowid, 'from:alice')).toMatchObject({
+    expect(matchInfo(db, rowid, { text: 'from:alice', chips: [] })).toMatchObject({
       columns: ['sender'],
       bodyMatches: 0,
       body: null,
@@ -130,7 +135,10 @@ describe('match info for the reader', () => {
       10,
     );
     setBody(db, 'm1', 'alice suggests lunch at noon');
-    const match = matchInfo(db, rowidOf(db, 'm1'), 'from:alice@example.com lunch');
+    const match = matchInfo(db, rowidOf(db, 'm1'), {
+      text: 'from:alice@example.com lunch',
+      chips: [],
+    });
     expect(match!.columns).toEqual(['subject']);
     expect(marked(match)).toEqual(['lunch']);
   });
@@ -149,18 +157,22 @@ describe('match info for the reader', () => {
     setBody(db, 'a', 'invoice attached');
     setBody(db, 'b', 'nothing to see');
     setBody(db, 'c', 'second invoice');
-    expect(matchInfo(db, rowidOf(db, 'a'), 'invoice')).not.toBeNull();
+    expect(matchInfo(db, rowidOf(db, 'a'), { text: 'invoice', chips: [] })).not.toBeNull();
     // Bound as a plain number, the rowid can be ignored next to the match: b would match then.
-    expect(matchInfo(db, rowidOf(db, 'b'), 'invoice')).toBeNull();
-    expect(matchInfo(db, rowidOf(db, 'c'), 'invoice')).not.toBeNull();
+    expect(matchInfo(db, rowidOf(db, 'b'), { text: 'invoice', chips: [] })).toBeNull();
+    expect(matchInfo(db, rowidOf(db, 'c'), { text: 'invoice', chips: [] })).not.toBeNull();
     // The marks come from this message's own row, not the first one that matches.
-    expect(matchInfo(db, rowidOf(db, 'c'), 'invoice')!.body!.text).toBe('second invoice');
-    expect(matchInfo(db, rowidOf(db, 'a'), 'invoice')!.body!.text).toBe('invoice attached');
+    expect(matchInfo(db, rowidOf(db, 'c'), { text: 'invoice', chips: [] })!.body!.text).toBe(
+      'second invoice',
+    );
+    expect(matchInfo(db, rowidOf(db, 'a'), { text: 'invoice', chips: [] })!.body!.text).toBe(
+      'invoice attached',
+    );
     // Every term must match this message, not only one of them.
-    expect(matchInfo(db, rowidOf(db, 'a'), 'invoice second')).toBeNull();
-    expect(matchInfo(db, rowidOf(db, 'c'), 'invoice second')).not.toBeNull();
+    expect(matchInfo(db, rowidOf(db, 'a'), { text: 'invoice second', chips: [] })).toBeNull();
+    expect(matchInfo(db, rowidOf(db, 'c'), { text: 'invoice second', chips: [] })).not.toBeNull();
     // A filter the message fails makes it no match either.
-    expect(matchInfo(db, rowidOf(db, 'a'), 'invoice is:unread')).toBeNull();
+    expect(matchInfo(db, rowidOf(db, 'a'), { text: 'invoice is:unread', chips: [] })).toBeNull();
   });
 
   it('gives each state, with the reason for state 3, and a body only at states 1 and 2', () => {
@@ -169,7 +181,7 @@ describe('match info for the reader', () => {
     const rowid = rowidOf(db, 'm1');
     const at = (state: number, error: string | null = null, body = 'invoice body') => {
       setBody(db, 'm1', body, state, error);
-      return matchInfo(db, rowid, 'invoice')!;
+      return matchInfo(db, rowid, { text: 'invoice', chips: [] })!;
     };
     expect(at(BODY_STATE.pending, null, '')).toMatchObject({ state: 0, reason: null, body: null });
     expect(at(BODY_STATE.indexed)).toMatchObject({ state: 1, reason: null, bodyMatches: 1 });
@@ -199,7 +211,7 @@ describe('match info for the reader', () => {
     const { db, rowid } = oneMessage('Invoice', 'invoice body');
     const file = emlFile(db, rowid);
     expect(file?.bodyState).toBe(BODY_STATE.indexed);
-    expect(matchInfo(db, rowid, 'invoice')?.state).toBe(file?.bodyState);
+    expect(matchInfo(db, rowid, { text: 'invoice', chips: [] })?.state).toBe(file?.bodyState);
   });
 
   it('keeps ranges right on astral characters, combining marks, RTL, CJK and folded diacritics', () => {
@@ -215,14 +227,14 @@ describe('match info for the reader', () => {
     ];
     for (const [body, query, words] of cases) {
       const { db, rowid } = oneMessage('Note', body);
-      const match = matchInfo(db, rowid, query);
+      const match = matchInfo(db, rowid, { text: query, chips: [] });
       expect(marked(match), `${query} in ${body}`).toEqual(words);
     }
   });
 
   it(`counts every body match past the ${MAX_MARKS} marks drawn`, () => {
     const { db, rowid } = oneMessage('Note', 'th '.repeat(MAX_MARKS + 5));
-    const match = matchInfo(db, rowid, 'th')!;
+    const match = matchInfo(db, rowid, { text: 'th', chips: [] })!;
     expect(match.bodyMatches).toBe(MAX_MARKS + 5);
     expect(match.body!.ranges).toHaveLength(MAX_MARKS + 5);
     const { html } = plainBody(match.body!.text, 'mail-asset://v/x', match.body!.ranges);
@@ -236,7 +248,7 @@ describe('match info for the reader', () => {
       'Invoice \ue001 here',
       rowid,
     );
-    const match = matchInfo(db, rowid, 'invoice');
+    const match = matchInfo(db, rowid, { text: 'invoice', chips: [] });
     expect(match).toMatchObject({ columns: ['subject'], bodyMatches: 0, body: null, dropped: 2 });
   });
 });
