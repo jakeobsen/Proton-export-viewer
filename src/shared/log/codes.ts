@@ -95,6 +95,7 @@ export const LOG_CODES = [
   'index.rebuild',
   'index.rebuild_refused',
   'index.reconciled',
+  'index.rejected',
   'report.copied',
   'source.forgotten',
   'source.forget_refused',

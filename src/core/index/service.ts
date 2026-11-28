@@ -53,7 +53,15 @@ import type {
 import type { Logger } from '../../shared/log/writer';
 import type { RecentAnswer, RecentJob } from '../../shared/recent-search';
 import type { Stamp } from '../../shared/sources';
-import { ContainmentError, openContainedAsync, type FileRef, type RunScan } from '../containment';
+import {
+  ContainmentError,
+  hasIdentity,
+  openContainedAsync,
+  type FileRef,
+  type ListedFile,
+  type Rejection,
+  type RunScan,
+} from '../containment';
 import { BodyFiles } from './body-files';
 import { TXN_INPUT_BYTES, WRITE_BATCH_PAIRS } from './limits';
 import {
@@ -66,7 +74,9 @@ import {
   type CheckResult,
   type LabelsJobResult,
   type MetaJobItem,
+  type MetaJobOutput,
   type MetaJobResult,
+  type StatJobResult,
   type WriterOpened,
 } from './ops';
 import {
@@ -87,7 +97,8 @@ import {
   type BodyOrder,
   type BodyTodo,
   type FileStat,
-  type PairFiles,
+  type PairFile,
+  type PairRefs,
   type Phase1Item,
   type Phase2Item,
   type Phase2Stats,
@@ -102,6 +113,8 @@ export const META_JOB = 50;
 export const POOL_SIZE = 2;
 /** Batches parsed ahead of the writer, so parsed rows never pile up. */
 export const BATCHES_AHEAD = 2;
+/** Files per job when the files of stored pairs are looked at before reconcile. */
+export const STAT_JOB = 1000;
 /** Caches are released after this long without a query or a write. */
 export const IDLE_MS = 20_000;
 /** Progress is reported at most this often, and once more after the last change. */
@@ -164,6 +177,8 @@ export interface IndexOptions {
   capBytes?: number | null;
   /** Pairs per write transaction; at most the default. */
   batchPairs?: number;
+  /** Bytes a batch reads before the rest of it waits for the next batch; at most the default. */
+  readBytes?: number;
   /** Builds with test hooks only: awaited before each phase 1 write. */
   beforeWrite?: () => Promise<void>;
   /** Builds with test hooks only: awaited before a scan lists the run's folder, and after. */
@@ -224,6 +239,11 @@ export interface IndexServiceDeps {
   /** Called with the outcome of the check of an existing index. */
   onChecked?: (result: CheckResult | null, ms: number) => void;
   /**
+   * Called once phase 1 ends with the files refused for their type or size
+   * after the listing: by a look before reconcile, or by a read.
+   */
+  onRejected?: (rejected: Rejection[]) => void;
+  /**
    * Called when `progress` changes: at once for its condition and phase, and
    * at most every PROGRESS_MS for its counts.
    */
@@ -233,6 +253,14 @@ export interface IndexServiceDeps {
 export interface OpenOptions {
   /** The index is made in place of a damaged one. */
   rebuild?: boolean;
+}
+
+/** A pair registered for a read, with the rev its result must carry. */
+interface Registered {
+  files: PairRefs;
+  rev: number;
+  /** Its file was in a job that failed: it is read in a job of its own. */
+  alone?: boolean;
 }
 
 const fileStat = (ref: FileRef): FileStat => ({
@@ -271,6 +299,25 @@ function chunk<T>(list: T[], size: number): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size));
   return out;
+}
+
+/** A whole number as stored in a row's text, or null. */
+function wholeOf(value: string | null): bigint | null {
+  return value !== null && /^-?\d+$/.test(value) ? BigInt(value) : null;
+}
+
+/**
+ * The message file's identity as phase 1 recorded it in the row, or null when
+ * a part of it is missing or doesn't parse: such a file is not read.
+ */
+export function recordedRef(todo: BodyTodo): FileRef | null {
+  const dev = wholeOf(todo.dev);
+  const ino = wholeOf(todo.ino);
+  const mtimeNs = wholeOf(todo.mtimeNs);
+  const size = todo.size;
+  if (dev === null || ino === null || mtimeNs === null || dev < 0n || ino < 0n) return null;
+  if (size === null || !Number.isSafeInteger(size) || size < 0) return null;
+  return { rel: todo.rel, kind: 'eml', dev, ino, size, mtimeNs };
 }
 
 export class IndexService {
@@ -327,6 +374,9 @@ export class IndexService {
   private readonly idleMs: number;
   private readonly capBytes: number | null;
   private readonly batchPairs: number;
+  private readonly readBytes: number;
+  /** How phase 1's reads went: batches read, and the most bytes one batch read. */
+  readonly reads = { batches: 0, peakBytes: 0 };
   /** When progress was last reported, on the monotonic clock. */
   private lastReport = -Infinity;
   private reportTimer: ReturnType<typeof setTimeout> | null = null;
@@ -352,6 +402,7 @@ export class IndexService {
     this.idleMs = o.idleMs ?? IDLE_MS;
     this.capBytes = o.capBytes ?? null;
     this.batchPairs = Math.max(1, Math.min(WRITE_BATCH_PAIRS, o.batchPairs ?? WRITE_BATCH_PAIRS));
+    this.readBytes = Math.max(1, Math.min(TXN_INPUT_BYTES, o.readBytes ?? TXN_INPUT_BYTES));
     let textBudget = TXN_INPUT_BYTES;
     if (__PEV_TEST_HOOKS__ && o.txnBytes !== undefined) {
       textBudget = Math.max(1, Math.min(TXN_INPUT_BYTES, o.txnBytes));
@@ -761,25 +812,27 @@ export class IndexService {
         );
         throw new ThreadError('STALE');
       }
+      const known = new Set(await writer.call<string[]>('known'));
+      const files = await this.lookAtKnown(pool, scan, known);
+      // Metadata files refused by the look don't count, as if never listed.
+      this.progress.total = files.metadata.size;
       const plan = await writer.call<ReconcilePlan>('plan', {
-        metadata: scan.metadata,
-        eml: scan.eml,
+        metadata: files.metadata,
+        eml: files.eml,
       });
       await this.reconcileLabels(pool, writer, scan.labels, plan.labelsStat);
       const toRead: ApplyItem[] = [];
       const now: ApplyItem[] = [];
       for (const change of plan.changes) {
-        const meta = scan.metadata.get(change.protonId);
-        const eml = scan.eml.get(change.protonId);
-        const files: PairFiles = {
+        const pair: PairRefs = {
           protonId: change.protonId,
-          meta: meta ? fileStat(meta) : null,
-          eml: eml ? fileStat(eml) : null,
+          meta: files.metadata.get(change.protonId) ?? null,
+          eml: files.eml.get(change.protonId) ?? null,
         };
-        (change.meta === 'parse' ? toRead : now).push({ change, files });
+        (change.meta === 'parse' ? toRead : now).push({ change, files: pair });
       }
       // Loading starts at what the index already has, so a reopen never shows 0.
-      this.progress.loaded = scan.metadata.size - toRead.length;
+      this.progress.loaded = files.metadata.size - toRead.length;
       this.progress.phase = 'loading';
       this.report(true);
       // Changes that need nothing read: at most 1,000 pairs per transaction.
@@ -795,18 +848,18 @@ export class IndexService {
         this.touch();
       }
       // Pairs the index had that changed; new pairs are counted as they are read.
-      const known = plan.changes.filter((c) => !c.fresh).length;
-      if (known > 0) {
+      const changed = plan.changes.filter((c) => !c.fresh).length;
+      if (changed > 0) {
         this.deps.log.info(
           'index.reconciled',
-          { count: known, ms: Math.round(performance.now() - reconciled) },
+          { count: changed, ms: Math.round(performance.now() - reconciled) },
           this.src,
         );
       }
       if (__PEV_TEST_HOOKS__ && this.deps.options?.readByName) {
         toRead.sort((a, b) => (a.files.protonId < b.files.protonId ? -1 : 1));
       }
-      await this.readAndWrite(pool, writer, toRead, scan.metadata);
+      await this.readAndWrite(pool, writer, toRead, files.refs, files.emlByName);
       if (!this.current()) throw new ThreadError('STALE');
       await writer.call('finish', { stamp });
       this.took = Math.round(performance.now() - started);
@@ -828,6 +881,8 @@ export class IndexService {
       this.watch(err);
       this.deps.log.warn('index.phase1_failed', { reason: failureReason(code) }, this.src);
       return false;
+    } finally {
+      this.flushRejected();
     }
   }
 
@@ -881,7 +936,7 @@ export class IndexService {
     pool: Pool,
     writer: IndexThread,
     order: number[],
-    refs: Map<string, FileRef>,
+    scanned: Map<string, ListedFile>,
   ): Promise<void> {
     const stamp = this.deps.stamp;
     let failure: unknown = null;
@@ -960,7 +1015,7 @@ export class IndexService {
         if (failure || !this.current()) return;
         const todo = await take();
         if (!todo) return;
-        const item = await this.bodyItem(pool, todo, refs);
+        const item = await this.bodyItem(pool, todo, scanned);
         if (item === null) {
           // Left waiting for the next reconcile.
           this.progress.bodiesDone += 1;
@@ -986,28 +1041,23 @@ export class IndexService {
   }
 
   /**
-   * Reads one message file on the pool. Null leaves the message waiting: its
-   * file isn't the one the scan found, or changed since. Core opens the file
-   * and lends it to the job; it is closed at once when the job has a reply or
-   * no thread took it, and once the thread has exited when a thread took the
-   * job and was ended with it.
+   * Reads one message file on the pool. Null leaves the message waiting: the
+   * scan no longer lists its file under the same name, phase 1 recorded no
+   * whole identity for it, or the file isn't the one phase 1 recorded. The
+   * identity comes from the row: the open refuses a file with another device
+   * or inode, and the read refuses one whose size or mtime changed. Core
+   * opens the file and lends it to the job; it is closed at once when the job
+   * has a reply or no thread took it, and once the thread has exited when a
+   * thread took the job and was ended with it.
    */
   private async bodyItem(
     pool: Pool,
     todo: BodyTodo,
-    refs: Map<string, FileRef>,
+    scanned: Map<string, ListedFile>,
   ): Promise<Phase2Item | null> {
-    const ref = refs.get(todo.protonId);
-    if (
-      !ref ||
-      ref.rel !== todo.rel ||
-      ref.size !== todo.size ||
-      String(ref.mtimeNs) !== todo.mtimeNs ||
-      String(ref.dev) !== todo.dev ||
-      String(ref.ino) !== todo.ino
-    ) {
-      return null;
-    }
+    if (scanned.get(todo.protonId)?.rel !== todo.rel) return null;
+    const ref = recordedRef(todo);
+    if (!ref) return null;
     const failed = (error: string): Phase2Item => ({
       protonId: todo.protonId,
       rev: todo.rev,
@@ -1094,99 +1144,181 @@ export class IndexService {
     }
   }
 
+  /** Files refused after the listing, for the source's count; they are passed on in one go. */
+  private readonly rejected: Rejection[] = [];
+
+  private reject(found: Rejection[] | Rejection | null | undefined): void {
+    if (!found) return;
+    if (Array.isArray(found)) this.rejected.push(...found);
+    else this.rejected.push(found);
+  }
+
+  private flushRejected(): void {
+    if (this.rejected.length === 0) return;
+    const found = this.rejected.splice(0);
+    this.deps.onRejected?.(found);
+  }
+
   /**
-   * Reads the metadata of new and changed pairs and writes it, in batches of
-   * at most 1,000 pairs and 4 MiB. Each batch first gets its revs (a new pair
-   * is registered, a changed one moves to the next rev), so every result
-   * carries the rev it was read for. A few batches are read ahead of the
-   * writer, and none is read before the one before it was dispatched.
+   * The files of the pairs the index already has, looked at with lstat on the
+   * pool, in jobs of STAT_JOB files: reconcile compares their identity with
+   * the stored one. New pairs aren't looked at here; their metadata file gets
+   * its identity from its read, and its message file from an lstat in the
+   * same job. Only a new message file without metadata, which nothing reads,
+   * is looked at here. A file that is gone, or now of another type, counts as
+   * not there, the latter also as refused. The result has the plan's files,
+   * what the reads open, and the message files the reads look at.
+   */
+  private async lookAtKnown(
+    pool: Pool,
+    scan: RunScan,
+    known: Set<string>,
+  ): Promise<{
+    metadata: Map<string, PairFile>;
+    eml: Map<string, PairFile>;
+    refs: Map<string, ListedFile | FileRef>;
+    emlByName: Map<string, ListedFile>;
+  }> {
+    const metadata = new Map<string, PairFile>();
+    const eml = new Map<string, PairFile>();
+    const refs = new Map<string, ListedFile | FileRef>();
+    const emlByName = new Map<string, ListedFile>();
+    const looks: Array<{ id: string; file: ListedFile }> = [];
+    for (const [id, file] of scan.metadata) {
+      if (known.has(id)) looks.push({ id, file });
+      else {
+        metadata.set(id, { rel: file.rel });
+        refs.set(id, file);
+      }
+    }
+    for (const [id, file] of scan.eml) {
+      if (known.has(id) || !scan.metadata.has(id)) looks.push({ id, file });
+      else {
+        eml.set(id, { rel: file.rel });
+        emlByName.set(id, file);
+      }
+    }
+    const jobs = chunk(looks, STAT_JOB);
+    let next = 0;
+    const lane = async (): Promise<void> => {
+      while (next < jobs.length) {
+        const job = jobs[next]!;
+        next += 1;
+        if (!this.current()) throw new ThreadError('STALE');
+        // No time limit, as for the listing: a slow volume only takes longer.
+        const results = await pool.run<StatJobResult[]>(
+          'stat',
+          { root: this.deps.root, files: job.map((l) => l.file) },
+          0,
+        );
+        job.forEach(({ id, file }, i) => {
+          const seen = results[i] ?? null;
+          if (seen === null) return;
+          if ('rejected' in seen) {
+            this.reject(seen.rejected);
+            return;
+          }
+          if (file.kind === 'metadata') {
+            metadata.set(id, fileStat(seen.ref));
+            refs.set(id, seen.ref);
+          } else {
+            eml.set(id, fileStat(seen.ref));
+          }
+        });
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(this.poolSize, jobs.length) }, lane));
+    return { metadata, eml, refs, emlByName };
+  }
+
+  /**
+   * Reads the metadata of new and changed pairs and writes it. Pairs are
+   * taken in batches of at most 1,000: each batch first gets its revs (a new
+   * pair is registered, a changed one moves to the next rev), so every result
+   * carries the rev it was read for. A batch is read on the pool until 4 MiB
+   * have been read; the pairs it didn't get to go to the next batch, with the
+   * revs they have. What was read is written in transactions of at most
+   * 1,000 pairs and 4 MiB. The next batch is registered before this one's
+   * writes, so it is read while they run; at most BATCHES_AHEAD batches wait
+   * for their writes.
    */
   private async readAndWrite(
     pool: Pool,
     writer: IndexThread,
     toRead: ApplyItem[],
-    refs: Map<string, FileRef>,
+    refs: Map<string, ListedFile | FileRef>,
+    emls: Map<string, ListedFile>,
   ): Promise<void> {
     const stamp = this.deps.stamp;
-    const batches = splitBatches(
-      toRead,
-      this.batchPairs,
-      TXN_INPUT_BYTES,
-      (u) => u.files.meta?.size ?? 0,
-    );
-    let writes: Promise<void> = Promise.resolve();
     let failure: unknown = null;
-    const inFlight = new Set<Promise<void>>();
+    let writes: Promise<void> = Promise.resolve();
+    const waiting: Array<Promise<void>> = [];
     const stale = (count: number): void => {
       this.deps.log.info('writer.stale_dropped', { generation: stamp.generation, count }, this.src);
     };
-    // A batch's writes are queued once it has been read, so batches read
-    // together can be written in either order. Builds with test hooks can
-    // keep the order the batches were made in.
-    const inOrder = __PEV_TEST_HOOKS__ && this.deps.options?.readByName === true;
-    let queued: Promise<void> = Promise.resolve();
-    for (const batch of batches) {
-      if (failure) break;
-      if (!this.current()) {
-        stale(batch.length);
-        failure = new ThreadError('STALE');
-        break;
-      }
-      // Settles once the batch before this one has queued its writes or failed.
-      const turn = queued;
-      let done = (): void => undefined;
-      if (inOrder) queued = new Promise<void>((resolve) => (done = resolve));
-      const job = writer
-        .call<ApplyResult>('apply', { stamp, items: batch })
-        .then((applied) => {
-          if (applied.stale) throw new ThreadError('STALE');
-          const revs = new Map(applied.revs);
-          // A pair the plan saw differently is left alone, as if handled.
-          this.progress.loaded += batch.length - revs.size;
-          return this.parseBatch(
-            pool,
-            batch.map((u) => u.files).filter((p) => revs.has(p.protonId)),
-            refs,
-            revs,
-          );
-        })
-        .then((sized) => (inOrder ? turn.then(() => sized) : sized))
-        .then((sized) => {
-          // The budget again, on the bytes actually read: a file can have
-          // grown since the scan.
-          const parts = splitBatches(sized, this.batchPairs, TXN_INPUT_BYTES, (s) => s.bytes);
-          writes = writes.then(async () => {
-            for (const part of parts) {
-              if (__PEV_TEST_HOOKS__ && this.deps.options?.beforeWrite) {
-                await Promise.race([this.deps.options.beforeWrite(), this.closing]);
-              }
-              if (failure) return;
-              const items = part.map((s) => s.item);
-              if (!this.current()) {
-                stale(items.length);
-                failure = new ThreadError('STALE');
-                return;
-              }
-              try {
-                const result = await writer.call<BatchResult>('phase1', { stamp, items });
-                this.afterBatch(result, items);
-              } catch (err) {
-                failure = err;
-              }
+    let next = 0;
+    const register = async (count: number): Promise<Registered[]> => {
+      const items = toRead.slice(next, next + count);
+      next += items.length;
+      if (items.length === 0) return [];
+      const applied = await writer.call<ApplyResult>('apply', { stamp, items });
+      if (applied.stale) throw new ThreadError('STALE');
+      const revs = new Map(applied.revs);
+      // A pair the plan saw differently is left alone, as if handled.
+      this.progress.loaded += items.length - revs.size;
+      return items
+        .filter((u) => revs.has(u.files.protonId))
+        .map((u) => ({ files: u.files, rev: revs.get(u.files.protonId)! }));
+    };
+    let carried: Registered[] = [];
+    // Its failure is handled where it is awaited; this only keeps it from
+    // counting as unhandled meanwhile.
+    let registering = register(this.batchPairs);
+    registering.catch(() => undefined);
+    try {
+      for (;;) {
+        const batch = [...carried, ...(await registering)];
+        if (batch.length === 0 && next >= toRead.length) break;
+        if (!this.current()) {
+          stale(batch.length);
+          throw new ThreadError('STALE');
+        }
+        const { read, unread } = await this.parseBatch(pool, batch, refs, emls);
+        carried = unread;
+        // The next batch is registered before this one's writes are queued.
+        registering = register(this.batchPairs - carried.length);
+        registering.catch(() => undefined);
+        // The budget again, on the bytes actually read.
+        const parts = splitBatches(read, this.batchPairs, TXN_INPUT_BYTES, (s) => s.bytes);
+        writes = writes.then(async () => {
+          for (const part of parts) {
+            if (__PEV_TEST_HOOKS__ && this.deps.options?.beforeWrite) {
+              await Promise.race([this.deps.options.beforeWrite(), this.closing]);
             }
-          });
-          done();
-          return writes;
-        })
-        .catch((err: unknown) => {
-          failure ??= err;
-          done();
+            if (failure) return;
+            const items = part.map((s) => s.item);
+            if (!this.current()) {
+              stale(items.length);
+              failure = new ThreadError('STALE');
+              return;
+            }
+            try {
+              const result = await writer.call<BatchResult>('phase1', { stamp, items });
+              this.afterBatch(result, items);
+            } catch (err) {
+              failure = err;
+            }
+          }
         });
-      const tracked = job.finally(() => inFlight.delete(tracked));
-      inFlight.add(tracked);
-      if (inFlight.size > BATCHES_AHEAD) await Promise.race(inFlight);
+        waiting.push(writes);
+        if (waiting.length > BATCHES_AHEAD) await waiting.shift();
+        if (failure) break;
+      }
+    } catch (err) {
+      failure ??= err;
     }
-    await Promise.all(inFlight);
+    // Registered pairs that aren't read stay waiting, and are read at the next open.
+    await registering.catch(() => undefined);
     await writes;
     if (failure) throw failure;
   }
@@ -1216,6 +1348,7 @@ export class IndexService {
       return;
     }
     if (!result.labels) {
+      this.reject(result.rejected);
       this.deps.log.warn('index.labels_failed', { reason: reasonOf(result.error ?? '') }, this.src);
       return;
     }
@@ -1227,63 +1360,145 @@ export class IndexService {
   }
 
   /**
-   * Reads and parses a batch's metadata files on the pool. Each item carries
-   * the rev its pair was given for this read, and the bytes actually read,
-   * which can differ from the scan's size.
+   * Reads and parses part of a batch's metadata files on the pool, in jobs of
+   * META_JOB files, as many at once as the pool has threads. No new job starts
+   * once the batch has read its share of bytes, refused reads included; a job
+   * reads at most its own share, plus the file that took it past it. So a
+   * batch reads at most its share plus, for each thread, a job's share and one
+   * file at its limit. When a job of several files runs past its time limit
+   * (or its thread dies), its files are read again one per job, under the
+   * same share, so only the file that breaches gets the timeout code. Each
+   * result carries the rev its pair was given for this read and the bytes
+   * read. Returns what was read, in batch order, and the pairs left for the
+   * next batch.
    */
   private async parseBatch(
     pool: Pool,
-    batch: PairFiles[],
-    refs: Map<string, FileRef>,
-    revs: Map<string, number>,
-  ): Promise<Array<{ item: Phase1Item; bytes: number }>> {
-    const jobs = chunk(batch, this.metaJob).map((job) =>
-      this.parseJob(
-        pool,
-        job.map((p) => ({ protonId: p.protonId, ref: refs.get(p.protonId)! })),
-      ),
-    );
+    batch: Registered[],
+    refs: Map<string, ListedFile | FileRef>,
+    emls: Map<string, ListedFile>,
+  ): Promise<{ read: Array<{ item: Phase1Item; bytes: number }>; unread: Registered[] }> {
+    const itemOf = (protonId: string): MetaJobItem => {
+      const eml = emls.get(protonId);
+      return { protonId, ref: refs.get(protonId)!, ...(eml ? { eml } : {}) };
+    };
+    const items = batch.filter((p) => !p.alone).map((p) => itemOf(p.files.protonId));
+    // Files of a job that failed, read one per job.
+    const singles = batch.filter((p) => p.alone).map((p) => itemOf(p.files.protonId));
+    const share = this.readBytes;
+    const jobShare = Math.max(1, Math.ceil(share / this.poolSize));
     const results = new Map<string, MetaJobResult>();
-    for (const list of await Promise.all(jobs)) for (const r of list) results.set(r.protonId, r);
-    return batch.map((pair) => {
-      const r = results.get(pair.protonId);
-      return {
-        item: {
-          pair: r ? { ...pair, meta: fileStat(r.ref) } : pair,
-          expectedRev: revs.get(pair.protonId)!,
-          row: r?.row ?? null,
-          error: r ? r.error : 'META_FAILED',
-        },
-        bytes: r?.bytes ?? 0,
+    const left: MetaJobItem[] = [];
+    let total = 0;
+    let next = 0;
+    const lane = async (): Promise<void> => {
+      while (total < share) {
+        let job: MetaJobItem[];
+        if (singles.length > 0) job = [singles.shift()!];
+        else if (next < items.length) {
+          job = items.slice(next, next + this.metaJob);
+          next += job.length;
+        } else return;
+        const out = await this.parseJob(pool, job, jobShare);
+        if (!out) {
+          singles.push(...job);
+          continue;
+        }
+        for (const r of out.results) {
+          results.set(r.protonId, r);
+          total += r.bytes;
+          this.reject(r.rejected);
+        }
+        left.push(...out.unread);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(this.poolSize, batch.length) }, lane));
+    this.reads.batches += 1;
+    this.reads.peakBytes = Math.max(this.reads.peakBytes, total);
+    const unreadIds = new Set([...left, ...items.slice(next)].map((i) => i.protonId));
+    const aloneIds = new Set(singles.map((i) => i.protonId));
+    const read: Array<{ item: Phase1Item; bytes: number }> = [];
+    const unread: Registered[] = [];
+    for (const pair of batch) {
+      const id = pair.files.protonId;
+      if (aloneIds.has(id)) {
+        unread.push({ ...pair, alone: true });
+        continue;
+      }
+      if (unreadIds.has(id)) {
+        unread.push(pair);
+        continue;
+      }
+      const r = results.get(id);
+      const item: Phase1Item = {
+        pair: r && hasIdentity(r.ref) ? { ...pair.files, meta: fileStat(r.ref) } : pair.files,
+        expectedRev: pair.rev,
+        row: r?.row ?? null,
+        error: r ? r.error : 'META_FAILED',
       };
-    });
+      if (r && r.eml !== undefined) item.eml = r.eml ? fileStat(r.eml) : null;
+      if (r?.absent) {
+        item.pair = { ...pair.files, meta: null };
+        item.absent = true;
+      }
+      read.push({ item, bytes: r?.bytes ?? 0 });
+    }
+    return { read, unread };
   }
 
   /**
-   * Runs one job. If it runs past its limit (or its thread dies), each of its
-   * files is tried again on its own, so only the file that breaches gets the
-   * timeout code.
+   * Runs one job. A job of one file that runs past its limit (or whose thread
+   * dies) gives that file the timeout (or failure) code. For a job of several
+   * files it returns null: they are read again one per job.
    */
-  private async parseJob(pool: Pool, items: MetaJobItem[]): Promise<MetaJobResult[]> {
+  private async parseJob(
+    pool: Pool,
+    items: MetaJobItem[],
+    budget: number,
+  ): Promise<MetaJobOutput | null> {
     try {
-      return await pool.run<MetaJobResult[]>('meta', { root: this.deps.root, items }, this.jobMs);
+      return await pool.run<MetaJobOutput>(
+        'meta',
+        { root: this.deps.root, items, budget },
+        this.jobMs,
+      );
     } catch (err) {
       const code = err instanceof ThreadError ? err.code : 'FAILED';
-      if (items.length === 1) {
-        if (code === TIMEOUT) this.progress.timeouts += 1;
-        return [
+      if (code === THREAD_STOPPED) throw err;
+      if (code === TIMEOUT) this.progress.timeouts += 1;
+      if (items.length > 1) return null;
+      const item = items[0]!;
+      return {
+        results: [
           {
-            protonId: items[0]!.protonId,
+            protonId: item.protonId,
             row: null,
             error: code === TIMEOUT ? 'META_TIMEOUT' : 'META_FAILED',
-            ref: items[0]!.ref,
+            ref: hasIdentity(item.ref) ? item.ref : await this.identityOf(pool, item.ref),
             bytes: 0,
           },
-        ];
-      }
-      if (code === TIMEOUT) this.progress.timeouts += 1;
-      const singles = await Promise.all(items.map((item) => this.parseJob(pool, [item])));
-      return singles.flat();
+        ],
+        unread: [],
+      };
+    }
+  }
+
+  /**
+   * A file's identity from lstat on the pool, for a new file whose read
+   * failed, so an unchanged one isn't read again; the file as given if the
+   * look fails.
+   */
+  private async identityOf(pool: Pool, file: ListedFile): Promise<ListedFile | FileRef> {
+    try {
+      const [seen] = await pool.run<StatJobResult[]>(
+        'stat',
+        { root: this.deps.root, files: [file] },
+        0,
+      );
+      return seen && 'ref' in seen ? seen.ref : file;
+    } catch (err) {
+      if (err instanceof ThreadError && err.code === THREAD_STOPPED) throw err;
+      return file;
     }
   }
 
@@ -1291,6 +1506,8 @@ export class IndexService {
     this.touch();
     const handled = items.filter((i) => i.pair.meta !== null).length;
     this.progress.loaded += handled;
+    // A metadata file found not there doesn't count, as if it had never been listed.
+    this.progress.total -= result.absent;
     this.progress.failed += result.failed;
     this.progress.capped += result.capped.length;
     this.report();

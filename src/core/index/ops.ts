@@ -8,7 +8,15 @@ import { chmodSync, closeSync, fstatSync, openSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { overlaps } from '../../shared/overlap';
 import type { Stamp } from '../../shared/sources';
-import { readWithRescan, type FileRef } from '../containment';
+import {
+  SCAN_KINDS,
+  hasIdentity,
+  readWithRescan,
+  statListed,
+  type FileRef,
+  type ListedFile,
+  type Rejection,
+} from '../containment';
 import { borrowedFdStream } from '../fd-stream';
 import { extractBody, type AttachmentRow } from './body';
 import { FamilyInUse, deleteFamily, familyBytes } from './family';
@@ -64,7 +72,7 @@ import {
   type ApplyStats,
   type BodyOrder,
   type BodyTodo,
-  type FileStat,
+  type PairFile,
   type Phase1Item,
   type Phase1Stats,
   type Phase2Item,
@@ -336,7 +344,11 @@ export class WriterState {
     this.commit(() => writer.writeLabels(stamp, labels, stat));
   }
 
-  plan(metadata: Map<string, FileStat>, eml: Map<string, FileStat>): ReconcilePlan {
+  known(): string[] {
+    return this.need().writer.knownIds();
+  }
+
+  plan(metadata: Map<string, PairFile>, eml: Map<string, PairFile>): ReconcilePlan {
     return this.need().writer.planReconcile(metadata, eml);
   }
 
@@ -563,50 +575,133 @@ export function quickCheck(
 
 export interface MetaJobItem {
   protonId: string;
-  ref: FileRef;
+  /** The metadata file: by name only for a new pair, with its identity for a known one. */
+  ref: ListedFile | FileRef;
+  /** A new pair's message file, listed by name: it is looked at with lstat in the same job. */
+  eml?: ListedFile;
 }
 
 export interface MetaJobResult {
   protonId: string;
   row: MessageRow | null;
   error: string | null;
-  /** The file as it was read (a rescan can find it at a new inode). */
-  ref: FileRef;
-  /** The bytes read: a file can have changed since the scan sized it. */
+  /** The file as it was read, with the identity of its open; as asked for if it wasn't read. */
+  ref: ListedFile | FileRef;
+  /** The bytes read, those of a read that refused the file included. */
   bytes: number;
+  /** For an item with `eml`: the message file's identity, or null if it is gone or not a regular file. */
+  eml?: FileRef | null;
+  /**
+   * The metadata file counts as not there: it was refused for its size, or
+   * at its first look for its type, as the listing refuses files; or it was
+   * gone by its first look.
+   */
+  absent?: boolean;
+  /** Files of the item refused for their type or size, as the listing would have. */
+  rejected?: Rejection[];
 }
 
-/** Reads and parses metadata files; each failure becomes the pair's code. */
-export function parseMetaJob(root: string, items: MetaJobItem[]): MetaJobResult[] {
-  return items.map(({ protonId, ref }) => {
-    const read = readWithRescan(root, ref);
-    if (!read.ok) {
-      return { protonId, row: null, error: rejectCode(read.rejection.kind), ref, bytes: 0 };
+/** What a metadata job read, and the items it left for another job once it had read its share. */
+export interface MetaJobOutput {
+  results: MetaJobResult[];
+  /** Items not read: the job stopped once it had read `budget` bytes. */
+  unread: MetaJobItem[];
+}
+
+/**
+ * Reads and parses metadata files in order. The job stops once it has read
+ * `budget` bytes, after at least one file, and leaves the rest. A new pair's
+ * message file is looked at with lstat, and its identity recorded only if it
+ * is a regular file.
+ *
+ * A file is refused as the listing refuses files when its read finds it over
+ * its size limit, or when the read is its first look (it was listed by name)
+ * and finds it of another type: it is counted with the listing's rejections,
+ * and the pair has no metadata file. One gone by its first look is simply not
+ * there. Any other failure becomes the pair's code.
+ */
+export function parseMetaJob(
+  root: string,
+  items: MetaJobItem[],
+  budget = Number.POSITIVE_INFINITY,
+): MetaJobOutput {
+  const results: MetaJobResult[] = [];
+  let total = 0;
+  let next = 0;
+  while (next < items.length && (next === 0 || total < budget)) {
+    const item = items[next]!;
+    next += 1;
+    const result = parseOne(root, item);
+    total += result.bytes;
+    results.push(result);
+  }
+  return { results, unread: items.slice(next) };
+}
+
+function parseOne(root: string, { protonId, ref, eml }: MetaJobItem): MetaJobResult {
+  const rejected: Rejection[] = [];
+  const extra: Pick<MetaJobResult, 'eml' | 'rejected'> = { rejected };
+  if (eml) {
+    const seen = statListed(root, eml);
+    if (seen && 'rejected' in seen) rejected.push(seen.rejected);
+    extra.eml = seen && 'ref' in seen ? seen.ref : null;
+  }
+  const read = readWithRescan(root, ref);
+  if (!read.ok) {
+    const { kind } = read.rejection;
+    const bytes = read.read ?? 0;
+    const first = !hasIdentity(ref);
+    if (kind === 'too_large' || (first && SCAN_KIND.has(kind))) {
+      rejected.push(read.rejection);
+      return { protonId, row: null, error: null, ref, bytes, absent: true, ...extra };
     }
-    const bytes = read.bytes.length;
-    try {
-      return {
-        protonId,
-        row: parseMetadata(protonId, read.bytes.toString('utf8')),
-        error: null,
-        ref: read.ref,
-        bytes,
-      };
-    } catch (err) {
-      return { protonId, row: null, error: codeOf(err), ref: read.ref, bytes };
+    if (first && kind === 'changed') {
+      return { protonId, row: null, error: null, ref, bytes, absent: true, ...extra };
     }
-  });
+    // Not opened: its identity from lstat, so an unchanged file isn't read again.
+    const seen = first ? statListed(root, ref) : null;
+    const known = seen && 'ref' in seen ? seen.ref : ref;
+    return { protonId, row: null, error: rejectCode(kind), ref: known, bytes, ...extra };
+  }
+  const bytes = read.bytes.length;
+  try {
+    return {
+      protonId,
+      row: parseMetadata(protonId, read.bytes.toString('utf8')),
+      error: null,
+      ref: read.ref,
+      bytes,
+      ...extra,
+    };
+  } catch (err) {
+    return { protonId, row: null, error: codeOf(err), ref: read.ref, bytes, ...extra };
+  }
+}
+
+const SCAN_KIND = new Set<string>(SCAN_KINDS);
+
+/** What a look at a listed file found: its identity, its rejection, or nothing (gone). */
+export type StatJobResult = { ref: FileRef } | { rejected: Rejection } | null;
+
+/** Looks at listed files with lstat, in order. */
+export function statJob(root: string, files: ListedFile[]): StatJobResult[] {
+  return files.map((file) => statListed(root, file));
 }
 
 export interface LabelsJobResult {
   labels: LabelEntry[] | null;
   error: string | null;
   ref: FileRef;
+  /** labels.json refused for its type or size, as the listing would have. */
+  rejected?: Rejection | null;
 }
 
 export function parseLabelsJob(root: string, ref: FileRef): LabelsJobResult {
   const read = readWithRescan(root, ref);
-  if (!read.ok) return { labels: null, error: rejectCode(read.rejection.kind), ref };
+  if (!read.ok) {
+    const rejected = SCAN_KIND.has(read.rejection.kind) ? read.rejection : null;
+    return { labels: null, error: rejectCode(read.rejection.kind), ref, rejected };
+  }
   try {
     return { labels: parseLabels(read.bytes.toString('utf8')), error: null, ref: read.ref };
   } catch (err) {
@@ -698,8 +793,10 @@ export function threadHandler(role: ThreadRole): (op: string, args: unknown) => 
         case 'labels':
           writer.labels(a.stamp as Stamp, a.labels as LabelEntry[], a.stat as string | null);
           return null;
+        case 'known':
+          return writer.known();
         case 'plan':
-          return writer.plan(a.metadata as Map<string, FileStat>, a.eml as Map<string, FileStat>);
+          return writer.plan(a.metadata as Map<string, PairFile>, a.eml as Map<string, PairFile>);
         case 'apply':
           return writer.apply(a.stamp as Stamp, a.items as ApplyItem[]);
         case 'phase1':
@@ -779,15 +876,19 @@ export function threadHandler(role: ThreadRole): (op: string, args: unknown) => 
       root: string;
       items?: MetaJobItem[];
       ref?: FileRef;
+      budget?: number;
+      files?: ListedFile[];
       fd?: number;
       item?: BodyJobItem;
       stall?: boolean;
     };
     switch (op) {
       case 'meta':
-        return parseMetaJob(a.root, a.items ?? []);
+        return parseMetaJob(a.root, a.items ?? [], a.budget);
       case 'labels':
         return parseLabelsJob(a.root, a.ref as FileRef);
+      case 'stat':
+        return statJob(a.root, a.files ?? []);
       case 'body':
         // Test builds: a body job that never ends, to run past its limit.
         if (__PEV_TEST_HOOKS__ && a.stall) return new Promise<never>(() => undefined);

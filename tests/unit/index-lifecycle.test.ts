@@ -25,6 +25,7 @@ import {
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
+import { MAX_METADATA_BYTES } from '../../src/core/containment';
 import { descriptorsOn } from '../../src/core/index/family';
 import type { CheckResult } from '../../src/core/index/ops';
 import {
@@ -1264,5 +1265,38 @@ describe("the reader's open of a message file", () => {
       code: 'no_source',
     });
     await none.close();
+  });
+});
+
+describe('files refused after the listing', () => {
+  it("join the listing's count of refused files, and are logged by reason", async () => {
+    const { run, indexDir } = exportAt('refused-later', 6);
+    const ids = readdirSync(run)
+      .filter((n) => n.endsWith('.metadata.json'))
+      .map((n) => n.slice(0, -'.metadata.json'.length))
+      .sort();
+    truncateSync(join(run, `${ids[0]}.metadata.json`), MAX_METADATA_BYTES + 1);
+    symlinkSync(join(run, `${ids[1]}.eml`), join(run, 'link.eml'));
+    const c = core({ root: run, indexDir });
+    expect(await c.openIndex(null)).toMatchObject({ ok: true });
+    await c.session.settled();
+    expect(c.session.records.rejected).toEqual([
+      { rel: 'link.eml', kind: 'symlink' },
+      { rel: `${ids[0]}.metadata.json`, kind: 'too_large' },
+    ]);
+    expect(c.session.records.summary?.rejected).toMatchObject({ symlink: 1, too_large: 1 });
+    expect(c.logs.filter((l) => l.code === 'scan.rejected' || l.code === 'index.rejected')).toEqual(
+      [
+        { level: 'info', code: 'scan.rejected', data: { reason: 'symlink', count: 1 }, src: KEY },
+        {
+          level: 'info',
+          code: 'index.rejected',
+          data: { reason: 'too_large', count: 1 },
+          src: KEY,
+        },
+      ],
+    );
+    expect(await c.totals()).toMatchObject({ messages: 5 });
+    await c.session.close();
   });
 });

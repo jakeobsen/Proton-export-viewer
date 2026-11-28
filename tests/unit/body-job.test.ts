@@ -7,7 +7,7 @@
 import { appendFileSync, closeSync, fstatSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { openContained, scanRun, type FileRef } from '../../src/core/containment';
+import { examine, openContained, type FileRef } from '../../src/core/containment';
 import { testDir } from '../paths';
 
 const counter = vi.hoisted(() => ({
@@ -51,8 +51,10 @@ function folder(name: string, body: string) {
   const dir = testDir(name);
   writeFileSync(join(dir, 'a.metadata.json'), '{}');
   writeFileSync(join(dir, 'a.eml'), message(body));
-  const ref = scanRun(dir).eml.get('a')!;
-  return { dir, ref, file: join(dir, 'a.eml') };
+  // The identity phase 1 records for the message file.
+  const found = examine(dir, 'a.eml');
+  if (!found || !('ref' in found)) throw new Error('no regular message file');
+  return { dir, ref: found.ref, file: join(dir, 'a.eml') };
 }
 
 /** This process's open descriptors. */

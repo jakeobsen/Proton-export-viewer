@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The index service over generated exports, with its threads run in this
 // process: phase 1, reopening, resuming, time limits, caps, stale work, idle
-// release and the connection registry.
+// release and the connection registry; where files listed by name get their
+// identity, the bytes a batch reads, and files refused after the listing.
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -15,19 +18,34 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  truncateSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { scanRun, type RunScan } from '../../src/core/containment';
+import {
+  MAX_LABELS_BYTES,
+  MAX_METADATA_BYTES,
+  countRejections,
+  fileKindOf,
+  openContainedAsync,
+  scanRun,
+  type FileRef,
+  type Rejection,
+  type RejectKind,
+  type RunScan,
+} from '../../src/core/containment';
 import { parseMetadata, type MessageRow } from '../../src/core/index/metadata';
-import { QueryState, WriterState } from '../../src/core/index/ops';
+import { QueryState, WriterState, type ApplyResult } from '../../src/core/index/ops';
+import { TXN_INPUT_BYTES } from '../../src/core/index/limits';
 import { IndexService, type IndexOptions, type RecentHooks } from '../../src/core/index/service';
+import type { Phase1Item } from '../../src/core/index/writer';
 import { MAX_ATTACHMENTS } from '../../src/core/index/body';
 import { BODY_STATE, CAPPED, SCHEMA_VERSION } from '../../src/core/index/schema';
 import { validRanges } from '../../src/core/search/ranges';
 import { openDb } from '../../src/core/index/sql';
-import { ThreadError, type IndexThread, type ThreadRole } from '../../src/core/index/pool';
+import { ThreadError, TIMEOUT, type IndexThread, type ThreadRole } from '../../src/core/index/pool';
 import type {
   CardsWindow,
   IndexTotals,
@@ -39,6 +57,7 @@ import type { Logger } from '../../src/shared/log/writer';
 import type { RecentAnswer, RecentJob } from '../../src/shared/recent-search';
 import { searchKey } from '../../src/shared/search-chips';
 import { sanitizeEvent } from '../../src/shared/log/schema';
+import { RUN_FOLDER } from '../../tools/gen-export/generator.mjs';
 import { digest } from '../../tools/gen-export/tree.mjs';
 import { writeExport } from '../exports';
 import { InlineThread, STAMP, expected, item, message, newPair } from '../index-helpers';
@@ -63,7 +82,12 @@ function harness(
   options: IndexOptions = {},
   hang: (role: ThreadRole, op: string, args: unknown) => boolean = () => false,
   wrap: (role: ThreadRole, thread: IndexThread) => IndexThread = (_, thread) => thread,
-  hooks: { onChange?: () => void; onDamage?: (reason: string) => void } = {},
+  hooks: {
+    onChange?: () => void;
+    onDamage?: (reason: string) => void;
+    onRejected?: (rejected: Rejection[]) => void;
+    openFile?: (root: string, ref: FileRef) => Promise<number>;
+  } = {},
 ): Harness {
   const threads: InlineThread[] = [];
   const logs: Logged[] = [];
@@ -141,6 +165,106 @@ function dbRows(dbPath: string, sql: string): Array<Record<string, unknown>> {
 }
 
 const mode = (path: string) => statSync(path).mode & 0o777;
+
+function mkfifo(path: string) {
+  const made = spawnSync('/usr/bin/mkfifo', ['-m', '0644', path]);
+  if (made.status !== 0) throw new Error(`mkfifo failed: ${String(made.stderr)}`);
+}
+
+/**
+ * Wraps the threads to record what phase 1 asks of them: the files looked
+ * at, the metadata jobs, the revs registered and the items written. `before`
+ * runs ahead of each call.
+ */
+function recording(
+  before: (role: ThreadRole, op: string, args: unknown) => Promise<void> | void = () => undefined,
+) {
+  const seen = {
+    stat: [] as string[],
+    meta: [] as string[][],
+    revs: [] as Array<[string, number]>,
+    written: [] as Array<{ id: string; rev: number }>,
+    /** The IDs of each write transaction. */
+    writes: [] as string[][],
+  };
+  const wrap = (role: ThreadRole, inner: IndexThread): IndexThread => ({
+    get respawns() {
+      return inner.respawns;
+    },
+    get onRespawn() {
+      return inner.onRespawn;
+    },
+    set onRespawn(f) {
+      inner.onRespawn = f;
+    },
+    stop: () => inner.stop(),
+    call: async <T>(op: string, args?: unknown, timeoutMs?: number): Promise<T> => {
+      await before(role, op, args);
+      if (role === 'parse' && op === 'stat') {
+        seen.stat.push(...(args as { files: Array<{ rel: string }> }).files.map((f) => f.rel));
+      }
+      if (role === 'parse' && op === 'meta') {
+        seen.meta.push(
+          (args as { items: Array<{ protonId: string }> }).items.map((i) => i.protonId),
+        );
+      }
+      if (role === 'writer' && op === 'phase1') {
+        const items = (args as { items: Phase1Item[] }).items;
+        for (const i of items) seen.written.push({ id: i.pair.protonId, rev: i.expectedRev });
+        seen.writes.push(items.map((i) => i.pair.protonId));
+      }
+      const result = await inner.call<T>(op, args, timeoutMs);
+      if (role === 'writer' && op === 'apply') seen.revs.push(...(result as ApplyResult).revs);
+      return result;
+    },
+  });
+  return { seen, wrap };
+}
+
+/**
+ * The run folder as a scan that looks at every entry with lstat sees it:
+ * the files it refuses, by reason (metadata over 4 MiB included), and the
+ * message IDs of the metadata and message files it accepts.
+ */
+function lstatWalk(run: string): {
+  rejected: Record<RejectKind, number>;
+  metadata: Set<string>;
+  eml: Set<string>;
+} {
+  const rejected: Rejection[] = [];
+  const metadata = new Set<string>();
+  const eml = new Set<string>();
+  for (const name of readdirSync(run)) {
+    const st = lstatSync(join(run, name));
+    const type = st.isFile()
+      ? 'file'
+      : st.isSymbolicLink()
+        ? 'symlink'
+        : st.isDirectory()
+          ? 'directory'
+          : st.isFIFO()
+            ? 'fifo'
+            : st.isSocket()
+              ? 'socket'
+              : st.isBlockDevice() || st.isCharacterDevice()
+                ? 'device'
+                : 'other_type';
+    if (type !== 'file') {
+      rejected.push({ rel: name, kind: type });
+      continue;
+    }
+    const kind = fileKindOf(name);
+    if (!kind) continue;
+    const limit = kind.kind === 'metadata' ? MAX_METADATA_BYTES : MAX_LABELS_BYTES;
+    if (kind.kind !== 'eml' && st.size > limit) {
+      rejected.push({ rel: name, kind: 'too_large' });
+      continue;
+    }
+    if (kind.kind === 'metadata') metadata.add(kind.id!);
+    if (kind.kind === 'eml') eml.add(kind.id!);
+  }
+  return { rejected: countRejections(rejected), metadata, eml };
+}
 
 describe('phase 1', () => {
   it('indexes every metadata file with conversations, labels and safe file modes', async () => {
@@ -314,34 +438,58 @@ describe('phase 1', () => {
     await h.service.close();
   });
 
-  it('records a pair with a file missing, and refuses a file swapped after the scan', async () => {
-    const { run, indexDir } = exportAt('broken', 6);
+  it('records a pair with a file missing, and refuses a file that changed type before its first look as the listing would', async () => {
+    const { run, indexDir } = exportAt('broken', 8);
     const ids = readdirSync(run)
       .filter((n) => n.endsWith('.eml'))
       .map((n) => n.slice(0, -'.eml'.length))
       .sort();
     rmSync(join(run, `${ids[0]}.metadata.json`));
     rmSync(join(run, `${ids[1]}.eml`));
+    rmSync(join(run, `${ids[6]}.eml`));
     const scan = scanRun(run);
-    // After the scan, a metadata file becomes a FIFO; reading it must not block.
+    // After the listing, before any look: a metadata file becomes a FIFO
+    // (reading it must not block), and a message file a link.
     rmSync(join(run, `${ids[2]}.metadata.json`));
-    const made = spawnSync('/usr/bin/mkfifo', ['-m', '0644', join(run, `${ids[2]}.metadata.json`)]);
-    expect(made.status).toBe(0);
-    const h = harness(run, indexDir, { jobMs: 2000 });
+    mkfifo(join(run, `${ids[2]}.metadata.json`));
+    rmSync(join(run, `${ids[3]}.eml`));
+    symlinkSync(join(run, `${ids[4]}.eml`), join(run, `${ids[3]}.eml`));
+    // A pair with metadata only, whose metadata goes: nothing of it is left.
+    rmSync(join(run, `${ids[6]}.metadata.json`));
+    const rejected: Rejection[] = [];
+    const h = harness(run, indexDir, { jobMs: 2000 }, undefined, undefined, {
+      onRejected: (found) => rejected.push(...found),
+    });
     await h.service.open(null);
     await h.service.startIndexing(scan);
-    expect(h.service.progress).toMatchObject({ phase: 'done', total: 5, loaded: 5, failed: 1 });
+    // The FIFO counts as a refused file, not as metadata, and the gone one
+    // as never listed: 5 metadata files are left.
+    expect(h.service.progress).toMatchObject({ phase: 'done', total: 5, loaded: 5, failed: 0 });
     const pairs = Object.fromEntries(
       dbRows(
         h.service.dbPath,
-        'SELECT proton_id, meta_state, body_state, error_code FROM pairs',
-      ).map((r) => [String(r.proton_id), [r.meta_state, r.body_state, r.error_code]]),
+        'SELECT proton_id, meta_state, body_state, error_code, eml_rel FROM pairs',
+      ).map((r) => [String(r.proton_id), [r.meta_state, r.body_state, r.error_code, r.eml_rel]]),
     );
-    expect(pairs[ids[0]!]).toEqual([4, 0, 'PAIR_META_MISSING']);
-    expect(pairs[ids[1]!]).toEqual([1, 4, null]);
-    expect(pairs[ids[2]!]).toEqual([3, 0, 'FILE_FIFO']);
-    expect(Object.keys(pairs)).toHaveLength(6);
-    expect(h.logs.find((l) => l.code === 'index.meta_failed')?.data.reason).toBe('fifo');
+    expect(pairs[ids[0]!]).toEqual([4, 0, 'PAIR_META_MISSING', `${ids[0]}.eml`]);
+    expect(pairs[ids[1]!]).toEqual([1, 4, null, null]);
+    expect(pairs[ids[2]!]).toEqual([4, 0, 'PAIR_META_MISSING', `${ids[2]}.eml`]);
+    expect(pairs[ids[3]!]).toEqual([1, 4, null, null]);
+    expect(pairs[ids[6]!]).toBeUndefined();
+    expect(Object.keys(pairs)).toHaveLength(7);
+    expect(rejected.sort((a, b) => (a.rel < b.rel ? -1 : 1))).toEqual(
+      [
+        { rel: `${ids[2]}.metadata.json`, kind: 'fifo' },
+        { rel: `${ids[3]}.eml`, kind: 'symlink' },
+      ].sort((a, b) => (a.rel < b.rel ? -1 : 1)),
+    );
+    // The eml's identity is its lstat's.
+    const [stored] = dbRows(
+      h.service.dbPath,
+      `SELECT CAST(eml_ino AS TEXT) AS ino FROM pairs WHERE proton_id = '${ids[5]}'`,
+    );
+    expect(stored?.ino).toBe(String(lstatSync(join(run, `${ids[5]}.eml`), { bigint: true }).ino));
+    expect(h.logs.some((l) => l.code === 'index.meta_failed')).toBe(false);
     await h.service.close();
   });
 
@@ -469,42 +617,15 @@ describe('phase 1', () => {
     await h.service.close();
   });
 
-  it('writes batches in name order with readByName, even when a later batch is read first', async () => {
-    /**
-     * Runs phase 1 with the first batch's read held until the second batch's
-     * read has ended. Returns the IDs of each read and each write, in order.
-     */
-    const runHeld = async (readByName: boolean) => {
+  it('reads batches one after another and writes them in that order; with readByName, in name order', async () => {
+    /** Runs phase 1 with the first read held a while. Returns the IDs of each read and each write. */
+    const run1 = async (readByName: boolean) => {
       const { run, indexDir } = exportAt(`order-${readByName}`, 30, 11);
-      const reads: string[][] = [];
-      const writes: string[][] = [];
-      let secondRead = (): void => undefined;
-      const secondDone = new Promise<void>((resolve) => (secondRead = resolve));
-      const ids = (args: unknown, key: 'protonId' | 'pair') =>
-        (args as { items: Array<Record<string, unknown>> }).items.map((i) =>
-          key === 'pair' ? String((i.pair as { protonId: string }).protonId) : String(i.protonId),
-        );
-      const wrap = (role: ThreadRole, inner: IndexThread): IndexThread => ({
-        get respawns() {
-          return inner.respawns;
-        },
-        get onRespawn() {
-          return inner.onRespawn;
-        },
-        set onRespawn(f) {
-          inner.onRespawn = f;
-        },
-        stop: () => inner.stop(),
-        call: <T>(op: string, args?: unknown, timeoutMs?: number): Promise<T> => {
-          if (role === 'writer' && op === 'phase1') writes.push(ids(args, 'pair'));
-          if (role !== 'parse' || op !== 'meta') return inner.call<T>(op, args, timeoutMs);
-          reads.push(ids(args, 'protonId'));
-          const n = reads.length;
-          if (n === 1) return secondDone.then(() => inner.call<T>(op, args, timeoutMs));
-          const read = inner.call<T>(op, args, timeoutMs);
-          if (n === 2) void read.finally(secondRead);
-          return read;
-        },
+      let reads = 0;
+      const { seen, wrap } = recording(async (role, op) => {
+        if (role !== 'parse' || op !== 'meta') return;
+        reads += 1;
+        if (reads === 1) await new Promise((resolve) => setTimeout(resolve, 50));
       });
       const scan = scanRun(run);
       const h = harness(run, indexDir, { batchPairs: 10, readByName }, undefined, wrap);
@@ -513,21 +634,280 @@ describe('phase 1', () => {
       expect(h.service.progress).toMatchObject({ phase: 'done', loaded: 30, total: 30, failed: 0 });
       expect(dbPartition(h.service.dbPath)).toEqual(partitionOfFiles(run));
       await h.service.close();
-      return { reads, writes };
+      return { reads: seen.meta, writes: seen.written.map((w) => w.id) };
     };
 
-    // Without it, the held first batch is written after the second.
-    const free = await runHeld(false);
+    // The held first batch still comes first: a batch is read only after the one before it.
+    const free = await run1(false);
     expect(free.reads).toHaveLength(3);
-    expect(free.writes[0]).toEqual(free.reads[1]);
-    expect(free.writes).not.toEqual(free.reads);
+    expect(free.writes).toEqual(free.reads.flat());
 
-    // With it, every batch is written in the order it was made: name order.
-    const ordered = await runHeld(true);
-    expect(ordered.reads).toHaveLength(3);
-    expect(ordered.writes).toEqual(ordered.reads);
-    const all = ordered.writes.flat();
-    expect(all).toEqual([...all].sort());
+    const ordered = await run1(true);
+    expect(ordered.writes).toEqual(ordered.reads.flat());
+    expect(ordered.writes).toEqual([...ordered.writes].sort());
+  });
+
+  it('looks only at the files of stored pairs: none on a first open, all on a reopen, and reads nothing unchanged', async () => {
+    const { run, indexDir } = exportAt('looks', 12);
+    // One message file without metadata: nothing reads it, so it is looked at.
+    writeFileSync(join(run, 'lonely.eml'), 'Subject: lonely\r\n\r\n');
+    const first = recording();
+    const h = harness(run, indexDir, {}, undefined, first.wrap);
+    const opened = await h.service.open(null);
+    await h.service.startIndexing(scanRun(run));
+    expect(first.seen.stat).toEqual(['lonely.eml']);
+    expect(first.seen.meta.flat()).toHaveLength(12);
+    await h.service.close();
+
+    const second = recording();
+    const again = harness(run, indexDir, {}, undefined, second.wrap);
+    await again.service.open(opened.dbUuid);
+    await again.service.startIndexing(scanRun(run));
+    const files = readdirSync(run).filter((n) => n !== 'labels.json');
+    expect(second.seen.stat.sort()).toEqual(files.sort());
+    expect(second.seen.meta).toEqual([]);
+    expect(again.service.progress).toMatchObject({ phase: 'done', loaded: 12, total: 12 });
+    await again.service.close();
+  });
+
+  it('reads a batch up to its share of bytes; the pairs it left are read next, each rev written once', async () => {
+    const { run, indexDir } = exportAt('budget', 40);
+    const sizes = readdirSync(run)
+      .filter((n) => n.endsWith('.metadata.json'))
+      .map((n) => statSync(join(run, n)).size);
+    const largest = Math.max(...sizes);
+    const share = 3 * largest;
+    const options = { batchPairs: 10, metaJob: 2, poolSize: 2, readBytes: share };
+    const { seen, wrap } = recording();
+    const h = harness(run, indexDir, options, undefined, wrap);
+    await h.service.open(null);
+    await h.service.startIndexing(scanRun(run));
+    expect(h.service.progress).toMatchObject({ phase: 'done', loaded: 40, total: 40, failed: 0 });
+    // Pairs were left for later batches: more batches than 40 / 10.
+    expect(h.service.reads.batches).toBeGreaterThan(4);
+    // Bytes in flight at most: the share, plus per thread a job's share and the file past it.
+    const jobShare = Math.ceil(share / options.poolSize);
+    const bound = share + options.poolSize * (jobShare + largest);
+    expect(h.service.reads.peakBytes).toBeGreaterThan(0);
+    expect(h.service.reads.peakBytes).toBeLessThanOrEqual(bound);
+    console.log('budget:', JSON.stringify({ ...h.service.reads, share, bound, largest }));
+    // Every registered rev is written once, with its own pair.
+    const written = seen.written.map((w) => `${w.id}:${w.rev}`);
+    expect(new Set(written).size).toBe(written.length);
+    expect(written.sort()).toEqual(seen.revs.map(([id, rev]) => `${id}:${rev}`).sort());
+    expect(seen.revs).toHaveLength(40);
+    expect(dbPartition(h.service.dbPath)).toEqual(partitionOfFiles(run));
+    await h.service.close();
+  });
+
+  it('charges refused reads to both shares: files over the limit in a row are read a few per batch', async () => {
+    for (const [poolSize, metaJob] of [
+      [1, 50],
+      [2, 1],
+    ] as const) {
+      const { run, indexDir } = exportAt(`over-limit-${poolSize}`, 6);
+      const ids = readdirSync(run)
+        .filter((n) => n.endsWith('.metadata.json'))
+        .map((n) => n.slice(0, -'.metadata.json'.length))
+        .sort();
+      // Sparse: each read gets the limit and one byte more, of zeros.
+      for (const id of ids.slice(0, 3)) {
+        truncateSync(join(run, `${id}.metadata.json`), MAX_METADATA_BYTES + 1);
+      }
+      const rejected: Rejection[] = [];
+      const h = harness(
+        run,
+        indexDir,
+        { poolSize, metaJob, readByName: true },
+        undefined,
+        undefined,
+        {
+          onRejected: (found) => rejected.push(...found),
+        },
+      );
+      await h.service.open(null);
+      await h.service.startIndexing(scanRun(run));
+      const label = `pool ${poolSize}`;
+      expect(
+        rejected.map((r) => r.kind),
+        label,
+      ).toEqual(['too_large', 'too_large', 'too_large']);
+      expect(h.service.progress, label).toMatchObject({ phase: 'done', total: 3, loaded: 3 });
+      // A refused read uses up the share like any other, so they don't all go in one batch.
+      expect(h.service.reads.batches, label).toBeGreaterThanOrEqual(2);
+      const jobShare = Math.ceil(TXN_INPUT_BYTES / poolSize);
+      const bound = TXN_INPUT_BYTES + poolSize * (jobShare + MAX_METADATA_BYTES + 1);
+      expect(h.service.reads.peakBytes, label).toBeGreaterThan(MAX_METADATA_BYTES);
+      expect(h.service.reads.peakBytes, label).toBeLessThanOrEqual(bound);
+      await h.service.close();
+    }
+  });
+
+  it('reads the files of a job that failed one per job under the same share, and leaves the rest for the next batch, read alone', async () => {
+    const { run, indexDir } = exportAt('retry-share', 8);
+    const ids = readdirSync(run)
+      .filter((n) => n.endsWith('.metadata.json'))
+      .map((n) => n.slice(0, -'.metadata.json'.length))
+      .sort();
+    // About 100 kB each, so three of them pass the share.
+    for (const id of ids) {
+      const path = join(run, `${id}.metadata.json`);
+      const doc = JSON.parse(readFileSync(path, 'utf8')) as { Payload: Record<string, unknown> };
+      doc.Payload.Subject = 'x'.repeat(100_000);
+      writeFileSync(path, JSON.stringify(doc));
+    }
+    const largest = Math.max(...ids.map((id) => statSync(join(run, `${id}.metadata.json`)).size));
+    const share = 250_000;
+    const first = ids.slice(0, 4);
+    const { seen, wrap } = recording();
+    // The job with the first four files runs past its limit; each alone doesn't.
+    const h = harness(
+      run,
+      indexDir,
+      { poolSize: 1, metaJob: 4, jobMs: 300, readBytes: share, readByName: true },
+      (role, op, args) => {
+        const items = (args as { items?: Array<{ protonId: string }> }).items ?? [];
+        return (
+          role === 'parse' && op === 'meta' && items.length > 1 && items[0]!.protonId === ids[0]
+        );
+      },
+      wrap,
+    );
+    await h.service.open(null);
+    await h.service.startIndexing(scanRun(run));
+    expect(h.service.progress).toMatchObject({ phase: 'done', loaded: 8, failed: 0, timeouts: 1 });
+    // After the failed job, its files are only ever read alone.
+    const after = seen.meta.slice(1);
+    expect(seen.meta[0]).toEqual(first);
+    expect(
+      after.filter((job) => job.some((id) => first.includes(id))).every((j) => j.length === 1),
+    ).toBe(true);
+    // The retries stop at the share: the first batch writes three, the fourth comes next.
+    expect(seen.writes[0]).toEqual(first.slice(0, 3));
+    // At most the share, plus for the one thread a job's share and the file past it.
+    expect(h.service.reads.peakBytes).toBeLessThanOrEqual(share + (share + largest));
+    // Every registered rev is written once, the carried ones included.
+    const written = seen.written.map((w) => `${w.id}:${w.rev}`);
+    expect(new Set(written).size).toBe(written.length);
+    expect(written.sort()).toEqual(seen.revs.map(([id, rev]) => `${id}:${rev}`).sort());
+    await h.service.close();
+  });
+
+  it('stops reading once closed: pairs left for the next batch wait, and the next open reads them', async () => {
+    const { run, indexDir } = exportAt('budget-close', 30);
+    const largest = Math.max(
+      ...readdirSync(run)
+        .filter((n) => n.endsWith('.metadata.json'))
+        .map((n) => statSync(join(run, n)).size),
+    );
+    let reads = 0;
+    let release = (): void => undefined;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let reached = (): void => undefined;
+    const atThird = new Promise<void>((resolve) => (reached = resolve));
+    const { seen, wrap } = recording(async (role, op) => {
+      if (role !== 'parse' || op !== 'meta') return;
+      reads += 1;
+      if (reads === 3) {
+        reached();
+        await held;
+      }
+    });
+    const options = { batchPairs: 10, metaJob: 2, poolSize: 1, readBytes: 2 * largest };
+    const h = harness(run, indexDir, options, undefined, wrap);
+    const opened = await h.service.open(null);
+    const phase1 = h.service.startIndexing(scanRun(run));
+    await atThird;
+    const closing = h.service.close();
+    release();
+    await closing;
+    await phase1;
+    expect(h.service.progress.phase).toBe('failed');
+    // The held read was the last one asked for.
+    expect(reads).toBe(3);
+    expect(seen.meta).toHaveLength(3);
+    const states = dbRows(h.service.dbPath, 'SELECT meta_state AS s FROM pairs').map((r) => r.s);
+    expect(states.filter((x) => x === 0).length).toBeGreaterThan(0);
+
+    const again = harness(run, indexDir);
+    await again.service.open(opened.dbUuid);
+    await again.service.startIndexing(scanRun(run));
+    expect(again.service.progress).toMatchObject({ phase: 'done', loaded: 30, total: 30 });
+    expect(dbPartition(again.service.dbPath)).toEqual(partitionOfFiles(run));
+    await again.service.close();
+  });
+
+  it('gives the hostile corpus the totals, pairs and refused files that an lstat of every entry gives', async () => {
+    const dir = testDir('hostile-scan');
+    const out = join(dir, 'export');
+    const made = spawnSync(
+      process.execPath,
+      [
+        join(process.cwd(), 'tools', 'gen-export', 'gen-export.mjs'),
+        'hostile',
+        '--seed',
+        '1',
+        '--nonce',
+        'n0nce1234',
+        '--out',
+        out,
+      ],
+      { encoding: 'utf8' },
+    );
+    expect(made.status, made.stderr).toBe(0);
+    const run = realpathSync(join(out, 'hostile1@example.com', RUN_FOLDER));
+    // Metadata over its limit (sparse), with its message file.
+    writeFileSync(join(run, 'zzbig.metadata.json'), '');
+    truncateSync(join(run, 'zzbig.metadata.json'), MAX_METADATA_BYTES + 1);
+    writeFileSync(join(run, 'zzbig.eml'), 'Subject: big\r\n\r\n');
+    const scan = scanRun(run);
+    // After the listing: a metadata file becomes a FIFO, a message file a
+    // link, and another message file goes.
+    const accepted = [...scan.metadata.keys()]
+      .filter((id) => scan.eml.has(id) && id !== 'zzbig')
+      .sort();
+    const [fifo, link, gone, target] = accepted.slice(-4) as [string, string, string, string];
+    rmSync(join(run, `${fifo}.metadata.json`));
+    mkfifo(join(run, `${fifo}.metadata.json`));
+    rmSync(join(run, `${link}.eml`));
+    symlinkSync(join(run, `${target}.eml`), join(run, `${link}.eml`));
+    rmSync(join(run, `${gone}.eml`));
+    const walk = lstatWalk(run);
+    let failing = 0;
+    for (const id of walk.metadata) {
+      try {
+        parseMetadata(id, readFileSync(join(run, `${id}.metadata.json`), 'utf8'));
+      } catch {
+        failing += 1;
+      }
+    }
+
+    const later: Rejection[] = [];
+    const h = harness(run, join(dir, 'index'), { jobMs: 5000 }, undefined, undefined, {
+      onRejected: (found) => later.push(...found),
+    });
+    await h.service.open(null);
+    await h.service.startIndexing(scan);
+    expect(countRejections([...scan.rejected, ...later])).toEqual(walk.rejected);
+    expect(walk.rejected.too_large).toBe(1);
+    expect(h.service.progress).toMatchObject({
+      phase: 'done',
+      total: walk.metadata.size,
+      loaded: walk.metadata.size,
+      failed: failing,
+    });
+    expect(h.logs.find((l) => l.code === 'index.phase1_done')?.data.count).toBe(walk.metadata.size);
+    const pairs = dbRows(h.service.dbPath, 'SELECT proton_id, eml_rel FROM pairs');
+    expect(new Set(pairs.map((r) => String(r.proton_id)))).toEqual(
+      new Set([...walk.metadata, ...walk.eml]),
+    );
+    expect(
+      pairs
+        .filter((r) => r.eml_rel !== null)
+        .map((r) => String(r.proton_id))
+        .sort(),
+    ).toEqual([...walk.eml].sort());
+    await h.service.close();
   });
 });
 
@@ -638,7 +1018,8 @@ describe('reconcile on reopen', () => {
     // The folder is read, never written.
     expect(digest(exportRoot)).toBe(folderBefore);
 
-    // Nothing changed since: nothing is written or read but the plan.
+    // Nothing changed since: nothing is written or read but the plan. The
+    // stored pairs' files are only looked at.
     const third = harness(run, indexDir);
     await third.service.open(opened.dbUuid);
     await third.service.startIndexing(scanRun(run));
@@ -653,13 +1034,304 @@ describe('reconcile on reopen', () => {
     // Phase 2 only finds that no message waits for its text.
     expect(writer.calls.filter((op) => op !== 'shrink')).toEqual([
       'open',
+      'known',
       'plan',
       'finish',
       'bodyOrder',
     ]);
-    expect(third.threads.filter((t) => t.role === 'parse').flatMap((t) => t.calls)).toEqual([]);
+    const looks = third.threads.filter((t) => t.role === 'parse').flatMap((t) => t.calls);
+    expect(looks.length).toBeGreaterThan(0);
+    expect(new Set(looks)).toEqual(new Set(['stat']));
     expect(third.logs.map((l) => l.code)).not.toContain('index.reconciled');
     await third.service.close();
+  });
+});
+
+describe('files that change after the listing', () => {
+  it('removes a stored message whose metadata grew past its limit, and counts the file once as too large', async () => {
+    const { run, indexDir } = exportAt('grown-cap', 6);
+    const first = harness(run, indexDir);
+    const opened = await first.service.open(null);
+    await first.service.startIndexing(scanRun(run));
+    await first.service.close();
+    const id = readdirSync(run)
+      .filter((n) => n.endsWith('.metadata.json'))
+      .map((n) => n.slice(0, -'.metadata.json'.length))
+      .sort()[0]!;
+    const [before] = dbRows(
+      first.service.dbPath,
+      `SELECT rowid FROM messages WHERE proton_id = '${id}'`,
+    );
+    expect(before).toBeDefined();
+    // Its text, and an attachment as reading its message file lists one.
+    const db = openDb(first.service.dbPath);
+    db.stmt(
+      "INSERT INTO attachments(message_rowid, idx, filename, mime, size, content_id, source) VALUES (?, 0, 'a.pdf', 'application/pdf', 1, NULL, 'eml')",
+    ).run(Number(before!.rowid));
+    db.close();
+    expect(
+      dbRows(
+        first.service.dbPath,
+        `SELECT 1 FROM message_text WHERE rowid = ${Number(before!.rowid)}`,
+      ),
+    ).toHaveLength(1);
+    truncateSync(join(run, `${id}.metadata.json`), MAX_METADATA_BYTES + 1);
+
+    const rejected: Rejection[] = [];
+    const { seen, wrap } = recording();
+    const h = harness(run, indexDir, {}, undefined, wrap, {
+      onRejected: (found) => rejected.push(...found),
+    });
+    await h.service.open(opened.dbUuid);
+    await h.service.startIndexing(scanRun(run));
+    expect(rejected).toEqual([{ rel: `${id}.metadata.json`, kind: 'too_large' }]);
+    // Its look gave its size: it is refused without being read.
+    expect(seen.meta.flat()).not.toContain(id);
+    expect(h.service.progress).toMatchObject({ phase: 'done', total: 5, loaded: 5, failed: 0 });
+    const rowid = Number(before!.rowid);
+    expect(dbRows(h.service.dbPath, `SELECT 1 FROM messages WHERE proton_id = '${id}'`)).toEqual(
+      [],
+    );
+    expect(dbRows(h.service.dbPath, `SELECT 1 FROM message_text WHERE rowid = ${rowid}`)).toEqual(
+      [],
+    );
+    expect(
+      dbRows(h.service.dbPath, `SELECT 1 FROM attachments WHERE message_rowid = ${rowid}`),
+    ).toEqual([]);
+    const [pair] = dbRows(
+      h.service.dbPath,
+      `SELECT meta_state, error_code, meta_rel FROM pairs WHERE proton_id = '${id}'`,
+    );
+    expect(pair).toEqual({ meta_state: 4, error_code: 'PAIR_META_MISSING', meta_rel: null });
+    await h.service.close();
+  });
+
+  it('refuses a stored file that grows past its limit between its look and its read', async () => {
+    const { run, indexDir } = exportAt('grown-late', 5);
+    const first = harness(run, indexDir);
+    const opened = await first.service.open(null);
+    await first.service.startIndexing(scanRun(run));
+    await first.service.close();
+    const id = readdirSync(run)
+      .filter((n) => n.endsWith('.metadata.json'))
+      .map((n) => n.slice(0, -'.metadata.json'.length))
+      .sort()[0]!;
+    const path = join(run, `${id}.metadata.json`);
+    // Changed, so it is read again; it grows past the limit after its look.
+    writeFileSync(path, readFileSync(path, 'utf8').replace('"Subject"', '"Subject" '));
+    const { wrap } = recording((role, op) => {
+      if (role === 'parse' && op === 'meta') truncateSync(path, MAX_METADATA_BYTES + 1);
+    });
+    const rejected: Rejection[] = [];
+    const h = harness(run, indexDir, {}, undefined, wrap, {
+      onRejected: (found) => rejected.push(...found),
+    });
+    await h.service.open(opened.dbUuid);
+    await h.service.startIndexing(scanRun(run));
+    expect(rejected).toEqual([{ rel: `${id}.metadata.json`, kind: 'too_large' }]);
+    expect(h.service.progress).toMatchObject({ phase: 'done', total: 4, loaded: 4, failed: 0 });
+    const [pair] = dbRows(
+      h.service.dbPath,
+      `SELECT meta_state, error_code FROM pairs WHERE proton_id = '${id}'`,
+    );
+    expect(pair).toEqual({ meta_state: 4, error_code: 'PAIR_META_MISSING' });
+    expect(dbRows(h.service.dbPath, `SELECT 1 FROM messages WHERE proton_id = '${id}'`)).toEqual(
+      [],
+    );
+    await h.service.close();
+  });
+
+  it('looks at stored files without a time limit: a slow look does not fail phase 1', async () => {
+    const { run, indexDir } = exportAt('slow-look', 6);
+    const first = harness(run, indexDir);
+    const opened = await first.service.open(null);
+    await first.service.startIndexing(scanRun(run));
+    await first.service.close();
+    // Each look takes 150 ms; any limit below that would end it.
+    const { seen, wrap } = recording(async (role, op) => {
+      if (role !== 'parse' || op !== 'stat') return;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+    const limits: number[] = [];
+    const timed = (role: ThreadRole, inner: IndexThread): IndexThread => {
+      const outer = wrap(role, inner);
+      return {
+        get respawns() {
+          return outer.respawns;
+        },
+        get onRespawn() {
+          return outer.onRespawn;
+        },
+        set onRespawn(f) {
+          outer.onRespawn = f;
+        },
+        stop: () => outer.stop(),
+        call: <T>(op: string, args?: unknown, timeoutMs?: number): Promise<T> => {
+          if (role === 'parse' && op === 'stat') {
+            limits.push(timeoutMs ?? 0);
+            if (timeoutMs) return Promise.reject(new ThreadError(TIMEOUT));
+          }
+          return outer.call<T>(op, args, timeoutMs);
+        },
+      };
+    };
+    const h = harness(run, indexDir, { jobMs: 100 }, undefined, timed);
+    await h.service.open(opened.dbUuid);
+    await h.service.startIndexing(scanRun(run));
+    expect(h.service.progress).toMatchObject({ phase: 'done', loaded: 6, total: 6 });
+    expect(seen.stat.length).toBeGreaterThan(0);
+    expect(limits.every((ms) => ms === 0)).toBe(true);
+    await h.service.close();
+  });
+
+  it('gives a new file whose read failed its identity, so an unchanged one is not read again', async () => {
+    const { run, indexDir } = exportAt('failed-identity', 6);
+    const ids = readdirSync(run)
+      .filter((n) => n.endsWith('.metadata.json'))
+      .map((n) => n.slice(0, -'.metadata.json'.length))
+      .sort();
+    const [locked, slow] = ids as [string, string];
+    const lockedPath = join(run, `${locked}.metadata.json`);
+    // One can't be opened; the other's read always runs past its limit.
+    chmodSync(lockedPath, 0o000);
+    try {
+      const first = harness(run, indexDir, { jobMs: 200, metaJob: 1 }, (role, op, args) => {
+        const items = (args as { items?: Array<{ protonId: string }> }).items ?? [];
+        return role === 'parse' && op === 'meta' && items.some((i) => i.protonId === slow);
+      });
+      const opened = await first.service.open(null);
+      await first.service.startIndexing(scanRun(run));
+      expect(first.service.progress).toMatchObject({ phase: 'done', loaded: 6, failed: 2 });
+      const stored = Object.fromEntries(
+        dbRows(
+          first.service.dbPath,
+          'SELECT proton_id, error_code, CAST(meta_ino AS TEXT) AS ino FROM pairs',
+        ).map((r) => [String(r.proton_id), [r.error_code, r.ino]]),
+      );
+      expect(stored[locked]).toEqual([
+        'FILE_UNREADABLE',
+        String(lstatSync(lockedPath, { bigint: true }).ino),
+      ]);
+      expect(stored[slow]).toEqual([
+        'META_TIMEOUT',
+        String(lstatSync(join(run, `${slow}.metadata.json`), { bigint: true }).ino),
+      ]);
+      await first.service.close();
+
+      // Unchanged since: neither is read again.
+      const { seen, wrap } = recording();
+      const again = harness(run, indexDir, {}, undefined, wrap);
+      await again.service.open(opened.dbUuid);
+      await again.service.startIndexing(scanRun(run));
+      expect(seen.meta).toEqual([]);
+      expect(again.service.progress).toMatchObject({ phase: 'done', loaded: 6 });
+      await again.service.close();
+    } finally {
+      chmodSync(lockedPath, 0o644);
+    }
+  });
+
+  it('refuses a labels.json over its limit when it is listed, and clears the stored labels', async () => {
+    const { run, indexDir } = exportAt('labels-over', 6);
+    const first = harness(run, indexDir);
+    const opened = await first.service.open(null);
+    await first.service.startIndexing(scanRun(run));
+    await first.service.close();
+    expect(dbRows(first.service.dbPath, 'SELECT 1 FROM labels').length).toBeGreaterThan(0);
+    truncateSync(join(run, 'labels.json'), MAX_LABELS_BYTES + 1);
+    const scan = scanRun(run);
+    expect(scan.labels).toBeNull();
+    expect(scan.rejected).toEqual([{ rel: 'labels.json', kind: 'too_large' }]);
+    const { wrap } = recording();
+    const h = harness(run, indexDir, {}, undefined, wrap);
+    await h.service.open(opened.dbUuid);
+    await h.service.startIndexing(scan);
+    expect(h.service.progress.phase).toBe('done');
+    expect(dbRows(h.service.dbPath, 'SELECT 1 FROM labels')).toEqual([]);
+    expect(h.threads.filter((t) => t.role === 'parse').flatMap((t) => t.calls)).not.toContain(
+      'labels',
+    );
+    await h.service.close();
+  });
+
+  it('leaves no failed registration unhandled while it waits for writes', async () => {
+    const { run, indexDir } = exportAt('register-fails', 12);
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    let applies = 0;
+    let release = (): void => undefined;
+    const writesHeld = new Promise<void>((resolve) => (release = resolve));
+    const wrap = (role: ThreadRole, inner: IndexThread): IndexThread => ({
+      get respawns() {
+        return inner.respawns;
+      },
+      get onRespawn() {
+        return inner.onRespawn;
+      },
+      set onRespawn(f) {
+        inner.onRespawn = f;
+      },
+      stop: () => inner.stop(),
+      call: async <T>(op: string, args?: unknown, timeoutMs?: number): Promise<T> => {
+        if (role === 'writer' && op === 'phase1') await writesHeld;
+        if (role === 'writer' && op === 'apply') {
+          applies += 1;
+          // The registration made while the batches before wait for their writes.
+          if (applies === 4) throw new ThreadError('WRITER_DOWN');
+        }
+        return inner.call<T>(op, args, timeoutMs);
+      },
+    });
+    try {
+      const h = harness(run, indexDir, { batchPairs: 2 }, undefined, wrap);
+      await h.service.open(null);
+      const phase1 = h.service.startIndexing(scanRun(run));
+      await expect.poll(() => applies).toBe(4);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      release();
+      await phase1;
+      expect(h.service.progress.phase).toBe('failed');
+      expect(unhandled).toEqual([]);
+      await h.service.close();
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it("gives a stored pair whose file became a FIFO after its look the pair's code, as before", async () => {
+    const { run, indexDir } = exportAt('swapped-late', 5);
+    const first = harness(run, indexDir);
+    const opened = await first.service.open(null);
+    await first.service.startIndexing(scanRun(run));
+    await first.service.close();
+    const id = readdirSync(run)
+      .filter((n) => n.endsWith('.metadata.json'))
+      .map((n) => n.slice(0, -'.metadata.json'.length))
+      .sort()[0]!;
+    const path = join(run, `${id}.metadata.json`);
+    // Changed, so it is read again; it becomes a FIFO between its look and its read.
+    writeFileSync(path, readFileSync(path, 'utf8').replace('"Subject"', '"Subject" '));
+    const { wrap } = recording((role, op) => {
+      if (role !== 'parse' || op !== 'meta') return;
+      rmSync(path);
+      mkfifo(path);
+    });
+    const rejected: Rejection[] = [];
+    const h = harness(run, indexDir, { jobMs: 2000 }, undefined, wrap, {
+      onRejected: (found) => rejected.push(...found),
+    });
+    await h.service.open(opened.dbUuid);
+    await h.service.startIndexing(scanRun(run));
+    expect(h.service.progress).toMatchObject({ phase: 'done', total: 5, loaded: 5, failed: 1 });
+    const [pair] = dbRows(
+      h.service.dbPath,
+      `SELECT meta_state, error_code FROM pairs WHERE proton_id = '${id}'`,
+    );
+    expect(pair).toEqual({ meta_state: 3, error_code: 'FILE_FIFO' });
+    expect(h.logs.find((l) => l.code === 'index.meta_failed')?.data.reason).toBe('fifo');
+    expect(rejected).toEqual([]);
+    await h.service.close();
   });
 });
 
@@ -1023,43 +1695,119 @@ describe('phase 2', () => {
     await h.service.close();
   });
 
-  it('leaves a file that changed or went since the scan for the next reconcile', async () => {
+  it('leaves a file that changed or went since phase 1 for the next reconcile', async () => {
     const { run, indexDir } = exportAt('phase2-changed', 10);
-    const [changed, gone, linked] = idsOf(run) as [string, string, string];
+    const [changed, gone, linked, replaced, renamed, unlisted] = idsOf(run) as [
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+    ];
+    const file = (id: string) => join(run, `${id}.eml`);
+    // Whole seconds, so a replacement can carry the very same mtime.
+    const whole = new Date(1_700_000_000_000);
+    utimesSync(file(replaced), whole, whole);
     const scan = scanRun(run);
-    // After the scan, before phase 2 reads them.
-    writeFileSync(join(run, `${changed}.eml`), eml('rewritten afterwards'));
-    rmSync(join(run, `${gone}.eml`));
-    // A link the open refuses, in place of a file.
-    const target = join(run, `${linked}.eml`);
-    renameSync(target, `${target}.moved`);
-    symlinkSync(`${target}.moved`, target);
-    const first = harness(run, indexDir);
+    // After phase 1 recorded each file's identity, before phase 2 reads them.
+    let changedOnce = false;
+    const afterPhase1 = (role: ThreadRole, op: string) => {
+      if (role !== 'writer' || op !== 'bodyOrder' || changedOnce) return false;
+      changedOnce = true;
+      // Rewritten in place: the same inode, with a new size and mtime.
+      writeFileSync(file(changed), eml('rewritten afterwards'));
+      rmSync(file(gone));
+      // A link the open refuses, in place of a file.
+      renameSync(file(linked), `${file(linked)}.moved`);
+      symlinkSync(`${file(linked)}.moved`, file(linked));
+      // Another file of the same size and mtime takes its place: only the inode differs.
+      const bytes = readFileSync(file(replaced));
+      const at = bytes.lastIndexOf(0x65);
+      bytes[at] = 0x61;
+      writeFileSync(`${file(replaced)}.new`, bytes);
+      utimesSync(`${file(replaced)}.new`, whole, whole);
+      renameSync(`${file(replaced)}.new`, file(replaced));
+      renameSync(file(renamed), `${file(renamed)}.away`);
+      // Still there, but the scan no longer lists it under its recorded name.
+      scan.eml.set(unlisted, { rel: `${unlisted}.other.eml`, kind: 'eml' });
+      return false;
+    };
+    const first = harness(run, indexDir, {}, afterPhase1);
     const opened = await first.service.open(null);
     await first.service.startIndexing(scan);
+    expect(changedOnce).toBe(true);
     expect(first.service.progress).toMatchObject({
       bodyPhase: 'done',
       bodiesDone: 10,
       bodiesFailed: 1,
     });
     const after = states(first.service.dbPath);
-    expect(after[changed]).toEqual([BODY_STATE.pending, null]);
-    expect(after[gone]).toEqual([BODY_STATE.pending, null]);
+    for (const id of [changed, gone, replaced, renamed, unlisted]) {
+      expect(after[id], id).toEqual([BODY_STATE.pending, null]);
+    }
     expect(after[linked]).toEqual([BODY_STATE.failed, 'FILE_SYMLINK']);
     expect(
       first.logs.filter((l) => l.code === 'index.body_failed').map((l) => l.data.reason),
     ).toEqual(['symlink']);
+    // Nothing of a file that changed was kept.
+    expect(await found(first.service, 'rewritten')).toEqual([]);
     await first.service.close();
 
     // The next open reconciles them: the changed file is read, the gone one is marked.
+    rmSync(file(linked));
+    renameSync(`${file(linked)}.moved`, file(linked));
+    renameSync(`${file(renamed)}.away`, file(renamed));
     const second = harness(run, indexDir);
     await second.service.open(opened.dbUuid);
     await second.service.startIndexing(scanRun(run));
     const again = states(second.service.dbPath);
     expect(again[changed]).toEqual([BODY_STATE.indexed, null]);
     expect(again[gone]).toEqual([BODY_STATE.emlMissing, null]);
+    expect(again[replaced]).toEqual([BODY_STATE.indexed, null]);
+    expect(again[renamed]).toEqual([BODY_STATE.indexed, null]);
+    expect(again[unlisted]).toEqual([BODY_STATE.indexed, null]);
     expect(await found(second.service, 'rewritten')).toEqual([changed]);
     await second.service.close();
+  });
+
+  it('never opens a message file whose row has no whole identity, and leaves it waiting', async () => {
+    const { run, indexDir } = exportAt('phase2-no-identity', 8);
+    const [noDevIno, noSize, badMtime] = idsOf(run) as [string, string, string];
+    const scan = scanRun(run);
+    let dbPath = '';
+    const afterPhase1 = (role: ThreadRole, op: string) => {
+      if (role !== 'writer' || op !== 'bodyOrder' || !dbPath) return false;
+      const db = openDb(dbPath);
+      try {
+        db.exec(`UPDATE pairs SET eml_dev = NULL, eml_ino = NULL WHERE proton_id = '${noDevIno}'`);
+        db.exec(`UPDATE pairs SET eml_size = NULL WHERE proton_id = '${noSize}'`);
+        db.exec(`UPDATE pairs SET eml_mtime_ns = 'soon' WHERE proton_id = '${badMtime}'`);
+      } finally {
+        db.close();
+      }
+      dbPath = '';
+      return false;
+    };
+    const openedRels: string[] = [];
+    const h = harness(run, indexDir, {}, afterPhase1, undefined, {
+      openFile: (root, ref) => {
+        openedRels.push(ref.rel);
+        return openContainedAsync(root, ref);
+      },
+    });
+    await h.service.open(null);
+    dbPath = h.service.dbPath;
+    await h.service.startIndexing(scan);
+    expect(dbPath).toBe('');
+    expect(h.service.progress).toMatchObject({ bodyPhase: 'done', bodiesDone: 8, bodiesFailed: 0 });
+    const after = states(h.service.dbPath);
+    for (const id of [noDevIno, noSize, badMtime]) {
+      expect(after[id], id).toEqual([BODY_STATE.pending, null]);
+      expect(openedRels, id).not.toContain(`${id}.eml`);
+    }
+    expect(openedRels).toHaveLength(5);
+    await h.service.close();
   });
 
   it('writes nothing once the generation has moved on', async () => {

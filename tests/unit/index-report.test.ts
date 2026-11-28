@@ -14,7 +14,12 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { scanRun } from '../../src/core/containment';
+import {
+  openContainedAsync,
+  scanRun,
+  type FileRef,
+  type Rejection,
+} from '../../src/core/containment';
 import { MAX_ATTACHMENTS, MAX_LABELS, MAX_RECIPIENTS } from '../../src/core/index/metadata';
 import { SYSTEM_IDS } from '../../src/core/index/ops';
 import { bodyCode, indexReport, pairReason, withScan } from '../../src/core/index/report';
@@ -47,6 +52,8 @@ function service(
   indexDir: string,
   options: IndexOptions = {},
   hang: (role: ThreadRole, op: string, args: unknown) => boolean = () => false,
+  onRejected?: (rejected: Rejection[]) => void,
+  openFile?: (root: string, ref: FileRef) => Promise<number>,
 ): IndexService {
   return new IndexService({
     indexDir,
@@ -56,6 +63,8 @@ function service(
     thread: (role) => new InlineThread(role, (op, args) => hang(role, op, args)),
     isCurrent: () => true,
     options,
+    ...(onRejected ? { onRejected } : {}),
+    ...(openFile ? { openFile } : {}),
   });
 }
 
@@ -141,52 +150,67 @@ describe('the index report', () => {
     mkdirSync(join(run, 'zz-folder.eml'));
     expect(spawnSync('/usr/bin/mkfifo', [join(run, 'zz-pipe.metadata.json')]).status).toBe(0);
     const scan = scanRun(run);
-    // Refused when read: a metadata file becomes a FIFO after the scan.
+    // Refused at its first look: a metadata file becomes a FIFO after the
+    // listing. It is counted with the listing's refusals, and its message
+    // has no metadata.
     rmSync(join(run, `${swapped}.metadata.json`));
     expect(spawnSync('/usr/bin/mkfifo', [join(run, `${swapped}.metadata.json`)]).status).toBe(0);
 
-    const s = service(run, join(dir, 'index'), { jobMs: 1000 }, (role, op, args) => {
-      if (role !== 'parse' || op !== 'meta') return false;
-      return (args as { items: Array<{ protonId: string }> }).items.some(
-        (i) => i.protonId === slow,
-      );
-    });
+    const refused = [...scan.rejected];
+    const s = service(
+      run,
+      join(dir, 'index'),
+      { jobMs: 1000 },
+      (role, op, args) => {
+        if (role !== 'parse' || op !== 'meta') return false;
+        return (args as { items: Array<{ protonId: string }> }).items.some(
+          (i) => i.protonId === slow,
+        );
+      },
+      (found) => refused.push(...found),
+    );
     await s.open(null);
     await s.startIndexing(scan);
     expect(s.progress.phase).toBe('done');
     expect(s.took).toEqual(expect.any(Number));
 
     const part = (await s.ask({ op: 'report' })) as IndexReport;
-    const report = withScan(part, scan.rejected, s.took);
+    const report = withScan(part, refused, s.took);
     // 30 pairs, less the seven whose metadata is missing or couldn't be used.
     expect(report.messages).toBe(23);
+    expect(refused).toHaveLength(4);
     expect(report.rejected).toEqual({ symlink: 1, directory: 1, fifo: 2 });
-    expect(report.metaMissing).toBe(1);
+    expect(report.metaMissing).toBe(2);
     expect(report.emlMissing).toBe(2);
     expect(report.failed).toEqual({ meta_json: 2, meta_shape: 1, meta_id: 1 });
     expect(report.timeouts).toBe(1);
     expect(report.capped).toEqual({ to: 2 });
     expect(report.cappedMessages).toBe(2);
     expect(report.hiddenLabelIds).toBe(1);
-    // By result: the 13 files less the one listed with no message file only.
-    expect(fileCounts(report)).toEqual({ skipped: 10, truncated: 2 });
-    // 14 rows for 13 files: the message with no file and a cut list has two.
-    expect(report.attention).toBe(13);
+    // By result: the 14 files less the one listed with no message file only.
+    expect(fileCounts(report)).toEqual({ skipped: 11, truncated: 2 });
+    // 15 rows for 14 files: the message with no file and a cut list has two.
+    expect(report.attention).toBe(14);
     expect(report.more).toBe(0);
     expect(report.took).toBe(s.took);
 
     const meta = (id: string) => `${id}.metadata.json`;
-    expect(report.rows).toEqual([
+    // The listing's refusals first, by file name.
+    const listed = [
       { result: 'skipped', file: 'zz-folder.eml', reason: 'directory' },
       { result: 'skipped', file: 'zz-link.metadata.json', reason: 'symlink' },
       { result: 'skipped', file: 'zz-pipe.metadata.json', reason: 'fifo' },
+      { result: 'skipped', file: meta(swapped), reason: 'fifo' },
+    ].sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+    expect(report.rows).toEqual([
+      ...listed,
       { result: 'skipped', file: meta(badJson), reason: 'meta_json' },
       { result: 'skipped', file: meta(badShape), reason: 'meta_shape' },
       { result: 'skipped', file: meta(badId), reason: 'meta_id' },
-      { result: 'skipped', file: meta(swapped), reason: 'fifo' },
       { result: 'skipped', file: meta(slow), reason: 'timeout' },
       { result: 'skipped', file: meta(jsonNoEml), reason: 'meta_json' },
       { result: 'skipped', file: `${metaGone}.eml`, reason: 'meta_missing' },
+      { result: 'skipped', file: `${swapped}.eml`, reason: 'meta_missing' },
       { result: 'listed', file: meta(emlGone), reason: 'eml_missing' },
       { result: 'listed', file: meta(wideNoEml), reason: 'eml_missing' },
       { result: 'truncated', file: meta(wide), reason: 'capped', lists: ['to'] },
@@ -204,7 +228,7 @@ describe('the index report', () => {
     expect(text).toContain('Message file missing: 2\n');
     expect(text).toContain('Lists cut to their limit: 2 (to 2)\n');
     expect(text).toContain('Unknown label IDs hidden: 1\n');
-    expect(text).toContain('13 files need attention\n');
+    expect(text).toContain('14 files need attention\n');
     expect(text).not.toContain(' more\n');
     expect(text).toContain(
       `Truncated\t${meta(wide)}\tOver 1,000 To addresses. First 1,000 kept. (capped: to)\n`,
@@ -216,7 +240,7 @@ describe('the index report', () => {
     const file = readdirSync(join(dir, 'index')).find((n) => n.endsWith('.sqlite'));
     const db = openDb(join(dir, 'index', file!), true);
     try {
-      const own = report.rows.slice(3);
+      const own = report.rows.slice(listed.length);
       expect(indexReport(db, SYSTEM_IDS, 3)).toMatchObject({
         rows: own.slice(0, 3),
         attention: 10,
@@ -248,12 +272,20 @@ describe('the index report', () => {
     rmSync(join(run, `${emlGone}.eml`));
     writeFileSync(join(run, `${badJson}.metadata.json`), '{"Version": 1, "Payload": {');
     const scan = scanRun(run);
-    // Refused when phase 2 opens it: the message file becomes a FIFO after the scan.
-    rmSync(join(run, `${swapped}.eml`));
-    expect(spawnSync('/usr/bin/mkfifo', [join(run, `${swapped}.eml`)]).status).toBe(0);
+    // Refused when phase 2 opens it: the message file becomes a FIFO once phase 1
+    // has recorded it, just before phase 2 opens it.
+    let fifo = false;
+    const swapOnOpen = (root: string, ref: FileRef): Promise<number> => {
+      if (ref.rel.endsWith(`${swapped}.eml`) && !fifo) {
+        fifo = true;
+        rmSync(join(run, `${swapped}.eml`));
+        expect(spawnSync('/usr/bin/mkfifo', [join(run, `${swapped}.eml`)]).status).toBe(0);
+      }
+      return openContainedAsync(root, ref);
+    };
 
     const indexDir = join(dir, 'index');
-    const s = service(run, indexDir, { jobMs: 1000 }, hangBodies(slow));
+    const s = service(run, indexDir, { jobMs: 1000 }, hangBodies(slow), undefined, swapOnOpen);
     await s.open(null);
     await s.startIndexing(scan);
     expect(s.progress).toMatchObject({

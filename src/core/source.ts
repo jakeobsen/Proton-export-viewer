@@ -14,7 +14,6 @@
 // and dropped if their index is no longer the current one.
 
 import { closeSync, fstatSync } from 'node:fs';
-import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import type {
   CoreEvent,
@@ -39,6 +38,7 @@ import {
   addEntry,
   countRejections,
   emptyScan,
+  listRunAsync,
   openContained,
   openWithRescan,
   pairCounts,
@@ -306,8 +306,33 @@ export class SourceSession {
       onChange: () => {
         if (this.index === service) this.sendEvent(stamp, service.progress, false);
       },
+      onRejected: (found) => this.rejectedLater(service, stamp, found),
     });
     return service;
+  }
+
+  /**
+   * Files refused after the listing, by phase 1: one that is now of another
+   * type, or one over its size limit. They join the listing's rejections, so
+   * the count by reason is the same as if the listing had looked at every
+   * file, and are logged by reason.
+   */
+  private rejectedLater(service: IndexService, stamp: Stamp, found: Rejection[]): void {
+    if (this.index !== service || !this.gate.isCurrent(stamp)) return;
+    const listed = new Set(this.records.rejected.map((r) => r.rel));
+    const added = found.filter((r) => !listed.has(r.rel));
+    if (added.length === 0) return;
+    this.records.rejected = [...this.records.rejected, ...added];
+    if (this.records.summary) {
+      this.records.summary = {
+        ...this.records.summary,
+        rejected: countRejections(this.records.rejected),
+      };
+    }
+    for (const [kind, count] of Object.entries(countRejections(added))) {
+      if (count > 0)
+        this.log.info('index.rejected', { reason: kind, count }, { src: stamp.sourceKey });
+    }
   }
 
   /**
@@ -738,12 +763,13 @@ export class SourceSession {
   }
 
   /**
-   * Looks at every entry of the run folder, and reports how far it got: once
-   * the folder is listed, then at most every SCAN_REPORT_MS, and at the end.
+   * Lists the run folder with each entry's type and sorts the entries, and
+   * reports how far it got: once the folder is listed, then at most every
+   * SCAN_REPORT_MS, and at the end.
    */
   private async scanEntries(root: string, stamp: Stamp): Promise<RunScan> {
     if (__PEV_TEST_HOOKS__) await this.indexSetup?.options?.beforeScan?.();
-    const names = await readdir(root);
+    const entries = await listRunAsync(root);
     const scan = emptyScan(root);
     let reported = 0;
     const report = (done: number) => {
@@ -753,7 +779,7 @@ export class SourceSession {
         {
           phase: 'scanning',
           loaded: done,
-          total: names.length,
+          total: entries.length,
           failed: 0,
           timeouts: 0,
           capped: 0,
@@ -771,14 +797,14 @@ export class SourceSession {
       );
     };
     report(0);
-    for (let i = 0; i < names.length; i += 1) {
-      addEntry(scan, names[i]!);
+    for (let i = 0; i < entries.length; i += 1) {
+      addEntry(scan, entries[i]!);
       if (i % SCAN_SLICE === SCAN_SLICE - 1) {
         if (performance.now() - reported >= SCAN_REPORT_MS) report(i + 1);
         await yieldToLoop();
       }
     }
-    report(names.length);
+    report(entries.length);
     // Test builds can hold the scan here too, with everything listed.
     if (__PEV_TEST_HOOKS__) await this.indexSetup?.options?.beforeScan?.();
     return scan;
