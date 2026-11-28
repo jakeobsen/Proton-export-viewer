@@ -82,7 +82,10 @@ async function hostileRow(row: Locator): Promise<void> {
   await expect(row.locator('.t')).toHaveText(SUBJECT);
   await expect(row.locator('.t')).toHaveAttribute('title', SUBJECT);
   await expect(row.locator('.cnt-badge')).toHaveText('2');
-  expect(holds(await row.textContent())).toBe(false);
+  // The name line and the subject line; a result's snippet line is the
+  // search's own text, cleaned with the snippets.
+  expect(holds(await row.locator('.l1').textContent())).toBe(false);
+  expect(holds(await row.locator('.subj').textContent())).toBe(false);
   inOrder(await boxes(row, ['.from', '.cnt-badge', '.date']), 1);
   expect((await boxes(row, ['.t']))[0]!.isolated).toBe(true);
 }
@@ -146,6 +149,17 @@ test('in the list, the results and the conversation, subjects and names are clea
   const results = pev.page.locator('.conv.result');
   await expect(results).toHaveCount(1);
   await hostileRow(results.first());
+  // The snippet line is isolated too, and sits below the subject line.
+  const lines = await results.first().evaluate((row) =>
+    ['.l1', '.subj', '.snip'].map((s) => {
+      const el = row.querySelector<HTMLElement>(s)!;
+      const box = el.getBoundingClientRect();
+      return { top: box.top, bottom: box.bottom, bidi: getComputedStyle(el).unicodeBidi };
+    }),
+  );
+  expect(lines[1]!.top).toBeGreaterThanOrEqual(lines[0]!.bottom);
+  expect(lines[2]!.top).toBeGreaterThanOrEqual(lines[1]!.bottom);
+  expect(lines[2]!.bidi).toBe('isolate');
   await typeText(pev.page, '');
   await expect(results).toHaveCount(0);
 
@@ -183,21 +197,20 @@ const READER_EML = [
   '',
 ].join('\r\n');
 
+// A sender whose name is only format characters.
+const BLANK_NAME_EML = READER_EML.replace(
+  'From: "\u202eEve Mallory" <eve@example.com>',
+  'From: "\u202e\u200b" <zed@example.com>',
+);
+
 interface ShownHeaders {
   view: { url: string; headers: { subject: string; from: string; to: string } } | null;
   pending: boolean;
 }
 
-test("the reader's header and Details show the subject, the names and the recipients cleaned", async ({
-  pev,
-}) => {
-  const root = realpathSync(testDir('mail-text-reader'));
-  writeFileSync(join(root, 'reader.eml'), READER_EML);
-  const opened = await pev.main<{ ok: boolean }>('readerSource', root, [
-    [1, { file: 'reader.eml' }],
-  ]);
-  expect(opened.ok).toBe(true);
-  await pev.shell('openInReader', [1]);
+/** Opens `rowid` in the reader and waits until the pane shows it. */
+async function openShown(pev: PevApp, rowid: number): Promise<ShownHeaders> {
+  await pev.shell('openInReader', [rowid]);
   await expect
     .poll(async () => {
       const r = await pev.shell<ShownHeaders>('reader');
@@ -205,7 +218,21 @@ test("the reader's header and Details show the subject, the names and the recipi
       return !r.pending && r.view !== null && src === r.view.url;
     })
     .toBe(true);
-  const { view } = await pev.shell<ShownHeaders>('reader');
+  return pev.shell<ShownHeaders>('reader');
+}
+
+test("the reader's header and Details show the subject, the names and the recipients cleaned", async ({
+  pev,
+}) => {
+  const root = realpathSync(testDir('mail-text-reader'));
+  writeFileSync(join(root, 'reader.eml'), READER_EML);
+  writeFileSync(join(root, 'blank.eml'), BLANK_NAME_EML);
+  const opened = await pev.main<{ ok: boolean }>('readerSource', root, [
+    [1, { file: 'reader.eml' }],
+    [2, { file: 'blank.eml' }],
+  ]);
+  expect(opened.ok).toBe(true);
+  const { view } = await openShown(pev, 1);
   // The raw values still hold the format and control characters.
   expect(RAW.every((c) => view!.headers.subject.includes(c))).toBe(true);
   expect(view!.headers.subject).toContain('\t');
@@ -235,6 +262,12 @@ test("the reader's header and Details show the subject, the names and the recipi
   await expect(dd.nth(0)).not.toContainText('\u202e');
   await expect(dd.nth(1)).not.toContainText('\u2067');
   await expect(dd.nth(1)).toContainText('Bob');
+
+  // A name that cleans to nothing gives way to the address, shown once.
+  const blank = await openShown(pev, 2);
+  expect(blank.view!.headers.from).toContain('\u200b');
+  await expect(pane.locator('.rp-name')).toHaveText('zed@example.com');
+  await expect(pane.locator('.rp-addr')).toHaveCount(0);
   const windows = await pev.main<Array<{ visible: boolean; focused: boolean }>>('windowState');
   expect(windows.filter((w) => w.visible || w.focused)).toEqual([]);
 });

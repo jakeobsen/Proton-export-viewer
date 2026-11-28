@@ -660,6 +660,7 @@ body,
   font-size: 11.5px;
 }
 
+/* A snippet is mail data: an isolated run of text. */
 .conv .snip {
   height: 18px;
   margin-top: 2px;
@@ -669,6 +670,7 @@ body,
   line-height: 18px;
   text-overflow: ellipsis;
   white-space: nowrap;
+  unicode-bidi: isolate;
 }
 
 .conv .snip mark {

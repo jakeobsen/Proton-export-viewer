@@ -87,7 +87,8 @@ function WarnIcon() {
 function Header({ headers }: { headers: MessageHeaders }) {
   const sender = senderOf(headers.from);
   const subject = displayText(headers.subject);
-  const name = displayText(sender.name);
+  // A name that cleans to nothing gives way to the address, as on the cards.
+  const name = displayText(sender.name) || displayText(sender.address);
   return (
     <>
       {subject !== '' && (
@@ -114,12 +115,11 @@ function Who({ headers, details: more }: { headers: MessageHeaders; details: Mes
   const [details, setDetails] = useState(false);
   const sender = senderOf(headers.from);
   const address = displayText(sender.address);
+  const name = displayText(sender.name) || address;
   const recipients = displayText([headers.to, headers.cc].filter((r) => r !== '').join(', '));
   return (
     <div className="rp-who">
-      {address !== '' && address !== displayText(sender.name) && (
-        <span className="rp-addr">&lt;{address}&gt;</span>
-      )}
+      {address !== '' && address !== name && <span className="rp-addr">&lt;{address}&gt;</span>}
       {recipients !== '' && <span className="rp-to">to {recipients}</span>}
       <button
         type="button"
