@@ -3,9 +3,10 @@
 // one of them expanded in the reader. Like the list, only a window of cards
 // around what is on screen is held, read again when the index moves on or the
 // view leaves it. Each read follows the expanded message, so a merge or split
-// keeps the expansion. If the expanded message is gone, the nearest card
-// (the next newer one first) opens in its place; with no card left, the
-// reader closes and its view is revoked.
+// keeps the expansion, and a move steps it to the next newer or older card.
+// If the expanded message is gone, the nearest card (the next newer one
+// first) opens in its place; with no card left, the reader closes and its
+// view is revoked.
 
 import {
   CARDS_AFTER,
@@ -85,6 +86,8 @@ export class CardsModel {
   private again = false;
   /** The next read anchors at the expanded card's place, wherever the screen is. */
   private seekExpanded = false;
+  /** Cards to move the expansion by once the expanded card's neighbours are read. */
+  private pendingMove = 0;
   /** Conversation changes since the start; a read for an older one is dropped. */
   private epoch = 0;
 
@@ -130,6 +133,7 @@ export class CardsModel {
     this.selected = rowid;
     this.expandedKey = null;
     this.seekExpanded = false;
+    this.pendingMove = 0;
     this.snap = {
       ...EMPTY,
       shown: true,
@@ -148,6 +152,7 @@ export class CardsModel {
     this.epoch += 1;
     this.selected = null;
     this.expandedKey = null;
+    this.pendingMove = 0;
     this.snap = { ...EMPTY, scrollId: this.snap.scrollId, shiftId: this.snap.shiftId };
     this.onChange();
   }
@@ -158,10 +163,45 @@ export class CardsModel {
    */
   expand(card: CardRow): boolean {
     if (!this.snap.shown || card.rowid === this.snap.expanded) return false;
+    // A card expanded by hand replaces any move still waiting for a read.
+    this.pendingMove = 0;
     this.expandedKey = { time: card.time, rowid: card.rowid };
     this.set({ expanded: card.rowid, scrollId: this.snap.scrollId + 1 });
     this.actions.open(card.rowid);
     return true;
+  }
+
+  /**
+   * Expands the card `step` places from the expanded one: 1 is the next newer,
+   * -1 the next older. Nothing happens past either end. If that card isn't
+   * held, the cards around the expanded one are read first. Returns false if
+   * there is no card to move to.
+   */
+  move(step: 1 | -1): boolean {
+    const { shown, ready, expanded, total } = this.snap;
+    if (!shown || !ready || expanded === null) return false;
+    const at = this.expandedIndex();
+    if (at !== null && this.pendingMove === 0) {
+      const to = at + step;
+      if (to < 0 || to >= total) return false;
+      const card = this.cardAt(to);
+      if (card) return this.expand(card);
+    }
+    // The expanded card or its neighbour isn't held: read at its place, then move.
+    this.pendingMove += step;
+    this.seekExpanded = true;
+    this.refresh();
+    return true;
+  }
+
+  /** Moves the expansion by the moves that waited for a read, within the conversation. */
+  private applyMove(): void {
+    const step = this.pendingMove;
+    this.pendingMove = 0;
+    const at = this.expandedIndex();
+    if (at === null) return;
+    const card = this.cardAt(Math.max(0, Math.min(this.snap.total - 1, at + step)));
+    if (card) this.expand(card);
   }
 
   /** The positions on screen, first and last; reads more cards if they aren't held. */
@@ -259,6 +299,7 @@ export class CardsModel {
     if (answer.threadId === null) {
       // Nothing of the conversation is left.
       this.seekExpanded = false;
+      this.pendingMove = 0;
       const hadExpanded = expanded !== null;
       this.set({
         threadId: null,
@@ -313,8 +354,12 @@ export class CardsModel {
     this.first = Math.max(0, this.first + moved);
     this.last = Math.max(this.first, this.last + moved);
     if (removed) {
+      // The nearest card opens in the removed one's place; a waiting move is dropped.
+      this.pendingMove = 0;
       if (next !== null) this.actions.open(next);
       else this.actions.close();
+    } else if (this.pendingMove !== 0) {
+      this.applyMove();
     }
     return true;
   }

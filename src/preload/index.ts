@@ -49,6 +49,15 @@ const api: PevApi = {
   },
   linkAction: (dialogId, action, generation) =>
     ipcRenderer.invoke(IPC.linkAction, { dialogId, action, generation }),
+  onCardKey: (listener) => {
+    const handler = (_event: unknown, key: unknown) => {
+      if (key === 'n' || key === 'p') listener(key);
+    };
+    ipcRenderer.on(IPC.cardKey, handler);
+    return () => {
+      ipcRenderer.off(IPC.cardKey, handler);
+    };
+  },
   sources: (generation) => ipcRenderer.invoke(IPC.sources, { generation }),
   chooseFolder: (generation) => ipcRenderer.invoke(IPC.chooseFolder, { generation }),
   openExport: (sourceKey, generation) =>

@@ -5,7 +5,8 @@
 // removing the card revokes the old view at once, even while the next parse
 // is pending; at every step a window holds at most one body frame and one
 // live token. A merge or split keeps the expansion, and a long conversation
-// draws a bounded number of cards.
+// draws a bounded number of cards. `n` and `p` move the expansion from the
+// list, the cards and the body frame, but not from an editable control.
 
 import { realpathSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -682,5 +683,166 @@ test('a conversation of 1,200 messages draws a bounded number of cards', async (
   // The expansion and its view stay as they were; its frame may be out of the drawn range.
   expect((await cardsState(pev)).expanded).toBe(row.newestRowid);
   expect((await oneView(pev)).live).toBe(1);
+  await checkHidden(pev);
+});
+
+const rejected = (pev: PevApp, reason: string) =>
+  pev.logs('main').filter((l) => l.code === 'ipc.rejected' && l.data.reason === reason).length;
+
+/** The expanded card stays `rowid`, with no open started, after a key that moves nothing. */
+async function stays(pev: PevApp, rowid: number): Promise<void> {
+  await pev.page.waitForTimeout(300);
+  expect((await cardsState(pev)).expanded).toBe(rowid);
+  expect((await reader(pev)).rowid).toBe(rowid);
+}
+
+test('n and p from the list and the cards expand the next newer and older card, stopping at either end', async ({
+  pev,
+}) => {
+  await openThreads(pev, 'conv-keys', [{ messages: 4 }, { messages: 1 }]);
+  const row = await rowOf(pev, 4);
+  const ids = await cardIds(pev, row.newestRowid);
+  await pressRow(pev, row);
+  await expanded(pev, ids[3]!);
+  const selected = pev.page.locator(`.conv[data-thread="${row.threadId}"]`);
+  await expect(selected).toHaveAttribute('aria-selected', 'true');
+  const installed = count(pev, 'view.installed');
+
+  // From the list: the newest card has nothing newer; p goes back one at a time.
+  await selected.focus();
+  await pev.page.keyboard.press('n');
+  await stays(pev, ids[3]!);
+  await pev.page.keyboard.press('p');
+  await expanded(pev, ids[2]!);
+  await pev.page.keyboard.press('p');
+  await expanded(pev, ids[1]!);
+  // The list selection stays where it was.
+  await expect(selected).toHaveAttribute('aria-selected', 'true');
+  await expect(selected).toBeFocused();
+
+  // From the cards: the oldest card has nothing older.
+  await pev.page.locator(`.card[data-rowid="${ids[1]}"] .card-h`).focus();
+  await pev.page.keyboard.press('p');
+  await expanded(pev, ids[0]!);
+  await pev.page.keyboard.press('p');
+  await stays(pev, ids[0]!);
+  await pev.page.keyboard.press('n');
+  await expanded(pev, ids[1]!);
+  // With Control, Option or Shift it is another key.
+  await pev.page.keyboard.press('Control+n');
+  await pev.page.keyboard.press('Alt+n');
+  await pev.page.keyboard.press('Shift+N');
+  await stays(pev, ids[1]!);
+
+  // One view for each move, and one live token.
+  expect(count(pev, 'view.installed')).toBe(installed + 4);
+  expect(await oneView(pev)).toEqual({ frames: 1, live: 1 });
+  await expect(selected).toHaveAttribute('aria-selected', 'true');
+  await checkHidden(pev);
+});
+
+test('n and p typed in the body frame move the expanded card; in a field, a menu, editable text or the link dialog they do not', async ({
+  pev,
+}) => {
+  await openThreads(pev, 'conv-keys-frame', [{ messages: 3 }]);
+  const row = await rowOf(pev, 3);
+  const ids = await cardIds(pev, row.newestRowid);
+  await pressRow(pev, row);
+  await expanded(pev, ids[2]!);
+  // Keys the shell's own document sees.
+  await pev.page.evaluate(() => {
+    const seen = { keys: 0 };
+    (window as unknown as { __seen: typeof seen }).__seen = seen;
+    window.addEventListener('keydown', () => (seen.keys += 1), true);
+  });
+  const shellKeys = () =>
+    pev.page.evaluate(() => (window as unknown as { __seen: { keys: number } }).__seen.keys);
+
+  // The body frame has the focus: main passes the key on.
+  await pev.page.locator('.card.expanded .rp-frame').focus();
+  await pev.page.keyboard.press('p');
+  await expanded(pev, ids[1]!);
+  expect(await shellKeys()).toBe(0);
+  await pev.page.locator('.card.expanded .rp-frame').focus();
+  await pev.page.keyboard.press('n');
+  const view = await expanded(pev, ids[2]!);
+  expect(await shellKeys()).toBe(0);
+
+  // A text field, a menu and editable text keep the keys.
+  await pev.page.evaluate(() => {
+    const field = document.createElement('input');
+    field.id = 'key-field';
+    const menu = document.createElement('select');
+    menu.id = 'key-menu';
+    for (const name of ['m', 'n', 'p']) menu.append(new Option(name, name));
+    const text = document.createElement('div');
+    text.id = 'key-text';
+    text.contentEditable = 'true';
+    document.body.append(field, menu, text);
+  });
+  for (const id of ['key-field', 'key-menu', 'key-text']) {
+    await pev.page.locator(`#${id}`).focus();
+    await pev.page.keyboard.press('p');
+    await pev.page.keyboard.press('n');
+    await stays(pev, ids[2]!);
+  }
+  await expect(pev.page.locator('#key-field')).toHaveValue('pn');
+  await expect(pev.page.locator('#key-text')).toHaveText('pn');
+  await pev.page.evaluate(() => {
+    for (const id of ['key-field', 'key-menu', 'key-text']) document.getElementById(id)?.remove();
+  });
+
+  // The link dialog is open: the keys stay with it.
+  await pev.shell('windowOpen', [linkUrl(view, 'l1')]);
+  await expect(pev.page.locator('.link-dialog')).toHaveCount(1);
+  await pev.page.keyboard.press('p');
+  await stays(pev, ids[2]!);
+  await expect(pev.page.locator('.link-dialog')).toHaveCount(1);
+  await pev.page.keyboard.press('Escape');
+  await expect(pev.page.locator('.link-dialog')).toHaveCount(0);
+  await pev.page.keyboard.press('p');
+  await expanded(pev, ids[1]!);
+  expect(await pev.main('externalCalls')).toEqual([]);
+  await checkHidden(pev);
+});
+
+test('a held p installs only the view of the card where it stops', async ({ pev }) => {
+  await openThreads(pev, 'conv-keys-held', [{ messages: 8 }]);
+  const row = await rowOf(pev, 8);
+  const ids = await cardIds(pev, row.newestRowid);
+  await pressRow(pev, row);
+  const first = await expanded(pev, ids[7]!);
+  await pev.page.locator(`.conv[data-thread="${row.threadId}"]`).focus();
+  const installed = count(pev, 'view.installed');
+  const superseded = rejected(pev, 'superseded');
+
+  // Six key-downs, the last five repeats, while core holds every open. With
+  // opens at least 500 ms apart, the first goes to core at once; of the five
+  // that wait their turn, only the newest follows it.
+  await pev.main('openGap', 500);
+  await pev.page.waitForTimeout(500);
+  await core(pev, 'hold');
+  for (let i = 0; i < 6; i += 1) await pev.page.keyboard.down('p');
+  await pev.page.keyboard.up('p');
+  await expect.poll(async () => (await reader(pev)).rowid).toBe(ids[1]);
+  await expect.poll(() => core(pev, 'held')).toBe(2);
+  expect(rejected(pev, 'superseded')).toBe(superseded + 4);
+  expect(await status(pev, first)).toBe(404);
+  expect(await oneView(pev)).toEqual({ frames: 0, live: 0 });
+  await expect(pev.page.locator('.card.expanded')).toHaveCount(1);
+  await expect(pev.page.locator(`.card[data-rowid="${ids[1]}"]`)).toHaveClass(/expanded/);
+
+  await core(pev, 'release');
+  await expanded(pev, ids[1]!);
+  expect(count(pev, 'view.installed')).toBe(installed + 1);
+  await expect.poll(() => rejected(pev, 'superseded')).toBe(superseded + 5);
+  await pev.page.waitForTimeout(600);
+  expect(count(pev, 'view.installed')).toBe(installed + 1);
+  expect(await oneView(pev)).toEqual({ frames: 1, live: 1 });
+  await pev.main('openGap', null);
+  await expect(pev.page.locator(`.conv[data-thread="${row.threadId}"]`)).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
   await checkHidden(pev);
 });

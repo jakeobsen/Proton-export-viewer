@@ -26,6 +26,7 @@ export const IPC = {
   report: 'pev:report',
   linkDialog: 'pev:link-dialog',
   linkAction: 'pev:link-action',
+  cardKey: 'pev:card-key',
   sources: 'pev:sources',
   chooseFolder: 'pev:choose-folder',
   openExport: 'pev:open-export',
@@ -127,6 +128,9 @@ export type SearchResult =
   | { ok: true; generation: number; queryId: number; page: SearchPage; progress: IndexProgress }
   | Rejected;
 
+/** The keys that move the expanded card: `n` to the next newer, `p` to the next older. */
+export type CardKeyName = 'n' | 'p';
+
 export type CloseViewResult = { ok: true } | Rejected;
 
 export type ErrorKind = 'uncaught' | 'rejection' | 'error';
@@ -156,6 +160,8 @@ export interface PevApi {
   onLinkDialog(listener: (prompt: LinkPrompt) => void): () => void;
   /** The user's choice in the link dialog. Only the dialog's id goes to main. */
   linkAction(dialogId: string, action: LinkAction, generation: number): Promise<LinkActionResult>;
+  /** Called with `n` or `p` typed while the body frame has the focus. */
+  onCardKey(listener: (key: CardKeyName) => void): () => void;
   sources(generation: number): Promise<SourcesResult>;
   chooseFolder(generation: number): Promise<SourceActionResult>;
   openExport(sourceKey: string, generation: number): Promise<SourceActionResult>;

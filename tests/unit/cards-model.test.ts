@@ -283,6 +283,109 @@ describe('the cards model', () => {
     db.close();
   });
 
+  it('moves to the next newer and older card, stopping at either end', async () => {
+    const { db, ids, model, actions, settle } = setup();
+    model.show(ids[2]!, null);
+    await settle();
+    const scroll = model.snapshot.scrollId;
+    expect(model.move(1)).toBe(true);
+    expect(model.snapshot.expanded).toBe(ids[3]);
+    expect(model.snapshot.scrollId).toBe(scroll + 1);
+    expect(model.move(-1)).toBe(true);
+    expect(model.move(-1)).toBe(true);
+    expect(model.snapshot.expanded).toBe(ids[1]);
+    expect(actions).toEqual([
+      ['open', ids[2]],
+      ['open', ids[3]],
+      ['open', ids[2]],
+      ['open', ids[1]],
+    ]);
+    // The oldest card: nothing older. The newest: nothing newer.
+    model.show(ids[0]!, null);
+    await settle();
+    expect(model.move(-1)).toBe(false);
+    model.show(ids[5]!, null);
+    await settle();
+    expect(model.move(1)).toBe(false);
+    expect(model.snapshot.expanded).toBe(ids[5]);
+    expect(actions.slice(4)).toEqual([
+      ['open', ids[0]],
+      ['open', ids[5]],
+    ]);
+    db.close();
+  });
+
+  it('does not move before the conversation is read, or with none shown', async () => {
+    const { db, ids, model, actions, settle } = setup();
+    expect(model.move(1)).toBe(false);
+    model.show(ids[2]!, null);
+    expect(model.move(1)).toBe(false);
+    await settle();
+    expect(model.snapshot.expanded).toBe(ids[2]);
+    expect(actions).toEqual([['open', ids[2]]]);
+    db.close();
+  });
+
+  it('reads at the expanded card first when the screen is elsewhere, then moves', async () => {
+    const { db, ids, model, actions, queries, settle } = setup(400);
+    model.show(ids[0]!, null);
+    await settle();
+    model.setViewport(300, 310);
+    await settle();
+    expect(model.expandedIndex()).toBeNull();
+    const reads = queries.length;
+    expect(model.move(1)).toBe(true);
+    await settle();
+    await settle();
+    expect(queries.length).toBe(reads + 1);
+    expect(queries.at(-1)!.anchor).toMatchObject({ rowid: ids[0] });
+    expect(model.snapshot.expanded).toBe(ids[1]);
+    expect(actions).toEqual([
+      ['open', ids[0]],
+      ['open', ids[1]],
+    ]);
+    db.close();
+  });
+
+  it('adds up the moves made while that read is under way, and opens only where they end', async () => {
+    const { db, ids, model, actions, settle, holdReads, releaseReads } = setup(400);
+    model.show(ids[10]!, null);
+    await settle();
+    model.setViewport(300, 310);
+    await settle();
+    holdReads();
+    model.move(1);
+    model.move(1);
+    model.move(1);
+    model.move(-1);
+    await releaseReads();
+    expect(model.snapshot.expanded).toBe(ids[12]);
+    expect(actions).toEqual([
+      ['open', ids[10]],
+      ['open', ids[12]],
+    ]);
+    db.close();
+  });
+
+  it('a card expanded by hand while that read is under way replaces the move', async () => {
+    const { db, ids, model, actions, settle, holdReads, releaseReads } = setup(400);
+    model.show(ids[0]!, null);
+    await settle();
+    model.setViewport(300, 310);
+    await settle();
+    holdReads();
+    model.move(1);
+    expect(model.expand(model.cardAt(305)!)).toBe(true);
+    await releaseReads();
+    await settle();
+    expect(model.snapshot.expanded).toBe(ids[305]);
+    expect(actions).toEqual([
+      ['open', ids[0]],
+      ['open', ids[305]],
+    ]);
+    db.close();
+  });
+
   it('reads more cards when the screen leaves the ones held, and only then', async () => {
     const { db, ids, model, queries, settle } = setup(400);
     model.show(ids[0]!, null);
