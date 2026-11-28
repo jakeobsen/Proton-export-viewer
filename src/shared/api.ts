@@ -44,6 +44,11 @@ export const IPC = {
   showInFolder: 'pev:show-in-folder',
   copyMessageId: 'pev:copy-message-id',
   copyReport: 'pev:copy-report',
+  viewSource: 'pev:source',
+  sourceTree: 'pev:source-tree',
+  sourcePart: 'pev:source-part',
+  copyHeaders: 'pev:copy-headers',
+  sourceBack: 'pev:source-back',
 } as const;
 
 export type RejectCode =
@@ -87,6 +92,32 @@ export interface AttachmentItem {
 
 /** The outcome of an action on the open message, such as Show in folder. */
 export type ReaderActionResult = { ok: true } | Rejected;
+
+/** One part of the open message in the source view's tree. Main has checked every field. */
+export interface SourceNode {
+  /** Dotted path: `1` is the message. A part is named to main only by it. */
+  path: string;
+  /** The parent's index in the list, or -1 for the message. */
+  parent: number;
+  /** A lower-case `type/subtype`, or "unknown type". */
+  type: string;
+  charset: string | null;
+  /** The cleaned file name, or ''. */
+  name: string;
+  inline: boolean;
+  /** Decoded bytes; a container's is the sum of its parts'. */
+  size: number;
+  /** The read stopped inside this part: `size` is only what was read. */
+  cut: boolean;
+  risky: boolean;
+}
+
+/** A header block shown in the body frame: the URL to load there. */
+export type SourceResult = { ok: true; url: string; truncated: boolean } | Rejected;
+/** The tree, or null when the message's structure couldn't be read within the limits. */
+export type SourceTreeResult = { ok: true; parts: SourceNode[] | null } | Rejected;
+/** Back to the message: its body URL, or null for a message the reader couldn't render. */
+export type SourceBackResult = { ok: true; url: string | null } | Rejected;
 
 /**
  * The outcome of opening a message: its body view, or the fallback when the
@@ -213,6 +244,19 @@ export interface PevApi {
   showInFolder(openId: number, generation: number): Promise<ReaderActionResult>;
   /** Copies the open message's Message-ID. */
   copyMessageId(openId: number, generation: number): Promise<ReaderActionResult>;
+  /**
+   * Shows the source of the open `openId`, or of its fallback: the message's
+   * raw headers in the body frame.
+   */
+  viewSource(openId: number, generation: number): Promise<SourceResult>;
+  /** The message's parts for the source view's tree. */
+  sourceTree(openId: number, generation: number): Promise<SourceTreeResult>;
+  /** Shows the raw headers of one part, by its path from the tree; null for the message's. */
+  sourcePart(openId: number, path: string | null, generation: number): Promise<SourceResult>;
+  /** Copies the header block the source view shows. */
+  copyHeaders(openId: number, generation: number): Promise<ReaderActionResult>;
+  /** Leaves the source view. */
+  sourceBack(openId: number, generation: number): Promise<SourceBackResult>;
   log(
     level: 'error' | 'warn' | 'info',
     code: string,

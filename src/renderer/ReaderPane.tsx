@@ -2,7 +2,8 @@
 // The reader pane: one message with its sender, date and recipients, the
 // plain text and HTML switch, the actions on the message, the body frame, the
 // lines for search matches, blocked images, size limits and the fallback, and
-// the attachments.
+// the attachments. The source view of the message takes the pane's place
+// while it shows.
 
 import { useEffect, useMemo, useState } from 'react';
 import type { AttachmentItem, RejectCode } from '../shared/api';
@@ -26,11 +27,13 @@ import { indexedPartText, matchLine, type MatchLine } from './match-line';
 import {
   copyMessageId,
   openInReader,
+  openSource,
   showInFolder,
   useReaderState,
   type ReaderView,
 } from './reader';
 import { useShellState } from './shell';
+import { SourceView } from './SourceView';
 import './reader-pane.css';
 
 const ICON = {
@@ -72,6 +75,15 @@ function ImageOffIcon() {
       <circle cx="8.5" cy="8.5" r="1.5" />
       <polyline points="21 15 16 10 5 21" />
       <line x1="2" y1="2" x2="22" y2="22" />
+    </svg>
+  );
+}
+
+function SourceIcon() {
+  return (
+    <svg className="rp-icon" {...ICON}>
+      <polyline points="16 18 22 12 16 6" />
+      <polyline points="8 6 2 12 8 18" />
     </svg>
   );
 }
@@ -395,6 +407,16 @@ export function MessageBody() {
       </div>
     );
   }
+  if (reader.source !== null) {
+    const refused = reader.source.refused;
+    return (
+      <SourceView
+        source={reader.source}
+        headers={view?.headers ?? null}
+        refused={refused === null ? null : refusedText(refused)}
+      />
+    );
+  }
   const shown = view?.format ?? null;
   // HTML was asked for and plain text came back: this open can't show the HTML
   // ("Show HTML anyway" is offered when its size alone kept it back).
@@ -425,6 +447,17 @@ export function MessageBody() {
             HTML
           </button>
         </div>
+        {view && (
+          <button
+            type="button"
+            className="rp-act rp-source"
+            title="View source"
+            onClick={() => void openSource()}
+          >
+            <SourceIcon />
+            Source
+          </button>
+        )}
         {view && <MessageActions key={view.url} view={view} />}
       </div>
       {view && <Who headers={view.headers} details={view.details} />}
@@ -447,6 +480,10 @@ export function MessageBody() {
             onClick={() => void openInReader(rowid, 'plain')}
           >
             View as plain text
+          </button>
+          <span aria-hidden="true">·</span>
+          <button type="button" className="rp-btn rp-view-source" onClick={() => void openSource()}>
+            View source
           </button>
         </div>
       )}
