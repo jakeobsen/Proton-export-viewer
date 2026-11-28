@@ -14,7 +14,12 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { scanRun, type Rejection } from '../../src/core/containment';
+import {
+  openContainedAsync,
+  scanRun,
+  type FileRef,
+  type Rejection,
+} from '../../src/core/containment';
 import { MAX_ATTACHMENTS, MAX_LABELS, MAX_RECIPIENTS } from '../../src/core/index/metadata';
 import { SYSTEM_IDS } from '../../src/core/index/ops';
 import { bodyCode, indexReport, pairReason, withScan } from '../../src/core/index/report';
@@ -48,6 +53,7 @@ function service(
   options: IndexOptions = {},
   hang: (role: ThreadRole, op: string, args: unknown) => boolean = () => false,
   onRejected?: (rejected: Rejection[]) => void,
+  openFile?: (root: string, ref: FileRef) => Promise<number>,
 ): IndexService {
   return new IndexService({
     indexDir,
@@ -58,6 +64,7 @@ function service(
     isCurrent: () => true,
     options,
     ...(onRejected ? { onRejected } : {}),
+    ...(openFile ? { openFile } : {}),
   });
 }
 
@@ -265,12 +272,20 @@ describe('the index report', () => {
     rmSync(join(run, `${emlGone}.eml`));
     writeFileSync(join(run, `${badJson}.metadata.json`), '{"Version": 1, "Payload": {');
     const scan = scanRun(run);
-    // Refused when phase 2 opens it: the message file becomes a FIFO after the scan.
-    rmSync(join(run, `${swapped}.eml`));
-    expect(spawnSync('/usr/bin/mkfifo', [join(run, `${swapped}.eml`)]).status).toBe(0);
+    // Refused when phase 2 opens it: the message file becomes a FIFO once phase 1
+    // has recorded it, just before phase 2 opens it.
+    let fifo = false;
+    const swapOnOpen = (root: string, ref: FileRef): Promise<number> => {
+      if (ref.rel.endsWith(`${swapped}.eml`) && !fifo) {
+        fifo = true;
+        rmSync(join(run, `${swapped}.eml`));
+        expect(spawnSync('/usr/bin/mkfifo', [join(run, `${swapped}.eml`)]).status).toBe(0);
+      }
+      return openContainedAsync(root, ref);
+    };
 
     const indexDir = join(dir, 'index');
-    const s = service(run, indexDir, { jobMs: 1000 }, hangBodies(slow));
+    const s = service(run, indexDir, { jobMs: 1000 }, hangBodies(slow), undefined, swapOnOpen);
     await s.open(null);
     await s.startIndexing(scan);
     expect(s.progress).toMatchObject({
