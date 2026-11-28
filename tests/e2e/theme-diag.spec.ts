@@ -72,16 +72,16 @@ async function state(pev: PevApp, label: string): Promise<Record<string, unknown
   if (r.view) {
     const frame = await pev.bodyFrame(r.view.url);
     frameColor = await frame.locator('p').evaluate((p) => getComputedStyle(p).color);
-    frameDark = await frame.locator('p').evaluate(
-      () => matchMedia('(prefers-color-scheme: dark)').matches,
-    );
+    frameDark = await frame
+      .locator('p')
+      .evaluate(() => matchMedia('(prefers-color-scheme: dark)').matches);
   }
   return { label, ...main, shellDark, frameDark, frameColor };
 }
 
 test('theme: what the shell and the frame see', async () => {
   const seen: Array<Record<string, unknown>> = [];
-  const first = await launch('theme-diag');
+  const first = await launch('theme-diag', { appColorScheme: true });
   try {
     await openSchemes(first, 'theme-diag-a');
     seen.push(await state(first, 'start'));
@@ -98,7 +98,7 @@ test('theme: what the shell and the frame see', async () => {
   } finally {
     await first.close();
   }
-  const second = await launch('theme-diag', { userData: first.userData });
+  const second = await launch('theme-diag', { userData: first.userData, appColorScheme: true });
   try {
     seen.push(await state(second, 'relaunch, dark stored'));
     await openSchemes(second, 'theme-diag-b');
