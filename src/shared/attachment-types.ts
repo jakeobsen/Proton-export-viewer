@@ -16,6 +16,14 @@ const IMAGE_LABELS: Record<RasterFormat, string> = {
   webp: 'WebP image',
 };
 
+/** The short name of each image format, as the preview's line shows it. */
+export const IMAGE_FORMAT_NAMES: Record<RasterFormat, string> = {
+  png: 'PNG',
+  jpeg: 'JPEG',
+  gif: 'GIF',
+  webp: 'WebP',
+};
+
 /** Extensions of Windows programs and scripts. */
 const WINDOWS_PROGRAMS = [
   'exe',

@@ -19,6 +19,14 @@ export type LocatedFile =
       code: 'no_source' | 'superseded' | 'unavailable' | 'not_found' | 'eml_missing' | 'changed';
     };
 
+/** A message's file opened for a save, or why it isn't. */
+export type SaveOpen =
+  | { ok: true; fd: number; close(): void }
+  | {
+      ok: false;
+      code: 'no_source' | 'superseded' | 'unavailable' | 'not_found' | 'eml_missing' | 'changed';
+    };
+
 export interface ReaderSource {
   /** The message with this rowid, or null when the source has none it may open. */
   open(rowid: number): Promise<OpenedMessage | null>;
@@ -27,4 +35,9 @@ export interface ReaderSource {
    * identity, checked through a contained open.
    */
   locate(rowid: number, file: FileIdentity): Promise<LocatedFile>;
+  /**
+   * The message's file, opened read-only through a contained open, while it
+   * is still the file with this identity. The caller closes it.
+   */
+  openForSave(rowid: number, file: FileIdentity): Promise<SaveOpen>;
 }

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Core-process test hooks: hold opens to keep them pending, push markers
-// through every logging path, set the reader's source and limits, open the
-// source's gates, report the reader's memory, and turn the unsanitized path
-// on or off.
+// Core-process test hooks: hold opens to keep them pending, hold saves before
+// the chunk that completes them, push markers through every logging path, set
+// the reader's source and limits, open the source's gates, report the
+// reader's memory, and turn the unsanitized path on or off.
 
 import type { ReaderLane } from '../core/reader/lane';
 import type { ReaderSource } from '../core/reader/source';
@@ -47,6 +47,9 @@ export interface CoreTestDeps {
     heldOpened: Array<() => void>;
     holdCardsAt: number | null;
     heldCards: Array<() => void>;
+    saveGate: Promise<void> | null;
+    releaseSaves: (() => void) | null;
+    savesHeld: number;
   };
   open: (request: OpenRequest | ReadRequest) => void;
   toWorker: (message: WorkerRequest) => void;
@@ -212,6 +215,27 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
     }
     case 'held-opened':
       ok(deps.state.heldOpened.length);
+      return;
+    case 'save-hold': {
+      // Saves wait before the chunk that completes them, until 'save-release'.
+      if (!deps.state.saveGate) {
+        deps.state.saveGate = new Promise<void>((resolve) => {
+          deps.state.releaseSaves = resolve;
+        });
+      }
+      ok();
+      return;
+    }
+    case 'save-release': {
+      const release = deps.state.releaseSaves;
+      deps.state.saveGate = null;
+      deps.state.releaseSaves = null;
+      release?.();
+      ok();
+      return;
+    }
+    case 'saves-held':
+      ok(deps.state.savesHeld);
       return;
     case 'file-opens':
       ok(deps.state.fileOpens);

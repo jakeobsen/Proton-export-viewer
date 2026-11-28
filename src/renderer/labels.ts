@@ -10,3 +10,7 @@ export function exportLabel(runName: string): string {
   if (!m || !month || Number(m[3]) < 1 || Number(m[3]) > 31) return runName;
   return `Export ${Number(m[3])} ${month} ${m[1]}, ${m[4]}:${m[5]}`;
 }
+
+/** Shown for an export kept in the Downloads folder, which the app may write to. */
+export const DOWNLOADS_HINT =
+  "This export is in Downloads, so it isn't write-protected. Move it to another folder.";

@@ -138,7 +138,14 @@ function make() {
     appWin.views.install(openId, token, ctx.generation, ctx.generation, {
       html: '<p>x</p>',
       assets: [],
-      message: { rowid: 17, file: FILE, messageId: '', attachments: [] },
+      message: {
+        rowid: 17,
+        file: FILE,
+        version: null,
+        messageId: '',
+        subject: '',
+        attachments: [],
+      },
     });
     return { openId, token };
   };

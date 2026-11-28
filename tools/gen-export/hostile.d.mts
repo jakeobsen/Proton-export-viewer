@@ -10,6 +10,9 @@ export const INLINE_BOMBS: Record<string, [() => Buffer, string]>;
 /** The colours of the inline images that must show. */
 export const INLINE_COLORS: Record<'cid' | 'data' | 'first' | 'second', [number, number, number]>;
 
+/** Attachment names a save must clean: [fixture name, file name]. */
+export const HOSTILE_FILENAMES: Array<[string, string]>;
+
 export const SCRIPT_MARKER: string;
 export const MARKER_ATTRIBUTE: string;
 

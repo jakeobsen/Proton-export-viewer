@@ -14,6 +14,8 @@ const BASE: ReaderState = {
   fallback: false,
   fileRefused: false,
   refused: null,
+  saved: null,
+  preview: null,
   openId: 1,
   source: null,
   queryId: null,

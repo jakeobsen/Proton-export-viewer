@@ -495,3 +495,41 @@ test('no path or account name reaches a log file through the source paths', asyn
     expect(text, file).not.toContain('mail_2025');
   }
 });
+
+test('an export in Downloads shows the write-protection line under the toolbar and in Recents; a look-alike sibling does not', async ({
+  pev,
+}) => {
+  const HINT =
+    "This export is in Downloads, so it isn't write-protected. Move it to another folder.";
+  const base = realpathSync(testDir('downloads-hint'));
+  const downloads = join(base, 'Downloads');
+  mkdirSync(downloads);
+  await pev.main('setDownloadsDir', downloads);
+  const inside = writeExport(join(downloads, 'export'), { seed: 1 });
+  const sibling = writeExport(join(base, 'Downloads-old', 'export'), { seed: 2 });
+  const hint = pev.page.locator('.downloads-hint');
+
+  await pev.main('queuePick', inside.root, 'bm1');
+  expect(await act(pev, 'chooseFolder')).toMatchObject({ ok: true, outcome: 'opened' });
+  await expect(hint).toHaveText(HINT);
+  await pev.main('queuePick', sibling.root, 'bm2');
+  expect(await act(pev, 'chooseFolder')).toMatchObject({ ok: true, outcome: 'opened' });
+  await expect(hint).toHaveCount(0);
+
+  // Downloads handed over as a link to the real folder, as in the sandbox.
+  symlinkSync(downloads, join(base, 'downloads-link'));
+  await pev.main('setDownloadsDir', join(base, 'downloads-link'));
+  // With the sibling forgotten, the welcome screen lists the export in Downloads, with the line.
+  const siblingKey = (await view(pev)).active!.sourceKey;
+  expect(await act(pev, 'forgetExport', siblingKey)).toMatchObject({
+    ok: true,
+    outcome: 'forgotten',
+  });
+  const row = pev.page.locator('.recent-row');
+  await expect(row).toHaveCount(1);
+  await expect(row.locator('.recent-hint')).toHaveText(HINT);
+  // Reopened from Recents, the line shows under the toolbar again.
+  const key = (await view(pev)).recent[0]!.sourceKey;
+  expect(await act(pev, 'openExport', key)).toMatchObject({ ok: true, outcome: 'opened' });
+  await expect(hint).toHaveText(HINT);
+});

@@ -399,3 +399,46 @@
   color: var(--rp-danger);
   font-size: 12px;
 }
+
+.rp-act .rp-icon {
+  margin-right: 4px;
+  vertical-align: -2px;
+}
+
+/* Each attachment's actions sit at the right of its row. */
+.rp-att {
+  position: relative;
+  padding-right: 84px;
+}
+
+/* Room for Preview next to Save. */
+.rp-att:has(.rp-att-preview) {
+  padding-right: 160px;
+}
+
+.rp-att-btns {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  display: flex;
+  gap: 6px;
+  transform: translateY(-50%);
+}
+
+.rp-danger {
+  color: var(--rp-danger);
+}
+
+.rp-saved {
+  border-color: var(--line);
+  background: transparent;
+}
+
+.rp-save-failed {
+  border-color: var(--rp-danger-border);
+  background: var(--rp-danger-soft);
+}
+
+.rp-save-failed > .rp-icon {
+  color: var(--rp-danger);
+}

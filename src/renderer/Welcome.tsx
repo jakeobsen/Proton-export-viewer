@@ -3,7 +3,7 @@
 
 import { useState } from 'react';
 import type { ExportRow } from '../shared/sources';
-import { exportLabel } from './labels';
+import { DOWNLOADS_HINT, exportLabel } from './labels';
 import { chooseFolder, forgetExport, openExport } from './shell';
 
 function RecentRow({ row, busy }: { row: ExportRow; busy: boolean }) {
@@ -13,6 +13,7 @@ function RecentRow({ row, busy }: { row: ExportRow; busy: boolean }) {
       <div className="recent-info">
         <div className="recent-account">{row.account ?? exportLabel(row.runName)}</div>
         {row.account !== null && <div className="recent-sub">{exportLabel(row.runName)}</div>}
+        {row.inDownloads && <div className="recent-hint">{DOWNLOADS_HINT}</div>}
       </div>
       {confirming ? (
         <div className="recent-confirm" role="group" aria-label="Forget">

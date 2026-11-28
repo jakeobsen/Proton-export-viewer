@@ -54,7 +54,7 @@ import type { CheckResult } from './index/ops';
 import { ThreadError, type IndexThread, type ThreadRole } from './index/pool';
 import { BODY_STATE, mismatchOf, probeIdentity } from './index/schema';
 import { IndexBusy } from './index/sql';
-import type { LocatedFile, OpenedMessage } from './reader/source';
+import type { LocatedFile, OpenedMessage, SaveOpen } from './reader/source';
 import { overlaps } from '../shared/overlap';
 import {
   ConnectionRegistry,
@@ -704,6 +704,30 @@ export class SourceSession {
     generation: number,
     want: FileIdentity,
   ): Promise<LocatedFile> {
+    const found = await this.openIdentified(rowid, generation, want);
+    if (!found.ok) return found;
+    closeSync(found.fd);
+    return { ok: true, path: found.path };
+  }
+
+  /**
+   * A message's file for a save, opened as `locateForReader` finds it: only
+   * while the file at the pair's path is the one the view was read from. The
+   * caller closes it.
+   */
+  async openForSave(rowid: number, generation: number, want: FileIdentity): Promise<SaveOpen> {
+    const found = await this.openIdentified(rowid, generation, want);
+    if (!found.ok) return found;
+    const fd = found.fd;
+    return { ok: true, fd, close: () => closeSync(fd) };
+  }
+
+  /** The contained open behind `locateForReader` and `openForSave`, with no rescan. */
+  private async openIdentified(
+    rowid: number,
+    generation: number,
+    want: FileIdentity,
+  ): Promise<{ ok: true; fd: number; path: string } | Exclude<SaveOpen, { ok: true }>> {
     const current = this.gate.current;
     if (!current) return { ok: false, code: 'no_source' };
     if (current.generation !== generation) return { ok: false, code: 'superseded' };
@@ -733,8 +757,7 @@ export class SourceSession {
       if (!(err instanceof ContainmentError)) throw err;
       return { ok: false, code: err.errno === 'ENOENT' ? 'eml_missing' : 'changed' };
     }
-    closeSync(fd);
-    return { ok: true, path: join(root, file.rel) };
+    return { ok: true, fd, path: join(root, file.rel) };
   }
 
   /**

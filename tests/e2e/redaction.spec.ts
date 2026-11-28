@@ -10,14 +10,16 @@ import {
   realpathSync,
   renameSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { SCHEMA_VERSION } from '../../src/core/index/schema';
-import type { MessageOpenResult, SourceActionResult } from '../../src/shared/api';
+import type { MessageOpenResult, PreviewResult, SourceActionResult } from '../../src/shared/api';
 import type { IndexProgress } from '../../src/shared/index-types';
 import type { Stamp } from '../../src/shared/sources';
+import { solidPng } from '../../tools/gen-export/images.mjs';
 import { writeExport } from '../exports';
 import { MARKERS, MARKER_TEXT, findMarkers } from '../markers';
 import { testDir } from '../paths';
@@ -200,6 +202,35 @@ function markerMessage(): string {
   ].join('\r\n');
 }
 
+/**
+ * A message whose subject and text carry the markers, with a valid image and
+ * a file that only claims to be one, both named with markers.
+ */
+function markerImageMessage(): string {
+  const base64 = (bytes: Buffer) => (bytes.toString('base64').match(/.{1,76}/g) ?? []).join('\r\n');
+  const part = (name: string, bytes: Buffer) => [
+    '--b',
+    `Content-Type: image/png; name="${name}"`,
+    `Content-Disposition: attachment; filename="${name}"`,
+    'Content-Transfer-Encoding: base64',
+    '',
+    base64(bytes),
+  ];
+  return [
+    `Subject: ${MARKER_TEXT}`,
+    'Content-Type: multipart/mixed; boundary="b"',
+    '',
+    '--b',
+    'Content-Type: text/plain; charset=utf-8',
+    '',
+    MARKER_TEXT,
+    ...part(`${MARKERS[1]}.png`, solidPng(8, 6, [200, 40, 40])),
+    ...part(`${MARKERS[0]}.png`, Buffer.from(MARKER_TEXT)),
+    '--b--',
+    '',
+  ].join('\r\n');
+}
+
 function setSchemaVersion(dbPath: string, version: number): void {
   const db = new DatabaseSync(dbPath);
   try {
@@ -316,6 +347,62 @@ test('no marker reaches a log file through the index text and its schema checks,
   }
 });
 
+test('no marker reaches a log file through saves, Show in Finder or a foreign download', async ({
+  pev,
+}) => {
+  // The attachment's name, the subject and the paths carry markers.
+  const root = realpathSync(testDir('redaction-save'));
+  writeFileSync(join(root, 'marked.eml'), markerMessage());
+  writeFileSync(join(root, 'changing.eml'), markerMessage());
+  const source = await pev.main<{ ok: boolean }>('readerSource', root, [
+    [1, { file: 'marked.eml' }],
+    [2, { file: 'changing.eml' }],
+  ]);
+  expect(source.ok).toBe(true);
+  const opened = await pev.shell<MessageOpenResult>('openInReader', [1, 'plain']);
+  expect(opened.ok).toBe(true);
+  await expect
+    .poll(async () => (await pev.shell<{ pending: boolean }>('reader')).pending)
+    .toBe(false);
+  // Each save's nonce, which only its own download request may carry.
+  const nonces: string[] = [];
+  expect(await pev.shell('saveAttachment', [0])).toMatchObject({ ok: true });
+  nonces.push((await pev.main<string | null>('saveLastNonce'))!);
+  expect(await pev.shell('saveMessageFile')).toMatchObject({ ok: true });
+  nonces.push((await pev.main<string | null>('saveLastNonce'))!);
+  expect(new Set(nonces).size).toBe(2);
+  for (const nonce of nonces) expect(nonce).toMatch(/^[0-9a-f]{32}$/);
+  await pev.page.locator('.rp-show-saved').dispatchEvent('click');
+  // A save that fails: the file changed since it was opened.
+  await pev.shell('openInReader', [2, 'plain']);
+  await expect
+    .poll(async () => (await pev.shell<{ pending: boolean }>('reader')).pending)
+    .toBe(false);
+  const later = new Date(Date.now() + 60_000);
+  utimesSync(join(root, 'changing.eml'), later, later);
+  expect(await pev.shell('saveAttachment', [0])).toMatchObject({ ok: false });
+  // A download the app didn't start, to a URL carrying a marker.
+  await pev.main('download', 1, `app://shell/${encodeURIComponent(MARKERS[5])}`);
+
+  for (const [proc, code] of [
+    ['main', 'save.started'],
+    ['main', 'save.done'],
+    ['main', 'save.failed'],
+    ['main', 'save.shown'],
+    ['main', 'download.cancelled'],
+  ] as const) {
+    await expect.poll(() => pev.hasLog(code, { proc }), { message: `${proc} ${code}` }).toBe(true);
+  }
+  const downloads = await pev.main<string>('downloadsDir');
+  for (const file of readdirSync(pev.logsDir())) {
+    const text = readFileSync(join(pev.logsDir(), file), 'utf8');
+    expect(findMarkers(text), file).toEqual([]);
+    expect(text, file).not.toContain(downloads);
+    expect(text, file).not.toContain(root);
+    for (const nonce of nonces) expect(text, file).not.toContain(nonce);
+  }
+});
+
 test('no marker reaches a log file through the recent searches', async () => {
   const root = realpathSync(testDir(`${MARKERS[0]}-recent`));
   const written = writeExport(root, { seed: 36, messages: 4 });
@@ -377,5 +464,58 @@ test('no marker reaches a log file through the recent searches', async () => {
   const dir = second.logsDir();
   for (const file of readdirSync(dir)) {
     expect(findMarkers(readFileSync(join(dir, file), 'utf8')), file).toEqual([]);
+  }
+});
+
+test('no marker reaches a log file through a preview, its close or its refusals', async ({
+  pev,
+}) => {
+  // The attachments' names, the subject and the path carry markers.
+  const root = realpathSync(testDir('redaction-preview'));
+  writeFileSync(join(root, 'marked.eml'), markerImageMessage());
+  writeFileSync(join(root, 'changing.eml'), markerImageMessage());
+  const source = await pev.main<{ ok: boolean }>('readerSource', root, [
+    [1, { file: 'marked.eml' }],
+    [2, { file: 'changing.eml' }],
+  ]);
+  expect(source.ok).toBe(true);
+  const settled = () =>
+    expect.poll(async () => (await pev.shell<{ pending: boolean }>('reader')).pending).toBe(false);
+  expect((await pev.shell<MessageOpenResult>('openInReader', [1, 'plain'])).ok).toBe(true);
+  await settled();
+  // A preview, then its close.
+  expect(await pev.shell<PreviewResult>('previewAttachment', [0])).toMatchObject({ ok: true });
+  await pev.shell('closePreview');
+  // A forced preview of the file that isn't an image.
+  const view = (await pev.shell<{ view: { openId: number } }>('reader')).view;
+  const { generation } = await pev.page.evaluate(
+    () => window.__pevTestIpc.invoke('pev:state') as Promise<{ generation: number }>,
+  );
+  const forced = await pev.page.evaluate(
+    (args) => window.__pevTestIpc.invoke('pev:preview', args),
+    { openId: view.openId, index: 1, generation },
+  );
+  expect(forced).toEqual({ ok: false, code: 'no_preview' });
+  // A preview the lane refuses: the file changed since it was opened.
+  expect((await pev.shell<MessageOpenResult>('openInReader', [2, 'plain'])).ok).toBe(true);
+  await settled();
+  const later = new Date(Date.now() + 60_000);
+  utimesSync(join(root, 'changing.eml'), later, later);
+  expect(await pev.shell<PreviewResult>('previewAttachment', [0])).toMatchObject({ ok: false });
+
+  for (const [code, data] of [
+    ['preview.opened', {}],
+    ['preview.closed', {}],
+    ['preview.refused', { reason: 'no_preview' }],
+    ['preview.refused', { reason: 'changed' }],
+  ] as const) {
+    await expect
+      .poll(() => pev.hasLog(code, { proc: 'main', ...data }), { message: code })
+      .toBe(true);
+  }
+  for (const file of readdirSync(pev.logsDir())) {
+    const text = readFileSync(join(pev.logsDir(), file), 'utf8');
+    expect(findMarkers(text), file).toEqual([]);
+    expect(text, file).not.toContain(root);
   }
 });

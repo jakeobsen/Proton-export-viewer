@@ -48,6 +48,9 @@ export const IPC = {
   showInFolder: 'pev:show-in-folder',
   copyMessageId: 'pev:copy-message-id',
   copyReport: 'pev:copy-report',
+  save: 'pev:save',
+  saveEml: 'pev:save-eml',
+  showSaved: 'pev:show-saved',
   settings: 'pev:settings',
   setSetting: 'pev:set-setting',
   settingsChanged: 'pev:settings-changed',
@@ -66,6 +69,8 @@ export const IPC = {
   recentSearches: 'pev:recent-searches',
   keepRecent: 'pev:keep-recent',
   clearRecent: 'pev:clear-recent',
+  preview: 'pev:preview',
+  previewClose: 'pev:preview-close',
 } as const;
 
 export type RejectCode =
@@ -85,9 +90,13 @@ export type RejectCode =
   | 'offline'
   | 'changed'
   | 'unknown_dialog'
+  | 'save_failed'
+  | 'queue_full'
   | 'refused'
   | 'not_deleted'
-  | 'failed';
+  | 'failed'
+  | 'no_preview'
+  | 'preview_failed';
 
 export type Rejected = { ok: false; code: RejectCode };
 
@@ -108,11 +117,15 @@ export interface AttachmentItem {
   size: number;
   risky: boolean;
   imageFormat: RasterFormat | null;
+  /** Set when the attachment can be previewed: the format and canvas its bytes passed the check with. */
+  preview: { format: RasterFormat; width: number; height: number } | null;
 }
 
 /** The outcome of an action on the open message, such as Show in folder. */
 export type ReaderActionResult = { ok: true } | Rejected;
 
+/** A save that ended with its file in the downloads folder; `saveId` names it for Show in Finder. */
+export type SaveResult = { ok: true; saveId: number } | Rejected;
 /** One part of the open message in the source view's tree. Main has checked every field. */
 export interface SourceNode {
   /** Dotted path: `1` is the message. A part is named to main only by it. */
@@ -138,6 +151,9 @@ export type SourceResult = { ok: true; url: string; truncated: boolean } | Rejec
 export type SourceTreeResult = { ok: true; parts: SourceNode[] | null } | Rejected;
 /** Back to the message: its body URL, or null for a message the reader couldn't render. */
 export type SourceBackResult = { ok: true; url: string | null } | Rejected;
+
+/** A preview the open message's view now holds: the URL of the document that shows it. */
+export type PreviewResult = { ok: true; url: string } | Rejected;
 
 /**
  * The outcome of opening a message: its body view, or the fallback when the
@@ -319,6 +335,12 @@ export interface PevApi {
   showInFolder(openId: number, generation: number): Promise<ReaderActionResult>;
   /** Copies the open message's Message-ID. */
   copyMessageId(openId: number, generation: number): Promise<ReaderActionResult>;
+  /** Saves attachment `index` of the open message to the downloads folder; resolves when done. */
+  save(openId: number, index: number, generation: number): Promise<SaveResult>;
+  /** Saves the open message's file to the downloads folder; resolves when done. */
+  saveEml(openId: number, generation: number): Promise<SaveResult>;
+  /** Shows a file saved from the open message in Finder. */
+  showSaved(openId: number, saveId: number, generation: number): Promise<ReaderActionResult>;
   /**
    * Shows the source of the open `openId`, or of its fallback: the message's
    * raw headers in the body frame.
@@ -332,6 +354,10 @@ export interface PevApi {
   copyHeaders(openId: number, generation: number): Promise<ReaderActionResult>;
   /** Leaves the source view. */
   sourceBack(openId: number, generation: number): Promise<SourceBackResult>;
+  /** Previews attachment `index` of the open message, in place of any preview it had. */
+  preview(openId: number, index: number, generation: number): Promise<PreviewResult>;
+  /** Drops the open message's preview. */
+  previewClose(openId: number, generation: number): Promise<ReaderActionResult>;
   log(
     level: 'error' | 'warn' | 'info',
     code: string,

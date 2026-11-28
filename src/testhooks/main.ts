@@ -22,6 +22,7 @@ import { READER_SOURCE_ACTION, type SourceEntry } from './reader-source';
 import { READER_UNSANITIZED_ACTION } from './unsanitized';
 import { runControl, runFolderProof, type OpenDialog } from './proof/main';
 import { killRenderer } from './renderer-kill';
+import { saveTestApi } from './saves';
 import { runSelfTest } from './selftest';
 import { WindowEventRecorder } from './window-events';
 
@@ -230,7 +231,19 @@ export async function install(ctx: AppContext): Promise<boolean> {
       markers === undefined ? { type: 'test', action } : { type: 'test', action, markers },
     );
 
+  const saveHooks = ctx.saves ? saveTestApi(ctx.saves, ctx.saves.stagingDir) : null;
   const api = {
+    ...saveHooks,
+    /** Saves in core wait before the chunk that completes them, until released. */
+    coreHoldSaves: () => core('save-hold'),
+    coreReleaseSaves: () => core('save-release'),
+    coreSavesHeld: async () => {
+      const result = await core('saves-held');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
+    downloadsDir: () => app.getPath('downloads'),
+    /** Points the downloads folder elsewhere under the test's own folders. */
+    setDownloadsDir: (dir: string) => app.setPath('downloads', dir),
     marker: TESTHOOKS_MARKER,
     dialogCalls: () => [...dialogCalls],
     dialogsStubbed: () =>

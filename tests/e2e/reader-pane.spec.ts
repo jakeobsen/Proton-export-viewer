@@ -132,6 +132,7 @@ test('a message opens in the pane as HTML first, with its header fields', async 
     'Plain text',
     'HTML',
     'Source',
+    'Save .eml',
     'Show in folder',
     'Message-ID',
     'Details',

@@ -130,6 +130,40 @@ function crlf(lines) {
 }
 
 /**
+ * Attachment names a save must clean, each in a message of its own with one
+ * 11-byte attachment named by RFC 2231 `filename*`. Every cleaning rule has
+ * one.
+ */
+export const HOSTILE_FILENAMES = [
+  ['rtlo', 'invoice\u202efdp.exe'],
+  ['reserved-con', 'CON'],
+  ['reserved-nul', 'NUL.txt'],
+  ['reserved-com1', 'COM1'],
+  ['reserved-aux', 'aux.pdf'],
+  ['traversal', '../../etc/passwd'],
+  ['separators', 'a/b\\c:d*e?f"g<h>i|j'],
+  ['leading-dot', '.bashrc'],
+  ['leading-dash', '-rf'],
+  ['trailing-dot-space', 'report.pdf. '],
+  ['control-chars', 'bell\u0007tab\tnul.txt'],
+  ['long', `${'n'.repeat(300)}.txt`],
+  ['decomposed', 'cafe\u0301.txt'],
+  // Zero-width and format characters.
+  ['zero-width', 'in\u200bvoi\u200cce\u200d\u2060\ufeff.pdf'],
+  // Bidi marks and isolates.
+  ['bidi-marks', '\u200ereport\u200f\u061c\u2066x\u2069.txt'],
+  // Characters that look like a slash.
+  ['slash-lookalike', 'a\u2215b\uff0fc.txt'],
+  // Reserved device names in any case and with any extension.
+  ['reserved-case-ext', 'con.TXT'],
+  ['reserved-lpt9', 'Lpt9.log'],
+  // Only dots: nothing is left once cleaned.
+  ['dots-only', '...'],
+  // A multibyte name past the byte bound, with a long extension.
+  ['multibyte-long', `${'\u0436'.repeat(140)}.extension1234567890`],
+];
+
+/**
  * The hostile messages and the extra export entries. Returns
  * {plans, extras, counts}: plans carry ready-made .eml bytes.
  */
@@ -562,21 +596,7 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
   add('pathological', 'long-line', htmlType, page(`<p>${'word '.repeat(200000)}</p>`), refs(0));
 
   // Attachments with hostile file names, and image bombs.
-  const names = [
-    ['rtlo', 'invoice‮fdp.exe'],
-    ['reserved-con', 'CON'],
-    ['reserved-nul', 'NUL.txt'],
-    ['reserved-com1', 'COM1'],
-    ['reserved-aux', 'aux.pdf'],
-    ['traversal', '../../etc/passwd'],
-    ['separators', 'a/b\\c:d*e?f"g<h>i|j'],
-    ['leading-dot', '.bashrc'],
-    ['leading-dash', '-rf'],
-    ['trailing-dot-space', 'report.pdf. '],
-    ['control-chars', 'bell\u0007tab\tnul.txt'],
-    ['long', `${'n'.repeat(300)}.txt`],
-    ['decomposed', 'café.txt'],
-  ];
+  const names = HOSTILE_FILENAMES;
   for (const [name, filename] of names) {
     const b = `h-${name}`;
     const star = `UTF-8''${encodeURIComponent(filename)}`;
@@ -601,6 +621,59 @@ export function hostileMessages({ seed, nonce, labelInfo, owner }) {
       { attachments: [{ name: filename, type: 'application/octet-stream', bytes: 11 }] },
     );
   }
+  // The name comes from Content-Disposition's filename (RFC 2231, with
+  // continuations), not from Content-Type's name (RFC 2047).
+  add(
+    'attachments_images',
+    'filename-continued',
+    'multipart/mixed; boundary="h-continued"',
+    crlf([
+      '--h-continued',
+      'Content-Type: text/plain; charset=utf-8',
+      '',
+      'See the attachment.',
+      '--h-continued',
+      `Content-Type: application/pdf; name="=?UTF-8?B?${Buffer.from('other-name.pdf').toString('base64')}?="`,
+      "Content-Disposition: attachment; filename*0*=UTF-8''r%C3%A9sum; filename*1*=%C3%A9.pdf",
+      'Content-Transfer-Encoding: base64',
+      '',
+      base64Lines(Buffer.from('attachment\n')),
+      '--h-continued--',
+    ]),
+    refs(0),
+    { attachments: [{ name: 'r\u00e9sum\u00e9.pdf', type: 'application/pdf', bytes: 11 }] },
+  );
+  // Two attachments whose names differ only in case: on a volume that ignores
+  // case, the second is saved as " (2)".
+  add(
+    'attachments_images',
+    'filename-case-twins',
+    'multipart/mixed; boundary="h-twins"',
+    crlf([
+      '--h-twins',
+      'Content-Type: text/plain; charset=utf-8',
+      '',
+      'See the attachments.',
+      '--h-twins',
+      'Content-Type: text/plain; name="Notes.txt"',
+      'Content-Disposition: attachment; filename="Notes.txt"',
+      '',
+      'first',
+      '--h-twins',
+      'Content-Type: text/plain; name="notes.TXT"',
+      'Content-Disposition: attachment; filename="notes.TXT"',
+      '',
+      'second',
+      '--h-twins--',
+    ]),
+    refs(0),
+    {
+      attachments: [
+        { name: 'Notes.txt', type: 'text/plain', bytes: 5 },
+        { name: 'notes.TXT', type: 'text/plain', bytes: 6 },
+      ],
+    },
+  );
   const bombs = {
     'png-dimensions': ['image/png', dimensionBombPng(30000, 30000)],
     'png-aspect': ['image/png', dimensionBombPng(100000, 1)],

@@ -103,6 +103,8 @@ export interface SourceManagerDeps {
   afterReset?(): void;
   /** Tells the shell where the open source's index stands. */
   indexChanged?(progress: IndexProgress): void;
+  /** Whether an export root lies in the Downloads folder (real paths and identities). */
+  inDownloads?(root: string): boolean;
   picker: Picker;
   scopes: Scopes;
   discover?: typeof discoverRuns;
@@ -257,10 +259,15 @@ export class SourceManager {
   }
 
   view(): SourcesView {
+    const inDownloads = (s: SourceRecord) => {
+      const pick = this.registry.pick(s.pickId);
+      return pick !== undefined && (this.deps.inDownloads?.(join(pick.path, s.rel)) ?? false);
+    };
     const row = (s: SourceRecord) => ({
       sourceKey: s.sourceKey,
       account: s.accountName,
       runName: s.runName,
+      inDownloads: inDownloads(s),
     });
     let active: ActiveExport | null = null;
     if (this.active) {

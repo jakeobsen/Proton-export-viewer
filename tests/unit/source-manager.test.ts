@@ -31,6 +31,7 @@ import {
   type CoreControl,
   type OrderStep,
 } from '../../src/main/sources/manager';
+import { insideExport } from '../../src/main/saves/guard';
 import { REGISTRY_FILE } from '../../src/main/sources/registry';
 import { ScopeError, type Picked, type Scopes } from '../../src/main/sources/scope';
 import { searchKey } from '../../src/shared/search-chips';
@@ -256,7 +257,7 @@ class FakeCore implements CoreControl {
   }
 }
 
-function setup(name: string, at?: string) {
+function setup(name: string, at?: string, extra: { inDownloads?: (root: string) => boolean } = {}) {
   const userData = at ?? realpathSync(testDir(`${name}-ud`));
   const core = new FakeCore();
   const order: OrderStep[] = [];
@@ -296,6 +297,7 @@ function setup(name: string, at?: string) {
       picker: () => Promise.resolve(picks.shift() ?? null),
       scopes,
       record: (step) => order.push(step),
+      ...extra,
     });
   /** The next launch: the app quit (scope released, core gone) and starts again. */
   const relaunch = async (previous: SourceManager) => {
@@ -1917,6 +1919,45 @@ describe('Reset', () => {
     expect(t.core.current).toBeNull();
     expect(existsSync(join(t.userData, 'sources.json'))).toBe(false);
     expect(existsSync(join(t.userData, 'index'))).toBe(false);
+  });
+});
+
+describe('an export in the Downloads folder', () => {
+  it('is marked, also with Downloads given as a link or picked through one; a look-alike sibling is not', async () => {
+    const base = realpathSync(testDir('mgr-downloads'));
+    const downloads = join(base, 'Downloads');
+    mkdirSync(downloads);
+    // As in the sandbox, the app may be given Downloads as a link to the real folder.
+    symlinkSync(downloads, join(base, 'downloads-link'));
+    let given = downloads;
+    const t = setup('mgr-downloads', undefined, {
+      inDownloads: (root) => insideExport(root, [given]),
+    });
+    const inside = runAt(join(downloads, 'mail_20250701_090000'), ['x']);
+    const sibling = runAt(join(base, 'Downloads-old', 'mail_20250702_090000'), ['y']);
+    runAt(join(downloads, 'sub', 'mail_20250703_090000'), ['z']);
+    t.picks.push(
+      { path: inside, bookmark: 'b1' },
+      { path: sibling, bookmark: 'b2' },
+      { path: join(base, 'downloads-link', 'sub', 'mail_20250703_090000'), bookmark: 'b3' },
+    );
+    await t.manager.chooseFolder(null, t.generation());
+    expect(t.manager.view().active?.inDownloads).toBe(true);
+    await t.manager.chooseFolder(null, t.generation());
+    expect(t.manager.view().active?.inDownloads).toBe(false);
+    await t.manager.chooseFolder(null, t.generation());
+    expect(t.manager.view().active?.inDownloads).toBe(true);
+    const marked = () =>
+      t.manager
+        .view()
+        .recent.map((r) => r.inDownloads)
+        .sort();
+    expect(marked()).toEqual([false, true, true]);
+    given = join(base, 'downloads-link');
+    expect(marked()).toEqual([false, true, true]);
+    // Without the check, nothing is marked.
+    const plain = setup('mgr-downloads-none', t.userData);
+    expect(plain.manager.view().recent.every((r) => !r.inDownloads)).toBe(true);
   });
 });
 

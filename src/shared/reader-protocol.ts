@@ -69,6 +69,21 @@ export interface StoredBody {
   ranges: Array<[number, number]>;
 }
 
+/** The largest attachment, in decoded bytes, that can be previewed. */
+export const PREVIEW_MAX_BYTES = 25 * 1024 * 1024;
+/**
+ * How many decoded bytes of preview candidates one read checks in all; a
+ * candidate past it gets no preview.
+ */
+export const PREVIEW_CHECK_BYTES = 100 * 1024 * 1024;
+
+/** An attachment that passed the raster check: its format and canvas, from its bytes. */
+export interface AttachmentPreview {
+  format: RasterFormat;
+  width: number;
+  height: number;
+}
+
 /** One attachment of a rendered message, in the order the message has its parts. */
 export interface AttachmentEntry {
   /** The part's dotted path in the message: `1.2` is the second part of the first. */
@@ -85,6 +100,11 @@ export interface AttachmentEntry {
   risky: boolean;
   /** The raster format the part's first bytes have, or null. Only a signature check. */
   imageFormat: RasterFormat | null;
+  /**
+   * Set when the whole part, at most PREVIEW_MAX_BYTES decoded, passed the
+   * raster check; null otherwise. Only these get a preview.
+   */
+  preview: AttachmentPreview | null;
 }
 
 /** Details shows at most this many References ids. */
@@ -164,6 +184,15 @@ export type ReaderFailure = (typeof READER_FAILURES)[number];
 export interface FileIdentity {
   dev: string;
   ino: string;
+}
+
+/**
+ * A file's size and modification time (ns) as decimal strings, as the reader
+ * found them before and after its read. A save checks that they are unchanged.
+ */
+export interface FileVersion {
+  size: string;
+  mtimeNs: string;
 }
 
 /**

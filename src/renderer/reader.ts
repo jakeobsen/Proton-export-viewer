@@ -8,9 +8,12 @@
 
 import { useSyncExternalStore } from 'react';
 import type {
+  AttachmentItem,
   MessageOpenResult,
+  PreviewResult,
   ReaderActionResult,
   RejectCode,
+  SaveResult,
   SourceNode,
   SourceResult,
 } from '../shared/api';
@@ -34,6 +37,19 @@ export interface SourceState {
   refused: RejectCode | null;
 }
 
+/** The attachment preview the shown view holds: the dialog shows it. */
+export interface ReaderPreview {
+  openId: number;
+  /** The attachment's index in the view's list. */
+  index: number;
+  /** The preview's document, which main serves under the view's token. */
+  url: string;
+  name: string;
+  size: number;
+  /** The format and canvas the attachment's bytes passed the check with. */
+  image: NonNullable<AttachmentItem['preview']>;
+}
+
 export interface ReaderState {
   /** The message in the pane, or null when the pane is closed. */
   rowid: number | null;
@@ -48,6 +64,8 @@ export interface ReaderState {
   fileRefused: boolean;
   /** Main refused the open. */
   refused: RejectCode | null;
+  /** How the last save from the shown view ended. */
+  saved: { openId: number; saveId: number } | 'failed' | null;
   /** The open the pane shows, a view or a fallback; actions on it name it. */
   openId: number | null;
   /** Set while the source view shows. */
@@ -56,6 +74,8 @@ export interface ReaderState {
   queryId: number | null;
   /** How the message matched that search: on a view, the fallback or a missing file. */
   match: ReaderMatch | null;
+  /** The preview the dialog shows; it goes with the view. */
+  preview: ReaderPreview | null;
 }
 
 const CLOSED: ReaderState = {
@@ -66,10 +86,12 @@ const CLOSED: ReaderState = {
   fallback: false,
   fileRefused: false,
   refused: null,
+  saved: null,
   openId: null,
   source: null,
   queryId: null,
   match: null,
+  preview: null,
 };
 
 let state: ReaderState = CLOSED;
@@ -80,6 +102,7 @@ let sourceSession = 0;
 /** Counts part selections, so a late answer for an older one is dropped. */
 let selection = 0;
 let searchQueryId: number | null = null;
+let previewLatest = 0;
 
 /**
  * The search whose result showed the conversation in the reader, or null
@@ -119,6 +142,7 @@ export async function openInReader(
   const queryId = searchQueryId;
   clearLink();
   sourceSession += 1;
+  previewLatest += 1;
   update({
     rowid,
     mode,
@@ -131,6 +155,8 @@ export async function openInReader(
     source: null,
     queryId,
     match: null,
+    saved: null,
+    preview: null,
   });
   const generation = getShellState().generation ?? (await refreshGeneration().catch(() => null));
   if (generation === null) {
@@ -297,9 +323,9 @@ export async function leaveSource(): Promise<void> {
 }
 
 /** An action on the message the pane shows, such as Show in folder, by its view's open. */
-async function viewAction(
-  act: (openId: number, generation: number) => Promise<ReaderActionResult>,
-): Promise<ReaderActionResult> {
+async function viewAction<T extends { ok: boolean }>(
+  act: (openId: number, generation: number) => Promise<T | ReaderActionResult>,
+): Promise<T | ReaderActionResult> {
   const view = state.view;
   if (!view || openGeneration === null) return { ok: false, code: 'superseded' };
   try {
@@ -307,6 +333,82 @@ async function viewAction(
   } catch {
     return { ok: false, code: 'core_unavailable' };
   }
+}
+
+/** Saves to the downloads folder, then shows how it ended while the same view is shown. */
+async function saveFromView(
+  act: (openId: number, generation: number) => Promise<SaveResult>,
+): Promise<SaveResult> {
+  const openId = state.view?.openId;
+  const result = (await viewAction(act)) as SaveResult;
+  // A save the view moved on from, or a source change, shows nothing.
+  if (openId === undefined || state.view?.openId !== openId) return result;
+  if (result.ok) update({ saved: { openId, saveId: result.saveId } });
+  else if (result.code !== 'superseded' && result.code !== 'stale_generation') {
+    update({ saved: 'failed' });
+  }
+  return result;
+}
+
+/** Saves attachment `index` of the pane's message to the downloads folder. */
+export function saveAttachment(index: number): Promise<SaveResult> {
+  return saveFromView((openId, generation) => window.pev.save(openId, index, generation));
+}
+
+/** Saves the pane's message file to the downloads folder. */
+export function saveMessageFile(): Promise<SaveResult> {
+  return saveFromView((openId, generation) => window.pev.saveEml(openId, generation));
+}
+
+/**
+ * Previews attachment `index` of the pane's message, in place of any preview
+ * it had. Shows it only while the same view is shown and no newer preview
+ * was asked; a refusal shows nothing.
+ */
+export async function previewAttachment(index: number): Promise<PreviewResult> {
+  const view = state.view;
+  const item = view?.attachments[index];
+  if (!view || !item?.preview) return { ok: false, code: 'no_preview' };
+  previewLatest += 1;
+  const mine = previewLatest;
+  const result = (await viewAction((openId, generation) =>
+    window.pev.preview(openId, index, generation),
+  )) as PreviewResult;
+  if (mine !== previewLatest || state.view?.openId !== view.openId) return result;
+  if (result.ok) {
+    update({
+      preview: {
+        openId: view.openId,
+        index,
+        url: result.url,
+        name: item.name,
+        size: item.size,
+        image: item.preview,
+      },
+    });
+  }
+  return result;
+}
+
+/** Closes the preview dialog; main drops the preview and its URLs. */
+export function closePreview(): void {
+  const preview = state.preview;
+  previewLatest += 1;
+  if (!preview) return;
+  update({ preview: null });
+  if (openGeneration === null) return;
+  void window.pev.previewClose(preview.openId, openGeneration).catch(() => undefined);
+}
+
+/** Shows the file the last save from the pane's view published, in Finder. */
+export function showSaved(): Promise<ReaderActionResult> {
+  const saved = state.saved;
+  if (saved === null || saved === 'failed') {
+    return Promise.resolve({ ok: false, code: 'not_found' });
+  }
+  return viewAction((openId, generation) =>
+    window.pev.showSaved(openId, saved.saveId, generation),
+  ) as Promise<ReaderActionResult>;
 }
 
 /** Shows the pane's message file in Finder. */
@@ -330,6 +432,7 @@ export function closeReader(): void {
   sourceSession += 1;
   selection += 1;
   latest += 1;
+  previewLatest += 1;
   openGeneration = null;
   clearLink();
   if (state !== CLOSED) {

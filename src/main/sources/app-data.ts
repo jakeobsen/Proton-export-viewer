@@ -20,6 +20,8 @@ const APP_FOLDERS: ReadonlyArray<{ name: string; files: RegExp }> = [
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.sqlite(?:-wal|-shm|-journal)?$/,
   },
   { name: 'logs', files: /^(?:main|renderer|core)(?:\.\d+)?\.jsonl$/ },
+  // Downloads waiting to be published, and the note of a fallback copy.
+  { name: 'save-staging', files: /^(?:[0-9a-f]{32}\.part(?:\.[a-z]{1,16})?|partial\.json)$/ },
 ];
 
 /** Every place in the data folder where a reset deletes something. */

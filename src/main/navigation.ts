@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Navigation policy: nothing navigates, except the body frame loading the one
-// mail-body URL main last authorized for this window. Popups never open; a
-// link id of this window's live body view opens the link dialog instead.
+// mail-body URL main last authorized for this window, and a preview frame
+// loading the live view's preview document while that preview lives. Popups
+// never open; a link id of this window's live body view opens the link
+// dialog instead.
 
 import type { WebContents, WebFrameMain } from 'electron';
 import type { Logger } from '../shared/log/writer';
@@ -36,6 +38,7 @@ export function guardNavigation(contents: WebContents, options: NavigationOption
     const isBodyFrame =
       !event.isMainFrame && !!frame && sameFrame(frame.parent, contents.mainFrame);
     if (isBodyFrame && event.url === views.authorizedUrl()) return;
+    if (isBodyFrame && event.url === views.previewFrameUrl()) return;
     if (__PEV_TEST_HOOKS__ && !event.isMainFrame && event.url === options.allowFrameUrl) return;
     event.preventDefault();
     log.warn('nav.denied', {

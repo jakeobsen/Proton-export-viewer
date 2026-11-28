@@ -7,7 +7,11 @@
 // without being decoded. Every part is recorded in a PartTree, so that inline
 // images can be found by what the HTML body refers to. Each part the index
 // lists as an attachment is decoded as it streams by, kept only as its decoded
-// size and first bytes, for the reader's attachment list. A message past the
+// size and first bytes, for the reader's attachment list. A part that may be
+// an image to preview (an image signature, at most PREVIEW_MAX_BYTES decoded)
+// is also kept whole until it ends, when the raster check runs on it and its
+// bytes are let go: one such part is held at a time, and at most
+// PREVIEW_CHECK_BYTES of them are checked per read. A message past the
 // parser's limits (more than MAX_MIME_PARTS parts, or a header block over
 // MAX_HEAD_BYTES) is read up to there; any other read error fails the read.
 
@@ -19,8 +23,14 @@ import FlowedDecoder from '@zone-eu/mailsplit/lib/flowed-decoder.js';
 import libmime from 'libmime';
 import { MailParser, type HeaderLines, type Headers } from 'mailparser';
 import { isAttachment } from '../index/body';
+import {
+  PREVIEW_CHECK_BYTES,
+  PREVIEW_MAX_BYTES,
+  type AttachmentPreview,
+} from '../../shared/reader-protocol';
 import { MAX_HEAD_BYTES, MAX_MIME_PARTS } from '../mime-limits';
 import { PartTree } from './parts';
+import { checkRaster, rasterFormat } from './raster';
 
 /** Encoded bytes kept of each body kind (text, HTML); the rest is dropped. */
 export const KEEP_BYTES = 20 * 1024 * 1024;
@@ -68,6 +78,8 @@ export interface ListedPart {
   size: number;
   /** Its first decoded bytes, at most HEAD_BYTES. */
   head: Buffer;
+  /** Its format and canvas if the whole part passed the raster check; else null. */
+  preview: AttachmentPreview | null;
 }
 
 export interface ExtractedMessage {
@@ -83,6 +95,10 @@ export interface ExtractedMessage {
   stopped: boolean;
   /** The parts the index lists as attachments, in message order. */
   listed: ListedPart[];
+  /** Preview candidates left unchecked because the read's check budget was spent. */
+  previewUnchecked: number;
+  /** The most decoded bytes held at once for a preview check. */
+  previewHeldPeak: number;
 }
 
 interface Counting {
@@ -91,6 +107,17 @@ interface Counting {
   size: number;
   head: Buffer[];
   headBytes: number;
+  /** Whether its first bytes have an image signature; null until HEAD_BYTES are in. */
+  signed: boolean | null;
+  /** The decoded part, while it may still be previewed; null once it can't be. */
+  kept: Buffer[] | null;
+  /** The check budget ran out while it was kept. */
+  overBudget: boolean;
+}
+
+/** Whether a part with these first bytes and this decoded size may be previewed. */
+export function previewCandidate(head: Uint8Array, size: number): boolean {
+  return size <= PREVIEW_MAX_BYTES && rasterFormat(head) !== null;
 }
 
 type Kind = 'text' | 'html';
@@ -247,6 +274,7 @@ function offsets(collected: Collected, separator: string): HtmlPart[] {
 export async function extractMessage(
   input: Readable,
   keepBytes = KEEP_BYTES,
+  checkBytes = PREVIEW_CHECK_BYTES,
 ): Promise<ExtractedMessage> {
   const splitter = new Splitter(SPLITTER_OPTIONS);
   const tree = new PartTree();
@@ -269,16 +297,42 @@ export async function extractMessage(
   // streams through, so the size listed is the size saved.
   const listed: ListedPart[] = [];
   let counting: Counting | null = null;
+  // Decoded bytes of preview candidates checked so far in this read.
+  let checked = 0;
+  let previewUnchecked = 0;
+  let previewHeldPeak = 0;
   const count = (node: MimeNode, part: number) => {
     const decoder = node.getDecoder() as Transform;
-    const c: Counting = { part, decoder, size: 0, head: [], headBytes: 0 };
+    const c: Counting = {
+      part,
+      decoder,
+      size: 0,
+      head: [],
+      headBytes: 0,
+      signed: null,
+      kept: [],
+      overBudget: false,
+    };
     decoder.on('data', (bytes: Buffer) => {
       c.size += bytes.length;
       if (c.headBytes < HEAD_BYTES) {
         const take = Buffer.from(bytes.subarray(0, HEAD_BYTES - c.headBytes));
         c.head.push(take);
         c.headBytes += take.length;
+        if (c.headBytes >= HEAD_BYTES) c.signed = rasterFormat(Buffer.concat(c.head)) !== null;
       }
+      if (!c.kept) return;
+      if (c.size > PREVIEW_MAX_BYTES || c.signed === false) {
+        c.kept = null;
+        return;
+      }
+      if (checked + c.size > checkBytes) {
+        c.kept = null;
+        c.overBudget = true;
+        return;
+      }
+      c.kept.push(bytes);
+      previewHeldPeak = Math.max(previewHeldPeak, c.size);
     });
     counting = c;
   };
@@ -289,7 +343,20 @@ export async function extractMessage(
     const ended = once(c.decoder, 'end');
     c.decoder.end();
     await ended;
-    listed.push({ part: c.part, size: c.size, head: Buffer.concat(c.head) });
+    const head = Buffer.concat(c.head);
+    let preview: AttachmentPreview | null = null;
+    if (c.kept && previewCandidate(head, c.size)) {
+      const result = checkRaster(Buffer.concat(c.kept, c.size));
+      checked += c.size;
+      if (result.ok) {
+        const { format, width, height } = result.image;
+        preview = { format, width, height };
+      }
+    } else if (c.overBudget && previewCandidate(head, c.size)) {
+      previewUnchecked += 1;
+    }
+    c.kept = null;
+    listed.push({ part: c.part, size: c.size, head, preview });
   };
 
   async function consume(source: AsyncIterable<SplitChunk>): Promise<void> {
@@ -347,5 +414,7 @@ export async function extractMessage(
     htmlParts: offsets(collected.html, HTML_SEPARATOR),
     stopped,
     listed,
+    previewUnchecked,
+    previewHeldPeak,
   };
 }

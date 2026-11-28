@@ -213,7 +213,9 @@ describe('the part limit', () => {
     ].join('\r\n');
     const message = await extractMessage(stream(eml));
     expect(message.stopped).toBe(true);
-    expect(message.listed).toEqual([{ part: 1, size: 3000, head: data.subarray(0, HEAD_BYTES) }]);
+    expect(message.listed).toEqual([
+      { part: 1, size: 3000, head: data.subarray(0, HEAD_BYTES), preview: null },
+    ]);
   });
 
   it('stops at a header block over the limit and keeps what came before', async () => {

@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // One policy for every window session: scoped protocol handlers, default-deny
-// requests, denied permissions and devices, no spellchecker, no downloads.
+// requests, denied permissions and devices, no spellchecker, and no downloads
+// but the saves main starts itself.
 
 import type { Session } from 'electron';
 import { ALLOWED_REQUEST_SCHEMES, devShellCsp } from '../shared/constants';
 import { PERMISSIONS, SCHEMES } from '../shared/log/codes';
 import type { Logger } from '../shared/log/writer';
 import { appHandler, assetHandler, bodyHandler } from './protocols';
+import type { DownloadLike, WindowSaves } from './saves/manager';
 import type { ViewRegistry } from './views';
 
 /** Hooks a build with test hooks uses to observe the policy. Release builds leave them unset. */
@@ -28,6 +30,8 @@ export interface HardenOptions {
   observer?: PolicyObserver | undefined;
   /** Extra origins allowed while running under the dev server. */
   devAllow?: ((url: string) => boolean) | undefined;
+  /** The window's saves: the only downloads let through. */
+  saves?: WindowSaves | undefined;
 }
 
 export function schemeLabel(url: string): (typeof SCHEMES)[number] {
@@ -78,6 +82,7 @@ export function hardenSession(ses: Session, options: HardenOptions): void {
       log,
       windowId,
       onRequest: observer?.onAssetRequest,
+      saves: options.saves,
     }),
   );
 
@@ -130,7 +135,10 @@ export function hardenSession(ses: Session, options: HardenOptions): void {
 
   ses.setSpellCheckerEnabled(false);
 
-  ses.on('will-download', (event) => {
+  // Only a save main started goes ahead; any other download is cancelled, and
+  // its URL is never logged.
+  ses.on('will-download', (event, item, _webContents, frame) => {
+    if (options.saves?.willDownload(item as DownloadLike, frame ?? null)) return;
     event.preventDefault();
     log.info('download.cancelled', { windowId });
   });
