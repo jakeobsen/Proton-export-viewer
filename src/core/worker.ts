@@ -107,6 +107,8 @@ async function render(request: WorkerRender): Promise<WorkerRendered> {
           });
         }
       },
+      onPreviewUnchecked: (count) =>
+        post({ type: 'log', level: 'info', code: 'reader.preview_unchecked', data: { count } }),
       ...(sanitize ? { sanitize } : {}),
       ...(request.stored ? { stored: request.stored } : {}),
       onMarksDropped: (count) => {

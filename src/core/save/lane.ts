@@ -12,7 +12,7 @@
 // The descriptor is core's, and is closed only after the worker has exited: a
 // worker still reading must never read a file that got the same number.
 
-import type { FileVersion } from '../../shared/reader-protocol';
+import { PREVIEW_MAX_BYTES, type FileVersion } from '../../shared/reader-protocol';
 import {
   SAVE_IDLE_MS,
   type SaveFailure,
@@ -94,10 +94,17 @@ export class SaveLane {
     file: SaveFile,
     version: FileVersion,
     target: SaveTarget,
-  ): { ok: true; size: number } | { ok: false; code: 'busy' | 'changed' | 'unreadable' } {
+  ):
+    | { ok: true; size: number }
+    | { ok: false; code: 'busy' | 'changed' | 'unreadable' | 'refused' } {
     if (this.active) {
       file.close();
       return { ok: false, code: 'busy' };
+    }
+    // A preview is held whole in the worker for its check: never past the cap.
+    if (target.kind === 'preview' && target.size > PREVIEW_MAX_BYTES) {
+      file.close();
+      return { ok: false, code: 'refused' };
     }
     let now: FileVersion;
     try {

@@ -28,6 +28,7 @@ import {
   copyMessageId,
   openInReader,
   openSource,
+  previewAttachment,
   saveAttachment,
   saveMessageFile,
   showInFolder,
@@ -293,6 +294,16 @@ function AttachmentRow({ item, top }: { item: AttachmentItem; top: number | null
         </div>
       )}
       <div className="rp-att-btns">
+        {item.preview && (
+          <button
+            type="button"
+            className="rp-btn rp-att-preview"
+            data-preview-index={item.index}
+            onClick={() => void previewAttachment(item.index)}
+          >
+            Preview
+          </button>
+        )}
         <button
           type="button"
           className={item.risky ? 'rp-btn rp-att-save rp-danger' : 'rp-btn rp-att-save'}
@@ -324,6 +335,8 @@ function Attachments({ items }: { items: AttachmentItem[] }) {
       <div
         className={virtual ? 'rp-att-list rp-att-virtual' : 'rp-att-list'}
         role="list"
+        // Takes the focus back from a closed preview whose button has gone.
+        tabIndex={-1}
         style={virtual ? { height } : undefined}
         onScroll={virtual ? (e) => setTop(e.currentTarget.scrollTop) : undefined}
       >

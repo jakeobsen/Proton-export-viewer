@@ -7,6 +7,7 @@
 // so a save of any size keeps a few chunks in memory. The chunk that completes
 // the save is sent only after the file has been checked again.
 
+import type { RasterFormat } from './attachment-types';
 import type { FileIdentity, FileVersion } from './reader-protocol';
 
 /** The most bytes one chunk carries. */
@@ -15,18 +16,25 @@ export const SAVE_CHUNK_BYTES = 512 * 1024;
 /** A save that makes no progress for this long fails. */
 export const SAVE_IDLE_MS = 30_000;
 
-/** What a save streams: one part's decoded bytes, or the message file as it is. */
+/** One part of a message, as a view listed it. */
+interface PartTarget {
+  /** The part's dotted path, as the reader numbered it. */
+  path: string;
+  /** The part's type as the view listed it: the save checks that the part still has it. */
+  contentType: string;
+  /** The decoded size the view listed: exactly this many bytes are saved. */
+  size: number;
+}
+
+/**
+ * What a save streams: one part's decoded bytes, the message file as it is,
+ * or one image part for a preview. A preview's bytes must pass the raster
+ * check again, as `format`, before the chunk that completes them is sent.
+ */
 export type SaveTarget =
   | { kind: 'eml'; size: number }
-  | {
-      kind: 'part';
-      /** The part's dotted path, as the reader numbered it. */
-      path: string;
-      /** The part's type as the view listed it: the save checks that the part still has it. */
-      contentType: string;
-      /** The decoded size the view listed: exactly this many bytes are saved. */
-      size: number;
-    };
+  | ({ kind: 'part' } & PartTarget)
+  | ({ kind: 'preview'; format: RasterFormat } & PartTarget);
 
 /** main -> core: open a save of one message, for a view of the current generation. */
 export interface SaveOpenRequest {
@@ -67,6 +75,8 @@ export const SAVE_FAILURES = [
   'stalled',
   // It was cancelled.
   'cancelled',
+  // A preview's bytes failed the raster check, or aren't the format listed.
+  'refused',
 ] as const;
 export type SaveFailure = (typeof SAVE_FAILURES)[number];
 
@@ -84,5 +94,5 @@ export type SaveWorkerOut =
   | { type: 'last'; bytes: Uint8Array }
   /** Still reading towards the part, with nothing to send yet. */
   | { type: 'tick' }
-  | { type: 'failed'; reason: 'changed' | 'unreadable' }
+  | { type: 'failed'; reason: 'changed' | 'unreadable' | 'refused' }
   | { type: 'log'; level: 'error' | 'warn' | 'info'; code: string; data?: Record<string, unknown> };

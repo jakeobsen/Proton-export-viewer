@@ -23,6 +23,7 @@ import {
   SaveManager,
   checkProof,
   type DownloadLike,
+  type PreviewAsk,
   type Proof,
   type SaveAsk,
   type SaveDeps,
@@ -552,5 +553,179 @@ describe('SaveManager', () => {
       saves.remember(i, { path: `/p${i}`, dev: '1', ino: String(i), openId: 5 });
     expect(saves.savedFile(1, 5)).toBeNull();
     expect(saves.savedFile(20, 5)?.path).toBe('/p20');
+  });
+});
+
+describe('SaveManager previews', () => {
+  const IMAGE = Buffer.from('image bytes, synthetic, as core checked them');
+  const previewAsk = (t: ReturnType<typeof setup>): PreviewAsk => ({
+    openId: t.ask.openId,
+    generation: t.ask.generation,
+    rowid: t.ask.rowid,
+    file: t.ask.file,
+    version: t.ask.version,
+    target: {
+      kind: 'preview',
+      path: '1.3',
+      contentType: 'image/png',
+      size: IMAGE.length,
+      format: 'png',
+    },
+  });
+  const opened = (size: number): CoreResult => ({ type: 'result', reqId: 0, ok: true, size });
+
+  it('pulls the part into memory: no staging, no download, nothing published', async () => {
+    const t = setup();
+    t.setOpen(opened(IMAGE.length));
+    t.setPulls([
+      { chunk: new Uint8Array(IMAGE.subarray(0, 10)), done: false },
+      { chunk: new Uint8Array(IMAGE.subarray(10)), done: true },
+    ]);
+    const outcome = await t.manager.preview(t.win, previewAsk(t));
+    expect(outcome).toEqual({ ok: true, bytes: new Uint8Array(IMAGE) });
+    expect(t.calls).toEqual([
+      expect.objectContaining({ type: 'save-open', target: previewAsk(t).target }),
+      expect.objectContaining({ type: 'save-pull' }),
+      expect.objectContaining({ type: 'save-pull' }),
+    ]);
+    expect(t.urls).toEqual([]);
+    expect(existsSync(t.staging.dir) ? readdirSync(t.staging.dir) : []).toEqual([]);
+    expect(existsSync(t.downloads)).toBe(false);
+    // The view logs the preview once it holds it.
+    expect(t.logged).toEqual([]);
+  });
+
+  for (const [label, pulls, reason] of [
+    [
+      'more bytes than the view listed, at once',
+      [{ chunk: new Uint8Array(IMAGE.length + 1), done: false }],
+      'refused',
+    ],
+    [
+      'more bytes than the view listed, over two chunks',
+      [
+        { chunk: new Uint8Array(IMAGE.length), done: false },
+        { chunk: new Uint8Array(1), done: true },
+      ],
+      'refused',
+    ],
+    ['core’s refusal of the bytes', [{ code: 'refused' }], 'refused'],
+    ['a changed file', [{ code: 'changed' }], 'changed'],
+    ['fewer bytes than listed', [{ chunk: new Uint8Array(IMAGE.length - 1), done: true }], 'short'],
+  ] as const) {
+    it(`a preview with ${label} fails, logs “${reason}” and tells core`, async () => {
+      const t = setup();
+      t.setOpen(opened(IMAGE.length));
+      t.setPulls(pulls.map((p) => ({ ...p })));
+      expect(await t.manager.preview(t.win, previewAsk(t))).toEqual({
+        ok: false,
+        code: 'preview_failed',
+      });
+      expect(t.logged).toEqual([
+        { level: 'info', code: 'preview.refused', data: { reason, windowId: 3 } },
+      ]);
+      // Core is told to stop, unless its last chunk came and was taken.
+      expect(t.calls.some((c) => c.type === 'save-cancel')).toBe(reason !== 'short');
+    });
+  }
+
+  it('a preview core won’t open, or opens at another size, fails before any pull', async () => {
+    for (const [answer, reason] of [
+      [{ type: 'result', reqId: 0, ok: false, code: 'refused' }, 'refused'],
+      [{ type: 'result', reqId: 0, ok: false, code: 'unreadable' }, 'unreadable'],
+      [{ type: 'result', reqId: 0, ok: false, code: 'eml_missing' }, 'not_found'],
+      [opened(IMAGE.length + 1), 'refused'],
+    ] as const) {
+      const t = setup();
+      t.setOpen(answer as CoreResult);
+      expect(await t.manager.preview(t.win, previewAsk(t))).toEqual({
+        ok: false,
+        code: 'preview_failed',
+      });
+      expect(t.calls.some((c) => c.type === 'save-pull')).toBe(false);
+      expect(t.logged.at(-1)).toEqual({
+        level: 'info',
+        code: 'preview.refused',
+        data: { reason, windowId: 3 },
+      });
+    }
+  });
+
+  it('a preview waits behind a running save, and runs after it', async () => {
+    const t = setup();
+    const s = await started(t);
+    const preview = t.manager.preview(t.win, previewAsk(t));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(t.calls.filter((c) => c.type === 'save-open')).toHaveLength(1);
+    t.setOpen(opened(IMAGE.length));
+    t.setPulls([
+      { chunk: new Uint8Array(BYTES), done: true },
+      { chunk: new Uint8Array(IMAGE), done: true },
+    ]);
+    await download(s, new FakeItem(s.url));
+    expect(await s.outcome).toMatchObject({ ok: true });
+    expect(await preview).toEqual({ ok: true, bytes: new Uint8Array(IMAGE) });
+    expect(t.calls.filter((c) => c.type === 'save-open')).toHaveLength(2);
+  });
+
+  it(`previews count towards the ${MAX_WAITING} waiting; a source change drops a waiting one`, async () => {
+    const t = setup({ downloadStartMs: 60_000 });
+    const first = await started(t);
+    const waiting = Array.from({ length: MAX_WAITING }, () =>
+      t.manager.preview(t.win, previewAsk(t)),
+    );
+    expect(await t.manager.preview(t.win, previewAsk(t))).toEqual({
+      ok: false,
+      code: 'queue_full',
+    });
+    expect(t.logged.at(-1)).toEqual({
+      level: 'info',
+      code: 'preview.refused',
+      data: { reason: 'queue_full', windowId: 3 },
+    });
+    expect(await t.manager.request(t.win, t.ask)).toEqual({ ok: false, code: 'queue_full' });
+    t.manager.cancelAll('generation');
+    expect(await first.outcome).toEqual({ ok: false, code: 'save_failed' });
+    for (const w of waiting) expect(await w).toEqual({ ok: false, code: 'preview_failed' });
+    expect(
+      t.logged.filter((l) => l.code === 'preview.refused' && l.data.reason === 'generation'),
+    ).toHaveLength(MAX_WAITING);
+    // Every event passes the log's allowlist as it is.
+    for (const entry of t.logged) {
+      const clean = sanitizeEvent({
+        level: entry.level as 'info',
+        proc: 'main',
+        code: entry.code,
+        data: entry.data,
+      });
+      expect(clean, entry.code).not.toBeNull();
+      expect(clean?.data).toEqual(entry.data);
+    }
+  });
+
+  it('a running preview stops at a source change, and tells core', async () => {
+    const t = setup();
+    t.setOpen(opened(IMAGE.length));
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    t.setPulls([{ chunk: new Uint8Array(IMAGE), done: true }]);
+    const request = t.manager['deps'].request;
+    t.manager['deps'].request = async (call, stamp) => {
+      if (call.type === 'save-pull') await held;
+      return request(call, stamp);
+    };
+    const preview = t.manager.preview(t.win, previewAsk(t));
+    await t.waitFor(() => t.calls.some((c) => c.type === 'save-open'));
+    await new Promise((r) => setTimeout(r, 5));
+    t.manager.cancelAll('generation');
+    release();
+    expect(await preview).toEqual({ ok: false, code: 'preview_failed' });
+    expect(t.calls.map((c) => c.type)).toContain('save-cancel');
+    expect(t.logged.at(-1)).toMatchObject({
+      code: 'preview.refused',
+      data: { reason: 'generation' },
+    });
   });
 });

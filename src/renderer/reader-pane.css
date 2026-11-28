@@ -411,6 +411,11 @@
   padding-right: 84px;
 }
 
+/* Room for Preview next to Save. */
+.rp-att:has(.rp-att-preview) {
+  padding-right: 160px;
+}
+
 .rp-att-btns {
   position: absolute;
   top: 50%;

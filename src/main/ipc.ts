@@ -23,6 +23,7 @@ import {
   type SourceResult,
   type SourceTreeResult,
   type OpenResult,
+  type PreviewResult,
   type SaveResult,
   type PingResult,
   type Rejected,
@@ -73,6 +74,7 @@ import {
   type SourcePart,
   type SourceWhat,
 } from '../shared/reader-protocol';
+import { checkRaster } from '../core/reader/raster';
 import { CoreUnavailableError } from './core-host';
 import { notifySettings, type AppContext, type AppWindow } from './context';
 import { DIALOG_ID_RE } from './link-dialog';
@@ -85,7 +87,7 @@ import { attachmentName, emlName } from './saves/names';
 import type { SaveAsk, SaveWindow } from './saves/manager';
 import { headerDocument } from './source-doc';
 import { sourceNodes } from './source-parts';
-import { bodyUrl, type View, type ViewBody, type ViewMessage } from './views';
+import { bodyUrl, previewUrl, type View, type ViewBody, type ViewMessage } from './views';
 
 const Generation = z
   .number()
@@ -603,6 +605,7 @@ export function registerIpc(ctx: AppContext): void {
           name: a.name,
           contentType: a.contentType,
           size: a.size,
+          preview: a.preview,
         })),
       },
     });
@@ -630,6 +633,7 @@ export function registerIpc(ctx: AppContext): void {
         size: a.size,
         risky: a.risky,
         imageFormat: a.imageFormat,
+        preview: a.preview,
       })),
       details: message.details,
       highlighted: message.highlighted,
@@ -768,6 +772,83 @@ export function registerIpc(ctx: AppContext): void {
       assetId: 'e',
       name: emlName(message.subject),
     }));
+  });
+
+  /**
+   * Previews one attachment of the window's live view, in place of any
+   * preview it had. Only an attachment the reader found to be a valid image
+   * can be previewed. Its bytes come through the save lane, checked again by
+   * core, then here; the view holds them until it is revoked or the preview
+   * is closed, and serves them under its own token.
+   */
+  guarded<PreviewResult>(IPC.preview, async (appWin, raw) => {
+    const refused = (reason: 'stale_generation' | 'not_live' | 'no_preview' | 'refused') =>
+      ctx.log.info('preview.refused', { reason, windowId: appWin.id });
+    const args = SaveArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ openId, index, generation }] = args.data;
+    const live = liveView(appWin, openId, generation);
+    if (typeof live === 'string') {
+      refused(live === 'stale_generation' ? live : 'not_live');
+      return reject(live, appWin);
+    }
+    const { view, message } = live;
+    const attachment = message.attachments[index];
+    const listed = attachment?.preview;
+    if (!attachment || !listed) {
+      refused('no_preview');
+      return reject('no_preview', appWin);
+    }
+    if (!ctx.saves) return reject('invalid', appWin);
+    if (ctx.sources.isOffline()) return reject('offline', appWin);
+    if (!message.file || !message.version) return reject('changed', appWin);
+    const outcome = await ctx.saves.preview(saveWindow(appWin), {
+      openId: view.openId,
+      generation: view.generation,
+      rowid: message.rowid,
+      file: message.file,
+      version: message.version,
+      target: {
+        kind: 'preview',
+        path: attachment.path,
+        contentType: attachment.contentType,
+        size: attachment.size,
+        format: listed.format,
+      },
+    });
+    // The lane logged why it gave no bytes.
+    if (!outcome.ok) return reject(outcome.code, appWin);
+    const check = checkRaster(outcome.bytes);
+    if (!check.ok || check.image.format !== listed.format) {
+      refused('refused');
+      return reject('preview_failed', appWin);
+    }
+    // Only the view that asked holds it, and only while it is still live.
+    const n =
+      appWin.win.isDestroyed() || view.generation !== ctx.generation
+        ? null
+        : appWin.views.setPreview(
+            view.openId,
+            view.token,
+            index,
+            check.image.contentType,
+            outcome.bytes,
+          );
+    if (n === null) {
+      refused('not_live');
+      return reject('superseded', appWin);
+    }
+    ctx.log.info('preview.opened', { bytes: outcome.bytes.byteLength, windowId: appWin.id });
+    return { ok: true, url: previewUrl(view.token, n) };
+  });
+
+  guarded<ReaderActionResult>(IPC.previewClose, (appWin, raw) => {
+    const live = actionView(appWin, raw);
+    if (typeof live === 'string') return reject(live, appWin);
+    if (appWin.views.clearPreview(live.view.openId)) {
+      ctx.log.info('preview.closed', { windowId: appWin.id });
+    }
+    return { ok: true };
   });
 
   /**

@@ -221,7 +221,7 @@ test('the list shows each attachment and leaves out the image the HTML body show
   );
   // The shell gets an index per row, never the part it is.
   expect(view.attachments.map((a) => Object.keys(a).sort())).toEqual(
-    Array(4).fill(['imageFormat', 'index', 'label', 'name', 'risky', 'size']),
+    Array(4).fill(['imageFormat', 'index', 'label', 'name', 'preview', 'risky', 'size']),
   );
   expect(view.attachments.map((a) => a.index)).toEqual([0, 1, 2, 3]);
 

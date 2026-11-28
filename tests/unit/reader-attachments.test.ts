@@ -91,6 +91,7 @@ describe('the attachment list', () => {
         size: samplePng().length,
         risky: false,
         imageFormat: 'png',
+        preview: { format: 'png', width: 16, height: 16 },
       },
       {
         path: '1.2',
@@ -100,6 +101,7 @@ describe('the attachment list', () => {
         size: 15,
         risky: false,
         imageFormat: null,
+        preview: null,
       },
       {
         path: '1.3',
@@ -109,6 +111,7 @@ describe('the attachment list', () => {
         size: Buffer.byteLength('café au lait'),
         risky: false,
         imageFormat: null,
+        preview: null,
       },
       {
         path: '1.4',
@@ -118,6 +121,7 @@ describe('the attachment list', () => {
         size: 3,
         risky: false,
         imageFormat: null,
+        preview: null,
       },
       {
         path: '1.5',
@@ -127,6 +131,7 @@ describe('the attachment list', () => {
         size: Buffer.byteLength('MZ program'),
         risky: true,
         imageFormat: null,
+        preview: null,
       },
     ]);
   });

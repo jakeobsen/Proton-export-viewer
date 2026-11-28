@@ -69,6 +69,8 @@ export const IPC = {
   recentSearches: 'pev:recent-searches',
   keepRecent: 'pev:keep-recent',
   clearRecent: 'pev:clear-recent',
+  preview: 'pev:preview',
+  previewClose: 'pev:preview-close',
 } as const;
 
 export type RejectCode =
@@ -92,7 +94,9 @@ export type RejectCode =
   | 'queue_full'
   | 'refused'
   | 'not_deleted'
-  | 'failed';
+  | 'failed'
+  | 'no_preview'
+  | 'preview_failed';
 
 export type Rejected = { ok: false; code: RejectCode };
 
@@ -113,6 +117,8 @@ export interface AttachmentItem {
   size: number;
   risky: boolean;
   imageFormat: RasterFormat | null;
+  /** Set when the attachment can be previewed: the format and canvas its bytes passed the check with. */
+  preview: { format: RasterFormat; width: number; height: number } | null;
 }
 
 /** The outcome of an action on the open message, such as Show in folder. */
@@ -145,6 +151,9 @@ export type SourceResult = { ok: true; url: string; truncated: boolean } | Rejec
 export type SourceTreeResult = { ok: true; parts: SourceNode[] | null } | Rejected;
 /** Back to the message: its body URL, or null for a message the reader couldn't render. */
 export type SourceBackResult = { ok: true; url: string | null } | Rejected;
+
+/** A preview the open message's view now holds: the URL of the document that shows it. */
+export type PreviewResult = { ok: true; url: string } | Rejected;
 
 /**
  * The outcome of opening a message: its body view, or the fallback when the
@@ -345,6 +354,10 @@ export interface PevApi {
   copyHeaders(openId: number, generation: number): Promise<ReaderActionResult>;
   /** Leaves the source view. */
   sourceBack(openId: number, generation: number): Promise<SourceBackResult>;
+  /** Previews attachment `index` of the open message, in place of any preview it had. */
+  preview(openId: number, index: number, generation: number): Promise<PreviewResult>;
+  /** Drops the open message's preview. */
+  previewClose(openId: number, generation: number): Promise<ReaderActionResult>;
   log(
     level: 'error' | 'warn' | 'info',
     code: string,

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The bytes of one save, in chunks: a part's decoded bytes, found by its path
-// with the reader's own numbering, or the message file as it is.
+// with the reader's own numbering, or the message file as it is. A preview is
+// a part whose completing bytes also wait for the raster check.
 //
 // A save streams exactly the size the view listed. One byte more, or an end
 // before it, means the message isn't the one the view showed, and the save
@@ -15,6 +16,7 @@ import { Splitter, type MimeNode } from '@zone-eu/mailsplit';
 import { SAVE_CHUNK_BYTES, type SaveTarget } from '../../shared/save-protocol';
 import { SPLITTER_OPTIONS } from '../reader/extract';
 import { PartTree } from '../reader/parts';
+import { checkRaster } from '../reader/raster';
 
 /** Bytes of input read between two ticks while no chunk is ready. */
 export const TICK_BYTES = 8 * 1024 * 1024;
@@ -29,7 +31,7 @@ export interface ChunkSink {
 
 /** The save can't go on: the message changed, or it couldn't be read. */
 export class SaveStop extends Error {
-  constructor(readonly reason: 'changed' | 'unreadable') {
+  constructor(readonly reason: 'changed' | 'unreadable' | 'refused') {
     super(reason);
     this.name = 'SaveStop';
   }
@@ -123,7 +125,7 @@ class Done extends Error {}
  */
 export async function producePart(
   input: Readable,
-  target: Extract<SaveTarget, { kind: 'part' }>,
+  target: Extract<SaveTarget, { kind: 'part' | 'preview' }>,
   sink: ChunkSink,
 ): Promise<Uint8Array> {
   const tree = new PartTree();
@@ -206,5 +208,34 @@ export async function producePart(
   }
   // The input ended without the part: it isn't where the view found it.
   if (last === null) throw new SaveStop('changed');
+  return last;
+}
+
+/** Passes each chunk on, keeping a copy first: the original goes to core with its message. */
+function keeping(sink: ChunkSink, kept: Uint8Array[]): ChunkSink {
+  return {
+    put: (bytes) => {
+      kept.push(Uint8Array.from(bytes));
+      return sink.put(bytes);
+    },
+    tick: () => sink.tick(),
+  };
+}
+
+/**
+ * One image part's decoded bytes, for a preview: as producePart, but the
+ * bytes that complete it come back only if the whole part passes the raster
+ * check as the format listed. Otherwise it fails as refused. The part is at
+ * most the preview cap, which the lane checks before it starts.
+ */
+export async function producePreview(
+  input: Readable,
+  target: Extract<SaveTarget, { kind: 'preview' }>,
+  sink: ChunkSink,
+): Promise<Uint8Array> {
+  const kept: Uint8Array[] = [];
+  const last = await producePart(input, target, keeping(sink, kept));
+  const checked = checkRaster(Buffer.concat([...kept, last]));
+  if (!checked.ok || checked.image.format !== target.format) throw new SaveStop('refused');
   return last;
 }

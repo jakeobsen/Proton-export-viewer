@@ -45,6 +45,9 @@ export const LOG_CODES = [
   'save.shown',
   'save.partial_kept',
   'save.staging_failed',
+  'preview.opened',
+  'preview.refused',
+  'preview.closed',
   'protocol.not_found',
   'view.installed',
   'reader.show_in_folder',
@@ -76,6 +79,7 @@ export const LOG_CODES = [
   'reader.worker_retired',
   'reader.images_refused',
   'reader.marks_dropped',
+  'reader.preview_unchecked',
   'index.created',
   'index.opened',
   'index.open_failed',
@@ -252,6 +256,11 @@ export const REASONS = [
   'failed',
   'unavailable',
   'closed',
+  // Attachment previews.
+  'queue_full',
+  'not_live',
+  'no_preview',
+  'preview_failed',
 ] as const;
 
 /** The lists of a message whose entries can be cut to a limit when indexed. */

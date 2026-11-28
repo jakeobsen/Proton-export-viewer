@@ -8,7 +8,7 @@ import { APP_HOST, BODY_CSP, VIEW_HOST } from '../shared/constants';
 import { checkRaster } from '../core/reader/raster';
 import type { Logger } from '../shared/log/writer';
 import { SAVE_PROOF_HEADER, type SaveRequestProof } from './saves/manager';
-import type { ViewRegistry } from './views';
+import { previewAssetUrl, type View, type ViewRegistry } from './views';
 
 export interface RequestLike {
   url: string;
@@ -35,8 +35,9 @@ const CONTENT_TYPES: Record<string, string> = {
 
 const ASSET_ID_RE = /^[a-z0-9][a-z0-9.]{0,31}$/;
 const CID_RE = /^c\d{1,4}$/;
-// A view's body, or its source document number n.
-const VIEW_PATH_RE = /^\/([0-9a-f]{32})(?:\/source\/([1-9]\d{0,8}))?$/;
+const PREVIEW_RE = /^p(\d{1,9})$/;
+// A view's body, its source document number n, or its preview's document.
+const VIEW_PATH_RE = /^\/([0-9a-f]{32})(?:\/source\/([1-9]\d{0,8})|\/(p\d{1,9}))?$/;
 const ASSET_PATH_RE = /^\/([0-9a-f]{32})\/([^/]+)$/;
 
 function notFound(): Response {
@@ -124,10 +125,31 @@ export interface ViewHandlerOptions {
   saves?: SaveAssets | undefined;
 }
 
+/** The preview `id` (`p<n>`) names, if `view` holds it now. */
+function previewOf(view: View, id: string) {
+  const match = PREVIEW_RE.exec(id);
+  return match && view.preview && String(view.preview.n) === match[1] ? view.preview : null;
+}
+
 /**
- * Serves `mail-body://v/<token>` for live views of this window only, and
+ * The fixed document a preview frame shows: the preview's image alone,
+ * scaled to fit. It holds no mail data, only the image's URL.
+ */
+export function previewDocument(token: string, n: number): string {
+  return (
+    '<!doctype html><html><head><meta charset="utf-8"><style>' +
+    'html,body{margin:0;height:100%;overflow:hidden}' +
+    'body{display:flex;align-items:center;justify-content:center}' +
+    'img{max-width:100%;max-height:100%;object-fit:contain}' +
+    `</style></head><body><img src="${previewAssetUrl(token, n)}" alt=""></body></html>`
+  );
+}
+
+/**
+ * Serves `mail-body://v/<token>` for live views of this window only,
  * `mail-body://v/<token>/source/<n>` while that is the view's current source
- * document. A source-only view has no body.
+ * document, and `mail-body://v/<token>/p<n>`, the document of the preview
+ * that view holds now. A source-only view has no body.
  */
 export function bodyHandler(options: ViewHandlerOptions): Handler {
   return async (request) => {
@@ -136,13 +158,17 @@ export function bodyHandler(options: ViewHandlerOptions): Handler {
     const match = url && url.host === VIEW_HOST ? VIEW_PATH_RE.exec(url.pathname) : null;
     const view = match?.[1] ? options.views.lookup(match[1]) : undefined;
     const n = match?.[2];
+    const previewId = match?.[3];
+    const preview = view && previewId !== undefined ? previewOf(view, previewId) : null;
     const html = !view
       ? null
       : n !== undefined
         ? options.views.sourceDoc(view.token, Number(n))
-        : view.sourceOnly
-          ? null
-          : view.html;
+        : previewId !== undefined
+          ? preview && previewDocument(view.token, preview.n)
+          : view.sourceOnly
+            ? null
+            : view.html;
     if (html === null) {
       options.log.info('protocol.not_found', {
         scheme: 'mail-body',
@@ -164,9 +190,10 @@ export function bodyHandler(options: ViewHandlerOptions): Handler {
 
 /**
  * Serves `mail-asset://v/<token>/<id>` for assets registered with a live view
- * of this window. An inline image (`c<n>`) passes the raster check again here,
- * and is served with the type of the format it found. A save's asset has a
- * token of its own, outlives the view it was asked from, and is served once.
+ * of this window. An inline image (`c<n>`) and the view's preview (`p<n>`)
+ * pass the raster check again here, and are served with the type of the
+ * format it found. A save's asset has a token of its own, outlives the view
+ * it was asked from, and is served once.
  */
 export function assetHandler(options: ViewHandlerOptions): Handler {
   const reject = (reason: string): Response => {
@@ -192,6 +219,20 @@ export function assetHandler(options: ViewHandlerOptions): Handler {
     const view = options.views.lookup(match[1]);
     if (!view) return reject('unknown_token');
     const id = match[2];
+    if (PREVIEW_RE.test(id)) {
+      const preview = previewOf(view, id);
+      if (!preview) return reject('unknown_asset');
+      const check = checkRaster(preview.bytes);
+      if (!check.ok) return reject(check.reason);
+      return new Response(new Uint8Array(preview.bytes), {
+        status: 200,
+        headers: {
+          'Content-Type': check.image.contentType,
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+        },
+      });
+    }
     const asset = ASSET_ID_RE.test(id) ? view.assets.get(id) : undefined;
     if (!asset) return reject('unknown_asset');
     let contentType = asset.contentType;

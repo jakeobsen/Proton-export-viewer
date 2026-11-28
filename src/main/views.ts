@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Per-window registry of message-body views. A window has at most one live
-// view; it is revoked as soon as the next open is accepted.
+// view; it is revoked as soon as the next open is accepted. A view may hold
+// one attachment preview, which goes with it.
 
 import { randomBytes } from 'node:crypto';
-import { BODY_SCHEME, VIEW_HOST } from '../shared/constants';
-import type { FileIdentity, FileVersion } from '../shared/reader-protocol';
+import { ASSET_SCHEME, BODY_SCHEME, VIEW_HOST } from '../shared/constants';
+import type { AttachmentPreview, FileIdentity, FileVersion } from '../shared/reader-protocol';
 
 export interface ViewAsset {
   contentType: string;
@@ -27,6 +28,19 @@ export interface ViewAttachment {
   contentType: string;
   /** The decoded size, in bytes. */
   size: number;
+  /** The format and canvas the whole part passed the raster check with; null: no preview. */
+  preview: AttachmentPreview | null;
+}
+
+/** The attachment preview a view holds: one image, served under the view's token. */
+export interface ViewPreview {
+  /** Names the preview in its URLs (`p<n>`); a new preview gets a new number. */
+  n: number;
+  /** The attachment's index in the view's list. */
+  index: number;
+  /** The type of the format the bytes passed the raster check as. */
+  contentType: string;
+  bytes: Uint8Array;
 }
 
 /** What main keeps about the message a view shows, for the actions on it. */
@@ -95,6 +109,8 @@ export interface View {
    * body, and its body URL is never authorized or served.
    */
   sourceOnly: boolean;
+  /** The attachment preview the view shows, if any. */
+  preview: ViewPreview | null;
 }
 
 /**
@@ -130,6 +146,16 @@ export function sourceUrl(token: string, n: number): string {
   return `${BODY_SCHEME}://${VIEW_HOST}/${token}/source/${n}`;
 }
 
+/** The fixed document that shows preview `n` of the view with `token`. */
+export function previewUrl(token: string, n: number): string {
+  return `${BODY_SCHEME}://${VIEW_HOST}/${token}/p${n}`;
+}
+
+/** The image of preview `n` of the view with `token`. */
+export function previewAssetUrl(token: string, n: number): string {
+  return `${ASSET_SCHEME}://${VIEW_HOST}/${token}/p${n}`;
+}
+
 export class ViewRegistry {
   private readonly live = new Map<string, View>();
   private latestOpenId = 0;
@@ -137,6 +163,7 @@ export class ViewRegistry {
   private authorized: string | null = null;
   private fallback: Fallback | null = null;
   private sourceSessions = 0;
+  private previewSeq = 0;
 
   constructor(private readonly newToken: () => string = () => randomBytes(16).toString('hex')) {}
 
@@ -175,6 +202,7 @@ export class ViewRegistry {
       source: null,
       sourceBlocks: 0,
       sourceOnly: false,
+      preview: null,
     };
     this.live.set(token, view);
     this.pendingToken = null;
@@ -230,6 +258,7 @@ export class ViewRegistry {
           source: null,
           sourceBlocks: 0,
           sourceOnly: true,
+          preview: null,
         };
         this.live.set(f.token, view);
       }
@@ -348,6 +377,41 @@ export class ViewRegistry {
   /** The only body URL the body frame may navigate to. */
   authorizedUrl(): string | null {
     return this.authorized;
+  }
+
+  /**
+   * Gives the live view of open `openId`, if it still has `token`, a preview
+   * of attachment `index`, in place of any it had. Returns its number, or
+   * null when that view is no longer live.
+   */
+  setPreview(
+    openId: number,
+    token: string,
+    index: number,
+    contentType: string,
+    bytes: Uint8Array,
+  ): number | null {
+    const view = this.byOpenId(openId);
+    if (!view || view.token !== token) return null;
+    this.previewSeq += 1;
+    view.preview = { n: this.previewSeq, index, contentType, bytes };
+    return this.previewSeq;
+  }
+
+  /** Drops the preview of the live view of open `openId`. Returns whether it had one. */
+  clearPreview(openId: number): boolean {
+    const view = this.byOpenId(openId);
+    if (!view?.preview) return false;
+    view.preview = null;
+    return true;
+  }
+
+  /** The only preview URL a preview frame may navigate to: the live view's, while it has one. */
+  previewFrameUrl(): string | null {
+    for (const view of this.live.values()) {
+      if (view.preview) return previewUrl(view.token, view.preview.n);
+    }
+    return null;
   }
 
   get liveCount(): number {

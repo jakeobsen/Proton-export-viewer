@@ -66,6 +66,10 @@ export interface RenderOptions {
   stored?: StoredBody;
   /** Told how many match ranges were dropped because they failed the check. */
   onMarksDropped?: (count: number) => void;
+  /** Told how many attachments got no preview because the read's check budget was spent. */
+  onPreviewUnchecked?: (count: number) => void;
+  /** The read's preview check budget, in decoded bytes; PREVIEW_CHECK_BYTES unless set. */
+  previewCheckBytes?: number;
 }
 
 function cut(text: string, max: number): string {
@@ -122,14 +126,16 @@ export function headerFields(headers: Headers | null, lines: HeaderLines | null)
  * in message order, except the parts the shown body displays as images. It
  * has no cap of its own: it holds every attachment read, so each one can be
  * saved, and can be longer than the index's rows, which stop at
- * MAX_ATTACHMENTS. The two agree on the rows the index keeps.
+ * MAX_ATTACHMENTS. The two agree on the rows the index keeps. An entry's
+ * preview is the raster check's result on the whole part, never its
+ * declared type.
  */
 export function attachmentList(
   extracted: Pick<ExtractedMessage, 'tree' | 'listed'>,
   shown: ReadonlySet<number>,
 ): AttachmentEntry[] {
   const out: AttachmentEntry[] = [];
-  for (const { part, size, head } of extracted.listed) {
+  for (const { part, size, head, preview } of extracted.listed) {
     const record = extracted.tree.parts[part];
     if (!record || shown.has(part)) continue;
     const name = cleanFilename(record.filename ?? '');
@@ -142,6 +148,7 @@ export function attachmentList(
       size,
       risky: isRisky(name),
       imageFormat,
+      preview,
     });
   }
   return out;
@@ -251,8 +258,9 @@ export async function renderMessage(
   input: Readable,
   options: RenderOptions,
 ): Promise<RenderedMessage> {
-  const extracted = await extractMessage(input);
+  const extracted = await extractMessage(input, KEEP_BYTES, options.previewCheckBytes);
   const { headers: parsedHeaders, lines, text, html, stopped } = extracted;
+  if (extracted.previewUnchecked > 0) options.onPreviewUnchecked?.(extracted.previewUnchecked);
   const headers = headerFields(parsedHeaders, lines);
   const hasHtml = html.content.length > 0 || html.cut;
   const hasText = text.content.length > 0 || text.cut;

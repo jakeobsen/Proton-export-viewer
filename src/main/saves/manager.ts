@@ -17,13 +17,21 @@
 //    published into the downloads folder without replacing anything.
 // A source switch, Forget, Reset, a closed window or quit cancels saves; a new
 // view in the window (an expansion) does not.
+//
+// A preview takes the same turn in the same queue, but core's chunks go into
+// main's memory, never to a file: only step 2 applies, and main refuses as
+// soon as core sends more than the size the view listed.
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { mkdirSync, realpathSync, rmSync } from 'node:fs';
 import { APP_HOST, APP_SCHEME, ASSET_SCHEME, VIEW_HOST } from '../../shared/constants';
 import type { CoreResult } from '../../shared/core-protocol';
 import type { Logger } from '../../shared/log/writer';
-import type { FileIdentity, FileVersion } from '../../shared/reader-protocol';
+import {
+  PREVIEW_MAX_BYTES,
+  type FileIdentity,
+  type FileVersion,
+} from '../../shared/reader-protocol';
 import {
   SAVE_IDLE_MS,
   type SaveRequest as CoreSaveRequest,
@@ -123,6 +131,15 @@ export interface SaveAsk {
 export type SaveOutcome =
   { ok: true; saveId: number } | { ok: false; code: 'save_failed' | 'queue_full' };
 
+/** What a preview needs from the view it was asked from; its target is a preview. */
+export type PreviewAsk = Omit<SaveAsk, 'target' | 'assetId' | 'name'> & {
+  target: Extract<SaveTarget, { kind: 'preview' }>;
+};
+
+/** A preview's bytes, every one core checked; or why there are none, as logged. */
+export type PreviewOutcome =
+  { ok: true; bytes: Uint8Array } | { ok: false; code: 'preview_failed' | 'queue_full' };
+
 /** Why a save failed, as logged. */
 type FailReason =
   | 'export_root'
@@ -138,7 +155,8 @@ type FailReason =
   | 'window_closed'
   | 'quit'
   | 'not_found'
-  | 'core_unavailable';
+  | 'core_unavailable'
+  | 'refused';
 
 /** The part of a download item a save uses. */
 export interface DownloadLike {
@@ -156,6 +174,8 @@ interface Job {
   win: SaveWindow;
   ask: SaveAsk;
   resolve: (outcome: SaveOutcome) => void;
+  /** A preview: the part's bytes, collected in memory, once every one came. */
+  preview: { bytes: Uint8Array | null } | null;
 }
 
 interface Running extends Job {
@@ -305,16 +325,37 @@ export class SaveManager {
 
   /** Asks for a save; resolves when it has ended. */
   request(win: SaveWindow, ask: SaveAsk): Promise<SaveOutcome> {
+    return this.enqueue(win, ask, null);
+  }
+
+  /**
+   * Asks for a preview's bytes: core reads the part, checks it again as an
+   * image of the listed format, and main keeps every byte in memory. Waits
+   * its turn with the saves.
+   */
+  async preview(win: SaveWindow, ask: PreviewAsk): Promise<PreviewOutcome> {
+    const preview: Job['preview'] = { bytes: null };
+    const outcome = await this.enqueue(win, { ...ask, assetId: '', name: '' }, preview);
+    if (outcome.ok && preview.bytes) return { ok: true, bytes: preview.bytes };
+    return {
+      ok: false,
+      code: !outcome.ok && outcome.code === 'queue_full' ? 'queue_full' : 'preview_failed',
+    };
+  }
+
+  private enqueue(win: SaveWindow, ask: SaveAsk, preview: Job['preview']): Promise<SaveOutcome> {
     const saves = this.forWindow(win.id);
     if (saves.waiting >= MAX_WAITING) {
-      this.deps.log.warn('save.queue_full', { windowId: win.id });
+      if (preview)
+        this.deps.log.info('preview.refused', { reason: 'queue_full', windowId: win.id });
+      else this.deps.log.warn('save.queue_full', { windowId: win.id });
       return Promise.resolve({ ok: false, code: 'queue_full' });
     }
     this.seq += 1;
     const saveId = this.seq;
     saves.waiting += 1;
     return new Promise<SaveOutcome>((resolve) => {
-      this.queue.push({ saveId, win, ask, resolve });
+      this.queue.push({ saveId, win, ask, resolve, preview });
       this.next();
     });
   }
@@ -349,7 +390,10 @@ export class SaveManager {
 
   private drop(job: Job, reason: FailReason): void {
     this.forWindow(job.win.id).waiting -= 1;
-    this.deps.log.info('save.failed', { reason, windowId: job.win.id });
+    this.deps.log.info(job.preview ? 'preview.refused' : 'save.failed', {
+      reason,
+      windowId: job.win.id,
+    });
     job.resolve({ ok: false, code: 'save_failed' });
   }
 
@@ -459,10 +503,13 @@ export class SaveManager {
     this.running = save;
     let opened = false;
     let outcome: SaveOutcome = { ok: false, code: 'save_failed' };
+    const onOpen = () => {
+      opened = true;
+    };
     try {
-      outcome = await this.steps(save, saves, () => {
-        opened = true;
-      });
+      outcome = job.preview
+        ? await this.collect(save, job.preview, onOpen)
+        : await this.steps(save, saves, onOpen);
     } catch {
       this.fail(save, 'publish');
     } finally {
@@ -475,7 +522,15 @@ export class SaveManager {
           .catch(() => undefined);
       }
       if (save.staged !== '') removeQuietly(save.staged);
-      if (outcome.ok) {
+      if (job.preview) {
+        // The view that asked logs the preview once it holds it.
+        if (!outcome.ok) {
+          this.deps.log.info('preview.refused', {
+            reason: save.failure ?? 'refused',
+            windowId: win.id,
+          });
+        }
+      } else if (outcome.ok) {
         this.deps.log.info('save.done', {
           reason: save.method ?? 'link',
           bytes: save.size,
@@ -489,6 +544,97 @@ export class SaveManager {
       job.resolve(outcome);
       this.next();
     }
+  }
+
+  /**
+   * A preview's turn: core opens the file the view was read from and checks
+   * it, then main pulls the part into memory. Core sends the chunk that
+   * completes it only after the whole part passed the raster check again.
+   */
+  private async collect(
+    save: Running,
+    preview: NonNullable<Job['preview']>,
+    onOpen: () => void,
+  ): Promise<SaveOutcome> {
+    const failed: SaveOutcome = { ok: false, code: 'save_failed' };
+    const { ask, saveId } = save;
+    const limit = Math.min(ask.target.size, PREVIEW_MAX_BYTES);
+    let opened: CoreResult;
+    try {
+      opened = await this.deps.request(
+        {
+          type: 'save-open',
+          saveId,
+          generation: ask.generation,
+          rowid: ask.rowid,
+          file: ask.file,
+          version: ask.version,
+          target: ask.target,
+        },
+        this.deps.stamp(),
+      );
+    } catch {
+      this.fail(save, 'core_unavailable');
+      return failed;
+    }
+    if (!opened.ok) {
+      const code = opened.code;
+      this.fail(
+        save,
+        code === 'changed' || code === 'unreadable' || code === 'refused' ? code : 'not_found',
+      );
+      return failed;
+    }
+    onOpen();
+    if (save.failure !== null) return failed;
+    save.size = opened.size ?? 0;
+    if (save.size !== ask.target.size || save.size > limit) {
+      this.fail(save, 'refused');
+      return failed;
+    }
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    while (!save.coreDone) {
+      let result: CoreResult;
+      try {
+        result = await this.deps.request({ type: 'save-pull', saveId }, this.deps.stamp());
+      } catch {
+        this.fail(save, 'core_unavailable');
+        return failed;
+      }
+      if (save.failure !== null) return failed;
+      if (!result.ok) {
+        const code = result.code;
+        this.fail(
+          save,
+          code === 'changed' || code === 'unreadable' || code === 'stalled' || code === 'refused'
+            ? code
+            : 'cancelled',
+        );
+        return failed;
+      }
+      const chunk = result.chunk ?? new Uint8Array(0);
+      total += chunk.byteLength;
+      // Never more than the view listed, whatever core sends.
+      if (total > limit) {
+        this.fail(save, 'refused');
+        return failed;
+      }
+      chunks.push(chunk);
+      if (result.done) save.coreDone = true;
+    }
+    if (total !== save.size) {
+      this.fail(save, 'short');
+      return failed;
+    }
+    const bytes = new Uint8Array(total);
+    let at = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, at);
+      at += chunk.byteLength;
+    }
+    preview.bytes = bytes;
+    return { ok: true, saveId };
   }
 
   private async steps(save: Running, saves: WindowSaves, onOpen: () => void): Promise<SaveOutcome> {

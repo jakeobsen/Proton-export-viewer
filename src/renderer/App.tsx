@@ -7,6 +7,7 @@ import { indexChanged, syncMailbox, useCards, useMailbox, useSearch } from './ma
 import { ConversationList, Sidebar } from './Mailbox';
 import { SearchBox, SearchResults } from './SearchResults';
 import { LinkDialog } from './LinkDialog';
+import { PreviewDialog } from './PreviewDialog';
 import { generationChanged, useReaderState } from './reader';
 import { ReaderPane } from './ReaderPane';
 import { ReportView } from './Report';
@@ -180,6 +181,9 @@ export function App() {
         </div>
       </div>
       {shortcutsShown && <ShortcutsOverlay />}
+      {reader.preview !== null && (
+        <PreviewDialog key={reader.preview.url} preview={reader.preview} />
+      )}
       {state.link !== null && <LinkDialog key={state.link.dialogId} prompt={state.link} />}
     </div>
   );

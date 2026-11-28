@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // A save's bytes: a part found by the reader's numbering and decoded, or the
 // message file as it is; exactly the listed size, with the completing bytes
-// held back until the input has ended.
+// held back until the input has ended. A preview's completing bytes come only
+// once the whole part has passed the raster check as the listed format.
 
 import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
@@ -11,9 +12,12 @@ import {
   SaveStop,
   produceFile,
   producePart,
+  producePreview,
   type ChunkSink,
 } from '../../src/core/save/produce';
 import { SAVE_CHUNK_BYTES } from '../../src/shared/save-protocol';
+import { INLINE_BOMBS } from '../../tools/gen-export/hostile.mjs';
+import { jpegImage, paddedPng } from '../../tools/gen-export/images.mjs';
 
 /** A sink that records each chunk, and the order of puts. */
 function recorder(): ChunkSink & { chunks: Uint8Array[]; ticks: number } {
@@ -287,5 +291,57 @@ describe('producePart', () => {
       ),
     ).rejects.toEqual(new SaveStop('changed'));
     expect(sink2.ticks).toBeGreaterThan(0);
+  });
+});
+
+describe('producePreview', () => {
+  // Over two chunks, so the check must see the chunks already sent, not only the last.
+  const png = paddedPng(SAVE_CHUNK_BYTES + 4096);
+  const target = (bytes: Buffer, format: 'png' | 'jpeg' = 'png') =>
+    ({
+      kind: 'preview',
+      path: '1.3',
+      contentType: 'application/pdf',
+      size: bytes.length,
+      format,
+    }) as const;
+
+  it('sends the whole part once it passes the raster check as the listed format', async () => {
+    const sink = recorder();
+    const last = await producePreview(input(message(png)), target(png), sink);
+    expect(sink.chunks).toHaveLength(1);
+    expect(sha(joined(sink.chunks, last))).toBe(sha(png));
+  });
+
+  it('bytes that fail the check fail as refused, and the completing bytes never go out', async () => {
+    const bomb = INLINE_BOMBS['apng-frames']![0]();
+    const sink = recorder();
+    await expect(producePreview(input(message(bomb)), target(bomb), sink)).rejects.toEqual(
+      new SaveStop('refused'),
+    );
+    expect(Buffer.concat(sink.chunks).length).toBeLessThan(bomb.length);
+  });
+
+  it('an image of another format than listed fails as refused', async () => {
+    const jpeg = jpegImage(8, 8);
+    await expect(
+      producePreview(input(message(jpeg)), target(jpeg, 'png'), recorder()),
+    ).rejects.toEqual(new SaveStop('refused'));
+    const sink = recorder();
+    const last = await producePreview(input(message(jpeg)), target(jpeg, 'jpeg'), sink);
+    expect(sha(joined(sink.chunks, last))).toBe(sha(jpeg));
+  });
+
+  it('checks the bytes it read, not the chunks the receiver may have changed', async () => {
+    // A receiver that zeroes each chunk it takes, as a transfer would detach it.
+    const sink = recorder();
+    const put = sink.put;
+    sink.put = (bytes) => {
+      const done = put(Uint8Array.from(bytes));
+      bytes.fill(0);
+      return done;
+    };
+    const last = await producePreview(input(message(png)), target(png), sink);
+    expect(sha(joined(sink.chunks, last))).toBe(sha(png));
   });
 });

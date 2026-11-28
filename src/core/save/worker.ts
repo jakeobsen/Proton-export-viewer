@@ -7,7 +7,7 @@ import { Readable } from 'node:stream';
 import { parentPort } from 'node:worker_threads';
 import type { SaveTarget, SaveWorkerIn, SaveWorkerOut } from '../../shared/save-protocol';
 import { borrowedFdStream } from '../fd-stream';
-import { SaveStop, produceFile, producePart, type ChunkSink } from './produce';
+import { SaveStop, produceFile, producePart, producePreview, type ChunkSink } from './produce';
 
 function post(message: SaveWorkerOut): void {
   if (message.type === 'chunk' || message.type === 'last') {
@@ -46,7 +46,9 @@ async function run(fd: number, target: SaveTarget, fileSize: number): Promise<vo
     const last =
       target.kind === 'eml'
         ? await produceFile(target.size > 0 ? input(fd, target.size) : null, target, sink)
-        : await producePart(input(fd, fileSize), target, sink);
+        : target.kind === 'preview'
+          ? await producePreview(input(fd, fileSize), target, sink)
+          : await producePart(input(fd, fileSize), target, sink);
     post({ type: 'last', bytes: last });
   } catch (err) {
     post({ type: 'failed', reason: err instanceof SaveStop ? err.reason : 'unreadable' });

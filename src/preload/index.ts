@@ -64,6 +64,10 @@ const api: PevApi = {
     ipcRenderer.invoke(IPC.sourcePart, { openId, path, generation }),
   copyHeaders: (openId, generation) => ipcRenderer.invoke(IPC.copyHeaders, { openId, generation }),
   sourceBack: (openId, generation) => ipcRenderer.invoke(IPC.sourceBack, { openId, generation }),
+  preview: (openId, index, generation) =>
+    ipcRenderer.invoke(IPC.preview, { openId, index, generation }),
+  previewClose: (openId, generation) =>
+    ipcRenderer.invoke(IPC.previewClose, { openId, generation }),
   log: (level, code, generation, data) =>
     ipcRenderer.send(
       IPC.log,

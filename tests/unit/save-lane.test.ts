@@ -7,7 +7,7 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SaveLane, type SaveWorker } from '../../src/core/save/lane';
-import type { FileVersion } from '../../src/shared/reader-protocol';
+import { PREVIEW_MAX_BYTES, type FileVersion } from '../../src/shared/reader-protocol';
 import type { SaveWorkerIn, SaveWorkerOut } from '../../src/shared/save-protocol';
 
 class FakeWorker extends EventEmitter implements SaveWorker {
@@ -135,6 +135,36 @@ describe('SaveLane', () => {
     const pulled = t.lane.pull(1);
     t.workers[0]!.send({ type: 'failed', reason: 'unreadable' });
     expect(await pulled).toEqual({ ok: false, code: 'unreadable' });
+  });
+
+  it('a preview past the cap is refused before a worker starts, and its file closed', () => {
+    const t = setup();
+    const preview = (size: number) =>
+      ({ kind: 'preview', path: '1.2', contentType: 'image/png', size, format: 'png' }) as const;
+    expect(t.lane.open(1, t.file(10), VERSION, preview(PREVIEW_MAX_BYTES + 1))).toEqual({
+      ok: false,
+      code: 'refused',
+    });
+    expect(t.closed).toEqual([10]);
+    expect(t.workers).toHaveLength(0);
+    expect(t.lane.open(2, t.file(11), VERSION, preview(PREVIEW_MAX_BYTES))).toEqual({
+      ok: true,
+      size: PREVIEW_MAX_BYTES,
+    });
+  });
+
+  it('a preview the worker refuses ends as refused', async () => {
+    const t = setup();
+    t.lane.open(1, t.file(10), VERSION, {
+      kind: 'preview',
+      path: '1.2',
+      contentType: 'image/png',
+      size: 100,
+      format: 'png',
+    });
+    const pulled = t.lane.pull(1);
+    t.workers[0]!.send({ type: 'failed', reason: 'refused' });
+    expect(await pulled).toEqual({ ok: false, code: 'refused' });
   });
 
   it('a worker that exits on its own fails the save, and the file is closed', async () => {

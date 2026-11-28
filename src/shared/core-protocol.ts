@@ -320,7 +320,8 @@ export type CoreResult =
         | 'busy'
         | 'unreadable'
         | 'stalled'
-        | 'cancelled';
+        | 'cancelled'
+        | 'refused';
       /** Why the reader gave no body, for `reader_failed`. */
       reason?: ReaderFailure;
       /** For a `read` from search that failed as `reader_failed` or `eml_missing`: how the message matched. */

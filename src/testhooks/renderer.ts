@@ -18,6 +18,8 @@ import {
   closeReader,
   getReaderState,
   openInReader,
+  closePreview,
+  previewAttachment,
   saveAttachment,
   saveMessageFile,
   showSaved,
@@ -146,6 +148,15 @@ export function install(): void {
     /** Body frames in the shell's own tree, with their URLs. */
     readerFrames: () =>
       [...document.querySelectorAll<HTMLIFrameElement>('iframe.rp-frame')].map((f) => f.src),
+    /** The preview dialog's frames, with the attributes that confine them. */
+    previewFrames: () =>
+      [...document.querySelectorAll<HTMLIFrameElement>('iframe.pv-frame')].map((f) => ({
+        src: f.src,
+        sandbox: f.getAttribute('sandbox'),
+        referrerPolicy: f.referrerPolicy,
+        tabIndex: f.tabIndex,
+        pointerEvents: getComputedStyle(f).pointerEvents,
+      })),
     refreshGeneration,
     open: (id: string) => openStub(id),
     /** Opens a message in the reader pane. */
@@ -154,6 +165,9 @@ export function install(): void {
     reader: () => getReaderState(),
     /** Saves an attachment, or the message file, of the pane's message; resolves when done. */
     saveAttachment: (index: number) => saveAttachment(index),
+    /** Previews an attachment of the pane's message; resolves with main's answer. */
+    previewAttachment: (index: number) => previewAttachment(index),
+    closePreview,
     saveMessageFile: () => saveMessageFile(),
     showSaved: () => showSaved(),
     refreshSources,

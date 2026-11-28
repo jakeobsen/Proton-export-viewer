@@ -1,0 +1,135 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+.pv-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgb(22 20 38 / 40%);
+}
+
+@media (prefers-color-scheme: dark) {
+  .pv-scrim {
+    background: rgb(0 0 0 / 55%);
+  }
+}
+
+.pv-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(640px, 100%);
+  max-height: calc(100vh - 32px);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--bg);
+  color: var(--fg);
+  box-shadow:
+    0 12px 40px rgb(17 16 32 / 18%),
+    0 2px 6px rgb(17 16 32 / 8%);
+}
+
+.pv-icon {
+  flex: none;
+}
+
+.pv-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 18px 20px 4px;
+}
+
+.pv-head h3 {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  unicode-bidi: isolate;
+}
+
+.pv-close {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.pv-close:hover {
+  background: var(--hover);
+  color: var(--fg);
+}
+
+.pv-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 4px 20px 16px;
+}
+
+/* The frame takes no pointer input: nothing in it is meant to be used. */
+.pv-frame {
+  display: block;
+  width: 100%;
+  height: min(300px, calc(100vh - 220px));
+  border: 0;
+  border-radius: 10px;
+  background: var(--panel);
+  pointer-events: none;
+}
+
+.pv-line {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.pv-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--line);
+}
+
+.pv-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12.5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.pv-btn:hover {
+  background: var(--hover);
+}
+
+.pv-primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.pv-primary:hover {
+  background: var(--accent-text);
+}
