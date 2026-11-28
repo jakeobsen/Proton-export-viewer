@@ -9,6 +9,7 @@ import { ipcMain, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
 import { z } from 'zod';
 import {
   IPC,
+  type CloseViewResult,
   type ErrorKind,
   type IndexResult,
   type LinkActionResult,
@@ -23,6 +24,9 @@ import {
   type StateResult,
 } from '../shared/api';
 import {
+  CARDS_AFTER,
+  CARDS_BEFORE,
+  CARDS_FOLLOW,
   MAX_QUERY_LENGTH,
   WINDOW_AFTER,
   WINDOW_BEFORE,
@@ -121,6 +125,32 @@ const ShellQuery = z.discriminatedUnion('op', [
       before: z.number().int().min(0).max(WINDOW_BEFORE),
       after: z.number().int().min(1).max(WINDOW_AFTER),
       selected: Rowid.nullable(),
+    })
+    .strict(),
+  z
+    .object({
+      op: z.literal('cards'),
+      follow: z.array(Rowid).max(CARDS_FOLLOW),
+      threadId: Rowid.nullable(),
+      anchor: z
+        .object({
+          rowid: Rowid.optional(),
+          key: z
+            .object({
+              time: z.number().int().min(Number.MIN_SAFE_INTEGER).max(Number.MAX_SAFE_INTEGER),
+              rowid: Rowid,
+            })
+            .strict()
+            .optional(),
+          index: z
+            .number()
+            .int()
+            .nonnegative()
+            .max(2 ** 31),
+        })
+        .strict(),
+      before: z.number().int().min(0).max(CARDS_BEFORE),
+      after: z.number().int().min(1).max(CARDS_AFTER),
     })
     .strict(),
 ]);
@@ -268,6 +298,21 @@ export function registerIpc(ctx: AppContext): void {
     }
     ctx.log.info('view.installed', { openId, windowId: appWin.id });
     return { ok: true, openId, url: bodyUrl(token) };
+  });
+
+  /**
+   * Closes the reader of this window: its view and any open still under way
+   * are revoked, so a late result installs nothing.
+   */
+  guarded<CloseViewResult>(IPC.closeView, (appWin, raw) => {
+    const args = GenerationArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
+    const revoked = appWin.views.close();
+    if (revoked > 0) {
+      ctx.log.info('view.revoked', { reason: 'closed', count: revoked, windowId: appWin.id });
+    }
+    return { ok: true };
   });
 
   const openPacer = new OpenPacer<AppWindow>(() =>

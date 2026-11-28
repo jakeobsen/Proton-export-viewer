@@ -103,6 +103,19 @@ export function closeReader(): void {
   }
 }
 
+/**
+ * Closes the pane and has main revoke its view and any open still under way,
+ * so nothing it was showing or about to show stays reachable.
+ */
+export function closeReaderAndView(): void {
+  const open = state.rowid !== null;
+  closeReader();
+  if (!open) return;
+  const generation = getShellState().generation;
+  if (generation === null) return;
+  void window.pev.closeView(generation).catch(() => undefined);
+}
+
 /** Closes the pane when the generation moved on: main has revoked its view. */
 export function generationChanged(generation: number | null): void {
   if (state.rowid !== null && openGeneration !== null && generation !== openGeneration) {
