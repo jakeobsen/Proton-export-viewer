@@ -167,6 +167,21 @@ describe('the index report, on screen', () => {
     expect(reads()).toBe(4);
   });
 
+  it('keeps card keys from moving the cards until it closes', () => {
+    const move = vi.spyOn(mailbox.cards, 'move').mockReturnValue(true);
+    try {
+      mailbox.openReport();
+      mailbox.moveCard('n');
+      mailbox.moveCard('p');
+      expect(move).not.toHaveBeenCalled();
+      mailbox.closeReport();
+      mailbox.moveCard('p');
+      expect(move.mock.calls).toEqual([[-1]]);
+    } finally {
+      move.mockRestore();
+    }
+  });
+
   it('closed while phase 1 runs, the end of phase 1 is still read', async () => {
     mailbox.openReport();
     await flush();

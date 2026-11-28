@@ -413,9 +413,11 @@ export function expandCard(card: CardRow): void {
 
 /**
  * `n` expands the next newer card, `p` the next older one, stopping at either
- * end; the list selection stays. Nothing moves while the link dialog is open.
+ * end; the list selection stays. Nothing moves while the link dialog is open
+ * or the index report shows, whether the key was typed in the shell or
+ * passed on by main from the body frame.
  */
 export function moveCard(key: CardKeyName): void {
-  if (getShellState().link !== null) return;
+  if (getShellState().link !== null || state.reportOpen) return;
   cards.move(key === 'n' ? 1 : -1);
 }
