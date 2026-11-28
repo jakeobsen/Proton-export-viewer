@@ -2,14 +2,7 @@
 // Phase 2's extractor: the body text and attachment names of one message
 // file, read as a stream within the text and attachment limits.
 
-import {
-  appendFileSync,
-  renameSync,
-  rmSync,
-  symlinkSync,
-  utimesSync,
-  writeFileSync,
-} from 'node:fs';
+import { appendFileSync, closeSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import iconv from 'iconv-lite';
@@ -25,8 +18,8 @@ import {
   extractBody,
   type BodyText,
 } from '../../src/core/index/body';
-import { scanRun } from '../../src/core/containment';
-import { BODY_CHANGED, bodyJob } from '../../src/core/index/ops';
+import { openContained, scanRun, type FileRef } from '../../src/core/containment';
+import { BODY_CHANGED, bodyJob, type BodyJobItem } from '../../src/core/index/ops';
 import { MAX_MIME_PARTS } from '../../src/core/mime-limits';
 import { largeMessage } from '../../tools/gen-export/stream.mjs';
 import { testDir } from '../paths';
@@ -461,6 +454,16 @@ describe('the attachment list', () => {
 });
 
 describe('the body job', () => {
+  /** Runs the job as core does: on a descriptor opened through the containment checks. */
+  async function job(dir: string, item: BodyJobItem & { ref: FileRef }) {
+    const fd = openContained(dir, item.ref);
+    try {
+      return await bodyJob(fd, item);
+    } finally {
+      closeSync(fd);
+    }
+  }
+
   const message = (body: string) =>
     ['Subject: s', 'Content-Type: text/plain; charset=utf-8', '', body, ''].join('\r\n');
 
@@ -474,14 +477,14 @@ describe('the body job', () => {
 
   it('reads the file the scan found', async () => {
     const { dir, ref } = folder('body-job-ok', 'plain words');
-    const r = await bodyJob(dir, { protonId: 'a', rev: 4, ref });
+    const r = await job(dir, { protonId: 'a', rev: 4, ref });
     expect(r).toMatchObject({ protonId: 'a', rev: 4, ok: true, body: 'plain words\n' });
   });
 
-  it('leaves a file that changed before or while it was read, or went', async () => {
+  it('leaves a file that changed before or while it was read', async () => {
     const before = folder('body-job-before', 'first');
     writeFileSync(before.file, message('second, longer'));
-    expect(await bodyJob(before.dir, { protonId: 'a', rev: 1, ref: before.ref })).toEqual({
+    expect(await job(before.dir, { protonId: 'a', rev: 1, ref: before.ref })).toEqual({
       protonId: 'a',
       rev: 1,
       ok: false,
@@ -491,24 +494,17 @@ describe('the body job', () => {
     const same = folder('body-job-same-size', 'first');
     writeFileSync(same.file, message('fixed'));
     utimesSync(same.file, new Date(2030, 0, 1), new Date(2030, 0, 1));
-    expect(await bodyJob(same.dir, { protonId: 'a', rev: 1, ref: same.ref })).toMatchObject({
+    expect(await job(same.dir, { protonId: 'a', rev: 1, ref: same.ref })).toMatchObject({
       ok: false,
       error: BODY_CHANGED,
     });
 
     // Large enough to take many reads; it grows after the first.
     const during = folder('body-job-during', 'words '.repeat(2_000_000));
-    const job = bodyJob(during.dir, { protonId: 'a', rev: 1, ref: during.ref });
+    const reading = job(during.dir, { protonId: 'a', rev: 1, ref: during.ref });
     await new Promise((resolve) => setImmediate(resolve));
     appendFileSync(during.file, 'more\r\n');
-    expect(await job).toMatchObject({ ok: false, error: BODY_CHANGED });
-
-    const gone = folder('body-job-gone', 'x');
-    rmSync(gone.file);
-    expect(await bodyJob(gone.dir, { protonId: 'a', rev: 1, ref: gone.ref })).toMatchObject({
-      ok: false,
-      error: BODY_CHANGED,
-    });
+    expect(await reading).toMatchObject({ ok: false, error: BODY_CHANGED });
   });
 
   it('reads a file past the parser limits up to there, truncated and capped, and checks it again', async () => {
@@ -517,22 +513,12 @@ describe('the body job', () => {
     const parts = Array.from({ length: MAX_MIME_PARTS + 10 }, (_, i) => named(`p${i}`));
     writeFileSync(join(dir, 'a.eml'), mixed(parts));
     const ref = scanRun(dir).eml.get('a')!;
-    expect(await bodyJob(dir, { protonId: 'a', rev: 1, ref })).toMatchObject({
+    expect(await job(dir, { protonId: 'a', rev: 1, ref })).toMatchObject({
       protonId: 'a',
       rev: 1,
       ok: true,
       truncated: true,
       attachmentsCapped: true,
-    });
-  });
-
-  it('gives the containment code for a link in place of the file', async () => {
-    const { dir, ref, file } = folder('body-job-link', 'x');
-    renameSync(file, `${file}.moved`);
-    symlinkSync(`${file}.moved`, file);
-    expect(await bodyJob(dir, { protonId: 'a', rev: 1, ref })).toMatchObject({
-      ok: false,
-      error: 'FILE_SYMLINK',
     });
   });
 });
