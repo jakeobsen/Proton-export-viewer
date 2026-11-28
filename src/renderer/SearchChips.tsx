@@ -97,6 +97,7 @@ function ChoiceList({
       className="chip-choices"
       role="listbox"
       aria-label={label}
+      data-keeps-keys=""
       onKeyDown={(e) => {
         if (e.key === 'Escape') {
           e.stopPropagation();
@@ -133,6 +134,18 @@ export function ChipRow({ sidebar }: { sidebar: SidebarModel | null }) {
   const full = chips.length >= MAX_CHIPS;
   const close = () => setAdding(null);
   const toggle = (what: Adding) => setAdding((now) => (now === what ? null : what));
+  // A button whose list is open keeps its keys, and Esc there closes the list.
+  const opener = (what: 'label' | 'folder') => ({
+    'aria-expanded': adding === what,
+    'data-keeps-keys': adding === what ? '' : undefined,
+    onClick: () => toggle(what),
+    onKeyDown: (e: KeyboardEvent<HTMLButtonElement>) => {
+      if (e.key === 'Escape' && adding === what) {
+        e.stopPropagation();
+        close();
+      }
+    },
+  });
   const pick = (k: 'label' | 'folder') => (id: string) => {
     addSearchChip({ k, id });
     close();
@@ -181,20 +194,10 @@ export function ChipRow({ sidebar }: { sidebar: SidebarModel | null }) {
                 After …
               </button>
             ))}
-          <button
-            type="button"
-            className="chip-add"
-            aria-expanded={adding === 'label'}
-            onClick={() => toggle('label')}
-          >
+          <button type="button" className="chip-add" {...opener('label')}>
             + Label
           </button>
-          <button
-            type="button"
-            className="chip-add"
-            aria-expanded={adding === 'folder'}
-            onClick={() => toggle('folder')}
-          >
+          <button type="button" className="chip-add" {...opener('folder')}>
             + Folder
           </button>
           {!has('unread') && (

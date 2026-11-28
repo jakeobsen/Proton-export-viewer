@@ -591,6 +591,38 @@ test('Escape closes the overlay, then Settings, then the report, then clears the
   await checkHidden(pev);
 });
 
+test('Escape in a list of choices, or on its open button, closes the list and leaves the search', async ({
+  pev,
+}) => {
+  const root = realpathSync(testDir('keys-choices'));
+  const written = writeThreads(root, { seed: 73, threads: [{ messages: 1 }, { messages: 1 }] });
+  await pev.main('queuePick', root, 'bm1');
+  await pev.shell('chooseFolder', []);
+  await phase1Done(pev, written.pairs);
+  await typeText(pev.page, 'Conversation');
+  await expect(pev.page.locator('.results')).toBeVisible();
+
+  const toggle = pev.page.locator('.search-chips .chip-add', { hasText: '+ Folder' });
+  const list = pev.page.getByRole('listbox', { name: 'Folders' });
+  await toggle.dispatchEvent('click');
+  await expect(list).toBeVisible();
+  await list.getByRole('option').first().focus();
+  await keydown(pev.page, '.chip-choices .chip-choice >> nth=0', { key: 'Escape' });
+  await expect(list).toHaveCount(0);
+  await expect(pev.page.locator('.search-box')).toHaveValue('Conversation');
+  await expect(pev.page.locator('.results')).toBeVisible();
+
+  await toggle.dispatchEvent('click');
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  await toggle.focus();
+  await keydown(pev.page, '.search-chips .chip-add[aria-expanded="true"]', { key: 'Escape' });
+  await expect(list).toHaveCount(0);
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await expect(pev.page.locator('.search-box')).toHaveValue('Conversation');
+  await expect(pev.page.locator('.results')).toBeVisible();
+  await checkHidden(pev);
+});
+
 test('the theme from Settings applies to the shell at once and after a restart', async () => {
   const first = await launch('keys-theme', { appColorScheme: true });
   try {

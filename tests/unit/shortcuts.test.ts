@@ -99,6 +99,12 @@ describe('ShortcutReader', () => {
       element('<select><option>a</option></select>'),
       element('<div></div>', true),
     ];
+    // Anything inside an element that keeps its keys: a list of choices, its open button.
+    const inside = (html: string) => element(html).querySelector<HTMLElement>('button')!;
+    typing.push(
+      inside('<div role="listbox" data-keeps-keys=""><button role="option"></button></div>'),
+      element('<button aria-expanded="true" data-keeps-keys=""></button>'),
+    );
     for (const target of typing) {
       expect(editable(target)).toBe(true);
       for (const [key] of KEYS) expect(one(key, { target })).toBeNull();
@@ -106,6 +112,9 @@ describe('ShortcutReader', () => {
     // Controls that take no typed text don't hold the keys.
     for (const target of [
       element('<button></button>'),
+      // The conversation list and an expanded card's header still take shortcuts.
+      inside('<div role="listbox"><button role="option"></button></div>'),
+      element('<button aria-expanded="true"></button>'),
       element('<input type="checkbox">'),
       element('<input type="radio">'),
       element('<div tabindex="0"></div>'),

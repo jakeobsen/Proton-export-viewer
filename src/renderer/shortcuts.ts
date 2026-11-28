@@ -58,9 +58,14 @@ const NOT_TEXT = new Set([
   'submit',
 ]);
 
-/** A control that takes typed keys: a text field, a menu or editable content. */
+/**
+ * A control that takes typed keys: a text field, a menu, editable content, or
+ * anything inside an element marked `data-keeps-keys` (a list of choices that
+ * closes on its own Escape, and the button that opened it).
+ */
 export function editable(target: EventTarget | null): boolean {
   if (typeof HTMLElement === 'undefined' || !(target instanceof HTMLElement)) return false;
+  if (target.closest('[data-keeps-keys]') !== null) return true;
   if (target instanceof HTMLInputElement) return !NOT_TEXT.has(target.type);
   return (
     target instanceof HTMLTextAreaElement ||
