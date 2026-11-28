@@ -181,7 +181,11 @@ test('a message file saves byte for byte under its subject, and twice as " (2)"'
   await open(pev, 1);
   const dir = await downloads(pev);
   const name = emlName('Quarterly: report/final');
-  expect(await saveEml(pev)).toMatchObject({ ok: true });
+  const first = await saveEml(pev);
+  // Main's download reached the handler with its proof header: if Chromium
+  // ever drops it, this says so by name, not only as a failed save.
+  expect(await pev.main<string | null>('saveLastProof')).toBe('match');
+  expect(first).toMatchObject({ ok: true });
   expect(await saveEml(pev)).toMatchObject({ ok: true });
   expect(readFileSync(join(dir, name), 'utf8')).toBe(eml);
   expect(readFileSync(join(dir, name.replace(/\.eml$/, ' (2).eml')), 'utf8')).toBe(eml);

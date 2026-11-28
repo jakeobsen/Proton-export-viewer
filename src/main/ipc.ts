@@ -556,7 +556,7 @@ export function registerIpc(ctx: AppContext): void {
   /** The window a save is for: main starts its download there. */
   const saveWindow = (appWin: AppWindow): SaveWindow => ({
     id: appWin.id,
-    download: (url) => appWin.win.webContents.downloadURL(url),
+    download: (url, headers) => appWin.win.webContents.downloadURL(url, { headers }),
   });
 
   /**

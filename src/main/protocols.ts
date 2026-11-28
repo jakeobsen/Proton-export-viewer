@@ -7,21 +7,19 @@ import { extname, resolve, sep } from 'node:path';
 import { APP_HOST, BODY_CSP, VIEW_HOST } from '../shared/constants';
 import { checkRaster } from '../core/reader/raster';
 import type { Logger } from '../shared/log/writer';
+import { SAVE_PROOF_HEADER, type SaveRequestProof } from './saves/manager';
 import type { ViewRegistry } from './views';
 
 export interface RequestLike {
   url: string;
-  /**
-   * Set (to an origin, or null for an opaque one) when a page made the
-   * request; absent when the browser started it, as for a download main began.
-   */
-  initiatorOrigin?: string | null;
+  method?: string;
+  headers?: { get(name: string): string | null };
 }
 
 /** Serves the one-shot assets of a window's saves. */
 export interface SaveAssets {
-  /** The body of save asset `id` under `token`, once; null if there is none. */
-  serve(token: string, id: string, initiated: boolean): Response | null;
+  /** The body of save asset `id` under `token`, once, to main's own request; null otherwise. */
+  serve(token: string, id: string, request: SaveRequestProof): Response | null;
 }
 
 export type Handler = (request: RequestLike) => Promise<Response>;
@@ -172,8 +170,10 @@ export function assetHandler(options: ViewHandlerOptions): Handler {
     const match = url && url.host === VIEW_HOST ? ASSET_PATH_RE.exec(url.pathname) : null;
     if (!match?.[1] || !match[2]) return reject('bad_path');
     if (options.saves) {
-      const initiated = 'initiatorOrigin' in request && request.initiatorOrigin !== undefined;
-      const saved = options.saves.serve(match[1], match[2], initiated);
+      const saved = options.saves.serve(match[1], match[2], {
+        method: request.method ?? '',
+        header: request.headers?.get(SAVE_PROOF_HEADER) ?? null,
+      });
       if (saved) return saved;
     }
     const view = options.views.lookup(match[1]);

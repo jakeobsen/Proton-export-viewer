@@ -8,17 +8,19 @@
 // 2. core opens the message's file, checked to be the one the view was read
 //    from, and starts streaming;
 // 3. main registers a one-shot asset under a new token that no renderer ever
-//    sees, and has the window download it. `will-download` accepts only that
-//    URL, started by main itself, into the staging folder; every other
-//    download is cancelled;
+//    sees, and has the window download it with a request header holding a
+//    nonce only main knows. The asset is served once, and only to a request
+//    with that header. `will-download` accepts only that URL, once its body
+//    went to main's request, into the staging folder; every other download is
+//    cancelled;
 // 4. once the download completed with every byte core checked, the file is
 //    published into the downloads folder without replacing anything.
 // A source switch, Forget, Reset, a closed window or quit cancels saves; a new
 // view in the window (an expansion) does not.
 
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { mkdirSync, realpathSync, rmSync } from 'node:fs';
-import { ASSET_SCHEME, VIEW_HOST } from '../../shared/constants';
+import { APP_HOST, APP_SCHEME, ASSET_SCHEME, VIEW_HOST } from '../../shared/constants';
 import type { CoreResult } from '../../shared/core-protocol';
 import type { Logger } from '../../shared/log/writer';
 import type { FileIdentity, FileVersion } from '../../shared/reader-protocol';
@@ -39,6 +41,10 @@ export const MAX_WAITING = 4;
 export const DOWNLOAD_START_MS = 30_000;
 /** How many published files per window Show in Finder can still find. */
 const SAVED_KEPT = 16;
+/** The request header of main's own download of a save: the save's nonce. */
+export const SAVE_PROOF_HEADER = 'X-Pev-Save';
+/** The shell's origin, which Chromium gives as the initiator of the window's `downloadURL`. */
+const SHELL_ORIGIN = `${APP_SCHEME}://${APP_HOST}`;
 
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 /** A save request to core, without the id the host gives it. */
@@ -64,8 +70,10 @@ export interface SaveTestHooks {
   publishFs?: PublishFs;
   /** Publish by the copy, as if link() from staging had failed. */
   forceCopy?: boolean;
-  /** Called before main starts a save's download. */
-  beforeDownload?: (url: string) => Promise<void>;
+  /** Called before main starts a save's download, with its URL and nonce. */
+  beforeDownload?: (url: string, nonce: string) => Promise<void>;
+  /** Called with how each request for a save's asset compared with its nonce. */
+  onProof?: (proof: Proof) => void;
   /** Called with each staged file once its download has completed, before it is published. */
   onStaged?: (path: string) => Promise<void>;
   /** Called with how and where each save was published. */
@@ -75,8 +83,27 @@ export interface SaveTestHooks {
 /** The window a save is for. */
 export interface SaveWindow {
   id: number;
-  /** Starts a download of `url` in the window, as main. */
-  download(url: string): void;
+  /** Starts a download of `url` in the window, as main, with these request headers. */
+  download(url: string, headers: Record<string, string>): void;
+}
+
+/** What a request for a save's asset shows about who made it. */
+export interface SaveRequestProof {
+  method: string;
+  /** The value of the proof header, or null without one. */
+  header: string | null;
+}
+
+/** How a request's proof header compared with the save's nonce. */
+export type Proof = 'match' | 'missing' | 'wrong';
+
+/** Compares a proof header with a save's nonce in constant time; any length mismatch is wrong. */
+export function checkProof(header: string | null, nonce: string): Proof {
+  if (header === null || header === '') return 'missing';
+  const given = Buffer.from(header, 'utf8');
+  const wanted = Buffer.from(nonce, 'utf8');
+  if (given.length !== wanted.length) return 'wrong';
+  return timingSafeEqual(given, wanted) ? 'match' : 'wrong';
 }
 
 /** What a save needs from the view it was asked from. */
@@ -136,6 +163,10 @@ interface Running extends Job {
   size: number;
   url: string;
   token: string;
+  /** Sent only in main's own download request; never logged, stored or sent to a renderer. */
+  nonce: string;
+  /** The asset's body went to main's own download request. */
+  served: boolean;
   staged: string;
   item: DownloadLike | null;
   /** Core sent the last chunk, after its check of the file. */
@@ -170,24 +201,32 @@ export class WindowSaves {
 
   /**
    * The body of a one-shot save asset, once; null if `token` and `id` name
-   * none. A request a page made (one with an initiator) uses it up and fails
-   * the save: only the browser's own download may fetch it.
+   * none. Only main's own download may fetch it: a GET with the save's nonce
+   * in its proof header. Chromium gives the window's main frame as the
+   * initiator of that download, so its origin can't tell it from a request
+   * the shell page makes; the nonce, which no renderer ever has, does. Any
+   * other request uses the asset up and fails the save.
    */
-  serve(token: string, id: string, initiated: boolean): Response | null {
+  serve(token: string, id: string, request: SaveRequestProof): Response | null {
     const shot = this.oneShots.get(token);
     if (!shot || shot.id !== id) return null;
     this.oneShots.delete(token);
-    if (initiated) {
+    const proof = checkProof(request.header, shot.save.nonce);
+    this.manager.noteProof(proof);
+    if (request.method !== 'GET' || proof !== 'match') {
       this.manager.fail(shot.save, 'foreign');
       return null;
     }
+    shot.save.served = true;
     return this.manager.body(shot.save);
   }
 
   /**
    * Whether `will-download` may go ahead: only the download of the save this
-   * window expects, at its URL with no redirect, started by main (no
-   * initiator, no frame). Anything it can't tell counts as foreign.
+   * window expects, once its body went to main's own request, at its URL with
+   * no redirect. As the initiator, only none or the shell, from no frame or
+   * the window's top-level one: never a body frame. Anything it can't tell
+   * counts as foreign.
    */
   willDownload(item: DownloadLike, frame: unknown): boolean {
     const save = this.expecting;
@@ -195,16 +234,26 @@ export class WindowSaves {
     let url: string;
     let chain: string[];
     let origin: string;
+    let topLevel: boolean;
     try {
       url = item.getURL();
       chain = item.getURLChain();
       origin = item.getInitiatorOrigin();
+      topLevel =
+        frame === null ||
+        (typeof frame === 'object' && (frame as { parent?: unknown }).parent === null);
     } catch {
       return false;
     }
     if (url !== save.url) return false;
     this.expecting = null;
-    if (chain.length !== 1 || chain[0] !== save.url || origin !== '' || frame !== null) {
+    if (
+      !save.served ||
+      chain.length !== 1 ||
+      chain[0] !== save.url ||
+      (origin !== '' && origin !== SHELL_ORIGIN) ||
+      !topLevel
+    ) {
       this.manager.fail(save, 'foreign');
       return false;
     }
@@ -311,6 +360,11 @@ export class SaveManager {
     void this.run(job);
   }
 
+  /** Test builds only: tells a test how a request for a save's asset compared with its nonce. */
+  noteProof(proof: Proof): void {
+    if (__PEV_TEST_HOOKS__) this.test.onProof?.(proof);
+  }
+
   /** Ends a save as failed (the first reason counts) and stops its download and its stream in core. */
   fail(save: Running, reason: FailReason): void {
     if (save.failure !== null) return;
@@ -388,6 +442,8 @@ export class SaveManager {
       size: 0,
       url: '',
       token: '',
+      nonce: '',
+      served: false,
       staged: '',
       item: null,
       coreDone: false,
@@ -487,16 +543,20 @@ export class SaveManager {
     if (save.failure !== null) return failed;
     save.size = opened.size ?? 0;
 
-    // 3. A one-shot asset under a token no renderer sees, downloaded by main.
+    // 3. A one-shot asset under a token no renderer sees, downloaded by main
+    //    with a nonce in a request header that only main's request carries.
     save.token = randomBytes(16).toString('hex');
+    save.nonce = randomBytes(16).toString('hex');
     save.url = `${ASSET_SCHEME}://${VIEW_HOST}/${save.token}/${ask.assetId}`;
     save.staged = staging.newFile();
     saves.oneShots.set(save.token, { id: ask.assetId, save });
     saves.expecting = save;
-    if (__PEV_TEST_HOOKS__ && this.test.beforeDownload) await this.test.beforeDownload(save.url);
+    if (__PEV_TEST_HOOKS__ && this.test.beforeDownload) {
+      await this.test.beforeDownload(save.url, save.nonce);
+    }
     this.touch(save, this.deps.downloadStartMs ?? DOWNLOAD_START_MS, 'stalled');
     try {
-      if (save.failure === null) win.download(save.url);
+      if (save.failure === null) win.download(save.url, { [SAVE_PROOF_HEADER]: save.nonce });
     } catch {
       // The window is gone.
       this.fail(save, 'cancelled');

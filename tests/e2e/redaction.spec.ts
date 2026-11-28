@@ -321,8 +321,14 @@ test('no marker reaches a log file through saves, Show in Finder or a foreign do
   await expect
     .poll(async () => (await pev.shell<{ pending: boolean }>('reader')).pending)
     .toBe(false);
+  // Each save's nonce, which only its own download request may carry.
+  const nonces: string[] = [];
   expect(await pev.shell('saveAttachment', [0])).toMatchObject({ ok: true });
+  nonces.push((await pev.main<string | null>('saveLastNonce'))!);
   expect(await pev.shell('saveMessageFile')).toMatchObject({ ok: true });
+  nonces.push((await pev.main<string | null>('saveLastNonce'))!);
+  expect(new Set(nonces).size).toBe(2);
+  for (const nonce of nonces) expect(nonce).toMatch(/^[0-9a-f]{32}$/);
   await pev.page.locator('.rp-show-saved').dispatchEvent('click');
   // A save that fails: the file changed since it was opened.
   await pev.shell('openInReader', [2, 'plain']);
@@ -350,5 +356,6 @@ test('no marker reaches a log file through saves, Show in Finder or a foreign do
     expect(findMarkers(text), file).toEqual([]);
     expect(text, file).not.toContain(downloads);
     expect(text, file).not.toContain(root);
+    for (const nonce of nonces) expect(text, file).not.toContain(nonce);
   }
 });

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Main's saves: one at a time and at most four waiting per window; a one-shot
-// asset only main's own download may fetch, once; `will-download` accepts only
-// that download; a save publishes only a complete, checked download; cancels
-// leave nothing behind; nothing names a file in the log.
+// asset only main's own download (a GET with the save's nonce) may fetch,
+// once; `will-download` accepts only that download, after its body was served;
+// a save publishes only a complete, checked download; cancels leave nothing
+// behind; nothing names a file in the log, or holds the nonce.
 
 import { EventEmitter } from 'node:events';
 import {
@@ -17,10 +18,14 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   MAX_WAITING,
+  SAVE_PROOF_HEADER,
   SaveManager,
+  checkProof,
   type DownloadLike,
+  type Proof,
   type SaveAsk,
   type SaveDeps,
+  type SaveRequestProof,
 } from '../../src/main/saves/manager';
 import { Staging } from '../../src/main/saves/staging';
 import type { CoreResult } from '../../src/shared/core-protocol';
@@ -127,7 +132,14 @@ function setup(
   };
   const manager = new SaveManager(deps);
   const urls: string[] = [];
-  const win = { id: 3, download: (url: string) => urls.push(url) };
+  const heads: Array<Record<string, string>> = [];
+  const win = {
+    id: 3,
+    download: (url: string, headers: Record<string, string>) => {
+      urls.push(url);
+      heads.push(headers);
+    },
+  };
   const ask: SaveAsk = {
     openId: 9,
     generation: 1,
@@ -158,6 +170,7 @@ function setup(
     win,
     ask,
     urls,
+    heads,
     waitFor,
     parts,
     setPulls: (p: typeof pulls) => {
@@ -174,8 +187,23 @@ async function started(t: ReturnType<typeof setup>) {
   const outcome = t.manager.request(t.win, t.ask);
   await t.waitFor(() => t.urls.length === 1);
   const url = t.urls[0]!;
+  const nonce = t.heads[0]![SAVE_PROOF_HEADER]!;
   const saves = t.manager.forWindow(t.win.id);
-  return { outcome, url, saves, ...t.parts(url) };
+  /** Main's own download request, as the handler sees it. */
+  const main: SaveRequestProof = { method: 'GET', header: nonce };
+  return { outcome, url, nonce, main, saves, ...t.parts(url) };
+}
+
+/** Main's download as Chromium runs it: the request is served, then `will-download`, then the body. */
+async function download(
+  s: Awaited<ReturnType<typeof started>>,
+  item: FakeItem,
+  received?: number,
+): Promise<void> {
+  const body = s.saves.serve(s.token, s.id, s.main);
+  expect(body).not.toBeNull();
+  expect(s.saves.willDownload(item, null)).toBe(true);
+  await item.complete(body!, received);
 }
 
 describe('SaveManager', () => {
@@ -183,15 +211,20 @@ describe('SaveManager', () => {
     const t = setup();
     const s = await started(t);
     expect(s.id).toBe('a0');
-    const item = new FakeItem(s.url);
-    expect(s.saves.willDownload(item, null)).toBe(true);
-    expect(item.savePath.startsWith(t.staging.dir)).toBe(true);
-    const body = s.saves.serve(s.token, s.id, false);
+    // The proof header is the only one, with a fresh 128-bit nonce of its own.
+    expect(Object.keys(t.heads[0]!)).toEqual([SAVE_PROOF_HEADER]);
+    expect(s.nonce).toMatch(/^[0-9a-f]{32}$/);
+    expect(s.nonce).not.toBe(s.token);
+    expect(s.url).not.toContain(s.nonce);
+    const body = s.saves.serve(s.token, s.id, s.main);
     expect(body).not.toBeNull();
     expect(body!.headers.get('content-length')).toBe(String(BYTES.length));
     expect(body!.headers.get('content-disposition')).toBe('attachment');
     // Served once.
-    expect(s.saves.serve(s.token, s.id, false)).toBeNull();
+    expect(s.saves.serve(s.token, s.id, s.main)).toBeNull();
+    const item = new FakeItem(s.url);
+    expect(s.saves.willDownload(item, null)).toBe(true);
+    expect(item.savePath.startsWith(t.staging.dir)).toBe(true);
     await item.complete(body!);
     const outcome = await s.outcome;
     expect(outcome).toEqual({ ok: true, saveId: 1 });
@@ -203,6 +236,7 @@ describe('SaveManager', () => {
     const text = JSON.stringify(t.logged);
     expect(text).not.toContain('marker-name');
     expect(text).not.toContain(s.token);
+    expect(text).not.toContain(s.nonce);
     for (const entry of t.logged) {
       const clean = sanitizeEvent({
         level: entry.level as 'info',
@@ -221,21 +255,58 @@ describe('SaveManager', () => {
     mkdirSync(t.downloads);
     writeFileSync(join(t.downloads, NAME), 'theirs');
     const s = await started(t);
-    const item = new FakeItem(s.url);
-    s.saves.willDownload(item, null);
-    await item.complete(s.saves.serve(s.token, s.id, false)!);
+    await download(s, new FakeItem(s.url));
     expect(await s.outcome).toMatchObject({ ok: true });
     expect(readFileSync(join(t.downloads, NAME), 'utf8')).toBe('theirs');
     expect(readFileSync(join(t.downloads, 'marker-name-7f3a (2).pdf'))).toEqual(BYTES);
   });
 
-  it('a page’s request for the save asset uses it up and fails the save', async () => {
-    const t = setup();
-    const s = await started(t);
-    expect(s.saves.serve(s.token, s.id, true)).toBeNull();
-    expect(s.saves.serve(s.token, s.id, false)).toBeNull();
-    expect(await s.outcome).toEqual({ ok: false, code: 'save_failed' });
-    expect(t.logged.at(-1)).toMatchObject({ code: 'save.failed', data: { reason: 'foreign' } });
+  for (const [label, request, proof] of [
+    ['no proof header (a page’s request)', () => ({ method: 'GET', header: null }), 'missing'],
+    ['an empty proof header', () => ({ method: 'GET', header: '' }), 'missing'],
+    [
+      'another nonce of the same length',
+      (n: string) => ({ method: 'GET', header: n.replace(/^./, (c) => (c === '0' ? '1' : '0')) }),
+      'wrong',
+    ],
+    [
+      'the nonce with one more character',
+      (n: string) => ({ method: 'GET', header: `${n}0` }),
+      'wrong',
+    ],
+    ['the nonce cut short', (n: string) => ({ method: 'GET', header: n.slice(0, -1) }), 'wrong'],
+    ['a HEAD with the nonce', (n: string) => ({ method: 'HEAD', header: n }), 'match'],
+    [
+      'an OPTIONS with the nonce (a CORS preflight)',
+      (n: string) => ({ method: 'OPTIONS', header: n }),
+      'match',
+    ],
+  ] as const) {
+    it(`a request for the save asset with ${label} uses it up and fails the save`, async () => {
+      const t = setup();
+      const proofs: Proof[] = [];
+      t.manager.test = { onProof: (p) => proofs.push(p) };
+      const s = await started(t);
+      expect(s.saves.serve(s.token, s.id, request(s.nonce))).toBeNull();
+      // Main's own request comes too late: the asset is gone.
+      expect(s.saves.serve(s.token, s.id, s.main)).toBeNull();
+      expect(proofs).toEqual([proof]);
+      expect(await s.outcome).toEqual({ ok: false, code: 'save_failed' });
+      expect(t.logged.at(-1)).toMatchObject({ code: 'save.failed', data: { reason: 'foreign' } });
+      expect(JSON.stringify(t.logged)).not.toContain(s.nonce);
+    });
+  }
+
+  it('compares the proof header in constant time, and calls any other length wrong', () => {
+    const nonce = 'ab'.repeat(16);
+    expect(checkProof(nonce, nonce)).toBe('match');
+    expect(checkProof(null, nonce)).toBe('missing');
+    expect(checkProof('', nonce)).toBe('missing');
+    expect(checkProof('ba'.repeat(16), nonce)).toBe('wrong');
+    expect(checkProof(nonce.slice(1), nonce)).toBe('wrong');
+    expect(checkProof(`${nonce}a`, nonce)).toBe('wrong');
+    // Same number of characters, more bytes.
+    expect(checkProof(`${nonce.slice(1)}é`, nonce)).toBe('wrong');
   });
 
   it('will-download refuses any other URL, and leaves the save waiting', async () => {
@@ -244,31 +315,64 @@ describe('SaveManager', () => {
     expect(
       s.saves.willDownload(new FakeItem('mail-asset://v/' + 'f'.repeat(32) + '/a0'), null),
     ).toBe(false);
-    const item = new FakeItem(s.url);
-    expect(s.saves.willDownload(item, null)).toBe(true);
-    await item.complete(s.saves.serve(s.token, s.id, false)!);
+    await download(s, new FakeItem(s.url));
     expect(await s.outcome).toMatchObject({ ok: true });
   });
 
-  for (const [label, make] of [
-    ['a redirect', (url: string) => new FakeItem(url, ['mail-asset://v/x/a0', url])],
-    ['a page as initiator', (url: string) => new FakeItem(url, [url], 'app://shell')],
-    ['an opaque initiator', (url: string) => new FakeItem(url, [url], 'null')],
+  for (const [label, origin, frame] of [
+    ['no initiator and no frame', '', null],
+    [
+      'the shell as initiator, from the top-level frame (as Chromium reports it)',
+      'app://shell',
+      { parent: null },
+    ],
   ] as const) {
-    it(`will-download of the save's URL with ${label} is refused and fails the save`, async () => {
+    it(`will-download of main's served download with ${label} is accepted`, async () => {
       const t = setup();
       const s = await started(t);
-      expect(s.saves.willDownload(make(s.url), null)).toBe(false);
-      expect(await s.outcome).toEqual({ ok: false, code: 'save_failed' });
+      const body = s.saves.serve(s.token, s.id, s.main)!;
+      const item = new FakeItem(s.url, [s.url], origin);
+      expect(s.saves.willDownload(item, frame)).toBe(true);
+      await item.complete(body);
+      expect(await s.outcome).toMatchObject({ ok: true });
     });
   }
 
-  it('will-download started by a frame is refused and fails the save', async () => {
+  it('will-download of the save’s URL before its body was served is refused and fails the save', async () => {
     const t = setup();
     const s = await started(t);
-    expect(s.saves.willDownload(new FakeItem(s.url), { frame: true })).toBe(false);
+    expect(s.saves.willDownload(new FakeItem(s.url), null)).toBe(false);
     expect(await s.outcome).toEqual({ ok: false, code: 'save_failed' });
+    expect(t.logged.at(-1)).toMatchObject({ code: 'save.failed', data: { reason: 'foreign' } });
+    expect(s.saves.serve(s.token, s.id, s.main)).toBeNull();
   });
+
+  for (const [label, make, frame] of [
+    ['a redirect', (url: string) => new FakeItem(url, ['mail-asset://v/x/a0', url]), null],
+    ['an opaque initiator', (url: string) => new FakeItem(url, [url], 'null'), null],
+    ['a body frame’s origin', (url: string) => new FakeItem(url, [url], 'mail-body://v'), null],
+    ['a web origin', (url: string) => new FakeItem(url, [url], 'https://example.com'), null],
+    ['a subframe', (url: string) => new FakeItem(url, [url], 'app://shell'), { parent: {} }],
+    ['a frame of unknown place', (url: string) => new FakeItem(url, [url], ''), { frame: true }],
+    [
+      'a frame that can’t be read',
+      (url: string) => new FakeItem(url, [url], ''),
+      {
+        get parent(): unknown {
+          throw new Error('gone');
+        },
+      },
+    ],
+  ] as const) {
+    it(`will-download of the save's URL with ${label} is refused and fails the save`, async () => {
+      // Serving the body restarts the idle timer: a refusal that can't fail the save ends it there.
+      const t = setup({ downloadStartMs: 200, idleMs: 200 });
+      const s = await started(t);
+      expect(s.saves.serve(s.token, s.id, s.main)).not.toBeNull();
+      expect(s.saves.willDownload(make(s.url), frame)).toBe(false);
+      expect(await s.outcome).toEqual({ ok: false, code: 'save_failed' });
+    });
+  }
 
   it('initiator information that can’t be read never counts as main’s own', async () => {
     const t = setup({ downloadStartMs: 100 });
@@ -283,9 +387,7 @@ describe('SaveManager', () => {
   it('a download that ends short publishes nothing and leaves nothing', async () => {
     const t = setup();
     const s = await started(t);
-    const item = new FakeItem(s.url);
-    s.saves.willDownload(item, null);
-    await item.complete(s.saves.serve(s.token, s.id, false)!, BYTES.length - 1);
+    await download(s, new FakeItem(s.url), BYTES.length - 1);
     expect(await s.outcome).toEqual({ ok: false, code: 'save_failed' });
     expect(existsSync(t.downloads) ? readdirSync(t.downloads) : []).toEqual([]);
     expect(readdirSync(t.staging.dir)).toEqual([]);
@@ -295,8 +397,8 @@ describe('SaveManager', () => {
     const t = setup();
     const s = await started(t);
     const item = new FakeItem(s.url);
+    expect(s.saves.serve(s.token, s.id, s.main)).not.toBeNull();
     s.saves.willDownload(item, null);
-    expect(s.saves.serve(s.token, s.id, false)).not.toBeNull();
     item.completeUnread(BYTES);
     expect(await s.outcome).toEqual({ ok: false, code: 'save_failed' });
     expect(existsSync(t.downloads) ? readdirSync(t.downloads) : []).toEqual([]);
@@ -313,9 +415,7 @@ describe('SaveManager', () => {
       },
     };
     const s = await started(t);
-    const item = new FakeItem(s.url);
-    s.saves.willDownload(item, null);
-    await item.complete(s.saves.serve(s.token, s.id, false)!);
+    await download(s, new FakeItem(s.url));
     expect(await s.outcome).toEqual({ ok: false, code: 'save_failed' });
     expect(readdirSync(t.downloads)).toEqual([]);
     expect(t.logged.at(-1)).toMatchObject({ data: { reason: 'export_root' } });
@@ -326,8 +426,8 @@ describe('SaveManager', () => {
     t.setPulls([{ code: 'changed' }]);
     const s = await started(t);
     const item = new FakeItem(s.url);
+    const body = s.saves.serve(s.token, s.id, s.main)!;
     s.saves.willDownload(item, null);
-    const body = s.saves.serve(s.token, s.id, false)!;
     await expect(body.arrayBuffer()).rejects.toThrow();
     expect(item.cancelled).toBe(1);
     expect(await s.outcome).toEqual({ ok: false, code: 'save_failed' });
@@ -385,7 +485,7 @@ describe('SaveManager', () => {
     expect(await s.outcome).toEqual({ ok: false, code: 'save_failed' });
     expect(t.logged.at(-1)).toMatchObject({ data: { reason: 'stalled' } });
     // The one-shot is gone with the save.
-    expect(s.saves.serve(s.token, s.id, false)).toBeNull();
+    expect(s.saves.serve(s.token, s.id, s.main)).toBeNull();
   });
 
   it(`at most ${MAX_WAITING} saves wait per window; the next is refused at once`, async () => {
@@ -406,6 +506,7 @@ describe('SaveManager', () => {
     const t = setup();
     const s = await started(t);
     const item = new FakeItem(s.url);
+    expect(s.saves.serve(s.token, s.id, s.main)).not.toBeNull();
     s.saves.willDownload(item, null);
     t.manager.cancelAll('generation');
     expect(item.cancelled).toBe(1);

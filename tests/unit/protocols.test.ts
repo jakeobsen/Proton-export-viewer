@@ -139,3 +139,36 @@ describe('mail-body: and mail-asset: handlers', () => {
     expect((await asset({ url: `mail-asset://v/${open.token}/c1` })).status).toBe(404);
   });
 });
+
+describe('mail-asset: handler for saves', () => {
+  const views = new ViewRegistry();
+  const token = 'a'.repeat(32);
+  const asked: Array<{ token: string; id: string; method: string; header: string | null }> = [];
+  const asset = assetHandler({
+    views,
+    log: quiet,
+    windowId: 1,
+    saves: {
+      serve: (t, id, request) => {
+        asked.push({ token: t, id, ...request });
+        return request.header === 'n0nce' ? new Response('saved', { status: 200 }) : null;
+      },
+    },
+  });
+
+  it('hands a save its request’s method and proof header, matched without regard to case', async () => {
+    asked.length = 0;
+    const url = `mail-asset://v/${token}/a0`;
+    const res = await asset(new Request(url, { headers: { 'x-pev-save': 'n0nce' } }));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('saved');
+    const head = await asset(new Request(url, { method: 'HEAD', headers: { 'X-Pev-Save': 'x' } }));
+    expect(head.status).toBe(404);
+    expect((await asset(new Request(url))).status).toBe(404);
+    expect(asked).toEqual([
+      { token, id: 'a0', method: 'GET', header: 'n0nce' },
+      { token, id: 'a0', method: 'HEAD', header: 'x' },
+      { token, id: 'a0', method: 'GET', header: null },
+    ]);
+  });
+});

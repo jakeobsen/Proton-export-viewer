@@ -47,6 +47,10 @@ export interface SaveTestApi {
   saveReleaseStaged(): number;
   /** The URL of the last save main started a download for. */
   saveLastUrl(): string | null;
+  /** The nonce of that save, so a test can check that no log or file holds it. */
+  saveLastNonce(): string | null;
+  /** How the last request for a save's asset compared with its save's nonce. */
+  saveLastProof(): string | null;
   /** The file names in the staging folder, or [] when it is gone. */
   stagingFiles(): string[];
   /** Main's memory now. */
@@ -64,6 +68,8 @@ export function saveTestApi(
   const staged = new Gate();
   let forceCopy = false;
   let lastUrl: string | null = null;
+  let lastNonce: string | null = null;
+  let lastProof: string | null = null;
   const publishFs: PublishFs = {
     ...realPublishFs,
     copyNew: async (from, path, created) => {
@@ -83,9 +89,13 @@ export function saveTestApi(
     saves.test = {
       publishFs,
       forceCopy,
-      beforeDownload: async (url) => {
+      beforeDownload: async (url, nonce) => {
         lastUrl = url;
+        lastNonce = nonce;
         await download.pass();
+      },
+      onProof: (proof) => {
+        lastProof = proof;
       },
       onStaged: async (path) => {
         await onStaged?.(path);
@@ -115,6 +125,8 @@ export function saveTestApi(
     saveStagedHeld: () => staged.waiting,
     saveReleaseStaged: () => staged.open(),
     saveLastUrl: () => lastUrl,
+    saveLastNonce: () => lastNonce,
+    saveLastProof: () => lastProof,
     stagingFiles: () => {
       try {
         return readdirSync(stagingDir);
