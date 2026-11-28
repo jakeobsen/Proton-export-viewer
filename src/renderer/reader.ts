@@ -6,7 +6,7 @@
 // that search's ID, so main can say how the message matched it.
 
 import { useSyncExternalStore } from 'react';
-import type { MessageOpenResult, RejectCode } from '../shared/api';
+import type { MessageOpenResult, ReaderActionResult, RejectCode } from '../shared/api';
 import type { OpenMode, ReaderMatch } from '../shared/reader-protocol';
 import { clearLink, getShellState, refreshGeneration } from './shell';
 
@@ -120,6 +120,29 @@ export async function openInReader(
     update({ pending: false, view: result, match: result.match });
   }
   return result;
+}
+
+/** An action on the message the pane shows, such as Show in folder, by its view's open. */
+async function viewAction(
+  act: (openId: number, generation: number) => Promise<ReaderActionResult>,
+): Promise<ReaderActionResult> {
+  const view = state.view;
+  if (!view || openGeneration === null) return { ok: false, code: 'superseded' };
+  try {
+    return await act(view.openId, openGeneration);
+  } catch {
+    return { ok: false, code: 'core_unavailable' };
+  }
+}
+
+/** Shows the pane's message file in Finder. */
+export function showInFolder(): Promise<ReaderActionResult> {
+  return viewAction((openId, generation) => window.pev.showInFolder(openId, generation));
+}
+
+/** Copies the pane's message's Message-ID. */
+export function copyMessageId(): Promise<ReaderActionResult> {
+  return viewAction((openId, generation) => window.pev.copyMessageId(openId, generation));
 }
 
 /** Closes the pane and any link dialog that came from its body. */

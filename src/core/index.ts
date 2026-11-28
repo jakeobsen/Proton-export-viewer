@@ -19,6 +19,7 @@ import type { IndexMatch } from '../shared/index-types';
 import { errorData } from '../shared/log/schema';
 import { LogWriter, type Logger } from '../shared/log/writer';
 import type {
+  LocateRequest,
   ReadRequest,
   ReaderFailure,
   ReaderMatch,
@@ -28,7 +29,7 @@ import { WorkerThread, type ThreadRole } from './index/pool';
 import type { IndexOptions } from './index/service';
 import { READER_RETIRE_MB, ReaderLane } from './reader/lane';
 import { OpenTracker } from './reader/opens';
-import type { ReaderSource } from './reader/source';
+import type { LocatedFile, ReaderSource } from './reader/source';
 import { SourceSession, type ReaderFile } from './source';
 
 process.umask(0o077);
@@ -152,6 +153,25 @@ async function openForRead(
     .catch((): ReaderFile => ({ ok: false, code: 'not_found' }));
 }
 
+/** Finds the file a view was read from, for Show in folder: from the test source or the open export. */
+async function locate(request: LocateRequest): Promise<void> {
+  const { reqId, rowid, generation, file } = request;
+  let found: LocatedFile;
+  if (__PEV_TEST_HOOKS__ && readerSource) {
+    found = await readerSource
+      .locate(rowid, file)
+      .catch((): LocatedFile => ({ ok: false, code: 'not_found' }));
+  } else if (!session) {
+    found = { ok: false, code: 'no_source' };
+  } else {
+    found = await session
+      .locateForReader(rowid, generation, file)
+      .catch((): LocatedFile => ({ ok: false, code: 'not_found' }));
+  }
+  if (found.ok) reply({ type: 'result', reqId, ok: true, path: found.path });
+  else reply({ type: 'result', reqId, ok: false, code: found.code });
+}
+
 /** What main and the shell learn of a match: counts and column names, never text. */
 function readerMatch(match: IndexMatch | null | undefined): ReaderMatch | undefined {
   if (!match) return undefined;
@@ -232,7 +252,14 @@ async function readOpen(request: ReadRequest, stale: () => boolean): Promise<voi
     const message = outcome.message;
     if (message.type !== 'rendered') return fail('reader_failed', 'crash');
     if (!message.ok) return fail('reader_failed', 'parse');
-    reply({ type: 'result', reqId, ok: true, read: message.message, ...(match ? { match } : {}) });
+    reply({
+      type: 'result',
+      reqId,
+      ok: true,
+      read: message.message,
+      file: opened.file,
+      ...(match ? { match } : {}),
+    });
   } finally {
     await opened.close().catch(() => undefined);
   }
@@ -295,6 +322,9 @@ function handle(request: CoreRequest): void {
         return;
       }
       reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
+      return;
+    case 'locate':
+      void locate(request);
       return;
     case 'identify':
     case 'scan':

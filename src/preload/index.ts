@@ -38,6 +38,10 @@ const api: PevApi = {
       queryId === undefined ? { rowid, mode, generation } : { rowid, mode, generation, queryId },
     ),
   closeView: (generation) => ipcRenderer.invoke(IPC.closeView, { generation }),
+  showInFolder: (openId, generation) =>
+    ipcRenderer.invoke(IPC.showInFolder, { openId, generation }),
+  copyMessageId: (openId, generation) =>
+    ipcRenderer.invoke(IPC.copyMessageId, { openId, generation }),
   log: (level, code, generation, data) =>
     ipcRenderer.send(
       IPC.log,

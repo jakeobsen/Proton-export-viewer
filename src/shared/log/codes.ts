@@ -40,6 +40,8 @@ export const LOG_CODES = [
   'download.cancelled',
   'protocol.not_found',
   'view.installed',
+  'reader.show_in_folder',
+  'reader.copy_message_id',
   'view.revoked',
   'open.stale',
   'sources.invalid',

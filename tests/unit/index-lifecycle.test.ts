@@ -13,6 +13,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   truncateSync,
@@ -1026,6 +1027,91 @@ describe("the reader's open of a message file", () => {
     const quiet: Logger = { log() {}, error() {}, warn() {}, info() {} };
     const none = new SourceSession(null, quiet, () => {});
     expect(await none.openForReader(1, 1, () => false)).toEqual({ ok: false, code: 'no_source' });
+    await none.close();
+  });
+
+  it("locates a view's file only while it is the file the view was read from", async () => {
+    const e = exportAt('lc-locate', 6, 24);
+    const c = core({ root: e.run, indexDir: e.indexDir });
+    expect(await c.openIndex(null)).toMatchObject({ ok: true });
+    await c.session.index!.settled();
+    const generation = c.stamp.generation;
+    const files = new Map<number, EmlFile>();
+    for (let rowid = 1; rowid <= 6; rowid += 1) files.set(rowid, (await eml(c, rowid))!);
+    const listed = [...files].filter(([, f]) => f.rel !== null).map(([r]) => r);
+    expect(listed.length).toBeGreaterThanOrEqual(5);
+    const [same, replaced, linked, gone, other] = listed as [
+      number,
+      number,
+      number,
+      number,
+      number,
+    ];
+    /** The identity a view of the message records: the one its reader open read. */
+    const viewed = async (rowid: number) => {
+      const opened = await c.session.openForReader(rowid, generation, () => false);
+      if (!opened.ok) throw new Error(opened.code);
+      await opened.opened.close();
+      return opened.opened.file!;
+    };
+    const ids = new Map<number, Awaited<ReturnType<typeof viewed>>>();
+    for (const rowid of listed) ids.set(rowid, await viewed(rowid));
+    const path = (rowid: number) => join(e.run, files.get(rowid)!.rel!);
+
+    expect(await c.session.locateForReader(same, generation, ids.get(same)!)).toEqual({
+      ok: true,
+      path: path(same),
+    });
+    // Another message's identity names another file.
+    expect(await c.session.locateForReader(same, generation, ids.get(other)!)).toEqual({
+      ok: false,
+      code: 'changed',
+    });
+    // A file put in its place, with the same bytes, is not the file the view read.
+    const bytes = readFileSync(path(replaced));
+    writeFileSync(`${path(replaced)}.new`, bytes);
+    renameSync(`${path(replaced)}.new`, path(replaced));
+    expect(await c.session.locateForReader(replaced, generation, ids.get(replaced)!)).toEqual({
+      ok: false,
+      code: 'changed',
+    });
+    // A link in its place, even to the same file, is never followed.
+    const kept = `${path(linked)}.kept`;
+    renameSync(path(linked), kept);
+    symlinkSync(kept, path(linked));
+    expect(await c.session.locateForReader(linked, generation, ids.get(linked)!)).toEqual({
+      ok: false,
+      code: 'changed',
+    });
+    rmSync(path(gone));
+    expect(await c.session.locateForReader(gone, generation, ids.get(gone)!)).toEqual({
+      ok: false,
+      code: 'eml_missing',
+    });
+    expect(await c.session.locateForReader(same, generation + 1, ids.get(same)!)).toEqual({
+      ok: false,
+      code: 'superseded',
+    });
+    expect(await c.session.locateForReader(9999, generation, ids.get(same)!)).toEqual({
+      ok: false,
+      code: 'not_found',
+    });
+    // Nothing about where the files are is logged.
+    expect(JSON.stringify(c.logs)).not.toContain(e.run);
+    await c.session.close();
+
+    const off = core({ root: null, indexDir: e.indexDir });
+    expect(await off.session.locateForReader(same, off.stamp.generation, ids.get(same)!)).toEqual({
+      ok: false,
+      code: 'unavailable',
+    });
+    await off.session.close();
+    const quiet: Logger = { log() {}, error() {}, warn() {}, info() {} };
+    const none = new SourceSession(null, quiet, () => {});
+    expect(await none.locateForReader(same, 1, ids.get(same)!)).toEqual({
+      ok: false,
+      code: 'no_source',
+    });
     await none.close();
   });
 });
