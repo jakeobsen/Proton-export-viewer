@@ -15,10 +15,12 @@ import {
   RESULTS_MARGIN,
   SearchModel,
   TYPING_PAUSE_MS,
+  cleanParts,
   conversationsText,
   partialText,
   snippetParts,
 } from '../../src/renderer/search';
+import { countText } from '../../src/renderer/format';
 
 interface Call {
   request: SearchRequest;
@@ -530,6 +532,32 @@ describe('texts', () => {
       expect(snippetParts({ text: 'zebra', ranges })).toEqual([{ text: 'zebra', mark: false }]);
     }
     expect(snippetParts({ text: '', ranges: [[0, 1]] })).toEqual([]);
+  });
+
+  it('cleans a marked snippet part by part, so each mark stays on its own text', () => {
+    // An override and a zero-width space before the mark, a line break and a
+    // control inside the text after it, and white space at both ends.
+    const text = ' \u202eSee\u200b the\r\n invoice\u0007 for\tMay ';
+    const start = text.indexOf('invoice');
+    const parts = cleanParts(snippetParts({ text, ranges: [[start, start + 7]] }));
+    expect(parts).toEqual([
+      { text: 'See the ', mark: false },
+      { text: 'invoice', mark: true },
+      { text: '\u2407 for May', mark: false },
+    ]);
+    // A part left empty goes, and the marked text stays marked.
+    expect(
+      cleanParts([
+        { text: '\u200b\u202e', mark: false },
+        { text: 'zebra', mark: true },
+      ]),
+    ).toEqual([{ text: 'zebra', mark: true }]);
+  });
+
+  it('gives the header count, with the matching messages from a result', () => {
+    expect(countText(1, null)).toBe('1 message');
+    expect(countText(1200, null)).toBe('1,200 messages');
+    expect(countText(4, 2)).toBe('4 messages \u00b7 2 matching');
   });
 
   it('counts conversations, and shows the partial line only while bodies wait', () => {

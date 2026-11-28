@@ -7,6 +7,8 @@
 // every other value is a bound parameter.
 
 import type {
+  CardsQuery,
+  CardsWindow,
   IndexMatch,
   MarkedSnippet,
   RowDetails,
@@ -27,7 +29,7 @@ import { parseQuery, wordsOf, type ParsedQuery, type Term, type TextColumn } fro
 import { markedToRanges, stripMarks } from '../search/ranges';
 import { SYSTEM_LABELS } from './labels';
 import { foldAddress } from './metadata';
-import { rowDetails } from './queries';
+import { cardsWindow, rowDetails } from './queries';
 import { BODY_STATE, META_STATE } from './schema';
 import { asNumber, scalar, type Db, type Row, type SqlValue } from './sql';
 
@@ -222,25 +224,36 @@ export function buildQuery(db: Db, parsed: ParsedQuery): BuiltQuery {
 }
 
 /**
+ * Where hits are looked for: everywhere, within some conversations, among
+ * some messages, or in one message.
+ */
+type HitScope = 'all' | 'threads' | 'rowids' | 'one';
+
+/**
  * The matching messages as (rid, tid, time[, rank]) rows, optionally within
- * some conversations. Its text depends on the query's terms, so statements
+ * some conversations or among some messages, whose IDs come as one JSON
+ * array parameter after the others, or in one message, whose rowid comes as
+ * the last parameter. Its text depends on the query's terms, so statements
  * built on it are prepared uncached.
  */
 function hits(
   built: BuiltQuery,
   withRank: boolean,
-  inThreads: boolean,
-  oneMessage = false,
+  scope: HitScope,
 ): { sql: string; params: SqlValue[] } {
   const where = built.conditions.map((c) => ` AND ${c.sql}`).join('');
   const params = built.conditions.flatMap((c) => c.params);
   // A rowid bound as a plain number can be ignored next to a full-text match;
-  // as an explicit integer it always applies.
-  const threads = inThreads
-    ? ' AND m.thread_id IN (SELECT value FROM json_each(?))'
-    : oneMessage
-      ? ' AND m.rowid = CAST(? AS INTEGER)'
-      : '';
+  // as an explicit integer it always applies. The values json_each reads from
+  // an array of whole numbers are integers already.
+  const threads =
+    scope === 'threads'
+      ? ' AND m.thread_id IN (SELECT value FROM json_each(?))'
+      : scope === 'rowids'
+        ? ' AND m.rowid IN (SELECT value FROM json_each(?))'
+        : scope === 'one'
+          ? ' AND m.rowid = CAST(? AS INTEGER)'
+          : '';
   const cols = 'm.rowid AS rid, m.thread_id AS tid, coalesce(m.time, 0) AS time';
   if (built.match !== null) {
     return {
@@ -291,7 +304,7 @@ function groupedPage(rows: Row[], first: boolean): GroupedPage {
 }
 
 function pageByDate(db: Db, built: BuiltQuery, after: SearchDateKey | null): GroupedPage {
-  const h = hits(built, false, false);
+  const h = hits(built, false, 'all');
   const rows = db
     .once(
       `WITH hit AS MATERIALIZED (${h.sql})
@@ -305,7 +318,7 @@ function pageByDate(db: Db, built: BuiltQuery, after: SearchDateKey | null): Gro
 }
 
 function pageByRelevance(db: Db, built: BuiltQuery, after: SearchRankKey | null): GroupedPage {
-  const h = hits(built, true, false);
+  const h = hits(built, true, 'all');
   const rows = db
     .once(
       `WITH hit AS MATERIALIZED (${h.sql})
@@ -329,7 +342,7 @@ function pickMessages(
   threadIds: number[],
 ): { newest: Map<number, number>; best: Map<number, number> } {
   const ranked = built.hasText;
-  const h = hits(built, ranked, true);
+  const h = hits(built, ranked, 'threads');
   const rows = db
     .once(
       `WITH hit AS (${h.sql}),
@@ -395,7 +408,7 @@ export function matchInfo(db: Db, rowid: number, text: string): IndexMatch | nul
   const parsed = parseQuery(text);
   const built = buildQuery(db, parsed);
   if (!built.hasText || built.match === null) return null;
-  const whole = hits(built, false, false, true);
+  const whole = hits(built, false, 'one');
   if (!db.once(whole.sql).get(...whole.params, rowid)) return null;
 
   const pair = db
@@ -575,4 +588,67 @@ export function searchSnippets(db: Db, call: SnippetsQuery): SearchSnippets {
     if (snippet) byThread.set(threadId, snippet);
   }
   return none(dropped, byThread);
+}
+
+/** Which of these messages match a query, by the search's own hits: its words and its operators. */
+function matchedAmong(db: Db, built: BuiltQuery, rowids: number[]): Set<number> {
+  if (built.empty || rowids.length === 0) return new Set();
+  const h = hits(built, false, 'rowids');
+  const rows = db.once(`SELECT rid FROM (${h.sql})`).all(...h.params, JSON.stringify(rowids));
+  return new Set(rows.map((r) => asNumber(r.rid)));
+}
+
+/**
+ * How many messages of a conversation match a query: the same hits a
+ * result row counts as its "N matching".
+ */
+function matchingIn(db: Db, built: BuiltQuery, threadId: number): number {
+  if (built.empty) return 0;
+  const h = hits(built, false, 'threads');
+  return asNumber(
+    db.once(`SELECT count(*) AS n FROM (${h.sql})`).get(...h.params, JSON.stringify([threadId]))?.n,
+  );
+}
+
+/**
+ * A cards window as the shell gets it: with the revision of the snapshot it
+ * was read from and, when the conversation was opened from a search, which
+ * cards match it. The matching count is read in the same snapshot, but only
+ * when the count the header shows is from another revision (or there is
+ * none): while nothing commits, a scroll doesn't count again.
+ */
+export function cardsAnswer(db: Db, call: CardsQuery, rev: number): CardsWindow {
+  const window = cardsWindow(db, call);
+  const text = call.search?.text;
+  if (text === undefined || window.threadId === null) return { ...window, rev, searched: false };
+  const built = buildQuery(db, parseQuery(text));
+  const matched = matchedAmong(
+    db,
+    built,
+    window.cards.map((c) => c.rowid),
+  );
+  const answer: CardsWindow = {
+    ...window,
+    cards: window.cards.map((c) => ({ ...c, matched: matched.has(c.rowid) })),
+    rev,
+    searched: true,
+  };
+  const countRev = call.search?.countRev ?? null;
+  if (countRev === null || countRev !== rev)
+    answer.matching = matchingIn(db, built, window.threadId);
+  return answer;
+}
+
+/**
+ * The snippets of those of these messages that match a query with words,
+ * matched as the search matches them, with their ranges checked.
+ */
+export function matchedSnippets(
+  db: Db,
+  text: string,
+  rowids: number[],
+): { byRowid: Map<number, MarkedSnippet>; dropped: number } {
+  const built = buildQuery(db, parseQuery(text));
+  if (!built.hasText || built.match === null) return { byRowid: new Map(), dropped: 0 };
+  return snippets(db, built.match, [...matchedAmong(db, built, rowids)]);
 }

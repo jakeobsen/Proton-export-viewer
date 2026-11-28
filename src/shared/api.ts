@@ -7,6 +7,7 @@ import type {
   CardsWindow,
   IndexProgress,
   IndexReport,
+  Lead,
   ListWindow,
   SearchDateKey,
   SearchPage,
@@ -42,6 +43,7 @@ export const IPC = {
   indexChanged: 'pev:index-changed',
   search: 'pev:search',
   searchSnippets: 'pev:search-snippets',
+  leads: 'pev:leads',
   showInFolder: 'pev:show-in-folder',
   copyMessageId: 'pev:copy-message-id',
   copyReport: 'pev:copy-report',
@@ -234,6 +236,19 @@ export interface SnippetsRequest {
 export type SnippetsResult =
   { ok: true; generation: number; queryId: number; snippets: ThreadSnippet[] } | Rejected;
 
+/**
+ * Lead lines for messages on screen, asked for by the list or by the cards.
+ * The cards of a conversation opened from a result name that search by its
+ * query ID, so the messages that match it get its snippet.
+ */
+export interface LeadsRequest {
+  requester: 'list' | 'cards';
+  rowids: number[];
+  queryId?: number;
+}
+
+export type LeadsResult = { ok: true; generation: number; leads: Lead[] } | Rejected;
+
 export type CloseViewResult = { ok: true } | Rejected;
 /** The open export's index, as Settings shows it. Paths have home as `~`. */
 export interface SettingsIndex {
@@ -349,6 +364,12 @@ export interface PevApi {
    * made; one of an older search is answered as 'superseded'.
    */
   searchSnippets(request: SnippetsRequest, generation: number): Promise<SnippetsResult>;
+  /**
+   * Lead lines for messages on screen. A request waits while this window's
+   * previous one runs, and a newer one from the same requester answers it as
+   * 'superseded'.
+   */
+  leads(request: LeadsRequest, generation: number): Promise<LeadsResult>;
   /** What Settings shows, for the current generation. */
   settings(generation: number): Promise<SettingsResult>;
   /** Changes one setting; main checks the value. */

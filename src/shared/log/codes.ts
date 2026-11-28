@@ -212,6 +212,7 @@ export const REASONS = [
   'schema',
   'in_use',
   'overlap',
+  'busy',
   'app_data',
   'not_link',
   'unknown_link',

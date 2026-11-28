@@ -1163,7 +1163,7 @@ describe('a step of the open that fails', () => {
       ['unavailable', 'unavailable'],
       ['invalid', 'invalid'],
       ['closed', 'closed'],
-      ['busy', 'unknown'],
+      ['no_such_code', 'unknown'],
     ] as const) {
       const t = setup(`mgr-index-failed-${answer}`);
       t.picks.push({ path: tool(`mgr-index-failed-${answer}-tool`), bookmark: 'bm1' });

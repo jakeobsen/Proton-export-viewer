@@ -463,6 +463,11 @@ export async function install(ctx: AppContext): Promise<boolean> {
       if (!result.ok) throw new Error('hold-cards');
       return result.value ?? 0;
     },
+    /** The shell's cards queries core holds now. */
+    heldCards: async () => {
+      const result = await core('held-cards');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
     /** Phase 1 writes waiting to be let through. */
     heldWrites: async () => {
       const result = await core('held-writes');

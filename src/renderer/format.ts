@@ -60,6 +60,12 @@ export function loadingText(loaded: number, total: number): string {
   return `Loading ${formatCount(loaded)} of ${formatCount(total)}…`;
 }
 
+/** A conversation's header count: "4 messages", or from a result "4 messages · 2 matching". */
+export function countText(total: number, matching: number | null): string {
+  const messages = `${formatCount(total)} ${total === 1 ? 'message' : 'messages'}`;
+  return matching === null ? messages : `${messages} · ${formatCount(matching)} matching`;
+}
+
 /**
  * When something last changed, in local time: "Today, 09:58",
  * "Yesterday, 18:20", "24 Nov 2026, 09:58". `time` is in milliseconds.

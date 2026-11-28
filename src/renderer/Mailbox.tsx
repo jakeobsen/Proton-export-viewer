@@ -17,8 +17,19 @@ import {
   readingText,
 } from './format';
 import { exportLabel } from './labels';
+import { LeadText } from './Lead';
+import type { LeadLine } from './leads';
 import { ROW_HEIGHT, type Row } from './list';
-import { list, selectRow, showFolder, useList, useMailbox } from './mailbox-state';
+import {
+  list,
+  selectRow,
+  setListShown,
+  setListViewport,
+  showFolder,
+  useList,
+  useListLeads,
+  useMailbox,
+} from './mailbox-state';
 import { setListStep } from './shortcut-actions';
 import { openReportFrom } from './Report';
 import { attentionText } from '../shared/report-text';
@@ -202,12 +213,14 @@ function ConversationRow({
   total,
   selected,
   sidebar,
+  line,
 }: {
   row: Row;
   index: number;
   total: number;
   selected: boolean;
   sidebar: SidebarModel | null;
+  line: LeadLine | undefined;
 }) {
   const unread = row.unreadHere > 0;
   const who = participantsText(row.details?.participants ?? []);
@@ -246,6 +259,9 @@ function ConversationRow({
           <span className="clip" title="Has attachments" aria-label="Has attachments" />
         )}
       </div>
+      <div className="snip">
+        <LeadText line={line} />
+      </div>
       <Chips labelIds={row.details?.labelIds} sidebar={sidebar} />
     </div>
   );
@@ -254,6 +270,7 @@ function ConversationRow({
 export function ConversationList() {
   const { sidebar, folder, progress, report } = useMailbox();
   const snap = useList();
+  const leads = useListLeads();
   const scrollRef = useRef<HTMLDivElement>(null);
   // Where the virtualizer learns the scroll offset. A scroll the list makes
   // itself is passed on at once, before the paint, rather than waiting for
@@ -279,7 +296,7 @@ export function ConversationList() {
     const last = Math.floor(
       (el.scrollTop + Math.max(el.clientHeight, ROW_HEIGHT) - 1) / ROW_HEIGHT,
     );
-    list.setViewport(first, last);
+    setListViewport(first, last);
   }, []);
 
   const scrollTo = useCallback(
@@ -312,6 +329,12 @@ export function ConversationList() {
     observer.observe(el);
     return () => observer.disconnect();
   }, [reportViewport]);
+
+  // Out of sight (results show in its place), no row's line is asked for.
+  useEffect(() => {
+    setListShown(true);
+    return () => setListShown(false);
+  }, []);
 
   // The next or previous row, from the selected one, or with none selected
   // from the first row on screen: the arrow keys, and `j`/`k` anywhere.
@@ -392,6 +415,7 @@ export function ConversationList() {
                     total={snap.total}
                     selected={row.threadId === selectedThread}
                     sidebar={sidebar}
+                    line={leads.get(row.anchorRowid)}
                   />
                 ) : (
                   <div className="conv placeholder" aria-hidden="true" />

@@ -127,6 +127,13 @@ const api: PevApi = {
       threadIds: request.threadIds,
       generation,
     }),
+  leads: (request, generation) =>
+    ipcRenderer.invoke(IPC.leads, {
+      requester: request.requester,
+      rowids: request.rowids,
+      ...(request.queryId === undefined ? {} : { queryId: request.queryId }),
+      generation,
+    }),
   settings: (generation) => ipcRenderer.invoke(IPC.settings, { generation }),
   setSetting: (key, value, generation) =>
     ipcRenderer.invoke(IPC.setSetting, { key, value, generation }),

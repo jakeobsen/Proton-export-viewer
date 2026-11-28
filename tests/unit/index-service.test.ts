@@ -28,7 +28,13 @@ import { BODY_STATE, CAPPED, SCHEMA_VERSION } from '../../src/core/index/schema'
 import { validRanges } from '../../src/core/search/ranges';
 import { openDb } from '../../src/core/index/sql';
 import { ThreadError, type IndexThread, type ThreadRole } from '../../src/core/index/pool';
-import type { IndexTotals, ListPage, SearchPage, Sidebar } from '../../src/shared/index-types';
+import type {
+  CardsWindow,
+  IndexTotals,
+  ListPage,
+  SearchPage,
+  Sidebar,
+} from '../../src/shared/index-types';
 import type { Logger } from '../../src/shared/log/writer';
 import { sanitizeEvent } from '../../src/shared/log/schema';
 import { digest } from '../../tools/gen-export/tree.mjs';
@@ -772,6 +778,46 @@ describe('the query thread', () => {
     expect(after.rows).toHaveLength(1);
     query.close();
     writer.close();
+  });
+
+  it('answers cards with a higher revision after a failed query thread is replaced', async () => {
+    const { run, indexDir } = exportAt('rev-replaced', 10);
+    let replace = (): void => undefined;
+    const wrap = (role: ThreadRole, first: IndexThread): IndexThread => {
+      if (role !== 'query') return first;
+      let current = first;
+      const thread: IndexThread = {
+        respawns: 0,
+        onRespawn: null,
+        stop: () => current.stop(),
+        call: <T>(op: string, args?: unknown, timeoutMs?: number) =>
+          current.call<T>(op, args, timeoutMs),
+      };
+      // The thread exits; a new one, with a new query state, takes its place.
+      replace = () => {
+        current = new InlineThread('query');
+        (thread as { respawns: number }).respawns += 1;
+        thread.onRespawn?.();
+      };
+      return thread;
+    };
+    const h = harness(run, indexDir, {}, undefined, wrap);
+    await h.service.open(null);
+    await h.service.startIndexing(scanRun(run));
+    const cards = async () =>
+      (await h.service.ask({
+        op: 'cards',
+        follow: [],
+        threadId: null,
+        anchor: { index: 0 },
+        before: 0,
+        after: 1,
+      })) as CardsWindow;
+    const before = await cards();
+    expect((await cards()).rev).toBe(before.rev);
+    replace();
+    expect((await cards()).rev).toBeGreaterThan(before.rev);
+    await h.service.close();
   });
 });
 

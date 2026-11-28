@@ -20,6 +20,7 @@ import {
   type SearchSort,
   type ThreadSnippet,
 } from '../shared/index-types';
+import { partText } from '../shared/header-text';
 import { formatCount } from './format';
 
 /** How long typing must pause before a search runs, in milliseconds. */
@@ -354,6 +355,23 @@ export class SearchModel {
 export interface SnippetPart {
   text: string;
   mark: boolean;
+}
+
+/**
+ * A snippet's parts as a line shows them: each cleaned on its own, so a
+ * removed character only shortens its part and a mark stays on its text,
+ * with the line's ends trimmed. Parts left empty are dropped.
+ */
+export function cleanParts(parts: SnippetPart[]): SnippetPart[] {
+  const last = parts.length - 1;
+  return parts
+    .map((part, i) => {
+      let text = partText(part.text);
+      if (i === 0) text = text.trimStart();
+      if (i === last) text = text.trimEnd();
+      return { text, mark: part.mark };
+    })
+    .filter((part) => part.text !== '');
 }
 
 /**
