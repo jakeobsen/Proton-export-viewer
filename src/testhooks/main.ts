@@ -450,6 +450,29 @@ export async function install(ctx: AppContext): Promise<boolean> {
       const result = await core('held-searches');
       return result.ok ? (result.value ?? 0) : 0;
     },
+    /** Core holds the recent searches' job at the head of its queue until released. */
+    holdRecent: async () => {
+      if (!(await core('hold-recent')).ok) throw new Error('hold-recent');
+    },
+    /** Stops holding recent jobs; returns how many were held. */
+    releaseRecent: async () => {
+      const result = await core('release-recent');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
+    /** Recent jobs core holds now. */
+    heldRecent: async () => {
+      const result = await core('held-recent');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
+    /** The next wipe of the recent searches fails in core, deleting nothing. */
+    failRecentWipe: async () => {
+      if (!(await core('fail-recent-wipe')).ok) throw new Error('fail-recent-wipe');
+    },
+    /** Recordings of recent searches that reached this core. */
+    recentReceived: async () => {
+      const result = await core('recent-received');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
     /**
      * Holds the shell's cards queries anchored at message `rowid` in core;
      * null lets the held ones go and returns how many there were.

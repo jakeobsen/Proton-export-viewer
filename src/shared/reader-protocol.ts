@@ -3,6 +3,7 @@
 // main and core, and core and its reader worker.
 
 import type { RasterFormat } from './attachment-types';
+import type { SearchSpec } from './search-chips';
 
 /**
  * What the shell asks for: the message's HTML body, its plain text, or its
@@ -189,7 +190,7 @@ export interface ReadRequest {
   /** The window the open is for. Its newer opens, by openId, drop this one while it waits. */
   lane: number;
   /** The search the message was opened from: its matches are marked or listed. */
-  search?: { text: string };
+  search?: SearchSpec;
 }
 
 /** The most of one header block the source view shows. */
