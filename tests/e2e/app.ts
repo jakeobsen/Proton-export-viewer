@@ -144,7 +144,14 @@ export interface LaunchOptions {
 export async function launch(name: string, options: LaunchOptions = {}): Promise<PevApp> {
   const userData = options.userData ?? testDir(`e2e-${name}`);
   const app = await electron.launch({
-    args: [join(REPO_ROOT, 'out-test'), `--pev-user-data=${userData}`, ...(options.args ?? [])],
+    args: [
+      join(REPO_ROOT, 'out-test'),
+      `--pev-user-data=${userData}`,
+      // Screenshots in sRGB on every OS, so pixel checks compare like with like:
+      // macOS otherwise converts them to the display's colour profile.
+      '--force-color-profile=srgb',
+      ...(options.args ?? []),
+    ],
     cwd: REPO_ROOT,
     // Without this, Playwright turns Chromium's sandbox off on Linux.
     chromiumSandbox: true,
