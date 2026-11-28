@@ -4,19 +4,20 @@
 // way mailparser does it (transfer encoding, format=flowed, then the charset
 // with the same refusals). Of each body kind, at most KEEP_BYTES of encoded
 // content is kept; the rest of it, and every other part, is read and dropped
-// without being decoded.
+// without being decoded. A message past the parser's limits (more than
+// MAX_MIME_PARTS parts, or a header block over MAX_HEAD_BYTES) is read up to
+// there; any other read error fails the read.
 
-import { Readable, Writable } from 'node:stream';
+import { Readable, Writable, type Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { Splitter, type MimeNode } from '@zone-eu/mailsplit';
 import FlowedDecoder from '@zone-eu/mailsplit/lib/flowed-decoder.js';
 import libmime from 'libmime';
 import { MailParser, type HeaderLines, type Headers } from 'mailparser';
+import { MAX_HEAD_BYTES, MAX_MIME_PARTS } from '../mime-limits';
 
 /** Encoded bytes kept of each body kind (text, HTML); the rest is dropped. */
 export const KEEP_BYTES = 20 * 1024 * 1024;
-/** The longest header block read. */
-const MAX_HEAD_BYTES = 2 * 1024 * 1024;
 
 /** Content types read as text bodies, as mailparser reads them. */
 const TEXT_TYPES = new Set(['text/plain', 'text/html', 'message/delivery-status']);
@@ -38,6 +39,8 @@ export interface ExtractedMessage {
   lines: HeaderLines | null;
   text: Body;
   html: Body;
+  /** The parser stopped at one of its limits: the bodies hold what came before. */
+  stopped: boolean;
 }
 
 type Kind = 'text' | 'html';
@@ -131,7 +134,11 @@ export async function extractMessage(
   input: Readable,
   keepBytes = KEEP_BYTES,
 ): Promise<ExtractedMessage> {
-  const splitter = new Splitter({ maxHeadSize: MAX_HEAD_BYTES, ignoreEmbedded: true });
+  const splitter = new Splitter({
+    maxHeadSize: MAX_HEAD_BYTES,
+    maxChildNodes: MAX_MIME_PARTS,
+    ignoreEmbedded: true,
+  });
   const collected: Record<Kind, Collected> = {
     text: { parts: [], bytes: 0, kept: 0, cut: false },
     html: { parts: [], bytes: 0, kept: 0, cut: false },
@@ -146,7 +153,24 @@ export async function extractMessage(
     collected[part.kind].parts.push(await decodePart(part.node, part.chunks));
   };
 
-  await pipeline(input, splitter, async (source: AsyncIterable<SplitChunk>) => {
+  // Only the splitter's own limit error ends the read early. The input's
+  // errors and the reader's own reach the splitter too, as the pipeline
+  // passes them on, so each is told apart by where it was raised first.
+  const raisedElsewhere = new WeakSet<object>();
+  const noteElsewhere = (err: unknown) => {
+    if (typeof err === 'object' && err !== null) raisedElsewhere.add(err);
+  };
+  input.on('error', noteElsewhere);
+  let splitterLimit: unknown = null;
+  // The splitter's types name only its data events; it is a Transform stream.
+  (splitter as Transform).on('error', (err: unknown) => {
+    const code = (err as { code?: unknown } | null)?.code;
+    if (splitterLimit === null && code === 'EMAXLEN' && !raisedElsewhere.has(err as object)) {
+      splitterLimit = err;
+    }
+  });
+
+  async function consume(source: AsyncIterable<SplitChunk>): Promise<void> {
     for await (const chunk of source) {
       if (chunk.type === 'node') {
         await finish();
@@ -172,7 +196,24 @@ export async function extractMessage(
       into.cut = true;
     }
     await finish();
+  }
+
+  const read = pipeline(input, splitter, async (source: AsyncIterable<SplitChunk>) => {
+    try {
+      await consume(source);
+    } catch (err) {
+      noteElsewhere(err);
+      throw err;
+    }
   });
+  let stopped = false;
+  try {
+    await read;
+  } catch (err) {
+    if (splitterLimit === null || err !== splitterLimit) throw err;
+    stopped = true;
+    await finish();
+  }
 
   const { headers, lines } = headerBlock
     ? await parseHeaders(headerBlock)
@@ -182,5 +223,6 @@ export async function extractMessage(
     lines,
     text: joined(collected.text, '\n'),
     html: joined(collected.html, '<br/>\n'),
+    stopped,
   };
 }
