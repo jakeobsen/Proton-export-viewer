@@ -17,9 +17,11 @@ const START: IndexProgress = {
   capped: 0,
   condition: 'ok',
   bodyPhase: 'waiting',
+  bodiesBefore: 0,
   bodiesDone: 0,
   bodiesTotal: 0,
   bodiesFailed: 0,
+  bodiesTruncated: 0,
 };
 const REPORT: IndexReport = {
   messages: 5,
@@ -32,6 +34,7 @@ const REPORT: IndexReport = {
   timeouts: 0,
   capped: {},
   hiddenLabelIds: 0,
+  fullText: { indexed: 0, total: 0, truncated: 0, skipped: 0, skippedBy: {} },
   attention: 0,
   rows: [],
   more: 0,
@@ -116,10 +119,11 @@ describe('the index report, closed', () => {
     for (const [change, n] of [
       [{ capped: 1 }, 2],
       [{ bodiesFailed: 1 }, 3],
-      [{ failed: 1 }, 4],
-      [{ timeouts: 1 }, 5],
-      [{ phase: 'loading' }, 5],
-      [{ phase: 'done' }, 6],
+      [{ bodiesTruncated: 1 }, 4],
+      [{ failed: 1 }, 5],
+      [{ timeouts: 1 }, 6],
+      [{ phase: 'loading' }, 6],
+      [{ phase: 'done' }, 7],
     ] as Array<[Partial<IndexProgress>, number]>) {
       await later();
       await report(change);

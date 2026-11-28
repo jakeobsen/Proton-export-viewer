@@ -73,12 +73,14 @@ import {
   type IndexThread,
   type ThreadRole,
 } from './pool';
+import { reasonOf } from './report';
 import { BODY_STATE, CAPPED, CAPPED_LISTS } from './schema';
 import {
   BODY_TOO_LARGE,
   labelsStatOf,
   textBytes,
   type ApplyItem,
+  type BodyOrder,
   type BodyTodo,
   type FileStat,
   type PairFiles,
@@ -244,26 +246,6 @@ function chunk<T>(list: T[], size: number): T[][] {
   return out;
 }
 
-/** The log reason for a pair's code. */
-export function reasonOf(code: string): string {
-  if (code.startsWith('FILE_')) return code.slice('FILE_'.length).toLowerCase();
-  switch (code) {
-    case 'META_JSON':
-      return 'meta_json';
-    case 'META_SHAPE':
-      return 'meta_shape';
-    case 'META_ID':
-      return 'meta_id';
-    case 'META_TIMEOUT':
-    case 'BODY_TIMEOUT':
-      return 'timeout';
-    case BODY_TOO_LARGE:
-      return 'too_large';
-    default:
-      return 'worker_failed';
-  }
-}
-
 export class IndexService {
   readonly connections: ConnectionRegistry;
   readonly dbPath: string;
@@ -293,9 +275,11 @@ export class IndexService {
     capped: 0,
     condition: 'ok',
     bodyPhase: 'waiting',
+    bodiesBefore: 0,
     bodiesDone: 0,
     bodiesTotal: 0,
     bodiesFailed: 0,
+    bodiesTruncated: 0,
   };
   /** How long phase 1 took when it last ran to the end, in ms. */
   took: number | null = null;
@@ -736,9 +720,14 @@ export class IndexService {
       if (!writer) throw new ThreadError('NOT_OPEN');
       const pool = this.startPool();
       if (!this.current()) throw new ThreadError('STALE');
-      const order = await writer.call<number[]>('bodyOrder');
+      const { order, before } = await writer.call<BodyOrder>('bodyOrder');
+      // Counts start again with each run; what earlier runs handled is in `before`.
       this.progress.bodyPhase = 'indexing';
+      this.progress.bodiesBefore = before;
       this.progress.bodiesTotal = order.length;
+      this.progress.bodiesDone = 0;
+      this.progress.bodiesFailed = 0;
+      this.progress.bodiesTruncated = 0;
       this.report(true);
       await this.readBodies(pool, writer, order, scan.eml);
       if (!this.current()) throw new ThreadError('STALE');
@@ -958,6 +947,7 @@ export class IndexService {
     this.touch();
     this.progress.bodiesDone += handled;
     this.progress.bodiesFailed += stats.failed.length;
+    this.progress.bodiesTruncated += stats.truncated;
     this.progress.capped += stats.cappedNew;
     this.report();
     for (const fileId of stats.capped) {

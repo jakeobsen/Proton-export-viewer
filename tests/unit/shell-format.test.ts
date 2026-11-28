@@ -2,11 +2,13 @@
 // The shell's display text for the list, and the sidebar's model.
 
 import { describe, expect, it } from 'vitest';
-import type { FolderRow } from '../../src/shared/index-types';
+import type { FolderRow, IndexProgress } from '../../src/shared/index-types';
 import { sidebarModel } from '../../src/renderer/folders';
 import {
   formatCount,
   fullDate,
+  fullTextLine,
+  fullTextShare,
   listDate,
   loadingText,
   participantsText,
@@ -128,5 +130,39 @@ describe('the sidebar model', () => {
     const model = sidebarModel({ folders: chain, hiddenIds: 0 });
     expect(model.folders).toHaveLength(20_000);
     expect(model.folders.at(-1)?.depth).toBe(19_999);
+  });
+});
+
+describe('the full-text share', () => {
+  const at = (bodiesBefore: number, bodiesDone: number, bodiesTotal: number): IndexProgress => ({
+    phase: 'done',
+    loaded: 0,
+    total: 0,
+    failed: 0,
+    timeouts: 0,
+    capped: 0,
+    condition: 'ok',
+    bodyPhase: 'indexing',
+    bodiesBefore,
+    bodiesDone,
+    bodiesTotal,
+    bodiesFailed: 0,
+    bodiesTruncated: 0,
+  });
+
+  it('counts files handled before this run and in it, over all, rounded down', () => {
+    expect(fullTextShare(at(0, 0, 3))).toBe(0);
+    expect(fullTextShare(at(0, 1, 3))).toBe(33);
+    expect(fullTextShare(at(0, 2, 3))).toBe(66);
+    expect(fullTextShare(at(100_000, 0, 50_000))).toBe(66);
+    expect(fullTextShare(at(60_000, 1_000, 92_000))).toBe(40);
+    expect(fullTextShare(at(0, 3, 3))).toBe(100);
+    expect(fullTextLine(40)).toBe('Full text 40% · search is partial');
+  });
+
+  it('stays within 0 and 100, and is none with no file to read', () => {
+    expect(fullTextShare(at(0, 0, 0))).toBeNull();
+    expect(fullTextShare(at(0, 5, 3))).toBe(100);
+    expect(fullTextShare(at(2, -9, 3))).toBe(0);
   });
 });

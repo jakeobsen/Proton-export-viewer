@@ -3,8 +3,12 @@
 // is loaded and from the loading line while it loads, its counts and rows for
 // a generated export with files that need attention, focus moving to it and
 // back, the mail kept under it unseen and inert, "Copy report" with no file
-// name in the logs, and the checks on its channel.
+// name in the logs, and the checks on its channel. Then the text of the
+// message files: the sidebar's line while it is read, over the whole export
+// after a reopen too, and the report's counts and rows for text cut to the
+// limit or not read.
 
+import { spawnSync } from 'node:child_process';
 import {
   readFileSync,
   readdirSync,
@@ -16,6 +20,7 @@ import {
 import { join } from 'node:path';
 import type { Page } from '@playwright/test';
 import type { IndexProgress, IndexTotals } from '../../src/shared/index-types';
+import type { Stamp } from '../../src/shared/sources';
 import { writeExport } from '../exports';
 import { MARKERS, findMarkers } from '../markers';
 import { testDir } from '../paths';
@@ -52,6 +57,55 @@ const rectOf = (page: Page, selector: string) =>
     return [r.left, r.top, r.width, r.height];
   });
 
+/** The message files' IDs, in name order. */
+const emlIds = (run: string) =>
+  readdirSync(run)
+    .filter((n) => n.endsWith('.eml'))
+    .map((n) => n.slice(0, -'.eml'.length))
+    .sort();
+
+/** Rewrites one message file as a plain-text message whose body is `bytes` long. */
+function bigEml(run: string, id: string, bytes: number): void {
+  const line = 'lorem ipsum dolor sit amet consectetur adipiscing elit\r\n';
+  const body = line.repeat(Math.ceil(bytes / line.length));
+  writeFileSync(
+    join(run, `${id}.eml`),
+    `From: a@example.com\r\nTo: b@example.com\r\nSubject: Long\r\nDate: Tue, 24 Nov 2026 10:00:00 +0000\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${body}`,
+  );
+}
+
+/** Moves a message's two files to another folder. */
+function move(id: string, from: string, to: string): void {
+  for (const ext of ['.eml', '.metadata.json']) {
+    writeFileSync(join(to, id + ext), readFileSync(join(from, id + ext)));
+    rmSync(join(from, id + ext));
+  }
+}
+
+/** Lets phase 1's writes through one at a time until it is done; phase 2's stay held. */
+async function loadWithTextHeld(pev: PevApp, pairs: number): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        const p = await progress(pev);
+        if (p?.phase === 'done') return p.loaded === pairs && p.bodyPhase === 'indexing';
+        if ((await pev.main<number>('heldWrites')) > 0) await pev.main('releaseWrites', 1);
+        return false;
+      },
+      { timeout: 20_000 },
+    )
+    .toBe(true);
+}
+
+/** The report's rows: result, whole file name and reason. */
+const rowsOf = (page: Page) =>
+  page.locator('.ix-card .report tbody tr').evaluateAll((trs) =>
+    trs.map((tr) => {
+      const td = [...tr.querySelectorAll('td')];
+      return [td[0]!.textContent, td[1]!.getAttribute('title'), td[2]!.textContent];
+    }),
+  );
+
 /** The text of each clipboard write; test builds record them instead. */
 async function clipboardWrites(pev: PevApp): Promise<string[]> {
   const calls = await pev.main<Array<{ method: string; args: string[] }>>('externalCalls');
@@ -74,7 +128,9 @@ test('the report lists the files that need attention, and copies them as text', 
 
   await pev.main('queuePick', root, 'bm1');
   await pev.shell('chooseFolder', []);
-  await expect.poll(() => progress(pev), { timeout: 20_000 }).toMatchObject({ phase: 'done' });
+  await expect
+    .poll(() => progress(pev), { timeout: 20_000 })
+    .toMatchObject({ phase: 'done', bodyPhase: 'done' });
 
   const link = pev.page.locator('.list-head .attention');
   await expect(link).toHaveText('4 files need attention');
@@ -84,7 +140,7 @@ test('the report lists the files that need attention, and copies them as text', 
   const card = pev.page.locator('.ix-card');
   await expect(card.locator('h1')).toHaveText('Index report');
   await expect(card.locator('h1')).toBeFocused();
-  await expect(card.locator('.phase h3 .pill')).toHaveText('Done');
+  await expect(card.locator('.phase.messages h3 .pill')).toHaveText('Done');
   // The mail stays mounted under the report, unseen and inert, and the report
   // takes exactly its place.
   const mail = pev.page.locator('main.content');
@@ -94,9 +150,10 @@ test('the report lists the files that need attention, and copies them as text', 
   await expect(pev.page.locator('.list-scroll')).toBeHidden();
   expect(await rectOf(pev.page, 'main.center')).toEqual(await rectOf(pev.page, 'main.content'));
   // 12 pairs, less the two whose metadata is missing or isn't JSON.
-  await expect(card.locator('.ix-stats')).toContainText('10 messages');
-  await expect(card.locator('.ix-stats')).toContainText('folders and labels');
-  await expect(card.locator('.ix-stats')).toContainText(/took \d/);
+  const stats = card.locator('.phase.messages .ix-stats');
+  await expect(stats).toContainText('10 messages');
+  await expect(stats).toContainText('folders and labels');
+  await expect(stats).toContainText(/took \d/);
   await expect(card.locator('.report h2')).toHaveText('4 files need attention');
   const rows = await card.locator('.report tbody tr').evaluateAll((trs) =>
     trs.map((tr) => {
@@ -168,9 +225,13 @@ test('the loading line opens the report while the export loads', async ({ pev })
   await press(pev.page, '.side-foot .loading-text');
   const card = pev.page.locator('.ix-card');
   await expect(card.locator('h1')).toHaveText('Indexing');
-  await expect(card.locator('.phase h3 .pill')).toHaveText('25%');
-  await expect(card.locator('.ix-stats')).toContainText(`Loading 10 of ${written.pairs}…`);
-  await expect(card.locator('.progress')).toHaveAttribute('aria-valuenow', '10');
+  await expect(card.locator('.phase.messages h3 .pill')).toHaveText('25%');
+  await expect(card.locator('.phase.messages .ix-stats')).toContainText(
+    `Loading 10 of ${written.pairs}…`,
+  );
+  await expect(card.locator('.phase.messages .progress')).toHaveAttribute('aria-valuenow', '10');
+  // The full text comes once the messages are loaded.
+  await expect(card.locator('.phase.text')).toHaveCount(0);
   await expect(card.locator('.report')).toHaveCount(0);
   // The open message's frame stays under the report, unseen.
   const frame = pev.page.locator('.reader iframe.rp-frame');
@@ -179,11 +240,16 @@ test('the loading line opens the report while the export loads', async ({ pev })
   await expect(pev.page.locator('main.content')).toHaveAttribute('inert', '');
 
   await pev.main('releaseWrites', null);
-  await expect.poll(() => progress(pev), { timeout: 20_000 }).toMatchObject({ phase: 'done' });
+  await expect
+    .poll(() => progress(pev), { timeout: 20_000 })
+    .toMatchObject({ phase: 'done', bodyPhase: 'done' });
+  // Indexing until the text of every message file is read.
   await expect(card.locator('h1')).toHaveText('Index report');
-  await expect(card.locator('.phase h3 .pill')).toHaveText('Done');
-  await expect(card.locator('.ix-stats')).toContainText(`${written.pairs} messages`);
-  await expect(card.locator('.progress')).toHaveCount(0);
+  await expect(card.locator('.phase.messages h3 .pill')).toHaveText('Done');
+  await expect(card.locator('.phase.messages .ix-stats')).toContainText(
+    `${written.pairs} messages`,
+  );
+  await expect(card.locator('.phase.messages .progress')).toHaveCount(0);
   await press(pev.page, '.ix-foot button:text("Start browsing")');
   await expect(card).toHaveCount(0);
   await expect(pev.page.locator('.list-head .attention')).toHaveCount(0);
@@ -226,4 +292,137 @@ test('the report channels check their arguments and the generation', async ({ pe
   });
   // Only the valid call reached the clipboard.
   expect(await clipboardWrites(pev)).toHaveLength(1);
+});
+
+test('while the text is read, the sidebar shows how far and opens the report; then the report lists text cut or not read', async ({
+  pev,
+}) => {
+  const root = realpathSync(testDir('report-text-held'));
+  const written = writeExport(root, { seed: 52, messages: 8 });
+  const [big, swapped] = emlIds(written.run) as [string, string];
+  // Over the 1 MB that is kept for search.
+  bigEml(written.run, big, 1_100_000);
+  await pev.main('indexTestSettings', { holdWrites: true });
+  await pev.main('queuePick', root, 'bm1');
+  await pev.shell('chooseFolder', []);
+  // A write waits once the scan is done: the message file becomes a FIFO,
+  // which phase 2 refuses when it opens it.
+  await expect.poll(() => pev.main<number>('heldWrites'), { timeout: 20_000 }).toBeGreaterThan(0);
+  rmSync(join(written.run, `${swapped}.eml`));
+  expect(spawnSync('/usr/bin/mkfifo', [join(written.run, `${swapped}.eml`)]).status).toBe(0);
+  await loadWithTextHeld(pev, written.pairs);
+
+  const line = pev.page.locator('.side-foot .full-text');
+  await expect(line).toHaveText('Full text 0% · search is partial');
+  await expect(pev.page.locator('.side-foot [role="progressbar"]')).toHaveAttribute(
+    'aria-valuenow',
+    '0',
+  );
+  await press(pev.page, '.side-foot .full-text');
+  const card = pev.page.locator('.ix-card');
+  await expect(card.locator('h1')).toHaveText('Indexing');
+  await expect(card.locator('h1')).toBeFocused();
+  await expect(card.locator('.phase.messages h3 .pill')).toHaveText('Done');
+  const text = card.locator('.phase.text');
+  await expect(text.locator('h3 .pill')).toHaveText('0%');
+  await expect(text.locator('.progress')).toHaveAttribute('aria-valuenow', '0');
+  await expect(text.locator('.ix-stats')).toHaveText(`0 / ${written.pairs} bodies indexed`);
+  // Closed, focus goes back to the line that opened it.
+  await press(pev.page, '.ix-foot button:text("Start browsing")');
+  await expect(card).toHaveCount(0);
+  await expect(line).toBeFocused();
+
+  await pev.main('releaseWrites', null);
+  await expect
+    .poll(() => progress(pev), { timeout: 20_000 })
+    .toMatchObject({ bodyPhase: 'done', bodiesFailed: 1, bodiesTruncated: 1 });
+  // Once the text is read, the line goes, and the header counts the two files.
+  await expect(line).toHaveCount(0);
+  const link = pev.page.locator('.list-head .attention');
+  await expect(link).toHaveText('2 files need attention');
+  await press(pev.page, '.list-head .attention');
+  await expect(card.locator('h1')).toHaveText('Index report');
+  await expect(text.locator('h3 .pill')).toHaveText('Done');
+  await expect(text.locator('.progress')).toHaveCount(0);
+  // The cut text is indexed; the text not read isn't.
+  await expect(text.locator('.ix-stats')).toContainText(
+    `${written.pairs - 1} / ${written.pairs} bodies indexed`,
+  );
+  await expect(text.locator('.ix-stats')).toContainText('1 skipped · 1 truncated');
+  expect(await rowsOf(pev.page)).toEqual([
+    ['Skipped', `${swapped}.eml`, "Couldn't read text"],
+    ['Truncated', `${big}.eml`, 'Over the 1 MB search limit'],
+  ]);
+  await press(pev.page, '.ix-foot button:text("Copy report")');
+  await expect(card.locator('.ix-foot .note')).toHaveText('Report copied.');
+  const copied = (await clipboardWrites(pev))[0]!;
+  expect(copied).toContain(`Bodies indexed: ${written.pairs - 1} of ${written.pairs}\n`);
+  expect(copied).toContain('Text not read: 1 (fifo 1)\n');
+  expect(copied).toContain('Text over the limit: 1\n');
+  expect(copied).toContain(`Skipped\t${swapped}.eml\tCouldn't read text (fifo)\n`);
+  expect(copied).toContain(`Truncated\t${big}.eml\tOver the 1 MB search limit (truncated)\n`);
+});
+
+test('after a reopen, the sidebar shows the text read over the whole export, and the report only the bodies indexed', async ({
+  pev,
+}) => {
+  const root = realpathSync(testDir('report-text-reopen'));
+  const written = writeExport(root, { seed: 53, messages: 10 });
+  const ids = emlIds(written.run);
+  const later = ids.slice(0, 2);
+  const tooLong = ids[2]!;
+  // Its text alone is more than one write takes, so it isn't read.
+  bigEml(written.run, tooLong, 300_000);
+  const aside = realpathSync(testDir('report-text-aside'));
+  for (const id of later) move(id, written.run, aside);
+  await pev.main('indexTestSettings', { txnBytes: 200_000 });
+  await pev.main('queuePick', root, 'bm1');
+  await pev.shell('chooseFolder', []);
+  await expect
+    .poll(() => progress(pev), { timeout: 20_000 })
+    .toMatchObject({ phase: 'done', bodyPhase: 'done', bodiesFailed: 1 });
+  const first = await pev.main<Stamp>('sourceStamp');
+
+  // Another export, then this one again from its index, with the two messages
+  // back and their text held.
+  await pev.main('indexTestSettings', null);
+  const other = realpathSync(testDir('report-text-other'));
+  const otherExport = writeExport(other, { seed: 54, messages: 3 });
+  await pev.main('queuePick', other, 'bm2');
+  await pev.shell('chooseFolder', []);
+  await expect
+    .poll(async () => (await pev.main<Stamp>('sourceStamp')).sourceKey)
+    .not.toBe(first.sourceKey);
+  await expect
+    .poll(() => progress(pev), { timeout: 20_000 })
+    .toMatchObject({ phase: 'done', loaded: otherExport.pairs });
+  for (const id of later) move(id, aside, written.run);
+  await pev.main('indexTestSettings', { holdWrites: true, txnBytes: 200_000 });
+  await pev.shell('openExport', [first.sourceKey]);
+  await expect
+    .poll(async () => (await pev.main<Stamp>('sourceStamp')).sourceKey)
+    .toBe(first.sourceKey);
+  await loadWithTextHeld(pev, written.pairs);
+
+  // Eight of the ten files were handled before: seven indexed, one not read.
+  await expect(pev.page.locator('.side-foot .full-text')).toHaveText(
+    'Full text 80% · search is partial',
+  );
+  await expect(pev.page.locator('.side-foot [role="progressbar"]')).toHaveAttribute(
+    'aria-valuenow',
+    '80',
+  );
+  await press(pev.page, '.side-foot .full-text');
+  const text = pev.page.locator('.ix-card .phase.text');
+  await expect(text.locator('h3 .pill')).toHaveText('80%');
+  await expect(text.locator('.ix-stats')).toContainText('7 / 10 bodies indexed');
+  await expect(text.locator('.ix-stats')).toContainText('1 skipped · 0 truncated');
+  expect(await rowsOf(pev.page)).toEqual([['Skipped', `${tooLong}.eml`, "Couldn't read text"]]);
+
+  await pev.main('releaseWrites', null);
+  await expect
+    .poll(() => progress(pev), { timeout: 20_000 })
+    .toMatchObject({ bodyPhase: 'done', bodiesBefore: 8, bodiesDone: 2 });
+  await expect(text.locator('h3 .pill')).toHaveText('Done');
+  await expect(text.locator('.ix-stats')).toContainText('9 / 10 bodies indexed');
 });

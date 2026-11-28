@@ -346,7 +346,8 @@ export type CappedListName = (typeof CAPPED_LIST_NAMES)[number];
  * Why a file needs attention: a kind of file the checks refused (when the
  * folder was scanned or when the file was read), a message file without its
  * metadata or metadata without its message file, metadata that couldn't be
- * used, or a message with a list cut to its limit.
+ * used, a message with a list cut to its limit, or a message file whose text
+ * took too long to read, couldn't be read, or was cut to the search limit.
  */
 export type ReportReason =
   | RejectKind
@@ -357,14 +358,18 @@ export type ReportReason =
   | 'meta_id'
   | 'timeout'
   | 'failed'
-  | 'capped';
+  | 'capped'
+  | 'body_timeout'
+  | 'body_failed'
+  | 'body_truncated';
 
 /** Metadata that couldn't be used, by reason. */
 export type FailedReason = 'meta_json' | 'meta_shape' | 'meta_id' | 'failed';
 
 /**
- * What became of a file: 'skipped' files aren't listed, a 'listed' message
- * has no message file, and a 'truncated' one has a list cut to its limit.
+ * What became of a file: 'skipped' files aren't listed or their text isn't
+ * searchable, a 'listed' message has no message file, and a 'truncated' one
+ * has a list, or its searchable text, cut to its limit.
  */
 export type ReportResult = 'skipped' | 'listed' | 'truncated';
 
@@ -375,6 +380,27 @@ export interface ReportRow {
   reason: ReportReason;
   /** For 'capped': the lists that were cut. */
   lists?: CappedListName[];
+  /**
+   * For a message file's text: the code the copied report gives, e.g.
+   * 'timeout', 'fifo', 'worker_failed' or 'truncated'.
+   */
+  code?: string;
+}
+
+/**
+ * The text of the message files: listed messages with their text in the
+ * index (cut to the limit or not) out of all listed messages, as search
+ * counts them; then the files whose text was cut or couldn't be read.
+ */
+export interface FullTextReport {
+  indexed: number;
+  total: number;
+  /** Text cut to the search limit. */
+  truncated: number;
+  /** Text that couldn't be read. */
+  skipped: number;
+  /** Those, by code. */
+  skippedBy: Partial<Record<string, number>>;
 }
 
 /** The most rows an index report carries. */
@@ -401,6 +427,7 @@ export interface IndexReport {
   capped: Partial<Record<CappedListName, number>>;
   /** Label IDs on messages that labels.json doesn't name; they aren't shown. */
   hiddenLabelIds: number;
+  fullText: FullTextReport;
   /**
    * Files that need attention. A listed message with no message file and a
    * list cut to its limit is one file with two rows.
@@ -440,12 +467,20 @@ export interface IndexProgress {
   condition: IndexCondition;
   /** Where phase 2, the text of the message files, stands: 'waiting' until phase 1 is done. */
   bodyPhase: 'waiting' | 'indexing' | 'done' | 'failed';
+  /**
+   * Message files phase 2 handled before this run: indexed, cut to the limit,
+   * or failed. With `bodiesDone` and `bodiesTotal`, how far phase 2 has got
+   * over the whole export.
+   */
+  bodiesBefore: number;
   /** Message files phase 2 has handled in this run: indexed, cut to the limit, or failed. */
   bodiesDone: number;
   /** Message files phase 2 has to read in this run. */
   bodiesTotal: number;
-  /** Message files whose text couldn't be read. */
+  /** Message files whose text couldn't be read, in this run. */
   bodiesFailed: number;
+  /** Message files whose text was cut to the search limit, in this run. */
+  bodiesTruncated: number;
 }
 
 /** What core reports once a source's index is open. */

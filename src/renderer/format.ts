@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Display text for the list: counts, dates and participants.
 
-import type { Participant } from '../shared/index-types';
+import type { IndexProgress, Participant } from '../shared/index-types';
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -49,4 +49,23 @@ export function participantsText(participants: readonly Participant[]): string {
 /** "Loading 4,100 of 20,000…". */
 export function loadingText(loaded: number, total: number): string {
   return `Loading ${formatCount(loaded)} of ${formatCount(total)}…`;
+}
+
+/**
+ * How far phase 2 has got over the whole export, as a whole percent from 0 to
+ * 100: the message files handled in earlier runs and in this one, over all
+ * the files it reads. A file whose text couldn't be read counts as handled,
+ * so this isn't the share of bodies indexed, which the index report gives.
+ * Null while there is no file to read.
+ */
+export function fullTextShare(progress: IndexProgress): number | null {
+  const all = progress.bodiesBefore + progress.bodiesTotal;
+  if (all <= 0) return null;
+  const share = Math.floor(((progress.bodiesBefore + progress.bodiesDone) * 100) / all);
+  return Math.min(100, Math.max(0, share));
+}
+
+/** "Full text 40% · search is partial". */
+export function fullTextLine(share: number): string {
+  return `Full text ${share}% · search is partial`;
 }

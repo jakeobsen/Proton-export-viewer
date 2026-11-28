@@ -302,13 +302,13 @@ let reportStamp = '';
 /**
  * What the list header's count can move with, as index updates carry it:
  * the phase (a new scan, or reconcile), metadata that couldn't be used,
- * timeouts, lists cut to their limit (phase 2 cuts attachment lists) and
- * message files whose text couldn't be read.
+ * timeouts, lists cut to their limit (phase 2 cuts attachment lists), and
+ * message files whose text couldn't be read or was cut to the search limit.
  */
 function stampOf(progress: IndexProgress | null): string {
   if (progress === null) return '';
-  const { phase, failed, timeouts, capped, bodiesFailed } = progress;
-  return `${phase}:${failed}:${timeouts}:${capped}:${bodiesFailed}`;
+  const { phase, failed, timeouts, capped, bodiesFailed, bodiesTruncated } = progress;
+  return `${phase}:${failed}:${timeouts}:${capped}:${bodiesFailed}:${bodiesTruncated}`;
 }
 
 async function readReport(): Promise<void> {

@@ -63,6 +63,7 @@ import {
   StaleBatch,
   type ApplyItem,
   type ApplyStats,
+  type BodyOrder,
   type BodyTodo,
   type FileStat,
   type Phase1Item,
@@ -351,8 +352,10 @@ export class WriterState {
     this.truncateWal();
   }
 
-  bodyOrder(): number[] {
-    return this.need().writer.bodyOrder();
+  /** The messages phase 2 still has to read, and the files it handled before, in one call. */
+  bodyOrder(): BodyOrder {
+    const writer = this.need().writer;
+    return { order: writer.bodyOrder(), before: writer.bodyBefore() };
   }
 
   bodyTodo(rowids: number[]): BodyTodo[] {

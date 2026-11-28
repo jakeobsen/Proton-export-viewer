@@ -6,7 +6,15 @@ import { observeElementOffset, useVirtualizer } from '@tanstack/react-virtual';
 import { useCallback, useEffect, useLayoutEffect, useRef, type KeyboardEvent } from 'react';
 import type { ActiveExport } from '../shared/sources';
 import type { SidebarEntry, SidebarModel } from './folders';
-import { formatCount, fullDate, listDate, loadingText, participantsText } from './format';
+import {
+  formatCount,
+  fullDate,
+  fullTextLine,
+  fullTextShare,
+  listDate,
+  loadingText,
+  participantsText,
+} from './format';
 import { exportLabel } from './labels';
 import { ROW_HEIGHT, type Row } from './list';
 import { list, selectRow, showFolder, useList, useMailbox } from './mailbox-state';
@@ -153,6 +161,32 @@ function IndexStatus() {
     return (
       <div className="side-foot" role="status">
         Verifying index…
+      </div>
+    );
+  }
+  // Phase 2 over the whole export; nothing once it has ended.
+  const share =
+    progress.phase === 'done' && progress.bodyPhase === 'indexing' ? fullTextShare(progress) : null;
+  if (share !== null) {
+    return (
+      <div className="side-foot" role="status">
+        <button
+          type="button"
+          className="link full-text"
+          onClick={(e) => openReportFrom(e.currentTarget)}
+        >
+          {fullTextLine(share)}
+        </button>
+        <div
+          className="bar-track"
+          role="progressbar"
+          aria-label="Full text"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={share}
+        >
+          <span style={{ width: `${share}%` }} />
+        </div>
       </div>
     );
   }
