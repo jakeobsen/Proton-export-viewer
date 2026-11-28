@@ -24,6 +24,7 @@ import {
   invoke,
   keepSwitch,
   keyInBox,
+  mailboxFollows,
   openExport,
   openIndexSettings,
   phase1Done,
@@ -86,6 +87,7 @@ async function coreExits(pev: PevApp, pairs: number): Promise<Stamp> {
     .poll(async () => (await pev.main<Stamp>('sourceStamp')).generation)
     .toBeGreaterThan(before.generation);
   await phase1Done(pev, pairs);
+  await mailboxFollows(pev);
   return pev.main<Stamp>('sourceStamp');
 }
 
@@ -473,6 +475,7 @@ test('two exports keep their own switch and entries; Off then On held, a switch 
       .poll(async () => (await pev.main<SourcesView>('sourcesView')).active?.runName)
       .toBe(runName);
     await phase1Done(pev, pairs);
+    await mailboxFollows(pev);
   };
 
   await commit(pev, 'a-one');
