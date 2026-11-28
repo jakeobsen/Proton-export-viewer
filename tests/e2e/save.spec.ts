@@ -35,6 +35,17 @@ const sha = (bytes: Buffer | Uint8Array) => createHash('sha256').update(bytes).d
 /** Names collide as the volume compares them: without case on macOS. */
 const fold = (name: string) => (process.platform === 'darwin' ? name.toLowerCase() : name);
 
+// A failed test prints how its saves went: log codes and their fields, which
+// never hold a name, a path or a URL.
+test.afterEach(({ pev }, info) => {
+  if (info.status === info.expectedStatus) return;
+  const lines = pev
+    .logs()
+    .filter((l) => l.code.startsWith('save.') || l.level === 'warn' || l.level === 'error')
+    .map((l) => `${l.proc} ${l.level} ${l.code} ${JSON.stringify(l.data)}`);
+  console.log(`[${info.title}] logs:\n${lines.join('\n')}`);
+});
+
 /** A message with one attachment `name` holding `bytes`, base64-encoded. */
 function withAttachment(name: string, bytes: Buffer, subject = 'Files'): string {
   return crlf([
