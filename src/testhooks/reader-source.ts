@@ -7,8 +7,8 @@
 import { constants } from 'node:fs';
 import { lstat, open, realpath, type FileHandle } from 'node:fs/promises';
 import { isAbsolute, join, sep } from 'node:path';
-import type { OpenedMessage, ReaderSource } from '../core/reader/source';
-import type { TestInput } from '../shared/reader-protocol';
+import type { LocatedFile, OpenedMessage, ReaderSource } from '../core/reader/source';
+import type { FileIdentity, TestInput } from '../shared/reader-protocol';
 import { markLoaded } from './marker';
 
 markLoaded();
@@ -155,10 +155,39 @@ export class TestReaderSource implements ReaderSource {
     if (!entry) return null;
     if (entry.gate) await passGate(entry.gate);
     if ('test' in entry) {
-      return { input: { kind: 'test', input: entry.test }, close: () => Promise.resolve() };
+      return {
+        input: { kind: 'test', input: entry.test },
+        file: null,
+        close: () => Promise.resolve(),
+      };
     }
     const handle = await openContained(this.root, entry.file);
     if (!handle) return null;
-    return { input: { kind: 'fd', fd: handle.fd }, close: () => handle.close() };
+    const st = await handle.stat({ bigint: true }).catch(() => null);
+    if (!st) {
+      await handle.close();
+      return null;
+    }
+    return {
+      input: { kind: 'fd', fd: handle.fd },
+      file: { dev: st.dev.toString(), ino: st.ino.toString() },
+      close: () => handle.close(),
+    };
+  }
+
+  async locate(rowid: number, want: FileIdentity): Promise<LocatedFile> {
+    const entry = this.entries.get(rowid);
+    if (!entry || 'test' in entry) return { ok: false, code: 'not_found' };
+    const handle = await openContained(this.root, entry.file);
+    if (!handle) return { ok: false, code: 'changed' };
+    try {
+      const st = await handle.stat({ bigint: true });
+      if (st.dev.toString() !== want.dev || st.ino.toString() !== want.ino) {
+        return { ok: false, code: 'changed' };
+      }
+      return { ok: true, path: join(this.root, entry.file) };
+    } finally {
+      await handle.close();
+    }
   }
 }

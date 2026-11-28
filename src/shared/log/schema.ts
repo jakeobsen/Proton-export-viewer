@@ -69,6 +69,7 @@ const FIELDS: Record<string, Validator> = {
   fileId: (v) => typeof v === 'string' && UUID_RE.test(v),
   openId: isCount,
   generation: isCount,
+  schemaVersion: isCount,
   windowId: isCount,
   exitCode: isInt,
   status: (v) => isInt(v) && (v as number) >= 100 && (v as number) <= 599,

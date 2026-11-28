@@ -5,9 +5,11 @@
 // removing the card revokes the old view at once, even while the next parse
 // is pending; at every step a window holds at most one body frame and one
 // live token. A merge or split keeps the expansion, and a long conversation
-// draws a bounded number of cards.
+// draws a bounded number of cards. The header shows the conversation's
+// folders and labels, kept up to date. `n` and `p` move the expansion from the
+// list, the cards and the body frame, but not from an editable control.
 
-import { realpathSync, rmSync } from 'node:fs';
+import { readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Page } from '@playwright/test';
 import { CARD_HEIGHT } from '../../src/renderer/cards';
@@ -259,7 +261,7 @@ test('a conversation shows every message from every folder, oldest first, with t
     )
     .toBe(0);
   await expect(pev.page.locator('.cv-head .rp-subject')).toHaveText('Trail plans');
-  await expect(pev.page.locator('.cv-head .chip')).toHaveText('5 messages');
+  await expect(pev.page.locator('.cv-head .chip.count')).toHaveText('5 messages');
   const cards = pev.page.locator('.card');
   await expect(cards).toHaveCount(5);
   expect(
@@ -460,7 +462,7 @@ test('a pending card removed by the index opens the nearest card instead; with n
   await expanded(pev, ids[2]!);
   // The removed card's open installed nothing.
   expect(count(pev, 'view.installed')).toBe(installed + 1);
-  await expect(pev.page.locator('.cv-head .chip')).toHaveText('3 messages');
+  await expect(pev.page.locator('.cv-head .chip.count')).toHaveText('3 messages');
   await checkHidden(pev);
 });
 
@@ -615,7 +617,7 @@ test('a merge or a split keeps the expanded card and its view', async ({ pev }) 
   await pev.main('releaseWrites', null);
   await phase1Done(pev, 4);
   await expect(pev.page.locator('.card')).toHaveCount(4);
-  await expect(pev.page.locator('.cv-head .chip')).toHaveText('4 messages');
+  await expect(pev.page.locator('.cv-head .chip.count')).toHaveText('4 messages');
   expect((await cardsState(pev)).expanded).toBe(b.newestRowid);
   expect((await reader(pev)).view?.url).toBe(view);
   expect(await status(pev, view)).toBe(200);
@@ -643,13 +645,150 @@ test('a merge or a split keeps the expanded card and its view', async ({ pev }) 
   await checkHidden(pev);
 });
 
+/** The header's chips, in order: folders, then labels, then the count. */
+const headerChips = (pev: PevApp) => pev.page.locator('.cv-head .chip').allTextContents();
+
+test('the header shows the folders in sidebar order, then the row’s labels, then the count; names are isolated text; a merge and a reconcile update it', async ({
+  pev,
+}) => {
+  const root = realpathSync(testDir('conv-chips'));
+  const base = writeExport(root, { seed: 74, messages: 0 });
+  const RLO = 'Tax ‮evil';
+  writeFileSync(
+    join(base.run, 'labels.json'),
+    JSON.stringify({
+      Version: 1,
+      Payload: [
+        { ID: 'F-work', Name: 'Work', Path: 'Work', Type: 3 },
+        { ID: 'L-mark', Name: '<b>Bold</b>', Path: '<b>Bold</b>', Type: 1, Color: '#F78400' },
+        { ID: 'L-rlo', Name: RLO, Path: RLO, Type: 1, Color: '#1DA583' },
+        { ID: 'L-late', Name: 'Later', Path: 'Later', Type: 1, Color: '#415DF0' },
+      ],
+    }),
+  );
+  const t0 = 1_780_000_000;
+  const from = { name: 'Sam', address: 'sam@example.com' };
+  const put = (
+    id: string,
+    minutes: number,
+    labels: string[],
+    messageId: string,
+    references: string[],
+  ) =>
+    writeMessage(base.run, id, {
+      time: t0 + minutes * 60,
+      subject: id,
+      from,
+      labels,
+      messageId,
+      references,
+      body: `Body of ${id}.`,
+    });
+  // A: Inbox, Sent (starred) and the user folder, two labels. B: Inbox only. C1 links them.
+  put('A1', 0, ['0', '5', 'L-mark'], 'a1@example.com', []);
+  put('A2', 1, ['7', '5', '10', 'L-rlo'], 'a2@example.com', ['a1@example.com']);
+  put('A3', 2, ['F-work', '5'], 'a3@example.com', ['a1@example.com']);
+  put('B1', 3, ['0', '5'], 'b1@example.com', []);
+  put('C1', 4, ['0', '5'], 'c1@example.com', ['a1@example.com', 'b1@example.com']);
+  await pev.main('indexTestSettings', { batchPairs: 1, holdWrites: true, readByName: true });
+  await pev.main('queuePick', root, 'bm1');
+  await pev.shell('chooseFolder', []);
+  await expect.poll(() => pev.main<number>('heldWrites')).toBeGreaterThan(0);
+  await pev.main('releaseWrites', 4);
+  await expect.poll(async () => (await rows(pev)).length, { timeout: 20_000 }).toBe(2);
+  await showAll(pev);
+
+  const a = await rowOf(pev, 3);
+  await pressRow(pev, a);
+  await expect
+    .poll(() => headerChips(pev))
+    .toEqual(['Inbox', 'Sent', 'Work', '<b>Bold</b>', RLO, '3 messages']);
+  const head = pev.page.locator('.cv-head');
+  // Never All Mail or Starred; folders carry the folder icon, labels the dot.
+  await expect(head.locator('[data-folder="5"], [data-folder="10"]')).toHaveCount(0);
+  await expect(head.locator('.chip.folder .chip-icon')).toHaveCount(3);
+  await expect(head.locator('.chip[data-label] .dot')).toHaveCount(2);
+  // A name with markup is text.
+  await expect(head.locator('.chip b')).toHaveCount(0);
+  // The header's labels are the list row's.
+  const row = pev.page.locator(`.conv[data-thread="${a.threadId}"]`);
+  expect(await row.locator('.chip').allTextContents()).toEqual(
+    await head.locator('.chip[data-label]').allTextContents(),
+  );
+  // Each name is isolated, in the header and in the row: the right-to-left
+  // override stays inside its chip, and the count stays after it.
+  for (const name of [
+    head.locator('.chip-name', { hasText: 'evil' }),
+    row.locator('.chip-name', { hasText: 'evil' }),
+  ]) {
+    expect(
+      await name.evaluate((e) => [e.getAttribute('dir'), getComputedStyle(e).unicodeBidi]),
+    ).toEqual(['auto', 'isolate']);
+  }
+  const rlo = await head.locator('.chip[data-label="L-rlo"]').boundingBox();
+  const total = await head.locator('.chip.count').boundingBox();
+  expect(rlo!.x + rlo!.width).toBeLessThanOrEqual(total!.x);
+  // The full name shows on hover.
+  await expect(head.locator('.chip[data-label="L-rlo"] .chip-name')).toHaveAttribute('title', RLO);
+
+  // B, then C1 merges it into A: the conversation takes A's ID, and the
+  // header shows the merged conversation's chips right away.
+  const b = await rowOf(pev, 1);
+  await pressRow(pev, b);
+  await expect.poll(() => headerChips(pev)).toEqual(['Inbox', '1 message']);
+  await pev.main('releaseWrites', null);
+  await phase1Done(pev, 5);
+  await expect
+    .poll(async () => (await pev.shell<{ threadId: number }>('cards')).threadId)
+    .toBe(a.threadId);
+  expect(await headerChips(pev)).toEqual([
+    'Inbox',
+    'Sent',
+    'Work',
+    '<b>Bold</b>',
+    RLO,
+    '5 messages',
+  ]);
+
+  // A3 gains a label while another export is open; opened again, the
+  // reconcile's change reaches the header while the conversation is shown.
+  const first = await pev.main<Stamp>('sourceStamp');
+  await pev.main('indexTestSettings', null);
+  const other = realpathSync(testDir('conv-chips-other'));
+  const written = writeExport(other, { seed: 72, messages: 3 });
+  await pev.main('queuePick', other, 'bm2');
+  await pev.shell('chooseFolder', []);
+  await phase1Done(pev, written.pairs);
+  put('A3', 2, ['F-work', '5', 'L-late'], 'a3@example.com', ['a1@example.com']);
+  await pev.main('indexTestSettings', { batchPairs: 1, holdWrites: true, readByName: true });
+  await pev.shell('openExport', [first.sourceKey]);
+  await expect
+    .poll(async () => (await pev.main<Stamp>('sourceStamp')).sourceKey)
+    .toBe(first.sourceKey);
+  await expect.poll(async () => (await rows(pev)).length, { timeout: 20_000 }).toBe(1);
+  await showAll(pev);
+  await pressRow(pev, await rowOf(pev, 5));
+  await expect
+    .poll(() => headerChips(pev))
+    .toEqual(['Inbox', 'Sent', 'Work', '<b>Bold</b>', RLO, '5 messages']);
+  await pev.main('releaseWrites', null);
+  await expect
+    .poll(() => headerChips(pev), { timeout: 20_000 })
+    .toEqual(['Inbox', 'Sent', 'Work', 'Later', '<b>Bold</b>', RLO, '5 messages']);
+  const merged = await rowOf(pev, 5);
+  expect(
+    await pev.page.locator(`.conv[data-thread="${merged.threadId}"] .chip`).allTextContents(),
+  ).toEqual(['Later', '<b>Bold</b>', RLO]);
+  await checkHidden(pev);
+});
+
 test('a conversation of 1,200 messages draws a bounded number of cards', async ({ pev }) => {
   test.setTimeout(120_000);
   await openThreads(pev, 'conv-long', [{ messages: 1200 }]);
   const row = await rowOf(pev, 1200);
   await pressRow(pev, row);
   await expanded(pev, row.newestRowid);
-  await expect(pev.page.locator('.cv-head .chip')).toHaveText('1,200 messages');
+  await expect(pev.page.locator('.cv-head .chip.count')).toHaveText('1,200 messages');
   const drawn = () => pev.page.locator('.card:not(.placeholder)').count();
   expect(await drawn()).toBeLessThan(60);
   expect(await drawn()).toBeGreaterThan(0);
@@ -682,5 +821,206 @@ test('a conversation of 1,200 messages draws a bounded number of cards', async (
   // The expansion and its view stay as they were; its frame may be out of the drawn range.
   expect((await cardsState(pev)).expanded).toBe(row.newestRowid);
   expect((await oneView(pev)).live).toBe(1);
+  await checkHidden(pev);
+});
+
+const rejected = (pev: PevApp, reason: string) =>
+  pev.logs('main').filter((l) => l.code === 'ipc.rejected' && l.data.reason === reason).length;
+
+/** The expanded card stays `rowid`, with no open started, after a key that moves nothing. */
+async function stays(pev: PevApp, rowid: number): Promise<void> {
+  await pev.page.waitForTimeout(300);
+  expect((await cardsState(pev)).expanded).toBe(rowid);
+  expect((await reader(pev)).rowid).toBe(rowid);
+}
+
+test('n and p from the list and the cards expand the next newer and older card, stopping at either end', async ({
+  pev,
+}) => {
+  await openThreads(pev, 'conv-keys', [{ messages: 4 }, { messages: 1 }]);
+  const row = await rowOf(pev, 4);
+  const ids = await cardIds(pev, row.newestRowid);
+  await pressRow(pev, row);
+  await expanded(pev, ids[3]!);
+  const selected = pev.page.locator(`.conv[data-thread="${row.threadId}"]`);
+  await expect(selected).toHaveAttribute('aria-selected', 'true');
+  const installed = count(pev, 'view.installed');
+
+  // From the list: the newest card has nothing newer; p goes back one at a time.
+  await selected.focus();
+  await pev.page.keyboard.press('n');
+  await stays(pev, ids[3]!);
+  await pev.page.keyboard.press('p');
+  await expanded(pev, ids[2]!);
+  await pev.page.keyboard.press('p');
+  await expanded(pev, ids[1]!);
+  // The list selection stays where it was.
+  await expect(selected).toHaveAttribute('aria-selected', 'true');
+  await expect(selected).toBeFocused();
+
+  // From the cards: the oldest card has nothing older.
+  await pev.page.locator(`.card[data-rowid="${ids[1]}"] .card-h`).focus();
+  await pev.page.keyboard.press('p');
+  await expanded(pev, ids[0]!);
+  await pev.page.keyboard.press('p');
+  await stays(pev, ids[0]!);
+  await pev.page.keyboard.press('n');
+  await expanded(pev, ids[1]!);
+  // With Control, Option or Shift it is another key.
+  await pev.page.keyboard.press('Control+n');
+  await pev.page.keyboard.press('Alt+n');
+  await pev.page.keyboard.press('Shift+N');
+  await stays(pev, ids[1]!);
+
+  // One view for each move, and one live token.
+  expect(count(pev, 'view.installed')).toBe(installed + 4);
+  expect(await oneView(pev)).toEqual({ frames: 1, live: 1 });
+  await expect(selected).toHaveAttribute('aria-selected', 'true');
+  await checkHidden(pev);
+});
+
+test('n and p typed in the body frame move the expanded card; in a field, a menu, editable text or the link dialog they do not', async ({
+  pev,
+}) => {
+  await openThreads(pev, 'conv-keys-frame', [{ messages: 3 }]);
+  const row = await rowOf(pev, 3);
+  const ids = await cardIds(pev, row.newestRowid);
+  await pressRow(pev, row);
+  await expanded(pev, ids[2]!);
+  // Keys the shell's own document sees.
+  await pev.page.evaluate(() => {
+    const seen = { keys: 0 };
+    (window as unknown as { __seen: typeof seen }).__seen = seen;
+    window.addEventListener('keydown', () => (seen.keys += 1), true);
+  });
+  const shellKeys = () =>
+    pev.page.evaluate(() => (window as unknown as { __seen: { keys: number } }).__seen.keys);
+
+  // The body frame has the focus: main passes the key on. Keys the test
+  // driver sends never reach main's input handler (the browser skips
+  // pre-handling them), so the test runs that handler as for a typed key.
+  await pev.page.locator('.card.expanded .rp-frame').focus();
+  expect(await pev.main('keyInFocusedFrame', 'p')).toBe('child:mail-body');
+  await expanded(pev, ids[1]!);
+  expect(await shellKeys()).toBe(0);
+  await pev.page.locator('.card.expanded .rp-frame').focus();
+  expect(await pev.main('keyInFocusedFrame', 'n')).toBe('child:mail-body');
+  const view = await expanded(pev, ids[2]!);
+  expect(await shellKeys()).toBe(0);
+  // With the shell's own document focused, main passes nothing on.
+  await pev.page.locator('.card.expanded .card-h').focus();
+  expect(await pev.main('keyInFocusedFrame', 'p')).toBe('main');
+  await stays(pev, ids[2]!);
+
+  // A text field, a menu and editable text keep the keys.
+  await pev.page.evaluate(() => {
+    const field = document.createElement('input');
+    field.id = 'key-field';
+    const menu = document.createElement('select');
+    menu.id = 'key-menu';
+    for (const name of ['m', 'n', 'p']) menu.append(new Option(name, name));
+    const text = document.createElement('div');
+    text.id = 'key-text';
+    text.contentEditable = 'true';
+    document.body.append(field, menu, text);
+  });
+  for (const id of ['key-field', 'key-menu', 'key-text']) {
+    await pev.page.locator(`#${id}`).focus();
+    await pev.page.keyboard.press('p');
+    await pev.page.keyboard.press('n');
+    await stays(pev, ids[2]!);
+  }
+  await expect(pev.page.locator('#key-field')).toHaveValue('pn');
+  await expect(pev.page.locator('#key-text')).toHaveText('pn');
+  await pev.page.evaluate(() => {
+    for (const id of ['key-field', 'key-menu', 'key-text']) document.getElementById(id)?.remove();
+  });
+
+  // The link dialog is open: the keys stay with it.
+  await pev.shell('windowOpen', [linkUrl(view, 'l1')]);
+  await expect(pev.page.locator('.link-dialog')).toHaveCount(1);
+  await pev.page.keyboard.press('p');
+  await stays(pev, ids[2]!);
+  await expect(pev.page.locator('.link-dialog')).toHaveCount(1);
+  await pev.page.keyboard.press('Escape');
+  await expect(pev.page.locator('.link-dialog')).toHaveCount(0);
+  await pev.page.keyboard.press('p');
+  await expanded(pev, ids[1]!);
+  expect(await pev.main('externalCalls')).toEqual([]);
+  await checkHidden(pev);
+});
+
+test('n and p move no card while the index report shows, typed in the shell or passed on by main', async ({
+  pev,
+}) => {
+  const root = realpathSync(testDir('conv-keys-report'));
+  const written = writeThreads(root, { seed: 71, threads: [{ messages: 3 }] });
+  // A file the scan refuses, so the list header opens the report.
+  const eml = readdirSync(written.run).find((n) => n.endsWith('.eml'))!;
+  symlinkSync(join(written.run, eml), join(written.run, 'zz-link.metadata.json'));
+  await pev.main('queuePick', root, 'bm1');
+  await pev.shell('chooseFolder', []);
+  await phase1Done(pev, written.pairs);
+  await showAll(pev);
+  const row = await rowOf(pev, 3);
+  const ids = await cardIds(pev, row.newestRowid);
+  await pressRow(pev, row);
+  await expanded(pev, ids[2]!);
+
+  await press(pev.page, '.list-head .attention');
+  await expect(pev.page.locator('.ix-card')).toBeVisible();
+  await pev.page.keyboard.press('p');
+  await pev.main('cardKeyFromMain', 'p');
+  await stays(pev, ids[2]!);
+
+  // Back to the mail: both paths move the card again.
+  await press(pev.page, '.ix-foot button:text("Start browsing")');
+  await expect(pev.page.locator('.ix-card')).toHaveCount(0);
+  await pev.main('cardKeyFromMain', 'p');
+  await expanded(pev, ids[1]!);
+  await pev.page.locator('.card.expanded .card-h').focus();
+  await pev.page.keyboard.press('p');
+  await expanded(pev, ids[0]!);
+  await checkHidden(pev);
+});
+
+test('a held p installs only the view of the card where it stops', async ({ pev }) => {
+  await openThreads(pev, 'conv-keys-held', [{ messages: 8 }]);
+  const row = await rowOf(pev, 8);
+  const ids = await cardIds(pev, row.newestRowid);
+  await pressRow(pev, row);
+  const first = await expanded(pev, ids[7]!);
+  await pev.page.locator(`.conv[data-thread="${row.threadId}"]`).focus();
+  const installed = count(pev, 'view.installed');
+  const superseded = rejected(pev, 'superseded');
+
+  // Six key-downs, the last five repeats, while core holds every open. With
+  // opens at least 500 ms apart, the first goes to core at once; of the five
+  // that wait their turn, only the newest follows it.
+  await pev.main('openGap', 500);
+  await pev.page.waitForTimeout(500);
+  await core(pev, 'hold');
+  for (let i = 0; i < 6; i += 1) await pev.page.keyboard.down('p');
+  await pev.page.keyboard.up('p');
+  await expect.poll(async () => (await reader(pev)).rowid).toBe(ids[1]);
+  await expect.poll(() => core(pev, 'held')).toBe(2);
+  expect(rejected(pev, 'superseded')).toBe(superseded + 4);
+  expect(await status(pev, first)).toBe(404);
+  expect(await oneView(pev)).toEqual({ frames: 0, live: 0 });
+  await expect(pev.page.locator('.card.expanded')).toHaveCount(1);
+  await expect(pev.page.locator(`.card[data-rowid="${ids[1]}"]`)).toHaveClass(/expanded/);
+
+  await core(pev, 'release');
+  await expanded(pev, ids[1]!);
+  expect(count(pev, 'view.installed')).toBe(installed + 1);
+  await expect.poll(() => rejected(pev, 'superseded')).toBe(superseded + 5);
+  await pev.page.waitForTimeout(600);
+  expect(count(pev, 'view.installed')).toBe(installed + 1);
+  expect(await oneView(pev)).toEqual({ frames: 1, live: 1 });
+  await pev.main('openGap', null);
+  await expect(pev.page.locator(`.conv[data-thread="${row.threadId}"]`)).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
   await checkHidden(pev);
 });

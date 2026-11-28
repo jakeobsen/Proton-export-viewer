@@ -62,6 +62,10 @@ const PROGRESS: IndexProgress = {
   timeouts: 0,
   capped: 0,
   condition: 'ok',
+  bodyPhase: 'waiting',
+  bodiesDone: 0,
+  bodiesTotal: 0,
+  bodiesFailed: 0,
 };
 
 class FakeCore implements CoreControl {

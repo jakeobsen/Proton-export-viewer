@@ -27,8 +27,9 @@ import type {
   ResetRequest,
   ScanRequest,
 } from '../shared/core-protocol';
-import type { EmlFile, IndexOpened } from '../shared/index-types';
+import type { EmlFile, IndexOpened, IndexReport } from '../shared/index-types';
 import { errorClassOf } from '../shared/log/schema';
+import type { FileIdentity } from '../shared/reader-protocol';
 import type { Logger } from '../shared/log/writer';
 import type { ScanSummary } from '../shared/sources';
 import {
@@ -36,6 +37,7 @@ import {
   addEntry,
   countRejections,
   emptyScan,
+  openContained,
   openWithRescan,
   pairCounts,
   resolveRoot,
@@ -47,8 +49,8 @@ import { runIdentity } from './identity';
 import { FamilyInUse, deleteFamily } from './index/family';
 import type { CheckResult } from './index/ops';
 import { ThreadError, type IndexThread, type ThreadRole } from './index/pool';
-import { BODY_STATE, probeMismatch } from './index/schema';
-import type { OpenedMessage } from './reader/source';
+import { BODY_STATE, mismatchOf, probeIdentity } from './index/schema';
+import type { LocatedFile, OpenedMessage } from './reader/source';
 import { overlaps } from '../shared/overlap';
 import {
   ConnectionRegistry,
@@ -56,6 +58,7 @@ import {
   failureReason,
   type IndexOptions,
 } from './index/service';
+import { withScan } from './index/report';
 
 /** Entries scanned between yields, so core keeps answering during a long scan. */
 const SCAN_SLICE = 2000;
@@ -270,7 +273,8 @@ export class SourceSession {
    * While the run is
    * unavailable, only an existing index with the expected identity opens, for
    * browsing; nothing is created or indexed. One there that isn't this index
-   * is damaged: it is deleted, and rebuilt once the run is back.
+   * is damaged: it is deleted, and rebuilt once the run is back. One of
+   * another schema version is kept as it is until then.
    */
   private async openIndex(request: IndexRequest, root: string | null, stamp: Stamp): Promise<void> {
     const failed = (code: 'invalid' | 'stale' | 'closed' | 'damaged' | 'unavailable') => {
@@ -305,7 +309,19 @@ export class SourceSession {
           }
           if (err instanceof ThreadError && err.code === 'INDEX_DAMAGED') {
             const dbPath = this.dbPathOf(stamp.sourceKey);
-            const reason = (dbPath && probeMismatch(dbPath, request.dbUuid)) || 'identity';
+            const found = dbPath ? probeIdentity(dbPath) : null;
+            const reason = (dbPath && mismatchOf(found, request.dbUuid)) || 'identity';
+            if (reason === 'schema' && root === null) {
+              // An index of another schema version is no damage: it stays as
+              // it is while the export can't be read, and the next open with
+              // the export there rebuilds it.
+              this.log.info(
+                'index.schema_pending',
+                { schemaVersion: found?.version ?? 0 },
+                { src: stamp.sourceKey },
+              );
+              return fail('unavailable');
+            }
             this.log.warn('index.damaged', { reason }, { src: stamp.sourceKey });
             this.removeFamily(stamp.sourceKey, true);
             this.sendEvent(stamp, { ...fresh.progress, condition: 'damaged' }, true);
@@ -342,13 +358,13 @@ export class SourceSession {
     await this.index?.settled();
   }
 
-  /** Starts phase 1 once both the index and the scan are there, and only once for an index. */
+  /** Starts indexing once both the index and the scan are there, and only once for an index. */
   private startPhase1(stamp: Stamp, scan: RunScan): Promise<void> {
     return this.lock.run(() => {
       const service = this.index;
       if (!service || !this.isLive(service, stamp) || this.phase1Started.has(service)) return;
       this.phase1Started.add(service);
-      void service.startPhase1(scan);
+      void service.startIndexing(scan);
     });
   }
 
@@ -496,6 +512,10 @@ export class SourceSession {
     let answer: Awaited<ReturnType<IndexService['ask']>>;
     try {
       answer = await service.ask(request.query);
+      // The report adds what the last scan refused, which only the source holds.
+      if (request.query.op === 'report' && answer !== null && typeof answer === 'object') {
+        answer = withScan(answer as IndexReport, this.records.rejected, service.took);
+      }
     } catch (err) {
       if (service.isDamaged) return damaged();
       throw err;
@@ -558,12 +578,57 @@ export class SourceSession {
       ok: true,
       opened: {
         input: { kind: 'fd', fd },
+        file: { dev: opened.ref.dev.toString(), ino: opened.ref.ino.toString() },
         close: () => {
           closeSync(fd);
           return Promise.resolve();
         },
       },
     };
+  }
+
+  /**
+   * The path of a message's file for Show in folder, only while the file at
+   * the pair's path is still the one a view was read from: a contained open
+   * (no links, a regular file) whose `(dev, ino)` is that identity. A replaced
+   * file is never shown in place of the one that was read.
+   */
+  async locateForReader(
+    rowid: number,
+    generation: number,
+    want: FileIdentity,
+  ): Promise<LocatedFile> {
+    const current = this.gate.current;
+    if (!current) return { ok: false, code: 'no_source' };
+    if (current.generation !== generation) return { ok: false, code: 'superseded' };
+    const root = this.root;
+    if (root === null) return { ok: false, code: 'unavailable' };
+    const service = this.index;
+    if (!service || service.isDamaged) return { ok: false, code: 'not_found' };
+    const file = (await service.ask({ op: 'eml', rowid })) as EmlFile | null;
+    if (!this.gate.isCurrent(current) || this.index !== service || service.isDamaged) {
+      return { ok: false, code: 'superseded' };
+    }
+    if (!file) return { ok: false, code: 'not_found' };
+    if (file.rel === null || file.bodyState === BODY_STATE.emlMissing) {
+      return { ok: false, code: 'eml_missing' };
+    }
+    let fd: number;
+    try {
+      fd = openContained(root, {
+        rel: file.rel,
+        kind: 'eml',
+        dev: BigInt(want.dev),
+        ino: BigInt(want.ino),
+        size: file.size,
+        mtimeNs: BigInt(file.mtimeNs),
+      });
+    } catch (err) {
+      if (!(err instanceof ContainmentError)) throw err;
+      return { ok: false, code: err.errno === 'ENOENT' ? 'eml_missing' : 'changed' };
+    }
+    closeSync(fd);
+    return { ok: true, path: join(root, file.rel) };
   }
 
   /**
@@ -588,6 +653,11 @@ export class SourceSession {
           capped: 0,
           // An index opened first keeps its own condition, e.g. while it is rebuilt.
           condition: this.index?.progress.condition ?? 'ok',
+          // Phase 2 waits for phase 1, which waits for this scan.
+          bodyPhase: 'waiting',
+          bodiesDone: 0,
+          bodiesTotal: 0,
+          bodiesFailed: 0,
         },
         false,
       );

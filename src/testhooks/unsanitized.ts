@@ -4,7 +4,7 @@
 // body's CSP and the frame sandbox hold on their own, and that the request
 // records see what they stop.
 
-import type { SanitizedBody } from '../core/reader/sanitize';
+import type { HtmlSource, SanitizedBody } from '../core/reader/sanitize';
 import { markLoaded } from './marker';
 
 markLoaded();
@@ -12,7 +12,11 @@ markLoaded();
 /** The core test action that turns the unsanitized path on or off. */
 export const READER_UNSANITIZED_ACTION = 'pev-reader-unsanitized';
 
-/** Keeps the HTML as it is: no references are rewritten, and no links are kept. */
-export function unsanitized(html: string): SanitizedBody {
-  return { html, links: [], remote: 0, cids: 0 };
+/**
+ * Keeps the HTML as it is, its parts joined as the parser joins them: no
+ * references are rewritten, no links are kept, and no inline image is served.
+ */
+export function unsanitized(sources: readonly HtmlSource[]): SanitizedBody {
+  const html = sources.map((source) => source.html).join('<br/>\n');
+  return { html, links: [], remote: 0, cids: 0, cidTargets: [] };
 }

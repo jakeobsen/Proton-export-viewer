@@ -6,22 +6,42 @@
   padding: 16px 22px 8px;
 }
 
+/* The header's chips wrap to as many lines as they need. */
 .cv-head .chips {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  height: auto;
   margin-top: 6px;
+  overflow: visible;
 }
 
 .cv-head .chip {
   display: inline-flex;
   align-items: center;
+  gap: 5px;
   height: 20px;
   padding: 0 8px;
   border: 1px solid var(--line);
   border-radius: 10px;
   color: var(--muted);
   font-size: 11.5px;
+}
+
+.cv-head .chip-icon {
+  flex: none;
+}
+
+/* A focused chip shows its whole name, on as many lines as it takes. */
+.cv-head .chip:focus-visible {
+  height: auto;
+  min-height: 20px;
+  white-space: normal;
+}
+
+.cv-head .chip:focus-visible .chip-name {
+  overflow: visible;
+  overflow-wrap: anywhere;
 }
 
 .cv-scroll {
@@ -98,12 +118,14 @@
   min-width: 0;
 }
 
+/* The sender's name is mail data: an isolated run of text. */
 .ch-name {
   min-width: 0;
   overflow: hidden;
   font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
+  unicode-bidi: isolate;
 }
 
 .ch-l1 .pill {

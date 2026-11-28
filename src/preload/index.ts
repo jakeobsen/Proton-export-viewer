@@ -21,6 +21,8 @@ function isPrompt(value: unknown): value is LinkPrompt {
     typeof p.url === 'string' &&
     typeof p.mismatch === 'boolean' &&
     typeof p.lookalike === 'boolean' &&
+    typeof p.mail === 'boolean' &&
+    typeof p.unclear === 'boolean' &&
     (host === null ||
       (typeof host === 'object' && typeof host.start === 'number' && typeof host.end === 'number'))
   );
@@ -32,6 +34,10 @@ const api: PevApi = {
   openStub: (id, generation) => ipcRenderer.invoke(IPC.openStub, { id, generation }),
   open: (rowid, mode, generation) => ipcRenderer.invoke(IPC.open, { rowid, mode, generation }),
   closeView: (generation) => ipcRenderer.invoke(IPC.closeView, { generation }),
+  showInFolder: (openId, generation) =>
+    ipcRenderer.invoke(IPC.showInFolder, { openId, generation }),
+  copyMessageId: (openId, generation) =>
+    ipcRenderer.invoke(IPC.copyMessageId, { openId, generation }),
   log: (level, code, generation, data) =>
     ipcRenderer.send(
       IPC.log,
@@ -49,6 +55,15 @@ const api: PevApi = {
   },
   linkAction: (dialogId, action, generation) =>
     ipcRenderer.invoke(IPC.linkAction, { dialogId, action, generation }),
+  onCardKey: (listener) => {
+    const handler = (_event: unknown, key: unknown) => {
+      if (key === 'n' || key === 'p') listener(key);
+    };
+    ipcRenderer.on(IPC.cardKey, handler);
+    return () => {
+      ipcRenderer.off(IPC.cardKey, handler);
+    };
+  },
   sources: (generation) => ipcRenderer.invoke(IPC.sources, { generation }),
   chooseFolder: (generation) => ipcRenderer.invoke(IPC.chooseFolder, { generation }),
   openExport: (sourceKey, generation) =>
@@ -67,6 +82,9 @@ const api: PevApi = {
   sidebar: (generation) => ipcRenderer.invoke(IPC.index, { query: { op: 'sidebar' }, generation }),
   listWindow: (query, generation) => ipcRenderer.invoke(IPC.index, { query, generation }),
   cards: (query, generation) => ipcRenderer.invoke(IPC.index, { query, generation }),
+  indexReport: (generation) =>
+    ipcRenderer.invoke(IPC.index, { query: { op: 'report' }, generation }),
+  copyReport: (generation) => ipcRenderer.invoke(IPC.copyReport, { generation }),
   onIndexChanged: (listener) => {
     const handler = (_event: unknown, update: IndexUpdate) => listener(update);
     ipcRenderer.on(IPC.indexChanged, handler);
@@ -79,6 +97,12 @@ const api: PevApi = {
       text: request.text,
       sort: request.sort,
       after: request.after,
+      generation,
+    }),
+  searchSnippets: (request, generation) =>
+    ipcRenderer.invoke(IPC.searchSnippets, {
+      queryId: request.queryId,
+      threadIds: request.threadIds,
       generation,
     }),
 };

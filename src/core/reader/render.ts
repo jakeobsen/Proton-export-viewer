@@ -9,14 +9,28 @@
 // Each limit applies to the body being shown, and counts its encoded bytes
 // (before base64 or quoted-printable is undone), so an encoded body counts as
 // larger than its decoded text.
+// An HTML body comes with its inline images (see images.ts): the `cid:`
+// parts it names, read again from the message, and its `data:` images.
 
 import type { Readable } from 'node:stream';
 import type { AddressObject, HeaderLines, HeaderValue, Headers } from 'mailparser';
-import type { MessageHeaders, OpenMode, RenderedMessage } from '../../shared/reader-protocol';
+import { isRisky, typeLabel } from '../../shared/attachment-types';
+import { cleanFilename } from '../../shared/filename';
+import { headerText } from '../../shared/header-text';
+import {
+  MAX_REFERENCES,
+  type AttachmentEntry,
+  type MessageDetails,
+  type MessageHeaders,
+  type OpenMode,
+  type RenderedMessage,
+} from '../../shared/reader-protocol';
 import { htmlTextParser } from '../text/html-to-text';
-import { KEEP_BYTES, extractMessage, type Body } from './extract';
+import { KEEP_BYTES, extractMessage, type Body, type ExtractedMessage } from './extract';
+import { InlineImages, type ImageRefusal, type Reread } from './images';
 import { plainBody } from './plain';
-import { sanitizeHtml, type SanitizedBody } from './sanitize';
+import { rasterFormat } from './raster';
+import { sanitizeHtml, type HtmlSource, type ImageResolver, type SanitizedBody } from './sanitize';
 
 /** HTML bodies larger than this, in encoded bytes, open as plain text unless asked for anyway. */
 export const HTML_VIEW_BYTES = 5 * 1024 * 1024;
@@ -35,7 +49,15 @@ export interface RenderOptions {
   /** `mail-asset://v/<token>` of the view being opened. */
   assetBase: string;
   /** What makes the HTML body safe: the sanitizer, unless a test build replaces it. */
-  sanitize?: (html: string, assetBase: string) => SanitizedBody;
+  sanitize?: (
+    html: readonly HtmlSource[],
+    assetBase: string,
+    images: ImageResolver,
+  ) => SanitizedBody;
+  /** How to read the message again for its `cid:` images. Without it, none is shown. */
+  reread?: Reread;
+  /** Told, once the body is built, how many inline images weren't shown, by reason. */
+  onImagesRefused?: (refused: ReadonlyMap<ImageRefusal, number>) => void;
 }
 
 function cut(text: string, max: number): string {
@@ -87,6 +109,83 @@ export function headerFields(headers: Headers | null, lines: HeaderLines | null)
   };
 }
 
+/**
+ * The attachment list of a view: every part the index lists as an attachment,
+ * in message order, except the parts the shown body displays as images. It
+ * has no cap of its own: it holds every attachment read, so each one can be
+ * saved, and can be longer than the index's rows, which stop at
+ * MAX_ATTACHMENTS. The two agree on the rows the index keeps.
+ */
+export function attachmentList(
+  extracted: Pick<ExtractedMessage, 'tree' | 'listed'>,
+  shown: ReadonlySet<number>,
+): AttachmentEntry[] {
+  const out: AttachmentEntry[] = [];
+  for (const { part, size, head } of extracted.listed) {
+    const record = extracted.tree.parts[part];
+    if (!record || shown.has(part)) continue;
+    const name = cleanFilename(record.filename ?? '');
+    const imageFormat = rasterFormat(head);
+    out.push({
+      path: record.path,
+      name,
+      contentType: record.contentType,
+      label: typeLabel(name, imageFormat),
+      size,
+      risky: isRisky(name),
+      imageFormat,
+    });
+  }
+  return out;
+}
+
+/** The ids of a Message-ID or References value, each in its angle brackets. */
+function messageIds(value: HeaderValue | undefined): string[] {
+  const text = (Array.isArray(value) ? value : [value])
+    .filter((v): v is string => typeof v === 'string')
+    .join(' ');
+  return text.match(/<[^<>]*>/g) ?? (text.trim() === '' ? [] : [text.trim()]);
+}
+
+/** The structure line of Details, e.g. "multipart/mixed · HTML and plain text · 3 attachments". */
+export function formatLine(
+  contentType: string,
+  bodies: { hasHtml: boolean; hasText: boolean },
+  attachments: number,
+): string {
+  const kinds =
+    bodies.hasHtml && bodies.hasText
+      ? 'HTML and plain text'
+      : bodies.hasHtml
+        ? 'HTML'
+        : bodies.hasText
+          ? 'Plain text'
+          : 'No text';
+  const count =
+    attachments === 0 ? null : attachments === 1 ? '1 attachment' : `${attachments} attachments`;
+  return [headerText(contentType) || 'text/plain', kinds, count].filter(Boolean).join(' · ');
+}
+
+/** What Details shows beyond the header lines, each value cleaned for display. */
+export function detailsOf(
+  headers: Headers | null,
+  bodies: { hasHtml: boolean; hasText: boolean; attachments: number },
+): MessageDetails {
+  const contentType = headers?.get('content-type');
+  const type =
+    typeof contentType === 'object' && contentType !== null && 'value' in contentType
+      ? String((contentType as { value: unknown }).value)
+      : '';
+  const references = messageIds(headers?.get('references'));
+  return {
+    messageId: headerText(messageIds(headers?.get('message-id'))[0] ?? ''),
+    // Only the references shown are cleaned.
+    references: references.slice(0, MAX_REFERENCES).map(headerText),
+    moreReferences: Math.max(0, references.length - MAX_REFERENCES),
+    format: formatLine(type.toLowerCase(), bodies, bodies.attachments),
+  };
+}
+
 /** Tidies extracted HTML text for display: no trailing blanks, at most one empty line in a row. */
 function tidy(text: string): string {
   return text
@@ -126,13 +225,13 @@ function textOfHtml(html: string, max: number | null): string {
 /** The plain text shown for a message, and whether it is only the first part of it. */
 function plainText(text: Body, html: Body): { text: string; cut: boolean } {
   const source = text.content.length > 0 || text.cut ? text : html;
-  const cut = source.bytes > HTML_ANYWAY_BYTES;
+  const long = source.bytes > HTML_ANYWAY_BYTES;
   let content = source.content;
   if (source === html) {
     // Text from HTML: twice the bytes shown is more than enough characters to cut from.
-    content = tidy(textOfHtml(html.content, cut ? 2 * FIRST_TEXT_BYTES : null));
+    content = tidy(textOfHtml(html.content, long ? 2 * FIRST_TEXT_BYTES : null));
   }
-  return { text: cut ? firstBytes(content, FIRST_TEXT_BYTES) : content, cut };
+  return { text: long ? firstBytes(content, FIRST_TEXT_BYTES) : content, cut: long || source.cut };
 }
 
 /**
@@ -144,31 +243,56 @@ export async function renderMessage(
   input: Readable,
   options: RenderOptions,
 ): Promise<RenderedMessage> {
-  const { headers: parsedHeaders, lines, text, html } = await extractMessage(input);
+  const extracted = await extractMessage(input);
+  const { headers: parsedHeaders, lines, text, html, stopped } = extracted;
   const headers = headerFields(parsedHeaders, lines);
   const hasHtml = html.content.length > 0 || html.cut;
+  const hasText = text.content.length > 0 || text.cut;
+  const bodies = { hasHtml, hasText };
   const htmlLimit = options.mode === 'html-anyway' ? HTML_ANYWAY_BYTES : HTML_VIEW_BYTES;
   if (options.mode !== 'plain' && hasHtml && html.bytes <= htmlLimit) {
-    const body = (options.sanitize ?? sanitizeHtml)(html.content, options.assetBase);
+    const images = new InlineImages(extracted.tree);
+    const sources = extracted.htmlParts.map(({ part, start, end }) => ({
+      html: html.content.slice(start, end),
+      part,
+    }));
+    const body = (options.sanitize ?? sanitizeHtml)(sources, options.assetBase, images);
+    const served = await images.load(body.cidTargets, options.reread ?? null);
+    if (images.refused.size > 0) options.onImagesRefused?.(images.refused);
+    // A part the body shows as an image isn't listed again.
+    const attachments = attachmentList(extracted, images.shown);
+    const details = detailsOf(parsedHeaders, { ...bodies, attachments: attachments.length });
     return {
       headers,
+      attachments,
+      details,
       html: body.html,
       links: body.links,
       format: 'html',
       remote: body.remote,
+      cids: body.cids,
+      images: served,
+      imagesRefused: images.refusedCount,
       hasHtml,
       htmlTooLarge: false,
-      truncated: false,
+      cut: stopped ? 'parts' : null,
     };
   }
   const plain = plainText(text, html);
   const body = plainBody(plain.text, options.assetBase);
+  const attachments = attachmentList(extracted, new Set());
+  const details = detailsOf(parsedHeaders, { ...bodies, attachments: attachments.length });
   return {
     headers,
+    attachments,
+    details,
     html: body.html,
     links: body.links,
     format: 'plain',
     remote: 0,
+    cids: 0,
+    images: [],
+    imagesRefused: 0,
     hasHtml,
     // HTML was asked for and not shown for its size alone: it can be shown anyway.
     htmlTooLarge:
@@ -176,6 +300,6 @@ export async function renderMessage(
       hasHtml &&
       html.bytes > HTML_VIEW_BYTES &&
       html.bytes <= HTML_ANYWAY_BYTES,
-    truncated: plain.cut,
+    cut: plain.cut ? 'size' : stopped ? 'parts' : null,
   };
 }
