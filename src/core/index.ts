@@ -402,6 +402,8 @@ async function init(event: Electron.MessageEvent): Promise<void> {
       ...(init.test.txnBytes ? { txnBytes: init.test.txnBytes } : {}),
       ...(init.test.jobMs ? { jobMs: init.test.jobMs } : {}),
       ...(init.test.stallBodyOf ? { stallBodyOf: init.test.stallBodyOf } : {}),
+      ...(init.test.capBytes ? { capBytes: init.test.capBytes } : {}),
+      ...(init.test.recordBatches ? { onBatch: hooks.recordBatch } : {}),
       readByName: init.test.readByName === true,
       beforeWrite: writeGate.beforeWrite,
       beforeScan: scanGate.beforeWrite,

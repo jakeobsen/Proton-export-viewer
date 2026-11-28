@@ -61,6 +61,10 @@ export interface CoreTestInit {
   jobMs?: number;
   /** This message's body job never ends, so it runs past its time limit. */
   stallBodyOf?: string;
+  /** A cap on the index's size on disk, with its WAL and shared memory. */
+  capBytes?: number;
+  /** Phase 1's write transactions are timed, and their stats kept for a test to read. */
+  recordBatches?: boolean;
 }
 
 export interface StubAssetMessage {

@@ -166,6 +166,8 @@ export interface IndexOptions {
   batchPairs?: number;
   /** Builds with test hooks only: awaited before each phase 1 write. */
   beforeWrite?: () => Promise<void>;
+  /** Builds with test hooks only: told each phase 1 write transaction's time, in ms, and result. */
+  onBatch?: (ms: number, result: BatchResult) => void;
   /** Builds with test hooks only: awaited before a scan lists the run's folder, and after. */
   beforeScan?: () => Promise<void>;
   /** Builds with test hooks only: awaited before the index opens. */
@@ -1168,7 +1170,11 @@ export class IndexService {
                 return;
               }
               try {
+                const started = __PEV_TEST_HOOKS__ ? performance.now() : 0;
                 const result = await writer.call<BatchResult>('phase1', { stamp, items });
+                if (__PEV_TEST_HOOKS__ && this.deps.options?.onBatch) {
+                  this.deps.options.onBatch(performance.now() - started, result);
+                }
                 this.afterBatch(result, items);
               } catch (err) {
                 failure = err;

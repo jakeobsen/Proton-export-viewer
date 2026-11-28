@@ -12,12 +12,20 @@ export function reportName(
   nonce: string,
 ): string;
 export function parseLarge(spec: string | undefined): Array<{ kind: string; bytes: number }>;
-export function freeSpace(dir: string): { freeBytes: number };
+export function freeSpace(
+  dir: string,
+  statfs?: (dir: string) => { bavail: number; bsize: number },
+): { freeBytes: number };
 export function frontmost(): string | null;
 export function removeContainerFile(folder: string, file: string, nonce: string): boolean;
 export function parseFootprint(
   text: string,
 ): Array<{ name: string; pid: number; bytes: number; peakBytes: number }>;
+export function footprintOf(root: number): {
+  at: number;
+  totalBytes: number;
+  procs: Array<{ name: string; pid: number; bytes: number; peakBytes: number }>;
+} | null;
 export function footprintByPhase(
   samples: Array<{ at: number; totalBytes: number }>,
   phaseLog: Array<{ phase: string; at: number }>,
