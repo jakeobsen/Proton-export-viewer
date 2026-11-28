@@ -2,6 +2,10 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  ATT_RISKY_ROW,
+  ATT_ROW,
+  attachmentRowAt,
+  attachmentRowTops,
   avatarColor,
   blockedImages,
   firstMailbox,
@@ -104,5 +108,31 @@ describe('labels', () => {
   it('gives each address one color', () => {
     expect(avatarColor('a@example.org')).toBe(avatarColor('A@example.org'));
     expect(avatarColor('a@example.org')).toMatch(/^#[0-9a-f]{6}$/);
+  });
+});
+
+describe('virtual attachment rows', () => {
+  it('gives a row with the risk warning a line more, and the list its height last', () => {
+    const tops = attachmentRowTops([false, true, false, true, true]);
+    expect(tops).toEqual([
+      0,
+      ATT_ROW,
+      ATT_ROW + ATT_RISKY_ROW,
+      2 * ATT_ROW + ATT_RISKY_ROW,
+      2 * ATT_ROW + 2 * ATT_RISKY_ROW,
+      2 * ATT_ROW + 3 * ATT_RISKY_ROW,
+    ]);
+    expect(attachmentRowTops([])).toEqual([0]);
+  });
+
+  it('finds the row at an offset, also inside a taller row and past the end', () => {
+    const tops = attachmentRowTops([false, true, false]);
+    expect(attachmentRowAt(tops, 0)).toBe(0);
+    expect(attachmentRowAt(tops, ATT_ROW - 1)).toBe(0);
+    expect(attachmentRowAt(tops, ATT_ROW)).toBe(1);
+    expect(attachmentRowAt(tops, ATT_ROW + ATT_RISKY_ROW - 1)).toBe(1);
+    expect(attachmentRowAt(tops, ATT_ROW + ATT_RISKY_ROW)).toBe(2);
+    expect(attachmentRowAt(tops, 10_000)).toBe(2);
+    expect(attachmentRowAt([0], 5)).toBe(0);
   });
 });

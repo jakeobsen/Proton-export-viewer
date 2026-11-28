@@ -42,12 +42,15 @@
   padding: 16px 22px 4px;
 }
 
+/* The subject, names, addresses and recipients are mail data: each an
+   isolated run of text. */
 .rp-subject {
   margin: 0;
   font-size: 18px;
   font-weight: 650;
   line-height: 1.3;
   overflow-wrap: anywhere;
+  unicode-bidi: isolate;
 }
 
 .rp-sender {
@@ -76,6 +79,7 @@
   font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
+  unicode-bidi: isolate;
 }
 
 .rp-date {
@@ -158,6 +162,7 @@
 
 .rp-addr {
   overflow-wrap: anywhere;
+  unicode-bidi: isolate;
 }
 
 .rp-to {
@@ -166,6 +171,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  unicode-bidi: isolate;
 }
 
 .rp-linkish {
@@ -265,4 +271,131 @@
      scheme, and an HTML body, which has no dark scheme, paints its own light
      background. */
   background: var(--bg);
+}
+
+.rp-acts {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.rp-act {
+  height: 26px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.rp-act:hover:not(:disabled) {
+  background: var(--rp-hover);
+  color: inherit;
+}
+
+.rp-act:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.rp-note {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Mail data: shown as one isolated run of text, never reordering what is around it. */
+.rp-details dd {
+  unicode-bidi: isolate;
+}
+
+.rp-mono {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.rp-atts {
+  flex: none;
+  padding: 10px 22px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.rp-att-title {
+  margin-bottom: 8px;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--muted);
+}
+
+.rp-att-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rp-att-virtual {
+  display: block;
+  overflow-y: auto;
+}
+
+/*
+ * Rows set their own line height, so a virtual row's fixed height holds its
+ * lines: name (13px) and meta (12px) need 32.5px, plus 16px for the warning,
+ * inside 7px of padding and 1px of border on each side.
+ */
+.rp-att {
+  box-sizing: border-box;
+  min-height: 50px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  line-height: 1.3;
+}
+
+.rp-att-virtual .rp-att {
+  height: 50px;
+  overflow: hidden;
+}
+
+/* A virtual row with the risk warning is a line taller (ATT_RISKY_ROW, less the gap). */
+.rp-att-virtual .rp-att-risky {
+  height: 66px;
+}
+
+.rp-att-virtual .rp-att-warn span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rp-att-risky {
+  border-color: var(--rp-danger-border);
+  background: var(--rp-danger-soft);
+}
+
+.rp-att-name {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  unicode-bidi: isolate;
+}
+
+.rp-att-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.rp-att-warn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--rp-danger);
+  font-size: 12px;
 }

@@ -5,16 +5,20 @@
 // with the same refusals). Of each body kind, at most KEEP_BYTES of encoded
 // content is kept; the rest of it, and every other part, is read and dropped
 // without being decoded. Every part is recorded in a PartTree, so that inline
-// images can be found by what the HTML body refers to. A message past the
+// images can be found by what the HTML body refers to. Each part the index
+// lists as an attachment is decoded as it streams by, kept only as its decoded
+// size and first bytes, for the reader's attachment list. A message past the
 // parser's limits (more than MAX_MIME_PARTS parts, or a header block over
 // MAX_HEAD_BYTES) is read up to there; any other read error fails the read.
 
+import { once } from 'node:events';
 import { Readable, Writable, type Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { Splitter, type MimeNode } from '@zone-eu/mailsplit';
 import FlowedDecoder from '@zone-eu/mailsplit/lib/flowed-decoder.js';
 import libmime from 'libmime';
 import { MailParser, type HeaderLines, type Headers } from 'mailparser';
+import { isAttachment } from '../index/body';
 import { MAX_HEAD_BYTES, MAX_MIME_PARTS } from '../mime-limits';
 import { PartTree } from './parts';
 
@@ -53,6 +57,19 @@ export interface HtmlPart {
   end: number;
 }
 
+/** How many decoded bytes of an attachment are kept, to tell its format by its signature. */
+export const HEAD_BYTES = 16;
+
+/** A part the index lists as an attachment, as the reader read it. */
+export interface ListedPart {
+  /** Its index in the part tree. */
+  part: number;
+  /** Its decoded size, in bytes, as its transfer decoder gives it. */
+  size: number;
+  /** Its first decoded bytes, at most HEAD_BYTES. */
+  head: Buffer;
+}
+
 export interface ExtractedMessage {
   headers: Headers | null;
   lines: HeaderLines | null;
@@ -64,6 +81,16 @@ export interface ExtractedMessage {
   htmlParts: HtmlPart[];
   /** The parser stopped at one of its limits: the bodies hold what came before. */
   stopped: boolean;
+  /** The parts the index lists as attachments, in message order. */
+  listed: ListedPart[];
+}
+
+interface Counting {
+  part: number;
+  decoder: Transform;
+  size: number;
+  head: Buffer[];
+  headBytes: number;
 }
 
 type Kind = 'text' | 'html';
@@ -86,7 +113,51 @@ interface ActivePart {
   chunks: Buffer[];
 }
 
-type SplitChunk = MimeNode | { type: 'data' | 'body' | 'none'; value?: Buffer };
+export type SplitChunk = MimeNode | { type: 'data' | 'body' | 'none'; value?: Buffer };
+
+/**
+ * Runs `consume` over the chunks `splitter` makes of `input`. Resolves true
+ * when the splitter stopped at one of its limits (more than MAX_MIME_PARTS
+ * parts, or a header block over MAX_HEAD_BYTES): `consume` saw what came
+ * before, and its own end-of-message steps did not run. Resolves false at
+ * the message's end. Any other error rejects.
+ */
+export async function splitWithinLimits(
+  input: Readable,
+  splitter: Splitter,
+  consume: (source: AsyncIterable<SplitChunk>) => Promise<void>,
+): Promise<boolean> {
+  // Only the splitter's own limit error ends the read early. The input's
+  // errors and the reader's own reach the splitter too, as the pipeline
+  // passes them on, so each is told apart by where it was raised first.
+  const raisedElsewhere = new WeakSet<object>();
+  const noteElsewhere = (err: unknown) => {
+    if (typeof err === 'object' && err !== null) raisedElsewhere.add(err);
+  };
+  input.on('error', noteElsewhere);
+  let splitterLimit: unknown = null;
+  // The splitter's types name only its data events; it is a Transform stream.
+  (splitter as Transform).on('error', (err: unknown) => {
+    const code = (err as { code?: unknown } | null)?.code;
+    if (splitterLimit === null && code === 'EMAXLEN' && !raisedElsewhere.has(err as object)) {
+      splitterLimit = err;
+    }
+  });
+  try {
+    await pipeline(input, splitter, async (source: AsyncIterable<SplitChunk>) => {
+      try {
+        await consume(source);
+      } catch (err) {
+        noteElsewhere(err);
+        throw err;
+      }
+    });
+    return false;
+  } catch (err) {
+    if (splitterLimit === null || err !== splitterLimit) throw err;
+    return true;
+  }
+}
 
 /** Which body a leaf part belongs to, or null if it is not a body part (mailparser's rules). */
 export function bodyKind(node: MimeNode): Kind | null {
@@ -194,35 +265,50 @@ export async function extractMessage(
     collected[part.kind].parts.push({ content, part: part.part });
   };
 
-  // Only the splitter's own limit error ends the read early. The input's
-  // errors and the reader's own reach the splitter too, as the pipeline
-  // passes them on, so each is told apart by where it was raised first.
-  const raisedElsewhere = new WeakSet<object>();
-  const noteElsewhere = (err: unknown) => {
-    if (typeof err === 'object' && err !== null) raisedElsewhere.add(err);
+  // The attachment being decoded, by the same transfer decoder a save of it
+  // streams through, so the size listed is the size saved.
+  const listed: ListedPart[] = [];
+  let counting: Counting | null = null;
+  const count = (node: MimeNode, part: number) => {
+    const decoder = node.getDecoder() as Transform;
+    const c: Counting = { part, decoder, size: 0, head: [], headBytes: 0 };
+    decoder.on('data', (bytes: Buffer) => {
+      c.size += bytes.length;
+      if (c.headBytes < HEAD_BYTES) {
+        const take = Buffer.from(bytes.subarray(0, HEAD_BYTES - c.headBytes));
+        c.head.push(take);
+        c.headBytes += take.length;
+      }
+    });
+    counting = c;
   };
-  input.on('error', noteElsewhere);
-  let splitterLimit: unknown = null;
-  // The splitter's types name only its data events; it is a Transform stream.
-  (splitter as Transform).on('error', (err: unknown) => {
-    const code = (err as { code?: unknown } | null)?.code;
-    if (splitterLimit === null && code === 'EMAXLEN' && !raisedElsewhere.has(err as object)) {
-      splitterLimit = err;
-    }
-  });
+  const finishCount = async () => {
+    const c = counting;
+    counting = null;
+    if (!c) return;
+    const ended = once(c.decoder, 'end');
+    c.decoder.end();
+    await ended;
+    listed.push({ part: c.part, size: c.size, head: Buffer.concat(c.head) });
+  };
 
   async function consume(source: AsyncIterable<SplitChunk>): Promise<void> {
     for await (const chunk of source) {
       if (chunk.type === 'node') {
         await finish();
+        await finishCount();
         const node = chunk as MimeNode;
         const part = tree.add(node);
         if (node.root) headerBlock = node.getHeaders();
         const kind = bodyKind(node);
         if (kind) active = { node, part, kind, chunks: [] };
+        if (isAttachment(node)) count(node, part);
         continue;
       }
-      if (chunk.type !== 'body' || !active || !('value' in chunk) || !chunk.value) continue;
+      if (chunk.type !== 'body' || !('value' in chunk) || !chunk.value) continue;
+      const decoding = counting as Counting | null;
+      if (decoding && !decoding.decoder.write(chunk.value)) await once(decoding.decoder, 'drain');
+      if (!active) continue;
       const into = collected[active.kind];
       const value = chunk.value;
       into.bytes += value.length;
@@ -238,23 +324,15 @@ export async function extractMessage(
       into.cut = true;
     }
     await finish();
+    await finishCount();
   }
 
-  const read = pipeline(input, splitter, async (source: AsyncIterable<SplitChunk>) => {
-    try {
-      await consume(source);
-    } catch (err) {
-      noteElsewhere(err);
-      throw err;
-    }
-  });
-  let stopped = false;
-  try {
-    await read;
-  } catch (err) {
-    if (splitterLimit === null || err !== splitterLimit) throw err;
-    stopped = true;
+  const stopped = await splitWithinLimits(input, splitter, consume);
+  if (stopped) {
+    // The limit is met in a part's header block, after the parts before it
+    // ended: they are kept, and listed.
     await finish();
+    await finishCount();
   }
 
   const { headers, lines } = headerBlock
@@ -268,5 +346,6 @@ export async function extractMessage(
     tree,
     htmlParts: offsets(collected.html, HTML_SEPARATOR),
     stopped,
+    listed,
   };
 }

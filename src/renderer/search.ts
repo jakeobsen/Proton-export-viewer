@@ -20,6 +20,8 @@ import {
   type SearchSort,
   type ThreadSnippet,
 } from '../shared/index-types';
+import { partText } from '../shared/header-text';
+import { searchKey, type Chip } from '../shared/search-chips';
 import { formatCount } from './format';
 
 /** How long typing must pause before a search runs, in milliseconds. */
@@ -36,9 +38,11 @@ export interface ResultRow extends SearchRow {
 export interface SearchSnapshot {
   /** The text in the box. */
   text: string;
+  /** The chips beside it. */
+  chips: Chip[];
   /** The text the shown results are for; null while none are shown. */
   resultsFor: string | null;
-  /** Results show in place of the folder's list. */
+  /** Results show in place of the folder's list: the box has text, or there are chips. */
   active: boolean;
   /** The sort asked for. */
   sort: SearchSort;
@@ -67,6 +71,7 @@ export type RunSnippets = (request: SnippetsRequest) => Promise<ThreadSnippet[] 
 
 const IDLE: SearchSnapshot = {
   text: '',
+  chips: [],
   resultsFor: null,
   active: false,
   sort: 'date',
@@ -97,8 +102,12 @@ export class SearchModel {
    * or an emptied box. An answer asked for before that is dropped.
    */
   private seq = 0;
-  /** The shown search's text, and where its next page starts. */
+  /** The shown search's text and chips, its canonical key, and where its next page starts. */
   private shownText: string | null = null;
+  private shownChips: Chip[] = [];
+  private shownKey: string | null = null;
+  /** The search asked for and not yet answered, with what its answer's query ID resolves to. */
+  private inFlight: { seq: number; queryId: Promise<number | null> } | null = null;
   private next: SearchKey | null = null;
   private nextSort: SearchSort = 'date';
   private loading = false;
@@ -118,6 +127,11 @@ export class SearchModel {
     private readonly pauseMs: number = TYPING_PAUSE_MS,
   ) {}
 
+  /** The ID of the search whose results are shown; null with none. */
+  get currentQueryId(): number | null {
+    return this.queryId;
+  }
+
   get snapshot(): SearchSnapshot {
     return this.snap;
   }
@@ -132,10 +146,18 @@ export class SearchModel {
     this.timer = null;
   }
 
-  /** The box's text changed: search once typing pauses; an empty box shows the list again. */
+  /** True if the box has no text and there are no chips. */
+  private isEmpty(text: string, chips: Chip[]): boolean {
+    return text.trim() === '' && chips.length === 0;
+  }
+
+  /**
+   * The box's text changed: search once typing pauses; an empty box with no
+   * chips shows the list again.
+   */
   setText(text: string): void {
     this.cancelTimer();
-    if (text.trim() === '') {
+    if (this.isEmpty(text, this.snap.chips)) {
       this.stop({ text });
       return;
     }
@@ -150,19 +172,64 @@ export class SearchModel {
     }, this.pauseMs);
   }
 
+  /**
+   * The chips changed: the search runs again at once, with the box's text as
+   * it is. With no text and no chips left, the list shows again.
+   */
+  setChips(chips: Chip[]): void {
+    this.cancelTimer();
+    if (this.isEmpty(this.snap.text, chips)) {
+      this.stop({ text: this.snap.text });
+      return;
+    }
+    this.set({ chips });
+    this.start();
+  }
+
+  /** A whole search, picked from the recent ones: it runs at once. */
+  setSearch(text: string, chips: Chip[]): void {
+    this.cancelTimer();
+    if (this.isEmpty(text, chips)) {
+      this.stop({ text });
+      return;
+    }
+    this.set({ text, chips });
+    this.start();
+  }
+
   /** Another sort: the search runs again at once. */
   setSort(sort: SearchSort): void {
     if (sort === this.snap.sort) return;
     this.set({ sort });
-    if (this.snap.text.trim() === '') return;
+    if (this.isEmpty(this.snap.text, this.snap.chips)) return;
     this.cancelTimer();
     this.start();
   }
 
-  /** Empties the box and drops the results. */
+  /** Empties the box, removes the chips and drops the results. */
   clear(): void {
     this.cancelTimer();
     this.stop({ text: '' });
+  }
+
+  /**
+   * Enter in the box: the query ID of the search for the box's text and
+   * chips as they are now, to commit. The typing pause is cut short: that
+   * search runs at once, unless it is the one shown. Null if there is none,
+   * or if a newer search takes its place before it answers.
+   */
+  enterQueryId(): Promise<number | null> {
+    const { text, chips } = this.snap;
+    if (this.isEmpty(text, chips)) return Promise.resolve(null);
+    if (this.timer !== null) {
+      this.cancelTimer();
+    } else if (this.shownKey === searchKey({ text, chips }) && this.queryId !== null) {
+      return Promise.resolve(this.queryId);
+    } else if (this.inFlight?.seq === this.seq) {
+      return this.inFlight.queryId;
+    }
+    this.start();
+    return this.inFlight?.queryId ?? Promise.resolve(null);
   }
 
   private stop(patch: Partial<SearchSnapshot>): void {
@@ -173,14 +240,20 @@ export class SearchModel {
   private start(): void {
     this.detach();
     const seq = this.seq;
-    const { text, sort } = this.snap;
+    const { text, chips, sort } = this.snap;
     this.set({ active: true, searching: true, failed: false });
-    const request: SearchRequest = { text, sort, after: null } as SearchRequest;
+    const request: SearchRequest = { text, chips, sort, after: null } as SearchRequest;
+    let answered: (queryId: number | null) => void = () => {};
+    this.inFlight = { seq, queryId: new Promise((resolve) => (answered = resolve)) };
     void this.run(request)
       .catch(() => null)
       .then((page) => {
-        if (seq !== this.seq) return;
+        if (seq !== this.seq) {
+          answered(null);
+          return;
+        }
         this.forget();
+        answered(page ? page.queryId : null);
         if (!page) {
           this.set({
             searching: false,
@@ -196,6 +269,8 @@ export class SearchModel {
           (row, i, all) => all.findIndex((r) => r.threadId === row.threadId) === i,
         );
         this.shownText = text;
+        this.shownChips = chips;
+        this.shownKey = searchKey({ text, chips });
         this.queryId = page.queryId;
         this.next = page.next;
         this.nextSort = page.sort;
@@ -230,6 +305,9 @@ export class SearchModel {
   /** Drops what belongs to the shown search. */
   private forget(): void {
     this.shownText = null;
+    this.shownChips = [];
+    this.shownKey = null;
+    this.inFlight = null;
     this.queryId = null;
     this.next = null;
     this.loading = false;
@@ -301,6 +379,7 @@ export class SearchModel {
     // The keyset is for the sort core used, which is by date for a query with no words.
     const request = {
       text: this.shownText,
+      chips: this.shownChips,
       sort: this.nextSort,
       after: this.next,
     } as SearchRequest;
@@ -349,6 +428,23 @@ export class SearchModel {
 export interface SnippetPart {
   text: string;
   mark: boolean;
+}
+
+/**
+ * A snippet's parts as a line shows them: each cleaned on its own, so a
+ * removed character only shortens its part and a mark stays on its text,
+ * with the line's ends trimmed. Parts left empty are dropped.
+ */
+export function cleanParts(parts: SnippetPart[]): SnippetPart[] {
+  const last = parts.length - 1;
+  return parts
+    .map((part, i) => {
+      let text = partText(part.text);
+      if (i === 0) text = text.trimStart();
+      if (i === last) text = text.trimEnd();
+      return { text, mark: part.mark };
+    })
+    .filter((part) => part.text !== '');
 }
 
 /**

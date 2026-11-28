@@ -113,6 +113,8 @@ export class InlineImages {
   private pixels = 0;
   private dataTotal = 0;
   readonly refused = new Map<ImageRefusal, number>();
+  /** The parts shown as images in the body, by their index in the part tree. */
+  readonly shown = new Set<number>();
 
   constructor(private readonly tree: PartTree) {}
 
@@ -185,7 +187,10 @@ export class InlineImages {
       const check = checkRaster(bytes);
       if (!check.ok) this.refuse(check.reason);
       else if (!this.admit(check.image.pixels)) this.refuse('budget');
-      else images.push({ id, contentType: check.image.contentType, bytes });
+      else {
+        images.push({ id, contentType: check.image.contentType, bytes });
+        this.shown.add(part);
+      }
     }
     return images;
   }

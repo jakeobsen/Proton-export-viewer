@@ -32,6 +32,7 @@ import type {
   IndexProgress,
   IndexQuery,
 } from '../../shared/index-types';
+import { REASONS } from '../../shared/log/codes';
 import type { Logger } from '../../shared/log/writer';
 import { overlaps } from '../../shared/overlap';
 import {
@@ -46,6 +47,8 @@ import {
 import { ScopeError, type Picker, type ScopeHandle, type Scopes } from './scope';
 import { appDataPaths, removeAppData } from './app-data';
 import { discoverRuns, type FoundRun } from './discovery';
+import type { SearchSpec } from '../../shared/search-chips';
+import { RecentJobs } from './recent-jobs';
 import { Registry, type PickRecord, type SourceRecord } from './registry';
 
 /** One step of opening or closing a source, in the order it happened. */
@@ -99,6 +102,11 @@ export interface SourceManagerDeps {
   notify(): void;
   /** Stops main's own log files, so a reset leaves no log folder behind. */
   stopLogs?(): void;
+  /**
+   * After a reset deleted the app's data: main's log files start again, and
+   * settings go back to their defaults.
+   */
+  afterReset?(): void;
   /** Tells the shell where the open source's index stands. */
   indexChanged?(progress: IndexProgress): void;
   picker: Picker;
@@ -153,6 +161,9 @@ export const RESTART_WINDOW_MS = 60_000;
 /** The answer to an operation made for a generation that has moved on before it ran. */
 export const STALE = 'stale_generation';
 export type Stale = typeof STALE;
+/** A Reset that couldn't delete every file of the app's. */
+export const RESET_FAILED = 'reset_failed';
+export type ResetFailed = typeof RESET_FAILED;
 
 /**
  * Account folder names agree unless both are known and differ: a run picked by
@@ -180,17 +191,40 @@ export class SourceManager {
   private scope: { pickId: string; handle: ScopeHandle } | null = null;
   private queue: Promise<unknown> = Promise.resolve();
   private restoring = false;
-  /** Closed for good by a reset: nothing opens any more. */
+  /** Closed while a reset runs: nothing opens. */
   private admitting = true;
+  /** Closed at quit: final, so a Reset that ends afterwards neither admits opens nor starts core. */
+  private closed = false;
   /** Sources whose index was found damaged: the next index made for them is a rebuild. */
   private readonly rebuilds = new Set<string>();
   private readonly discover: typeof discoverRuns;
   private readonly now: () => number;
 
+  /** The open export's recent searches: one queue of recordings, reads and wipes. */
+  readonly recent: RecentJobs;
+
   constructor(private readonly deps: SourceManagerDeps) {
     this.registry = Registry.load(deps.userData, deps.log);
     this.discover = deps.discover ?? discoverRuns;
     this.now = deps.now ?? Date.now;
+    this.recent = new RecentJobs({
+      log: deps.log,
+      generation: () => this.deps.generation(),
+      send: (stamp, job) => this.deps.core.requestRunning({ type: 'recent', stamp, job }, stamp),
+      keeps: (sourceKey) => this.registry.source(sourceKey)?.keepRecentSearches !== false,
+      owes: (sourceKey) => this.registry.source(sourceKey)?.recentWipePending === true,
+      clearOwed: (sourceKey) => {
+        this.registry.updateSource(sourceKey, { recentWipePending: false });
+        this.registry.save();
+      },
+    });
+  }
+
+  /** Moves to the next generation; the recent searches' jobs of older ones end at once. */
+  private bump(): number {
+    const generation = this.deps.bumpGeneration();
+    this.recent.settle();
+    return generation;
   }
 
   /** Replaces the folder dialog and the scopes (test builds). */
@@ -221,6 +255,11 @@ export class SourceManager {
   /** The open source's last scan, when one finished for its current stamp. */
   scanSummary(): ScanSummary | null {
     return this.active?.scan ?? null;
+  }
+
+  /** The key of every source the app knows. */
+  sourceKeys(): string[] {
+    return this.registry.sources().map((s) => s.sourceKey);
   }
 
   view(): SourcesView {
@@ -412,6 +451,7 @@ export class SourceManager {
 
   /** At quit: nothing opens or restarts any more, and the folder scope is released. */
   close(): void {
+    this.closed = true;
     this.admitting = false;
     this.releaseScope(this.deps.generation(), 'quit');
   }
@@ -556,7 +596,7 @@ export class SourceManager {
       return 'app_data';
     }
     if (!target.again) this.restarts = [];
-    const generation = this.deps.bumpGeneration();
+    const generation = this.bump();
     await this.stopCore(generation);
     const pickId = target.pick.pickId;
     let scoped = true;
@@ -624,7 +664,7 @@ export class SourceManager {
    * or else as a new one.
    */
   private async activateOther(target: Target, identity: RunIdentity): Promise<SourceOutcome> {
-    const generation = this.deps.bumpGeneration();
+    const generation = this.bump();
     await this.stopCore(generation);
     const pickId = target.pick.pickId;
     this.record('scope.keep', { pickId, generation });
@@ -673,6 +713,7 @@ export class SourceManager {
       this.releaseScope(stamp.generation);
       this.deps.core.setSource(null);
       this.active = null;
+      this.recent.deactivated();
       this.registry.setActive(null);
       this.registry.save();
       this.deps.notify();
@@ -706,14 +747,19 @@ export class SourceManager {
       { generation: stamp.generation },
       { src: source.sourceKey },
     );
-    this.deps.notify();
-    if (online) {
-      if (!target.runs) void this.listRuns(stamp);
-      void this.scan(stamp);
-    } else if (fresh.dbUuid) {
-      // An unavailable export can still be browsed from its index.
-      void this.openIndex(stamp);
+    // Every activation wipes the recent searches first while the switch is
+    // off or a wipe is owed: one that a crash, a switch or a core exit
+    // dropped is paid before anything is read or recorded.
+    this.recent.activated(stamp);
+    if (fresh.keepRecentSearches === false || fresh.recentWipePending === true) {
+      void this.recent.wipe(stamp);
     }
+    this.deps.notify();
+    if (online && !target.runs) void this.listRuns(stamp);
+    // The index first, so a stored list shows at once; the scan follows it.
+    // An unavailable export can still be browsed from its index.
+    if (online || fresh.dbUuid) void this.openIndex(stamp);
+    else this.recent.noIndex(stamp);
     return online ? 'opened' : 'offline';
   }
 
@@ -739,14 +785,27 @@ export class SourceManager {
     return false;
   }
 
+  /**
+   * The run's identity, from core; null if core couldn't give it, which is
+   * logged with core's answer. The open then shows the run as unavailable.
+   */
   private async identify(stamp: Stamp): Promise<RunIdentity | null> {
     let result: CoreResult;
+    const failed = (answer: string) => {
+      this.deps.log.warn(
+        'source.identify_failed',
+        { generation: stamp.generation, reason: reasonOf(answer) },
+        { src: stamp.sourceKey },
+      );
+      return null;
+    };
     try {
       result = await this.deps.core.requestRunning({ type: 'identify', stamp }, stamp);
     } catch {
-      return null;
+      return failed('core_unavailable');
     }
-    if (!result.ok || !result.identity) return null;
+    if (!result.ok) return failed(result.code);
+    if (!result.identity) return failed('invalid');
     return this.current(result, stamp, false) ? result.identity : null;
   }
 
@@ -769,24 +828,27 @@ export class SourceManager {
           { generation: stamp.generation, reason: 'stale_generation' },
           { src: stamp.sourceKey },
         );
+        return;
       }
+      this.failed(stamp, 'source.scan_failed', result.code);
       return;
     }
     const scan = result.scan;
-    if (!scan) return;
+    if (!scan) {
+      this.failed(stamp, 'source.scan_failed', 'invalid');
+      return;
+    }
     const accept = () => {
-      if (this.current(result, stamp, true) && this.active) {
-        this.active.scan = scan;
-        void this.openIndex(stamp);
-      }
+      if (this.current(result, stamp, true) && this.active) this.active.scan = scan;
     };
     if (this.deps.hold) this.deps.hold(accept);
     else accept();
   }
 
   /**
-   * Has core open the source's index; phase 1 starts there. A new index's
-   * identity goes into the source's registry entry.
+   * Has core open the source's index, then, for a run that is there, scan it:
+   * core starts phase 1 once it has both. A new index's identity goes into
+   * the source's registry entry.
    */
   private async openIndex(stamp: Stamp): Promise<void> {
     const source = this.active?.source;
@@ -804,9 +866,24 @@ export class SourceManager {
         stamp,
       );
     } catch {
+      // Core ended: its exit restarts the source, or closes it past the limit.
       return;
     }
-    if (!result.ok || !result.index || !this.current(result, stamp, true)) return;
+    if (!result.ok) {
+      if (result.code !== 'stale') this.recent.noIndex(stamp);
+      // A damaged index comes with its own event and is rebuilt; a stale
+      // answer was for an open that a newer one replaced.
+      if (result.code !== 'damaged' && result.code !== 'stale') {
+        this.failed(stamp, 'index.open_failed', result.code);
+      }
+      return;
+    }
+    if (!result.index) {
+      this.recent.noIndex(stamp);
+      this.failed(stamp, 'index.open_failed', 'invalid');
+      return;
+    }
+    if (!this.current(result, stamp, true)) return;
     if (rebuild && result.index.created) this.rebuilds.delete(source.sourceKey);
     if (result.index.dbUuid !== source.dbUuid) {
       this.registry.updateSource(source.sourceKey, { dbUuid: result.index.dbUuid });
@@ -816,8 +893,42 @@ export class SourceManager {
       }
     }
     if (this.active && result.progress) this.active.index = result.progress.condition;
+    this.recent.ready(stamp);
     this.deps.log.info('index.opened', { generation: stamp.generation }, { src: stamp.sourceKey });
     this.deps.notify();
+    if (this.active?.online) void this.scan(stamp);
+  }
+
+  /**
+   * The open source's scan, index open or phase 1 failed. Nothing would show
+   * it, so the source is closed under a new generation, as when core keeps
+   * failing: the shell says so and offers to open it again. Core is stopped;
+   * the folder's scope stays for that. `code` logs core's answer, if any. An
+   * unavailable source, browsed from its index, shows that state instead.
+   */
+  private failed(
+    stamp: Stamp,
+    code: 'source.scan_failed' | 'index.open_failed' | null,
+    answer: string | null,
+  ): void {
+    void this.serial(async () => {
+      // An answer for an older generation is no longer about the open source.
+      if (!sameStamp(stamp, this.stamp())) return;
+      // Logged even when the source stays as it is: unavailable, or already closed.
+      if (code !== null) {
+        this.deps.log.warn(
+          code,
+          { generation: stamp.generation, reason: reasonOf(answer ?? '') },
+          { src: stamp.sourceKey },
+        );
+      }
+      const active = this.active;
+      if (!this.admitting || !active?.online || active.closed) return;
+      const generation = this.bump();
+      active.closed = true;
+      await this.stopCore(generation);
+      this.deps.notify();
+    });
   }
 
   /**
@@ -839,6 +950,8 @@ export class SourceManager {
     const changed = active.index !== event.progress.condition;
     active.index = event.progress.condition;
     this.deps.indexChanged?.(event.progress);
+    // Phase 1 stopped short (core logged why); a damaged index is rebuilt instead.
+    if (event.progress.phase === 'failed' && !event.damaged) this.failed(event.stamp, null, null);
     if (event.damaged) {
       const key = active.source.sourceKey;
       this.rebuilds.add(key);
@@ -893,7 +1006,7 @@ export class SourceManager {
       this.restarts = this.restarts.filter((t) => now - t < RESTART_WINDOW_MS);
       if (this.restarts.length >= RESTART_LIMIT) {
         // The open views go with the core that served them.
-        this.deps.bumpGeneration();
+        this.bump();
         active.closed = true;
         this.deps.log.warn('core.restart_gave_up', at, { src: source.sourceKey });
         this.deps.notify();
@@ -920,6 +1033,58 @@ export class SourceManager {
   }
 
   /**
+   * Builds the open source's index again, by hand. Under the lifecycle lock,
+   * the source's views are revoked under a new generation, core tears its
+   * index down and deletes it, and the source opens again with a fresh index.
+   * Only for the open, known source while its run is there. If core can't
+   * delete the index, the source opens again with it, and that is 'busy'.
+   */
+  rebuildIndex(sourceKey: string, expected: number): Promise<SourceOutcome | null | Stale> {
+    return this.serial(async () => {
+      if (!this.admitting) return 'closed';
+      const active = this.active;
+      const source = this.registry.source(sourceKey);
+      if (!active || !source || active.source.sourceKey !== sourceKey) return null;
+      if (!active.online) return 'offline';
+      const generation = this.bump();
+      this.deps.notify();
+      // The index loses its identity before its files go, so an index found
+      // after a crash in between is never taken for this one.
+      const dbUuid = source.dbUuid ?? null;
+      this.registry.updateSource(sourceKey, { dbUuid: null });
+      this.registry.save();
+      let deleted = await this.coreForget(sourceKey);
+      if (!deleted) {
+        // A core started afresh holds nothing of it.
+        await this.stopCore(generation);
+        this.deps.core.setSource(null);
+        deleted = await this.coreForget(sourceKey);
+      }
+      if (deleted) {
+        this.deps.log.info('index.rebuild', { generation, reason: 'manual' }, { src: sourceKey });
+      } else {
+        // The index is still there and still this one.
+        this.registry.updateSource(sourceKey, { dbUuid });
+        this.registry.save();
+        this.deps.log.warn('index.rebuild_refused', { reason: 'in_use' }, { src: sourceKey });
+      }
+      // Core retired the key when it deleted the index: the source opens in a
+      // new core, as after a switch.
+      const known = this.registry.source(sourceKey);
+      if (!known) return null;
+      const outcome = await this.activate({
+        pick: active.pick,
+        run: runOf(known),
+        known,
+        verify: false,
+        onMismatch: 'offline',
+        runs: active.runs,
+      });
+      return deleted || outcome !== 'opened' ? outcome : 'busy';
+    }, expected);
+  }
+
+  /**
    * Forgets a source: if it is open, it is torn down under a new generation
    * and its folder released; core deletes its index; then it leaves the
    * registry and the recent list. The export's own files are never touched.
@@ -931,7 +1096,7 @@ export class SourceManager {
       const open = this.active?.source.sourceKey === sourceKey;
       let generation = this.deps.generation();
       if (open) {
-        generation = this.deps.bumpGeneration();
+        generation = this.bump();
         // From here no result of the open source is taken any more.
         this.active = null;
         this.deps.notify();
@@ -970,40 +1135,67 @@ export class SourceManager {
   }
 
   /**
-   * Resets the app: from now on nothing opens. After the operation in
-   * progress, the open source is torn down in core and core is stopped; only
-   * then is the app's data deleted.
+   * Resets the app. From now until it's done nothing opens. After the
+   * operation in progress, the open source is torn down in core and core is
+   * stopped; only then is the app's data deleted. Then the app starts afresh,
+   * as at a launch with nothing to reopen. True if the data was deleted,
+   * false if an export overlaps it (nothing is deleted), RESET_FAILED if a
+   * file of the app's couldn't be deleted.
+   *
+   * The generation it is made for is checked again when its turn comes: if
+   * an operation before it moved the generation on (another Reset too), it is
+   * stale, nothing is deleted, and opens are admitted again. Null skips that
+   * check.
    */
-  reset(): Promise<void> {
+  reset(expected: number | null): Promise<boolean | Stale | ResetFailed> {
     this.admitting = false;
     return this.serial(async () => {
-      const exports = this.exportRoots();
-      const generation = this.deps.bumpGeneration();
-      this.active = null;
-      if (this.deps.core.running) {
-        try {
-          await this.deps.core.request({ type: 'reset' });
-        } catch {
-          // Core ended on its own; it holds nothing any more.
+      if (expected !== null && this.deps.generation() !== expected) {
+        if (!this.closed) this.admitting = true;
+        return STALE;
+      }
+      try {
+        return await this.resetNow();
+      } finally {
+        if (!this.closed) {
+          this.admitting = true;
+          if (!this.deps.core.running) await this.deps.core.startWith(null).catch(() => false);
         }
       }
-      await this.stopCore(generation);
-      this.releaseScope(generation);
-      this.deps.core.setSource(null);
-      this.rebuilds.clear();
-      // Nothing is deleted if any export the app knows overlaps what would be.
-      const targets = appDataPaths(this.deps.userData);
-      if (targets.some((target) => exports.some((root) => overlaps(root, target)))) {
-        this.deps.log.warn('app.reset_refused', { reason: 'overlap' });
-        this.deps.notify();
-        return;
-      }
-      this.registry.clear();
-      this.deps.log.info('app.reset', { generation });
-      this.deps.stopLogs?.();
-      removeAppData(this.deps.userData);
-      this.deps.notify();
     });
+  }
+
+  private async resetNow(): Promise<boolean | ResetFailed> {
+    const exports = this.exportRoots();
+    const generation = this.bump();
+    this.active = null;
+    if (this.deps.core.running) {
+      try {
+        await this.deps.core.request({ type: 'reset' });
+      } catch {
+        // Core ended on its own; it holds nothing any more.
+      }
+    }
+    await this.stopCore(generation);
+    this.releaseScope(generation);
+    this.deps.core.setSource(null);
+    this.rebuilds.clear();
+    // Nothing is deleted if any export the app knows overlaps what would be.
+    const targets = appDataPaths(this.deps.userData);
+    if (targets.some((target) => exports.some((root) => overlaps(root, target)))) {
+      this.deps.log.warn('app.reset_refused', { reason: 'overlap' });
+      this.deps.notify();
+      return false;
+    }
+    this.registry.clear();
+    this.deps.log.info('app.reset', { generation });
+    this.deps.stopLogs?.();
+    const left = removeAppData(this.deps.userData);
+    this.deps.afterReset?.();
+    // Logged once the logs have started again.
+    if (left > 0) this.deps.log.warn('app.reset_failed', { count: left });
+    this.deps.notify();
+    return left === 0 ? true : RESET_FAILED;
   }
 
   /** The run folder of every export the app knows, the open one included. */
@@ -1015,6 +1207,62 @@ export class SourceManager {
     }
     if (this.active) roots.push(join(this.active.pick.path, this.active.source.rel));
     return roots;
+  }
+
+  /** Whether the export that is open now; its sourceKey and generation are the ones given. */
+  private shown(sourceKey: string, expected: number): Stamp | null {
+    const stamp = this.stamp();
+    return stamp && stamp.sourceKey === sourceKey && stamp.generation === expected ? stamp : null;
+  }
+
+  /**
+   * Records a search committed in the open export, received at `at`. It is
+   * dropped at once while the export's switch is off, or while a wipe is
+   * owed and none is queued to pay it.
+   */
+  recordSearch(q: string, at: number): void {
+    const stamp = this.stamp();
+    if (stamp) this.recent.record(stamp, q, at);
+  }
+
+  /** The open export's recent searches, newest first; none while its switch is off or a wipe is owed. */
+  recentSearches(): Promise<SearchSpec[]> {
+    const stamp = this.stamp();
+    return stamp ? this.recent.list(stamp) : Promise.resolve([]);
+  }
+
+  /**
+   * "Keep recent searches" for the export Settings showed. Off saves the
+   * switch and the owed wipe in one save, then queues the wipe, in one
+   * synchronous step. On saves only the switch: a wipe still owed stays owed.
+   */
+  setKeepRecent(sourceKey: string, keep: boolean, expected: number): true | Stale {
+    const stamp = this.shown(sourceKey, expected);
+    if (!stamp) return STALE;
+    if (keep) {
+      this.registry.updateSource(sourceKey, { keepRecentSearches: true });
+      this.registry.save();
+      this.deps.notify();
+      return true;
+    }
+    this.registry.updateSource(sourceKey, { keepRecentSearches: false, recentWipePending: true });
+    this.registry.save();
+    void this.recent.wipe(stamp);
+    this.deps.notify();
+    return true;
+  }
+
+  /** "Clear recent searches" for the export Settings showed: resolves once the wipe has ended. */
+  async clearRecent(sourceKey: string, expected: number): Promise<'ok' | 'failed' | Stale> {
+    const stamp = this.shown(sourceKey, expected);
+    if (!stamp) return STALE;
+    const outcome = await this.recent.wipe(stamp);
+    return outcome === 'stale' ? STALE : outcome;
+  }
+
+  /** The "Keep recent searches" switch of a source the app knows: absent means on. */
+  keepsRecent(sourceKey: string): boolean {
+    return this.registry.source(sourceKey)?.keepRecentSearches !== false;
   }
 
   /**
@@ -1042,6 +1290,12 @@ export class SourceManager {
 
 function runOf(source: SourceRecord): FoundRun {
   return { rel: source.rel, runName: source.runName, accountName: source.accountName };
+}
+
+/** Core's answer code as a log reason: one the log knows, else 'unknown'. */
+function reasonOf(answer: string): string {
+  if (answer === 'stale') return 'stale_generation';
+  return (REASONS as readonly string[]).includes(answer) ? answer : 'unknown';
 }
 
 /**

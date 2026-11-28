@@ -4,6 +4,7 @@
 import { randomUUID } from 'node:crypto';
 import { BrowserWindow, session } from 'electron';
 import { SHELL_URL } from '../shared/constants';
+import { forwardFrameKeys } from './frame-keys';
 import type { AppContext, AppWindow } from './context';
 import { hardenSession } from './harden';
 import { guardNavigation } from './navigation';
@@ -86,6 +87,7 @@ export function createAppWindow(ctx: AppContext, options: WindowOptions = {}): A
     openLink: (url) => ctx.linkDialog.request(contents, appWin, url, ctx.generation),
     allowFrameUrl: options.allowFrameUrl,
   });
+  forwardFrameKeys(contents, () => views.authorizedUrl());
   contents.on('render-process-gone', (_event, details) => {
     ctx.log.error('renderer.gone', {
       reason: details.reason,

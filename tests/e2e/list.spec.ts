@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import type { Page } from '@playwright/test';
 import type { IndexProgress, IndexTotals, ListWindow, Sidebar } from '../../src/shared/index-types';
 import { formatCount, listDate, participantsText } from '../../src/renderer/format';
+import { ROW_HEIGHT } from '../../src/renderer/list';
 import { writeExport } from '../exports';
 import { testDir } from '../paths';
 import { expect, test, type PevApp } from './app';
@@ -223,7 +224,7 @@ test('rows that arrive while the export loads never move the anchored row', asyn
   };
 
   // The top row on screen is the anchor: scrolled down a little first.
-  await scrollList(pev.page, 4 * 82);
+  await scrollList(pev.page, 4 * ROW_HEIGHT);
   await expect.poll(async () => (await rowsOnScreen(pev.page))[0]?.pos).toBe(5);
   const anchor = (await rowsOnScreen(pev.page))[0]!;
   const tops = [];

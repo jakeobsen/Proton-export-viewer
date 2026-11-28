@@ -27,6 +27,7 @@ export interface SidebarModel {
 
 export const INBOX = '0';
 export const ALL_MAIL = '5';
+export const STARRED = '10';
 
 /** System folders in sidebar order; the last ones show only when they hold messages. */
 const SYSTEM: ReadonlyArray<{ id: string; name: string; always: boolean }> = [
@@ -36,7 +37,7 @@ const SYSTEM: ReadonlyArray<{ id: string; name: string; always: boolean }> = [
   { id: '9', name: 'Outbox', always: false },
   { id: '12', name: 'Scheduled', always: false },
   { id: '7', name: 'Sent', always: true },
-  { id: '10', name: 'Starred', always: true },
+  { id: STARRED, name: 'Starred', always: true },
   { id: '6', name: 'Archive', always: true },
   { id: '4', name: 'Spam', always: true },
   { id: '3', name: 'Trash', always: true },

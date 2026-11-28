@@ -16,6 +16,7 @@ import type {
 } from '../shared/core-protocol';
 import { errorData } from '../shared/log/schema';
 import type { LogWriter } from '../shared/log/writer';
+import type { RecentHooks } from '../core/index/service';
 import type { SourceSession } from '../core/source';
 import type { ReadRequest } from '../shared/reader-protocol';
 import { markLoaded } from './marker';
@@ -38,6 +39,7 @@ export interface CoreTestDeps {
     held: Array<OpenRequest | ReadRequest>;
     fileOpens: number;
     unsanitized: boolean;
+    breakMarks: boolean;
     searches: number;
     holdingSearches: boolean;
     heldSearches: IndexQueryRequest[];
@@ -57,11 +59,67 @@ export interface CoreTestDeps {
   setReaderSource: (source: ReaderSource) => void;
   readerSource: () => ReaderSource | null;
   writeGate: WriteGate | null;
+  /** Holds scans before they list the run's folder, the same way. */
+  scanGate: WriteGate | null;
+  /** Holds index opens before they start, the same way. */
+  indexGate: WriteGate | null;
   /** Runs a search that was held. */
   runSearch: (request: IndexQueryRequest) => void;
+  /** Holds and counts the recent searches' jobs. */
+  recentGate: RecentGate | null;
 }
 
-/** Holds phase 1's writes, while holding, until a test lets them through. */
+/**
+ * The recent searches' jobs as tests see them: how many recordings reached
+ * core, holding the job at the head of the queue (never reordering), and
+ * making the next wipe fail.
+ */
+export class RecentGate {
+  private holding = false;
+  private failNext = false;
+  private recordings = 0;
+  private readonly waiting: Array<() => void> = [];
+
+  readonly hooks: RecentHooks = {
+    received: (job) => {
+      if (job.op === 'record') this.recordings += 1;
+    },
+    before: () =>
+      this.holding ? new Promise<void>((resolve) => this.waiting.push(resolve)) : Promise.resolve(),
+    failWipe: () => {
+      const fail = this.failNext;
+      this.failNext = false;
+      return fail;
+    },
+  };
+
+  hold(): void {
+    this.holding = true;
+  }
+
+  /** Stops holding and lets the held job go; returns how many were held. */
+  release(): number {
+    this.holding = false;
+    const held = this.waiting.splice(0);
+    for (const go of held) go();
+    return held.length;
+  }
+
+  failNextWipe(): void {
+    this.failNext = true;
+  }
+
+  get held(): number {
+    return this.waiting.length;
+  }
+
+  /** Recordings that reached core. */
+  get received(): number {
+    return this.recordings;
+  }
+}
+
+/** Holds work (phase 1's writes, or scans), while holding, until a test lets it through. */
 export class WriteGate {
   private allowed = 0;
   private readonly waiting: Array<() => void> = [];
@@ -175,6 +233,23 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
     case 'held-searches':
       ok(deps.state.heldSearches.length);
       return;
+    case 'hold-recent':
+      deps.recentGate?.hold();
+      ok();
+      return;
+    case 'release-recent':
+      ok(deps.recentGate?.release() ?? 0);
+      return;
+    case 'held-recent':
+      ok(deps.recentGate?.held ?? 0);
+      return;
+    case 'fail-recent-wipe':
+      deps.recentGate?.failNextWipe();
+      ok();
+      return;
+    case 'recent-received':
+      ok(deps.recentGate?.received ?? 0);
+      return;
     case 'hold-cards': {
       // Holds the cards queries anchored at a message; null lets the held ones go.
       const rowid = (request.payload as { rowid?: unknown } | undefined)?.rowid;
@@ -205,6 +280,36 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
     }
     case 'held-writes':
       ok(deps.writeGate?.held ?? 0);
+      return;
+    case 'release-scans': {
+      const count = (request.payload as { count?: unknown } | undefined)?.count;
+      const valid =
+        count === null || (typeof count === 'number' && Number.isSafeInteger(count) && count > 0);
+      if (!deps.scanGate || !valid) {
+        deps.reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
+        return;
+      }
+      deps.scanGate.release(count as number | null);
+      ok();
+      return;
+    }
+    case 'held-scans':
+      ok(deps.scanGate?.held ?? 0);
+      return;
+    case 'release-index-opens': {
+      const count = (request.payload as { count?: unknown } | undefined)?.count;
+      const valid =
+        count === null || (typeof count === 'number' && Number.isSafeInteger(count) && count > 0);
+      if (!deps.indexGate || !valid) {
+        deps.reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
+        return;
+      }
+      deps.indexGate.release(count as number | null);
+      ok();
+      return;
+    }
+    case 'held-index-opens':
+      ok(deps.indexGate?.held ?? 0);
       return;
     case 'log':
       deps.log.info('test.log', {
@@ -279,6 +384,15 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
         return;
       }
       deps.state.unsanitized = request.payload;
+      ok();
+      return;
+    case 'reader-break-marks':
+      // Later opens from search send the worker match ranges that fail its check.
+      if (typeof request.payload !== 'boolean') {
+        deps.reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
+        return;
+      }
+      deps.state.breakMarks = request.payload;
       ok();
       return;
     case 'reader-lane':

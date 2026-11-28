@@ -35,7 +35,7 @@ import {
   type MessageRow,
 } from './metadata';
 import { BODY_STATE, CAPPED, META, META_STATE } from './schema';
-import { asNumber, type Db, type Row, type SqlValue } from './sql';
+import { asNumber, scalar, type Db, type Row, type SqlValue } from './sql';
 import { stripMarks } from '../search/ranges';
 
 /** One file of a pair as the scan saw it. */
@@ -118,6 +118,8 @@ export interface Phase1Stats extends GroupStats {
   /** Items dropped because their pair's rev had moved on or the pair is gone. */
   dropped: number;
   newThreads: number;
+  /** Messages placed again on their own, in the conversation they had emptied: its ID kept. */
+  kept: number;
   capped: Array<{ fileId: string; capped: number }>;
   errors: Array<{ fileId: string; code: string }>;
 }
@@ -137,6 +139,15 @@ export interface ApplyStats extends GroupStats {
   refreshed: number;
   /** Items left alone because the index no longer matched what the plan saw. */
   skipped: number;
+}
+
+/**
+ * The messages phase 2 still has to read, newest first, as rowids, and how
+ * many message files it handled before: both from the same state.
+ */
+export interface BodyOrder {
+  order: number[];
+  before: number;
 }
 
 /** A message whose file phase 2 is to read, with the file as reconcile last saw it. */
@@ -230,6 +241,7 @@ const emptyStats = (): Phase1Stats => ({
   failed: 0,
   dropped: 0,
   newThreads: 0,
+  kept: 0,
   capped: [],
   errors: [],
 });
@@ -693,6 +705,7 @@ export class IndexWriter {
       const messageOf = this.db.stmt(
         'SELECT rowid, thread_id, capped FROM messages WHERE proton_id = ?',
       );
+      const threadRow = this.db.stmt('SELECT 1 AS present FROM threads WHERE thread_id = ?');
       const setMeta = this.db.stmt(
         `UPDATE pairs SET meta_rel = ?, meta_size = ?, meta_mtime_ns = ?, meta_dev = ?, meta_ino = ?,
            meta_state = ?, error_code = ? WHERE proton_id = ?`,
@@ -715,13 +728,18 @@ export class IndexWriter {
         const old = messageOf.get(id);
         const oldRowid = old ? asNumber(old.rowid) : null;
         if (item.row) {
+          let emptied: number | null = null;
           if (old) {
-            this.detach(asNumber(old.rowid), asNumber(old.thread_id), stats);
+            const oldThread = asNumber(old.thread_id);
+            this.detach(asNumber(old.rowid), oldThread, stats);
             stats.replaced += 1;
+            // The message was its conversation's only member: the conversation
+            // is gone, and its ID is free for the message if it lands alone.
+            if (!threadRow.get(oldThread)) emptied = oldThread;
           }
           // The attachments flag comes from the message file, which stays.
           const kept = old ? asNumber(old.capped) & CAPPED.attachments : 0;
-          this.insertMessage(item.row, stats, oldRowid, kept);
+          this.insertMessage(item.row, stats, oldRowid, kept, emptied);
           stats.messages += 1;
           if (item.row.capped !== 0) stats.capped.push({ fileId, capped: item.row.capped });
           setMeta.run(...fileValues(item.pair.meta), META_STATE.indexed, null, id);
@@ -751,6 +769,20 @@ export class IndexWriter {
       )
       .all(BODY_STATE.pending)
       .map((r) => asNumber(r.rowid));
+  }
+
+  /**
+   * Message files phase 2 handled before: their text indexed, cut to the
+   * limit, or not readable. Files it never reads (a message without a message
+   * file, or whose metadata isn't indexed) aren't counted.
+   */
+  bodyBefore(): number {
+    return scalar(
+      this.db,
+      `SELECT count(*) FROM messages m JOIN pairs p ON p.proton_id = m.proton_id
+       WHERE p.body_state IN (${BODY_STATE.indexed}, ${BODY_STATE.truncated}, ${BODY_STATE.failed})
+         AND p.eml_rel IS NOT NULL`,
+    );
   }
 
   /** Of these messages, in this order, the ones that still wait for their body, with their files. */
@@ -1119,13 +1151,17 @@ export class IndexWriter {
    * Places a message: joins the conversation of its keys, merges the ones it
    * links, or starts a new one. `rowid` keeps the row of a message placed
    * again, whose text (and body) stays where it is; `keptCapped` holds the
-   * cap flags it keeps from before.
+   * cap flags it keeps from before. `keep` is the ID of the conversation such
+   * a message emptied when it left: if the message starts a conversation of
+   * its own, it gets that ID back, so it stays the same conversation; if it
+   * joins others, the ID stays retired.
    */
   private insertMessage(
     row: MessageRow,
     stats: Phase1Stats,
     rowid: number | null = null,
     keptCapped = 0,
+    keep: number | null = null,
   ): void {
     const keys = conversationKeys(row);
     const found = new Set<number>();
@@ -1136,14 +1172,16 @@ export class IndexWriter {
     const attach = row.numAttachments > 0 ? 1 : 0;
     let threadId: number;
     if (found.size === 0) {
+      // A null ID takes the next free one.
       threadId = asNumber(
         this.db
           .stmt(
-            'INSERT INTO threads(msg_count, unread_count, attach_count, first_time, last_time) VALUES (0, 0, 0, ?, ?)',
+            'INSERT INTO threads(thread_id, msg_count, unread_count, attach_count, first_time, last_time) VALUES (?, 0, 0, 0, ?, ?)',
           )
-          .run(row.time, row.time).lastInsertRowid,
+          .run(keep, row.time, row.time).lastInsertRowid,
       );
-      stats.newThreads += 1;
+      if (keep === null) stats.newThreads += 1;
+      else stats.kept += 1;
     } else {
       // Union by size: the largest conversation stays, ties go to the lower ID.
       const sized = [...found].map((id) => ({ id, n: this.agg(id).msg_count }));
