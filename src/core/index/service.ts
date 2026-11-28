@@ -39,6 +39,7 @@
 import { mkdirSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import type {
+  EmlFile,
   IndexAnswer,
   IndexCondition,
   IndexOpened,
@@ -160,6 +161,10 @@ export interface IndexOptions {
   batchPairs?: number;
   /** Builds with test hooks only: awaited before each phase 1 write. */
   beforeWrite?: () => Promise<void>;
+  /** Builds with test hooks only: awaited before a scan lists the run's folder, and after. */
+  beforeScan?: () => Promise<void>;
+  /** Builds with test hooks only: awaited before the index opens. */
+  beforeIndexOpen?: () => Promise<void>;
   /**
    * Builds with test hooks only: read new metadata files in name order, and
    * write their batches in that order.
@@ -170,6 +175,8 @@ export interface IndexOptions {
    * writes, at most; TXN_INPUT_BYTES otherwise.
    */
   txnBytes?: number;
+  /** Builds with test hooks only: this message's body job never ends, so it runs past its limit. */
+  stallBodyOf?: string;
 }
 
 export interface IndexServiceDeps {
@@ -539,9 +546,12 @@ export class IndexService {
     try {
       await this.openQuery();
       const answer = await this.query!.call<IndexAnswer>('query', { call });
-      if (call.op === 'search' || call.op === 'snippets') {
-        // A snippet whose match ranges failed the check is given as plain text.
-        const dropped = (answer as SearchPage | SearchSnippets | null)?.dropped ?? 0;
+      if (call.op === 'search' || call.op === 'snippets' || call.op === 'eml') {
+        // Snippets and match columns whose ranges failed the check are given without marks.
+        const dropped =
+          call.op === 'eml'
+            ? ((answer as EmlFile | null)?.match?.dropped ?? 0)
+            : ((answer as SearchPage | SearchSnippets | null)?.dropped ?? 0);
         if (dropped > 0) this.deps.log.warn('search.ranges_dropped', { count: dropped }, this.src);
       }
       return answer;
@@ -716,9 +726,11 @@ export class IndexService {
       return true;
     } catch (err) {
       this.progress.phase = 'failed';
-      this.report(true);
-      this.watch(err);
       const code = err instanceof ThreadError ? err.code : 'FAILED';
+      // A damaged index is reported as such once it is torn down, and main
+      // rebuilds it; any other failure is reported now, and main closes the source.
+      if (code !== 'INDEX_CORRUPT') this.report(true);
+      this.watch(err);
       this.deps.log.warn('index.phase1_failed', { reason: failureReason(code) }, this.src);
       return false;
     }
@@ -926,7 +938,12 @@ export class IndexService {
     let result: BodyJobResult;
     try {
       const item: BodyJobItem = { protonId: todo.protonId, rev: todo.rev, ref };
-      result = await pool.run<BodyJobResult>('body', { fd, item }, this.jobMs);
+      const stall = __PEV_TEST_HOOKS__ && this.deps.options?.stallBodyOf === todo.protonId;
+      result = await pool.run<BodyJobResult>(
+        'body',
+        { fd, item, ...(stall ? { stall: true } : {}) },
+        this.jobMs,
+      );
     } catch (err) {
       // A thread that took the job and was ended may still be reading the file.
       if (err instanceof ThreadError) exited = err.exited;
@@ -1230,7 +1247,8 @@ export class IndexService {
   }
 }
 
-function failureReason(code: string): string {
+/** The log reason for a thread error's code. */
+export function failureReason(code: string): string {
   switch (code) {
     case 'STALE':
     case 'CANCELLED':

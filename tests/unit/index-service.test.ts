@@ -27,7 +27,7 @@ import { MAX_ATTACHMENTS } from '../../src/core/index/body';
 import { BODY_STATE, CAPPED, SCHEMA_VERSION } from '../../src/core/index/schema';
 import { validRanges } from '../../src/core/search/ranges';
 import { openDb } from '../../src/core/index/sql';
-import type { IndexThread, ThreadRole } from '../../src/core/index/pool';
+import { ThreadError, type IndexThread, type ThreadRole } from '../../src/core/index/pool';
 import type { IndexTotals, ListPage, SearchPage, Sidebar } from '../../src/shared/index-types';
 import type { Logger } from '../../src/shared/log/writer';
 import { sanitizeEvent } from '../../src/shared/log/schema';
@@ -55,6 +55,7 @@ function harness(
   options: IndexOptions = {},
   hang: (role: ThreadRole, op: string, args: unknown) => boolean = () => false,
   wrap: (role: ThreadRole, thread: IndexThread) => IndexThread = (_, thread) => thread,
+  hooks: { onChange?: () => void; onDamage?: (reason: string) => void } = {},
 ): Harness {
   const threads: InlineThread[] = [];
   const logs: Logged[] = [];
@@ -86,6 +87,7 @@ function harness(
     },
     isCurrent: () => current,
     options,
+    ...hooks,
   });
   return { service, threads, logs, setCurrent: (v) => (current = v) };
 }
@@ -394,6 +396,53 @@ describe('phase 1', () => {
     );
     expect(subjects.map((r) => Number(r.n))).toEqual([3145728, 3145728, 3145728]);
     await h.service.close();
+  });
+
+  it('reports phase 1 failing at once, but a damaged index only as damage', async () => {
+    for (const [code, reason] of [
+      ['WAL_STOP', 'wal'],
+      ['INDEX_CORRUPT', 'corrupt'],
+    ] as const) {
+      const { run, indexDir } = exportAt(`phase-fail-${code}`, 6);
+      const phases: string[] = [];
+      const damage: string[] = [];
+      // The writer fails phase 1's first write.
+      const failing = (thread: IndexThread): IndexThread => ({
+        call: <T>(op: string, args?: unknown, timeoutMs?: number) =>
+          op === 'phase1'
+            ? Promise.reject(new ThreadError(code))
+            : thread.call<T>(op, args, timeoutMs),
+        stop: () => thread.stop(),
+        get respawns() {
+          return thread.respawns;
+        },
+        onRespawn: null,
+      });
+      const h: Harness = harness(
+        run,
+        indexDir,
+        {},
+        () => false,
+        (role, thread) => (role === 'writer' ? failing(thread) : thread),
+        {
+          onChange: () => phases.push(h.service.progress.phase),
+          onDamage: (r) => damage.push(r),
+        },
+      );
+      await h.service.open(null);
+      await h.service.startIndexing(scanRun(run));
+      expect(h.service.progress.phase).toBe('failed');
+      expect(h.logs.find((l) => l.code === 'index.phase1_failed')?.data.reason).toBe(reason);
+      if (code === 'WAL_STOP') {
+        expect(phases.at(-1)).toBe('failed');
+        expect(damage).toEqual([]);
+      } else {
+        // Main rebuilds a damaged index; a 'failed' report first would close it instead.
+        expect(phases).not.toContain('failed');
+        expect(damage).toEqual(['corrupt']);
+      }
+      await h.service.close();
+    }
   });
 
   it('stops writing once the generation has moved on', async () => {

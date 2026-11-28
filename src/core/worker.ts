@@ -8,10 +8,17 @@ import { getHeapStatistics } from 'node:v8';
 import { parentPort, workerData } from 'node:worker_threads';
 import type { WorkerMessage, WorkerRequest } from '../shared/core-protocol';
 import { errorData } from '../shared/log/schema';
-import type { ReaderInput, WorkerRender, WorkerRendered } from '../shared/reader-protocol';
+import type {
+  ReaderInput,
+  WorkerRender,
+  WorkerRendered,
+  WorkerSource,
+  WorkerSourced,
+} from '../shared/reader-protocol';
 import { fdRead, fdReread } from './reader/fd-input';
 import type { Reread } from './reader/images';
 import { renderMessage } from './reader/render';
+import { messageHeaderBlock, messageStructure, partHeaderBlock } from './reader/source-view';
 import { STUBS, type StubBuilder } from './stubs';
 
 const appRoot = (workerData as { appRoot?: string } | null)?.appRoot ?? '';
@@ -101,8 +108,44 @@ async function render(request: WorkerRender): Promise<WorkerRendered> {
         }
       },
       ...(sanitize ? { sanitize } : {}),
+      ...(request.stored ? { stored: request.stored } : {}),
+      onMarksDropped: (count) => {
+        post({ type: 'log', level: 'warn', code: 'reader.marks_dropped', data: { count } });
+      },
     });
     return { type: 'rendered', reqId: request.reqId, heldBytes: heldBytes(), ok: true, message };
+  } catch (err) {
+    post({ type: 'log', level: 'warn', code: 'reader.parse_failed', data: errorData(err, roots) });
+    return failed();
+  }
+}
+
+/** Reads for the source view: a header block, or the message's parts. */
+async function source(request: WorkerSource): Promise<WorkerSourced> {
+  const failed = (): WorkerSourced => ({
+    type: 'sourced',
+    reqId: request.reqId,
+    heldBytes: heldBytes(),
+    ok: false,
+  });
+  try {
+    const input = await inputStream(request.input);
+    if (!input) return failed();
+    const done = { type: 'sourced', reqId: request.reqId, ok: true } as const;
+    const { what } = request;
+    if (what.kind === 'structure') {
+      const parts = await messageStructure(input);
+      return { ...done, heldBytes: heldBytes(), parts };
+    }
+    const headers =
+      what.kind === 'headers'
+        ? await messageHeaderBlock(input)
+        : await partHeaderBlock(input, what.path);
+    return {
+      ...done,
+      heldBytes: heldBytes(),
+      headers: headers && { bytes: new Uint8Array(headers.bytes), truncated: headers.truncated },
+    };
   } catch (err) {
     post({ type: 'log', level: 'warn', code: 'reader.parse_failed', data: errorData(err, roots) });
     return failed();
@@ -112,6 +155,10 @@ async function render(request: WorkerRender): Promise<WorkerRendered> {
 parentPort?.on('message', (request: WorkerRequest) => {
   if (request.type === 'render') {
     void render(request).then(postRendered);
+    return;
+  }
+  if (request.type === 'source') {
+    void source(request).then(post);
     return;
   }
   if (request.type === 'build') {

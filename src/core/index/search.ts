@@ -7,6 +7,7 @@
 // every other value is a bound parameter.
 
 import type {
+  IndexMatch,
   MarkedSnippet,
   RowDetails,
   SearchCoverage,
@@ -21,6 +22,7 @@ import type {
   SnippetsQuery,
 } from '../../shared/index-types';
 import { MAX_SNIPPET_THREADS } from '../../shared/index-types';
+import type { MatchColumn } from '../../shared/reader-protocol';
 import { parseQuery, wordsOf, type ParsedQuery, type Term, type TextColumn } from '../search/query';
 import { markedToRanges, stripMarks } from '../search/ranges';
 import { SYSTEM_LABELS } from './labels';
@@ -228,10 +230,17 @@ function hits(
   built: BuiltQuery,
   withRank: boolean,
   inThreads: boolean,
+  oneMessage = false,
 ): { sql: string; params: SqlValue[] } {
   const where = built.conditions.map((c) => ` AND ${c.sql}`).join('');
   const params = built.conditions.flatMap((c) => c.params);
-  const threads = inThreads ? ' AND m.thread_id IN (SELECT value FROM json_each(?))' : '';
+  // A rowid bound as a plain number can be ignored next to a full-text match;
+  // as an explicit integer it always applies.
+  const threads = inThreads
+    ? ' AND m.thread_id IN (SELECT value FROM json_each(?))'
+    : oneMessage
+      ? ' AND m.rowid = CAST(? AS INTEGER)'
+      : '';
   const cols = 'm.rowid AS rid, m.thread_id AS tid, coalesce(m.time, 0) AS time';
   if (built.match !== null) {
     return {
@@ -362,6 +371,84 @@ function snippets(
     byRowid.set(asNumber(r.rowid), converted ?? { text: stripMarks(marked), ranges: [] });
   }
   return { byRowid, dropped };
+}
+
+/** The full-text columns a match line can name, by their position in the index. */
+const MATCH_COLUMN_AT: ReadonlyArray<[MatchColumn, number]> = [
+  ['subject', 0],
+  ['sender', 1],
+  ['recipients', 2],
+  ['attachments', 4],
+];
+/** The body's position in the full-text index. */
+const BODY_COLUMN = 3;
+
+/**
+ * How one message matches a search, for the reader: the columns other than
+ * the body that hold a match, and the stored body with its match ranges when
+ * the body holds any and was indexed. Null when the search has no word to
+ * mark (filters only, or only negated words) or the message doesn't match the
+ * whole search. Only the search's positive words are marked: negated words
+ * and the words that narrow an address match aren't.
+ */
+export function matchInfo(db: Db, rowid: number, text: string): IndexMatch | null {
+  const parsed = parseQuery(text);
+  const built = buildQuery(db, parsed);
+  if (!built.hasText || built.match === null) return null;
+  const whole = hits(built, false, false, true);
+  if (!db.once(whole.sql).get(...whole.params, rowid)) return null;
+
+  const pair = db
+    .stmt(
+      `SELECT p.body_state AS body_state, p.error_code AS error_code
+       FROM messages m JOIN pairs p ON p.proton_id = m.proton_id WHERE m.rowid = ?`,
+    )
+    .get(rowid);
+  const state = asNumber(pair?.body_state);
+  const reason =
+    state === BODY_STATE.failed
+      ? String(pair?.error_code ?? '') === 'BODY_TIMEOUT'
+        ? 'timeout'
+        : 'unreadable'
+      : null;
+
+  const positive = parsed.terms
+    .filter((t): t is Extract<Term, { kind: 'text' }> => t.kind === 'text' && !t.negated)
+    .map((t) => ftsItem(t.text, t.exact, t.column));
+  const withBody = state === BODY_STATE.indexed || state === BODY_STATE.truncated;
+  const marks = (column: number) =>
+    `highlight(fts, ${column}, char(57344), char(57345)) AS c${column}`;
+  const columns = [...MATCH_COLUMN_AT.map(([, at]) => at), ...(withBody ? [BODY_COLUMN] : [])];
+  const row = db
+    .once(
+      `SELECT ${columns.map(marks).join(', ')}
+       FROM fts WHERE fts MATCH ? AND rowid = CAST(? AS INTEGER)`,
+    )
+    .get(positive.join(' OR '), rowid);
+
+  let dropped = 0;
+  const matched: MatchColumn[] = [];
+  for (const [name, at] of MATCH_COLUMN_AT) {
+    const converted = markedToRanges(String(row?.[`c${at}`] ?? ''));
+    // A column whose marks fail the check still matched; only its marks go.
+    if (converted === null) dropped += 1;
+    if (converted === null || converted.ranges.length > 0) matched.push(name);
+  }
+  let body: IndexMatch['body'] = null;
+  if (withBody) {
+    const converted = markedToRanges(String(row?.[`c${BODY_COLUMN}`] ?? ''));
+    if (converted === null) dropped += 1;
+    else if (converted.ranges.length > 0) body = converted;
+  }
+  return {
+    state,
+    reason,
+    columns: matched,
+    bodyMatches: body?.ranges.length ?? 0,
+    changed: false,
+    body,
+    dropped,
+  };
 }
 
 const coverageCache = new WeakMap<Db, { version: number; coverage: SearchCoverage }>();

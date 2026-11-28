@@ -358,6 +358,9 @@ export async function install(ctx: AppContext): Promise<boolean> {
     /** Serves later HTML bodies without the sanitizer and the CSS filter, or with them again. */
     readerUnsanitized: (on: boolean) =>
       ctx.core.request({ type: 'test', action: READER_UNSANITIZED_ACTION, payload: on }),
+    /** Sends later stored bodies to the reader worker with ranges that fail its check, or not. */
+    readerBreakMarks: (on: boolean) =>
+      ctx.core.request({ type: 'test', action: 'reader-break-marks', payload: on }),
     /** Opens a gate of the reader's test source; lookups waiting there go on. */
     readerGate: (name: string) =>
       ctx.core.request({ type: 'test', action: 'reader-gate', payload: name }),
@@ -463,6 +466,37 @@ export async function install(ctx: AppContext): Promise<boolean> {
     /** Phase 1 writes waiting to be let through. */
     heldWrites: async () => {
       const result = await core('held-writes');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
+    /**
+     * Lets `count` held scan steps through; null stops holding them. A scan
+     * waits before it lists the run, and again once it has listed it.
+     */
+    releaseScans: async (count: number | null) => {
+      const result = await ctx.core.request({
+        type: 'test',
+        action: 'release-scans',
+        payload: { count },
+      });
+      if (!result.ok) throw new Error('release-scans');
+    },
+    /** Scan steps waiting to be let through. */
+    heldScans: async () => {
+      const result = await core('held-scans');
+      return result.ok ? (result.value ?? 0) : 0;
+    },
+    /** Lets `count` held index opens through; null stops holding them. */
+    releaseIndexOpens: async (count: number | null) => {
+      const result = await ctx.core.request({
+        type: 'test',
+        action: 'release-index-opens',
+        payload: { count },
+      });
+      if (!result.ok) throw new Error('release-index-opens');
+    },
+    /** Index opens waiting to be let through. */
+    heldIndexOpens: async () => {
+      const result = await core('held-index-opens');
       return result.ok ? (result.value ?? 0) : 0;
     },
     indexDir: () => join(app.getPath('userData'), 'index'),
