@@ -3,7 +3,8 @@
 import { useEffect } from 'react';
 import type { IndexCondition } from '../shared/index-types';
 import { Conversation } from './Conversation';
-import { indexChanged, syncMailbox, useCards, useSearch } from './mailbox-state';
+import { typedCardKey } from './card-keys';
+import { indexChanged, moveCard, syncMailbox, useCards, useSearch } from './mailbox-state';
 import { ConversationList, Sidebar } from './Mailbox';
 import { SearchBox, SearchResults } from './SearchResults';
 import { LinkDialog } from './LinkDialog';
@@ -27,6 +28,16 @@ export function App() {
   useEffect(() => window.pev.onLinkDialog(showLink), []);
   useEffect(() => window.pev.onSourcesChanged(() => void refreshSources()), []);
   useEffect(() => window.pev.onIndexChanged(indexChanged), []);
+  // `n`/`p`: typed in the shell, or in the body frame and passed on by main.
+  useEffect(() => window.pev.onCardKey(moveCard), []);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const key = typedCardKey(event);
+      if (key !== null) moveCard(key);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
   useEffect(() => {
     void refreshSources();
   }, []);

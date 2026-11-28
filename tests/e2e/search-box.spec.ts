@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The search box and its results in the shell: one search per typing pause,
 // only the latest answer shown, operators, both sorts, pages, conversations
-// that come again on a later page left out, the partial line, snippets as
-// text, and a result opening in the reader.
+// that come again on a later page left out (also when bodies are indexed
+// between pages), the partial line, snippets as text, and a result opening in
+// the reader.
 
 import { readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -38,7 +39,10 @@ interface SearchState {
 
 const state = (pev: PevApp) => pev.shell<SearchState>('search');
 
-/** A message of a made-up export: its ID, subject and time, and the message it replies to. */
+/**
+ * A message of a made-up export: its ID, subject and time, the message it
+ * replies to, and its body text (the template message's otherwise).
+ */
 interface Spec {
   id: string;
   subject: string;
@@ -46,6 +50,21 @@ interface Spec {
   replyTo?: string;
   sender?: string;
   labels?: string[];
+  body?: string;
+}
+
+/** A plain-text message file with this body. */
+function plainMessage(text: string): Buffer {
+  return Buffer.from(
+    [
+      `From: <${SENDER}>`,
+      'Subject: s',
+      'Content-Type: text/plain; charset=utf-8',
+      '',
+      text,
+      '',
+    ].join('\r\n'),
+  );
 }
 
 const SENDER = 'sam@example.com';
@@ -96,7 +115,10 @@ function write(
     join(run, `${spec.id}.metadata.json`),
     JSON.stringify({ ...doc, Payload: payload }),
   );
-  writeFileSync(join(run, `${spec.id}.eml`), body);
+  writeFileSync(
+    join(run, `${spec.id}.eml`),
+    spec.body === undefined ? body : plainMessage(spec.body),
+  );
 }
 
 /** Changes the subject of messages already written. */
@@ -115,6 +137,15 @@ async function phase1Done(pev: PevApp, total: number): Promise<void> {
       timeout: 20_000,
     })
     .toMatchObject({ phase: 'done', loaded: total, total, failed: 0 });
+}
+
+/** Waits until phase 2 has read every message file. */
+async function bodiesDone(pev: PevApp, total: number): Promise<void> {
+  await expect
+    .poll(async () => (await ask<IndexTotals>(pev, { op: 'totals' }))?.progress, {
+      timeout: 30_000,
+    })
+    .toMatchObject({ bodyPhase: 'done', bodiesDone: total, bodiesTotal: total, bodiesFailed: 0 });
 }
 
 async function open(pev: PevApp, root: string, pairs: number, bookmark = 'bm1'): Promise<void> {
@@ -366,22 +397,37 @@ test('operators, both sorts, "N matching" and snippets as text, and a result ope
   pev,
 }) => {
   const t = 1_700_000_000;
+  // Short bodies of the same length, so ranks follow the subjects; D1 matches in its body only.
+  const body = 'see you soon';
   const { root, pairs } = craft('sbox-operators', [
-    { id: 'A1', subject: 'Invoice for March', time: t + 100 },
-    { id: 'A2', subject: 'Re: Invoice for March', time: t + 200, replyTo: 'A1' },
-    { id: 'B1', subject: 'invoice invoice invoice', time: t + 50, sender: 'lee@example.org' },
-    { id: 'C1', subject: 'Lunch', time: t + 300 },
-    { id: 'D1', subject: 'Invoice <b>bold</b> draft', time: t + 150, labels: ['0', '5', '10'] },
-    { id: 'E1', subject: 'Invoice E', time: t + 10 },
-    { id: 'E2', subject: 'Re: lunch plans', time: t + 20, replyTo: 'E1' },
+    { id: 'A1', subject: 'Invoice for March', time: t + 100, body },
+    { id: 'A2', subject: 'Re: Invoice for March', time: t + 200, replyTo: 'A1', body },
+    {
+      id: 'B1',
+      subject: 'invoice invoice invoice',
+      time: t + 50,
+      sender: 'lee@example.org',
+      body,
+    },
+    { id: 'C1', subject: 'Lunch', time: t + 300, body },
+    {
+      id: 'D1',
+      subject: 'Draft <b>bold</b> notes',
+      time: t + 150,
+      labels: ['0', '5', '10'],
+      body: 'Invoice <b>bold</b> draft',
+    },
+    { id: 'E1', subject: 'Invoice E', time: t + 10, body },
+    { id: 'E2', subject: 'Re: lunch plans', time: t + 20, replyTo: 'E1', body },
   ]);
   await open(pev, root, pairs);
+  await bodiesDone(pev, pairs);
   const [a, b, c, d, e] = await Promise.all(
     [
       'Invoice for March',
       'invoice invoice invoice',
       'Lunch',
-      'Invoice <b>bold</b> draft',
+      'Draft <b>bold</b> notes',
       'Invoice E',
     ].map((s) => threadBySubject(pev, s)),
   );
@@ -395,10 +441,10 @@ test('operators, both sorts, "N matching" and snippets as text, and a result ope
   await expect(rowA.locator('.match-n')).toHaveText('2 matching');
   await expect(rowA.locator('.cnt-badge')).toHaveText('2');
   await expect(rowA.locator('.subj .t')).toHaveText('Invoice for March');
-  // Markup in mail stays text.
+  // Markup in mail stays text: in the subject, and in a snippet of the body.
   const rowD = pev.page.locator(`.results .conv[data-thread="${d}"]`);
-  await expect(rowD.locator('.subj .t')).toHaveText('Invoice <b>bold</b> draft');
-  await expect(rowD.locator('.snip')).toContainText('<b>bold</b>');
+  await expect(rowD.locator('.subj .t')).toHaveText('Draft <b>bold</b> notes');
+  await expect(rowD.locator('.snip')).toContainText('Invoice <b>bold</b> draft');
   await expect(rowD.locator('.snip b, .subj b')).toHaveCount(0);
   await expect(rowD.locator('.snip mark')).toHaveText(['Invoice']);
 
@@ -573,37 +619,35 @@ test('by date, a conversation moved behind the cursor between pages is left out,
   expect(all.threadIds.slice(200)).toEqual(late);
 });
 
-test('by relevance, a page read after the index changed shows no conversation twice', async ({
+test('by relevance, a page read after more bodies are indexed shows no conversation twice', async ({
   pev,
 }) => {
   const t = 1_700_000_000;
   const specs: Spec[] = [];
   for (let i = 0; i < 200; i += 1) {
-    specs.push({ id: `S${String(i).padStart(3, '0')}`, subject: 'zebra zebra', time: t + i });
+    specs.push({
+      id: `S${String(i).padStart(3, '0')}`,
+      subject: 'zebra zebra',
+      time: t + i,
+      body: 'see you soon',
+    });
   }
-  // The first conversation also has a reply that matches weakly.
-  specs.push({
-    id: 'R000',
-    subject: 'zebra with a long tail of other words that make it a weak match',
-    time: t + 1000,
-    replyTo: 'S000',
-  });
+  // A long body that never says zebra: once indexed, its message ranks below every other.
+  specs[0]!.body = 'lunch plans '.repeat(1500);
   for (let j = 0; j < 5; j += 1) {
-    specs.push({ id: `W${j}`, subject: `zebra weaker ${j} match`, time: t + 500 + j });
+    specs.push({
+      id: `W${j}`,
+      subject: `zebra weaker ${j} match`,
+      time: t + 500 + j,
+      body: 'notes '.repeat(30),
+    });
   }
-  const { root, run, pairs } = craft('sbox-rank-repeat', specs);
-  const other = craft('sbox-rank-other', [{ id: 'X1', subject: 'Other', time: t }]);
-  await open(pev, root, pairs);
-  const key = (await pev.main<Stamp>('sourceStamp')).sourceKey;
-  // Its reply makes it the folder's newest conversation.
-  const [newest] = await folderRows(pev, '5');
-  expect(newest).toMatchObject({ subject: 'zebra zebra', count: 2 });
-  const weakened = newest!.threadId;
+  const { root, pairs } = craft('sbox-rank-bodies', specs);
+  await openBodiesHeld(pev, root, pairs);
+  // The conversation with the long body, the only one dated t.
+  const weakened = (await folderRows(pev, '5')).find((r) => r.time === t)!.threadId;
 
-  // Its strong match stops matching: only the weak reply is left, so it falls
-  // behind every other conversation, and keeps its ID.
-  resubject(run, [['S000', 'Lunch']]);
-  await reopenHeld(pev, key, other.root);
+  // The first page is read before any body is indexed: all 200 strong matches.
   await typeText(pev.page, 'zebra');
   await settled(pev, 'zebra');
   await chooseSort(pev.page, 'relevance');
@@ -611,15 +655,155 @@ test('by relevance, a page read after the index changed shows no conversation tw
   const first = await settled(pev, 'zebra');
   expect(first.threadIds).toHaveLength(200);
   expect(first.threadIds).toContain(weakened);
+  const firstPage = (await ask<SearchPage>(pev, {
+    op: 'search',
+    queryId: 1,
+    text: 'zebra',
+    sort: 'relevance',
+    after: null,
+  }))!.answer;
+  const cursor = firstPage.next!;
 
   await pev.main('releaseWrites', null);
-  await phase1Done(pev, pairs);
-  expect(await threadBySubject(pev, 'Lunch')).toBe(weakened);
+  await bodiesDone(pev, pairs);
+  // Core's second page now holds the conversation with the long body again.
+  const second = (await ask<SearchPage>(pev, {
+    op: 'search',
+    queryId: 2,
+    text: 'zebra',
+    sort: 'relevance',
+    after: cursor,
+  }))!.answer;
+  expect(second.rows.map((r) => r.threadId)).toContain(weakened);
+
+  // The shell leaves it out, and shows the five weaker matches once each.
   const all = await scrollToEnd(pev, 205);
-  // At least the weakened conversation came again on core's next page, and was left out.
   expect(all.skipped).toBeGreaterThan(0);
   expect(new Set(all.threadIds).size).toBe(205);
   expect(all.threadIds.filter((t_) => t_ === weakened)).toHaveLength(1);
+});
+
+test('by relevance, a lone conversation changed while page 1 shows keeps its ID and shows once', async ({
+  pev,
+}) => {
+  const t = 1_700_000_000;
+  const specs: Spec[] = [];
+  for (let i = 0; i < 200; i += 1) {
+    specs.push({ id: `S${String(i).padStart(3, '0')}`, subject: 'zebra zebra', time: t + i });
+  }
+  for (let j = 0; j < 5; j += 1) {
+    specs.push({ id: `W${j}`, subject: `zebra weaker ${j} match`, time: t + 500 + j });
+  }
+  const { root, run, pairs } = craft('sbox-rank-lone', specs);
+  const other = craft('sbox-rank-lone-other', [{ id: 'X1', subject: 'Other', time: t }]);
+  await open(pev, root, pairs);
+  const key = (await pev.main<Stamp>('sourceStamp')).sourceKey;
+  // S000 is the oldest message, and its conversation's only one.
+  const rows = await folderRows(pev, '5');
+  expect(rows).toHaveLength(205);
+  const oldest = rows[rows.length - 1]!;
+  expect(oldest).toMatchObject({ subject: 'zebra zebra', count: 1 });
+  const lone = oldest.threadId;
+
+  // Its only message now matches weakly: it is placed again, alone, and keeps
+  // its conversation's ID.
+  const weak = 'zebra with a long tail of other words that make it a weak match';
+  resubject(run, [['S000', weak]]);
+  await reopenHeld(pev, key, other.root);
+  await typeText(pev.page, 'zebra');
+  await settled(pev, 'zebra');
+  await chooseSort(pev.page, 'relevance');
+  await expect.poll(async () => (await state(pev)).sort).toBe('relevance');
+  const first = await settled(pev, 'zebra');
+  expect(first.threadIds).toHaveLength(200);
+  expect(first.threadIds).toContain(lone);
+
+  // Page 1 stays shown while the change is written; the next pages follow its cursor.
+  await pev.main('releaseWrites', null);
+  await phase1Done(pev, pairs);
+  expect(await threadBySubject(pev, weak)).toBe(lone);
+  const all = await scrollToEnd(pev, 205);
+  // It came again on core's next page under the same ID, and was left out.
+  expect(all.skipped).toBeGreaterThan(0);
+  expect(new Set(all.threadIds).size).toBe(205);
+  expect(all.threadIds.filter((t_) => t_ === lone)).toHaveLength(1);
+});
+test("by date, bodies indexed between pages that make shown conversations' newest match newer bring none of them again", async ({
+  pev,
+}) => {
+  const t = 1_700_000_000;
+  const specs: Spec[] = [];
+  // 200 conversations: an older message that matches by its subject, and a
+  // newer reply that matches only by its body.
+  for (let i = 0; i < 200; i += 1) {
+    const n = String(i).padStart(3, '0');
+    specs.push({
+      id: `O${n}`,
+      subject: `Zebra old ${i}`,
+      time: t + 5000 - i,
+      body: 'see you soon',
+    });
+    specs.push({
+      id: `N${n}`,
+      subject: `Re: lunch ${i}`,
+      time: t + 10_000 - i,
+      replyTo: `O${n}`,
+      body: `the zebra came back ${i}`,
+    });
+  }
+  for (let j = 0; j < 5; j += 1)
+    specs.push({
+      id: `L${j}`,
+      subject: `Zebra late ${j}`,
+      time: t + 1000 - j,
+      body: 'see you soon',
+    });
+  const { root, pairs } = craft('sbox-date-bodies', specs);
+  await openBodiesHeld(pev, root, pairs);
+  const late = await Promise.all(
+    [0, 1, 2, 3, 4].map((j) => threadBySubject(pev, `Zebra late ${j}`)),
+  );
+
+  // The first page is read before any body is indexed: each conversation by its older message.
+  await typeText(pev.page, 'zebra');
+  const first = await settled(pev, 'zebra');
+  expect(first.total).toBe(205);
+  expect(first.threadIds).toHaveLength(200);
+  expect(first.threadIds.some((t_) => late.includes(t_))).toBe(false);
+  const before = (await ask<SearchPage>(pev, {
+    op: 'search',
+    queryId: 1,
+    text: 'zebra',
+    sort: 'date',
+    after: null,
+  }))!.answer;
+  expect(before.rows[0]!.time).toBe(t + 5000);
+
+  await pev.main('releaseWrites', null);
+  await bodiesDone(pev, pairs);
+  // Every reply's body matches now: each conversation's newest match is its reply.
+  const after = (await ask<SearchPage>(pev, {
+    op: 'search',
+    queryId: 2,
+    text: 'zebra',
+    sort: 'date',
+    after: null,
+  }))!.answer;
+  expect(after.rows[0]).toMatchObject({ time: t + 10_000, matching: 2 });
+  const second = (await ask<SearchPage>(pev, {
+    op: 'search',
+    queryId: 3,
+    text: 'zebra',
+    sort: 'date',
+    after: before.next,
+  }))!.answer;
+  expect(second.rows.map((r) => r.threadId)).toEqual(late);
+
+  // The shell's next page brings only the five after them, with none left out.
+  const all = await scrollToEnd(pev, 205);
+  expect(all.skipped).toBe(0);
+  expect(new Set(all.threadIds).size).toBe(205);
+  expect(all.threadIds.slice(200)).toEqual(late);
 });
 
 test("the snippets channel takes a query ID and up to 50 conversations, for the window's current search", async ({

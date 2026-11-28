@@ -28,6 +28,7 @@ import {
   type ReconcilePlan,
   type StoredPair,
 } from '../../src/core/index/writer';
+import type { SearchKey, SearchPage, SearchQuery, SearchRow } from '../../src/shared/index-types';
 import { STAMP, checkAgainstScratch, expected, fresh, message, partition } from '../index-helpers';
 
 // --- A folder of pairs, as reconcile sees it ------------------------------------
@@ -121,7 +122,11 @@ class Folder {
    * stored conversations are checked against a from-scratch grouping after
    * every transaction.
    */
-  reconcile(): { plan: ReconcilePlan; applied: ApplyStats[]; written: Phase1Stats } {
+  reconcile(order: (items: ApplyItem[]) => ApplyItem[] = (items) => items): {
+    plan: ReconcilePlan;
+    applied: ApplyStats[];
+    written: Phase1Stats;
+  } {
     const scanned = this.scan();
     const plan = this.writer.planReconcile(scanned.metadata, scanned.eml);
     const item = (c: (typeof plan.changes)[number]): ApplyItem => ({
@@ -140,7 +145,7 @@ class Folder {
     const revs = new Map(applied[1]!.revs);
     const written = this.writer.phase1Batch(
       STAMP,
-      toRead.map((u) => {
+      order(toRead).map((u) => {
         const row = this.entries.get(u.change.protonId)!.row;
         return {
           pair: u.files,
@@ -827,6 +832,181 @@ describe('labels.json', () => {
     expect(writer.planReconcile(empty, empty).labelsStat).toBeNull();
     expect(count(db, 'SELECT count(*) FROM labels')).toBe(0);
     db.close();
+  });
+});
+
+// --- A changed message that lands alone ---------------------------------------
+
+const tid = (f: Folder, id: string) => threadOfMessage(f.db, rowidOf(f.db, id))!;
+
+let queryIds = 0;
+function search(f: Folder, sort: 'date' | 'relevance', after: SearchKey | null): SearchPage {
+  queryIds += 1;
+  return searchPage(f.db, {
+    op: 'search',
+    queryId: queryIds,
+    text: 'alpha',
+    sort,
+    after,
+  } as SearchQuery);
+}
+
+/** The rows of every page after `after`, following the keysets. */
+function rest(f: Folder, sort: 'date' | 'relevance', after: SearchKey | null): SearchRow[] {
+  const rows: SearchRow[] = [];
+  while (after) {
+    const page = search(f, sort, after);
+    rows.push(...page.rows);
+    after = page.next;
+  }
+  return rows;
+}
+
+describe('a changed message that lands alone', () => {
+  it("keeps its conversation ID, which is below a later conversation's", () => {
+    const f = folder()
+      .add(message('lone', ['lone']))
+      .add(message('later', ['later']));
+    f.reconcile();
+    const id = tid(f, 'lone');
+    expect(id).toBeLessThan(tid(f, 'later'));
+    f.change(message('lone', ['lone'], { subject: 'new subject' }));
+    const { written } = f.reconcile();
+    expect(written).toMatchObject({ replaced: 1, kept: 1, newThreads: 0, merges: 0, splits: 0 });
+    expect(tid(f, 'lone')).toBe(id);
+    // New keys that reach no other conversation: still the same conversation.
+    f.change(message('lone', ['lone-v3', 'nowhere']));
+    expect(f.reconcile().written).toMatchObject({ kept: 1, newThreads: 0 });
+    expect(tid(f, 'lone')).toBe(id);
+    expect(count(f.db, 'SELECT count(*) FROM threads')).toBe(2);
+  });
+
+  it('keeps the ID of a conversation that has a reply, as before', () => {
+    const f = folder()
+      .add(message('first', ['first']))
+      .add(message('reply', ['reply', 'first']))
+      .add(message('later', ['later']));
+    f.reconcile();
+    const id = tid(f, 'first');
+    f.change(message('first', ['first'], { subject: 'edited' }));
+    expect(f.reconcile().written).toMatchObject({ replaced: 1, kept: 0, newThreads: 0 });
+    expect(tid(f, 'first')).toBe(id);
+    expect(tid(f, 'reply')).toBe(id);
+  });
+
+  it('starts a new conversation when the one it left still has members', () => {
+    const f = folder()
+      .add(message('first', ['first']))
+      .add(message('reply', ['reply', 'first']))
+      .add(message('later', ['later']));
+    f.reconcile();
+    const id = tid(f, 'first');
+    // Its own ID changes, so nothing links it to the reply any more.
+    f.change(message('first', ['first-v2']));
+    expect(f.reconcile().written).toMatchObject({ kept: 0, newThreads: 1 });
+    expect(tid(f, 'reply')).toBe(id);
+    expect(tid(f, 'first')).not.toBe(id);
+    expect(count(f.db, 'SELECT count(*) FROM threads')).toBe(3);
+  });
+
+  it('joins the conversation its new keys reach, and its old ID is retired', () => {
+    const f = folder()
+      .add(message('lone', ['lone']))
+      .add(message('other', ['other']));
+    f.reconcile();
+    const old = tid(f, 'lone');
+    f.change(message('lone', ['lone', 'other']));
+    expect(f.reconcile().written).toMatchObject({ kept: 0, newThreads: 0 });
+    expect(tid(f, 'lone')).toBe(tid(f, 'other'));
+    expect(count(f.db, `SELECT count(*) FROM threads WHERE thread_id = ${old}`)).toBe(0);
+  });
+
+  it('keeps the highest ID while a new conversation starts in the same batch, in either order', () => {
+    for (const newFirst of [false, true]) {
+      const f = folder()
+        .add(message('early', ['early']))
+        .add(message('top', ['top']));
+      f.reconcile();
+      const id = tid(f, 'top');
+      expect(id).toBeGreaterThan(tid(f, 'early'));
+      f.change(message('top', ['top'], { subject: 'edited' }));
+      f.add(message('fresh', ['fresh']));
+      const { written } = f.reconcile((items) =>
+        [...items].sort((a, b) => {
+          const rank = (u: ApplyItem) => (u.change.protonId === 'fresh' ? 0 : 1);
+          return newFirst ? rank(a) - rank(b) : rank(b) - rank(a);
+        }),
+      );
+      expect(written, String(newFirst)).toMatchObject({ kept: 1, newThreads: 1 });
+      expect(tid(f, 'top'), String(newFirst)).toBe(id);
+      expect(tid(f, 'fresh'), String(newFirst)).not.toBe(id);
+      expect(count(f.db, 'SELECT count(*) FROM threads')).toBe(3);
+    }
+  });
+
+  it('shows once in a search by date read across the change, under the ID it had', () => {
+    const f = folder();
+    for (let i = 0; i < 205; i += 1) {
+      f.add(
+        message(`m${String(i).padStart(3, '0')}`, [`k${i}`], {
+          time: 1000 + i,
+          subject: `alpha ${i}`,
+        }),
+      );
+    }
+    f.reconcile();
+    const first = search(f, 'date', null);
+    expect(first.rows).toHaveLength(200);
+    // On page 1, and below the highest conversation ID.
+    const target = first.rows[10]!;
+    const id = target.threadId;
+    expect(id).toBeLessThan(Math.max(...first.rows.map((r) => r.threadId)));
+    const targetId = String(
+      f.db.stmt('SELECT proton_id FROM messages WHERE rowid = ?').get(target.anchorRowid)
+        ?.proton_id,
+    );
+    // Only the subject changes: the same time, and it still matches.
+    const i = Number(targetId.slice(1));
+    f.change(message(targetId, [`k${i}`], { time: 1000 + i, subject: `alpha ${i} edited` }));
+    f.reconcile();
+    const later = rest(f, 'date', first.next);
+    expect(later).toHaveLength(5);
+    expect(later.map((r) => r.anchorRowid)).not.toContain(target.anchorRowid);
+    const again = search(f, 'date', null).rows.find((r) => r.anchorRowid === target.anchorRowid);
+    expect(again?.threadId).toBe(id);
+  });
+
+  it('shows once in a search by relevance read across a change that moves it past the cursor', () => {
+    const f = folder();
+    f.add(message('s000', ['s000'], { time: 5000, subject: 'alpha alpha alpha' }));
+    for (let i = 0; i < 205; i += 1) {
+      f.add(
+        message(`m${String(i).padStart(3, '0')}`, [`k${i}`], { time: 1000 + i, subject: 'alpha' }),
+      );
+    }
+    f.reconcile();
+    const first = search(f, 'relevance', null);
+    expect(first.rows).toHaveLength(200);
+    const strong = rowidOf(f.db, 's000');
+    expect(first.rows[0]!.anchorRowid).toBe(strong);
+    // Page 1 stays shown while the message changes and ranks below the cursor.
+    f.change(
+      message('s000', ['s000'], {
+        time: 5000,
+        subject: 'alpha and a great many other words that rank it below the rest',
+      }),
+    );
+    f.reconcile();
+    const later = rest(f, 'relevance', first.next);
+    expect(later.some((r) => r.anchorRowid === strong)).toBe(true);
+    // What the list shows: page 1, then each later conversation not shown yet.
+    const shown = new Set(first.rows.map((r) => r.threadId));
+    const anchors = [
+      ...first.rows.map((r) => r.anchorRowid),
+      ...later.filter((r) => !shown.has(r.threadId)).map((r) => r.anchorRowid),
+    ];
+    expect(anchors.filter((a) => a === strong)).toHaveLength(1);
+    expect(new Set(anchors).size).toBe(anchors.length);
   });
 });
 
