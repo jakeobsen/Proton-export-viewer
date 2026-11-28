@@ -27,7 +27,9 @@ import { CardsModel } from './cards';
 import { LeadsModel } from './leads';
 import { ListModel, type Row } from './list';
 import { closeReaderAndView, getReaderState, openInReader, setReaderSearch } from './reader';
+import type { Chip, SearchSpec } from '../shared/search-chips';
 import { SearchModel, type ResultRow } from './search';
+import { withChip, withoutChip } from './search-chips';
 import { getShellState, refreshGeneration } from './shell';
 
 export interface MailboxState {
@@ -224,8 +226,62 @@ function leaveSearch(drop: () => void): void {
 
 /** The search box's text changed. */
 export function setSearchText(text: string): void {
-  if (text.trim() === '') leaveSearch(() => search.setText(text));
-  else search.setText(text);
+  if (text.trim() === '' && search.snapshot.chips.length === 0) {
+    leaveSearch(() => search.setText(text));
+  } else search.setText(text);
+}
+
+/** The search's chips changed: it runs again at once, with the box's text as it is. */
+function setSearchChips(chips: Chip[]): void {
+  if (search.snapshot.text.trim() === '' && chips.length === 0) {
+    leaveSearch(() => search.setChips(chips));
+  } else search.setChips(chips);
+}
+
+export function addSearchChip(chip: Chip): void {
+  setSearchChips(withChip(search.snapshot.chips, chip));
+}
+
+/** Removes exactly that chip; the typed text stays as it is. */
+export function removeSearchChip(index: number): void {
+  setSearchChips(withoutChip(search.snapshot.chips, index));
+}
+
+/** Runs a recent search at once. It is recorded again only when it is committed. */
+export function runRecentSearch(spec: SearchSpec): void {
+  search.setSearch(spec.text, spec.chips);
+}
+
+/** Records a search of this window in the open export's recent searches, by its query ID. */
+async function commitQueryId(queryId: number | null): Promise<void> {
+  const generation = getShellState().generation;
+  if (queryId === null || generation === null) return;
+  try {
+    await window.pev.commitSearch(queryId, generation);
+  } catch {
+    // Not recorded; nothing else depends on it.
+  }
+}
+
+/**
+ * Enter in the search box: the search for the box's text and chips as they
+ * are now runs at once, unless it is the one shown, and is recorded once it
+ * answers. A newer search that takes its place first is not recorded.
+ */
+export async function commitSearch(): Promise<void> {
+  await commitQueryId(await search.enterQueryId());
+}
+
+/** The open export's recent searches, newest first; none if there is no answer. */
+export async function recentSearches(): Promise<SearchSpec[]> {
+  const generation = getShellState().generation;
+  if (generation === null) return [];
+  try {
+    const result = await window.pev.recentSearches(generation);
+    return result.ok && result.generation === getShellState().generation ? result.entries : [];
+  } catch {
+    return [];
+  }
 }
 
 export function setSearchSort(sort: SearchSort): void {
@@ -245,6 +301,8 @@ export function clearSearch(): void {
  */
 export function selectResult(row: ResultRow): void {
   search.select(row);
+  // Opening a result commits the search it belongs to.
+  void commitQueryId(search.currentQueryId);
   list.clearSelection();
   setReaderSearch(search.currentQueryId);
   const reader = getReaderState();

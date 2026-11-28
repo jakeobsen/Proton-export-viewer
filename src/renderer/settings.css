@@ -215,3 +215,10 @@
   gap: 8px;
   margin-top: 16px;
 }
+
+.settings .switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}

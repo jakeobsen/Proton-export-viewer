@@ -117,6 +117,7 @@ const api: PevApi = {
   search: (request, generation) =>
     ipcRenderer.invoke(IPC.search, {
       text: request.text,
+      chips: request.chips ?? [],
       sort: request.sort,
       after: request.after,
       generation,
@@ -164,6 +165,13 @@ const api: PevApi = {
   rebuildIndex: (sourceKey, generation) =>
     ipcRenderer.invoke(IPC.rebuildIndex, { sourceKey, generation }),
   resetApp: (generation) => ipcRenderer.invoke(IPC.resetApp, { generation }),
+  commitSearch: (queryId, generation) =>
+    ipcRenderer.invoke(IPC.commitSearch, { queryId, generation }),
+  recentSearches: (generation) => ipcRenderer.invoke(IPC.recentSearches, { generation }),
+  setKeepRecent: (sourceKey, keep, generation) =>
+    ipcRenderer.invoke(IPC.keepRecent, { sourceKey, keep, generation }),
+  clearRecent: (sourceKey, generation) =>
+    ipcRenderer.invoke(IPC.clearRecent, { sourceKey, generation }),
   openLogs: (generation) => ipcRenderer.invoke(IPC.openLogs, { generation }),
   copyDiagnostics: (generation) => ipcRenderer.invoke(IPC.copyDiagnostics, { generation }),
 };

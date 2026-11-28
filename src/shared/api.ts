@@ -18,6 +18,7 @@ import type {
 } from './index-types';
 import type { RasterFormat } from './attachment-types';
 import type { MessageDetails, MessageHeaders, OpenMode, ReaderMatch } from './reader-protocol';
+import type { Chip, SearchSpec } from './search-chips';
 import type { AppSettings, SettingKey } from './settings';
 import type { SourceOutcome, SourcesView } from './sources';
 
@@ -61,6 +62,10 @@ export const IPC = {
   sourcePart: 'pev:source-part',
   copyHeaders: 'pev:copy-headers',
   sourceBack: 'pev:source-back',
+  commitSearch: 'pev:commit-search',
+  recentSearches: 'pev:recent-searches',
+  keepRecent: 'pev:keep-recent',
+  clearRecent: 'pev:clear-recent',
 } as const;
 
 export type RejectCode =
@@ -206,10 +211,13 @@ export interface LinkPrompt {
 
 export type LinkActionResult = { ok: true } | Rejected;
 
-/** A search of the open export: the text, the sort, and where the page continues. */
-export type SearchRequest =
-  | { text: string; sort: 'date'; after: SearchDateKey | null }
-  | { text: string; sort: 'relevance'; after: SearchRankKey | null };
+/**
+ * A search of the open export: the text, its chips (none if left out), the
+ * sort, and where the page continues.
+ */
+export type SearchRequest = { text: string; chips?: Chip[] } & (
+  { sort: 'date'; after: SearchDateKey | null } | { sort: 'relevance'; after: SearchRankKey | null }
+);
 
 /** One page of results; `queryId` names the request it answers. */
 export type SearchResult =
@@ -261,6 +269,8 @@ export interface SettingsIndex {
   bytes: number;
   /** When the index last changed, in ms since the epoch. */
   updatedAt: number | null;
+  /** "Keep recent searches" for this export. */
+  keepRecentSearches: boolean;
 }
 
 /** What Settings shows. */
@@ -276,6 +286,9 @@ export type SettingsResult = { ok: true; generation: number; view: SettingsView 
 export type SetSettingResult = { ok: true; settings: AppSettings } | Rejected;
 /** An action that leaves no outcome but the generation it left. */
 export type DoneResult = { ok: true; generation: number } | Rejected;
+/** The open export's recent searches, newest first. */
+export type RecentSearchesResult =
+  { ok: true; generation: number; entries: SearchSpec[] } | Rejected;
 
 export type ErrorKind = 'uncaught' | 'rejection' | 'error';
 
@@ -395,4 +408,16 @@ export interface PevApi {
   openLogs(generation: number): Promise<DoneResult>;
   /** Copies the diagnostics summary; main builds it, and the shell never sees it. */
   copyDiagnostics(generation: number): Promise<DoneResult>;
+  /**
+   * Records the search this window ran as `queryId` in the open export's
+   * recent searches. Main takes the search itself from its own record of it;
+   * an older search's ID is 'superseded'.
+   */
+  commitSearch(queryId: number, generation: number): Promise<DoneResult>;
+  /** The open export's recent searches, newest first. */
+  recentSearches(generation: number): Promise<RecentSearchesResult>;
+  /** "Keep recent searches" for the export Settings showed; off deletes them. */
+  setKeepRecent(sourceKey: string, keep: boolean, generation: number): Promise<DoneResult>;
+  /** Deletes the recent searches of the export Settings showed. */
+  clearRecent(sourceKey: string, generation: number): Promise<DoneResult>;
 }

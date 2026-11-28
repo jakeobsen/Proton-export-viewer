@@ -51,6 +51,7 @@ import type {
   SearchSnippets,
 } from '../../shared/index-types';
 import type { Logger } from '../../shared/log/writer';
+import type { RecentAnswer, RecentJob } from '../../shared/recent-search';
 import type { Stamp } from '../../shared/sources';
 import { ContainmentError, openContainedAsync, type FileRef, type RunScan } from '../containment';
 import { BodyFiles } from './body-files';
@@ -117,7 +118,7 @@ const BODY_FILES_PER_LANE = 2;
 
 /** One registered connection: which thread holds it, on which database. */
 export interface Connection {
-  role: 'writer' | 'query' | 'verifier';
+  role: 'writer' | 'query' | 'verifier' | 'recent';
   dbPath: string;
 }
 
@@ -186,6 +187,18 @@ export interface IndexOptions {
   busyMs?: number;
   /** Builds with test hooks only: this message's body job never ends, so it runs past its limit. */
   stallBodyOf?: string;
+  /** Builds with test hooks only: hooks on the recent searches' jobs. */
+  recentHooks?: RecentHooks;
+}
+
+/** Builds with test hooks only: what tests see and hold of the recent searches' jobs. */
+export interface RecentHooks {
+  /** Called as each job reaches the index, before it waits for the ones ahead of it. */
+  received(job: RecentJob): void;
+  /** Awaited by the job at the head of the queue before it runs; it never reorders. */
+  before(job: RecentJob): Promise<void>;
+  /** True once after a test asks: the next wipe then fails without deleting. */
+  failWipe(): boolean;
 }
 
 export interface IndexServiceDeps {
@@ -266,6 +279,12 @@ export class IndexService {
   private writer: IndexThread | null = null;
   private query: IndexThread | null = null;
   private verifier: IndexThread | null = null;
+  /** While the run is unavailable: the recent-only connection's thread, opened on demand. */
+  private recentOnly: IndexThread | null = null;
+  private recentEntry: number | null = null;
+  private recentReady: Promise<void> | null = null;
+  /** Recent jobs run one at a time, in the order they came. */
+  private recentTail: Promise<unknown> = Promise.resolve();
   private checking: Promise<void> | null = null;
   private writerEntry: number | null = null;
   private queryEntry: number | null = null;
@@ -576,6 +595,65 @@ export class IndexService {
       this.watch(err);
       throw err;
     }
+  }
+
+  /**
+   * Runs one job on the recent searches once the ones before it have ended:
+   * on the writer, or, while the run is unavailable, on the recent-only
+   * connection, which never creates, replaces or migrates the index.
+   */
+  recent(job: RecentJob): Promise<RecentAnswer> {
+    const hooks = __PEV_TEST_HOOKS__ ? this.deps.options?.recentHooks : undefined;
+    hooks?.received(job);
+    const run = async (): Promise<RecentAnswer> => {
+      if (hooks) await Promise.race([hooks.before(job), this.closing]);
+      if (this.closed) throw new ThreadError('NOT_OPEN');
+      this.touch();
+      if (hooks && job.op === 'wipe' && hooks.failWipe()) throw new ThreadError('RECENT_FAILED');
+      try {
+        const thread = this.writer ?? (await this.openRecentOnly());
+        return await thread.call<RecentAnswer>('recent', { job });
+      } catch (err) {
+        this.watch(err);
+        throw err;
+      }
+    };
+    const next = this.recentTail.then(run, run);
+    this.recentTail = next.catch(() => undefined);
+    return next;
+  }
+
+  /** The recent-only connection: only to an index with the expected identity and schema version. */
+  private async openRecentOnly(): Promise<IndexThread> {
+    const uuid = this.opened?.uuid;
+    if (!uuid || this.closed) throw new ThreadError('NOT_OPEN');
+    if (!this.recentOnly) {
+      const thread = this.deps.thread('recent');
+      this.recentOnly = thread;
+      thread.onRespawn = () => {
+        this.connections.remove(this.recentEntry);
+        this.recentEntry = null;
+        this.recentReady = null;
+      };
+    }
+    const thread = this.recentOnly;
+    this.recentReady ??= thread
+      .call('open', {
+        dbPath: this.dbPath,
+        expectedUuid: uuid,
+        exportRoots: this.deps.exportRoots ?? [],
+      })
+      .then(
+        () => {
+          this.recentEntry = this.connections.add({ role: 'recent', dbPath: this.dbPath });
+        },
+        (err: unknown) => {
+          this.recentReady = null;
+          throw err;
+        },
+      );
+    await this.recentReady;
+    return thread;
   }
 
   /**
@@ -1255,18 +1333,29 @@ export class IndexService {
     await this.running;
     await this.verifier?.stop();
     await this.checking;
-    for (const role of ['query', 'writer'] as const) {
-      const thread = role === 'query' ? this.query : this.writer;
+    // The recent job in flight, if any, ends before its connection closes.
+    await this.recentTail;
+    for (const role of ['query', 'writer', 'recent'] as const) {
+      const thread =
+        role === 'query' ? this.query : role === 'writer' ? this.writer : this.recentOnly;
       if (!thread) continue;
       await thread.call('close').catch(() => undefined);
       await thread.stop();
-      if (role === 'query') this.connections.remove(this.queryEntry);
-      else this.connections.remove(this.writerEntry);
+      this.connections.remove(
+        role === 'query'
+          ? this.queryEntry
+          : role === 'writer'
+            ? this.writerEntry
+            : this.recentEntry,
+      );
     }
     this.queryEntry = null;
     this.writerEntry = null;
+    this.recentEntry = null;
     this.query = null;
     this.writer = null;
+    this.recentOnly = null;
+    this.recentReady = null;
   }
 }
 

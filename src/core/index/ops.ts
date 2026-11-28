@@ -27,6 +27,8 @@ import { MetadataError, parseMetadata, type MessageRow } from './metadata';
 import type { IndexAnswer, IndexQuery } from '../../shared/index-types';
 import { emlFile, listPage, listWindow, rowDetails, sidebar, threadOfMessage } from './queries';
 import { leads } from './leads';
+import type { RecentJob } from '../../shared/recent-search';
+import { RecentOnlyState, recentJob } from './recent';
 import { indexReport } from './report';
 import { cardsAnswer, matchInfo, searchPage, searchSnippets } from './search';
 import {
@@ -711,11 +713,29 @@ export function threadHandler(role: ThreadRole): (op: string, args: unknown) => 
           return writer.bodyTodo(a.rowids as number[]);
         case 'phase2':
           return writer.phase2(a.stamp as Stamp, a.items as Phase2Item[], a.budget as number);
+        case 'recent':
+          return recentJob(writer.db, a.job as RecentJob);
         case 'shrink':
           writer.shrink();
           return null;
         case 'close':
           writer.close();
+          return null;
+      }
+      throw new Error('UNKNOWN_OP');
+    };
+  }
+  if (role === 'recent') {
+    const recent = new RecentOnlyState();
+    return (op, args) => {
+      switch (op) {
+        case 'open':
+          recent.open(args as { dbPath: string; expectedUuid: string; exportRoots?: string[] });
+          return null;
+        case 'recent':
+          return recent.run((args as { job: RecentJob }).job);
+        case 'close':
+          recent.close();
           return null;
       }
       throw new Error('UNKNOWN_OP');

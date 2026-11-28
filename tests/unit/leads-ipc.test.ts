@@ -84,8 +84,14 @@ function make() {
   const callFrom = (senderFrame: unknown, channel: string, ...args: unknown[]) =>
     (fake.handlers.get(channel) as Handler)({ sender: event.sender, senderFrame }, ...args);
   /** Searches as the box does; resolves to the query ID main gave it. */
-  const search = async (text: string) => {
-    const result = (await call(SEARCH, { text, sort: 'date', after: null, generation: 1 })) as {
+  const search = async (text: string, chips: unknown[] = []) => {
+    const result = (await call(SEARCH, {
+      text,
+      chips,
+      sort: 'date',
+      after: null,
+      generation: 1,
+    })) as {
       queryId: number;
     };
     return result.queryId;
@@ -167,10 +173,28 @@ describe('lead lines in main', () => {
     await t.call(LEADS, { requester: 'cards', rowids: [5], queryId: first, generation: 1 });
     await t.call(LEADS, { requester: 'cards', rowids: [5], queryId: second, generation: 1 });
     expect(t.queries.filter((q) => q.op === 'leads')).toEqual([
-      { op: 'leads', rowids: [5], text: 'invoice' },
+      { op: 'leads', rowids: [5], text: 'invoice', chips: [] },
       { op: 'leads', rowids: [5] },
       { op: 'leads', rowids: [5] },
-      { op: 'leads', rowids: [5], text: 'lunch' },
+      { op: 'leads', rowids: [5], text: 'lunch', chips: [] },
+    ]);
+  });
+
+  it("puts in the chips of the window's search with its text, in their canonical form", async () => {
+    const t = make();
+    const queryId = await t.search('invoice', [{ k: 'unread' }, { k: 'from', v: '  Lee  ' }]);
+    await t.call(LEADS, { requester: 'cards', rowids: [5], queryId, generation: 1 });
+    const chipsOnly = await t.search('', [{ k: 'attachment' }]);
+    await t.call(LEADS, { requester: 'cards', rowids: [5], queryId: chipsOnly, generation: 1 });
+    expect(t.queries.filter((q) => q.op === 'leads')).toEqual([
+      {
+        op: 'leads',
+        rowids: [5],
+        text: 'invoice',
+        // Sorted by kind, the From value tidied.
+        chips: [{ k: 'from', v: 'Lee' }, { k: 'unread' }],
+      },
+      { op: 'leads', rowids: [5], text: '', chips: [{ k: 'attachment' }] },
     ]);
   });
 
@@ -220,7 +244,18 @@ describe('cards from a search in main', () => {
     expect(result).toMatchObject({ ok: true });
     expect(t.queries.at(-1)).toEqual({
       ...cardsQuery(),
-      search: { queryId, countRev: 4, text: 'invoice' },
+      search: { queryId, countRev: 4, text: 'invoice', chips: [] },
+    });
+    const chipped = await t.search('', [{ k: 'after', d: '2026-02-01' }]);
+    await t.call(INDEX, { query: cardsQuery({ queryId: chipped, countRev: null }), generation: 1 });
+    expect(t.queries.at(-1)).toEqual({
+      ...cardsQuery(),
+      search: {
+        queryId: chipped,
+        countRev: null,
+        text: '',
+        chips: [{ k: 'after', d: '2026-02-01' }],
+      },
     });
   });
 
