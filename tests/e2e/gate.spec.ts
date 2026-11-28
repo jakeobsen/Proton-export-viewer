@@ -5,10 +5,11 @@
 // workspace and quits. The export is only read. Timing values aren't judged
 // here; what each launch records, and that every wait ends, is.
 
+import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
-import { _electron as electron } from '@playwright/test';
 import type { GateConfig } from '../../src/testhooks/gate-config';
 import type { FirstRows, RafProbe, TimedExpansion } from '../../src/testhooks/gate-types';
 import {
@@ -39,6 +40,9 @@ function snapshot(root: string, at = ''): Record<string, string> {
     }),
   );
 }
+
+/** The Electron binary the app's dependencies installed. */
+const ELECTRON = createRequire(join(REPO_ROOT, 'package.json'))('electron') as string;
 
 interface Result {
   ok: boolean;
@@ -98,12 +102,29 @@ async function launch(
     ...over,
   };
   writeFileSync(config, JSON.stringify(full));
-  const app = await electron.launch({
-    args: [join(REPO_ROOT, 'out-test'), `--pev-user-data=${userData}`, `--pev-gate=${config}`],
-    cwd: REPO_ROOT,
-    chromiumSandbox: true,
-  });
-  await app.waitForEvent('close', { timeout: 180_000 });
+  // Started as the runner starts it: no driver attached, nothing read but the result.
+  const env = { ...process.env };
+  delete env.NODE_OPTIONS;
+  delete env.ELECTRON_RUN_AS_NODE;
+  const exit = await new Promise<{ code: number | null; signal: string | null; timedOut: boolean }>(
+    (done) => {
+      const child = spawn(
+        ELECTRON,
+        [join(REPO_ROOT, 'out-test'), `--pev-user-data=${userData}`, `--pev-gate=${config}`],
+        { cwd: REPO_ROOT, env, stdio: 'ignore' },
+      );
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill('SIGKILL');
+      }, 180_000);
+      child.once('exit', (code, signal) => {
+        clearTimeout(timer);
+        done({ code, signal, timedOut });
+      });
+    },
+  );
+  expect(exit, name).toEqual({ code: 0, signal: null, timedOut: false });
   const file = join(workspace, `gate-result-${nonce}.json`);
   expect(existsSync(file), name).toBe(true);
   return { result: JSON.parse(readFileSync(file, 'utf8')) as Result, workspace };
