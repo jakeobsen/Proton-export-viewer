@@ -401,10 +401,15 @@ export interface IndexReport {
   capped: Partial<Record<CappedListName, number>>;
   /** Label IDs on messages that labels.json doesn't name; they aren't shown. */
   hiddenLabelIds: number;
-  /** Files that need attention. */
+  /**
+   * Files that need attention. A listed message with no message file and a
+   * list cut to its limit is one file with two rows.
+   */
   attention: number;
-  /** The first of them, at most REPORT_ROWS. */
+  /** The first rows, at most REPORT_ROWS: one per file and reason. */
   rows: ReportRow[];
+  /** Rows left out after the first REPORT_ROWS. */
+  more: number;
 }
 
 /**

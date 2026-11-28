@@ -9,7 +9,8 @@ import type { SidebarEntry, SidebarModel } from './folders';
 import { formatCount, fullDate, listDate, loadingText, participantsText } from './format';
 import { exportLabel } from './labels';
 import { ROW_HEIGHT, type Row } from './list';
-import { list, openReport, selectRow, showFolder, useList, useMailbox } from './mailbox-state';
+import { list, selectRow, showFolder, useList, useMailbox } from './mailbox-state';
+import { openReportFrom } from './Report';
 import { attentionText } from '../shared/report-text';
 import { switchRun } from './shell';
 
@@ -123,7 +124,11 @@ function IndexStatus() {
     return (
       <div className="side-foot" role="status">
         {counted && (
-          <button type="button" className="link loading-text" onClick={openReport}>
+          <button
+            type="button"
+            className="link loading-text"
+            onClick={(e) => openReportFrom(e.currentTarget)}
+          >
             {loadingText(progress.loaded, progress.total)}
           </button>
         )}
@@ -352,7 +357,11 @@ export function ConversationList() {
           </span>
         )}
         {progress?.phase === 'done' && report !== null && report.attention > 0 && (
-          <button type="button" className="link attention" onClick={openReport}>
+          <button
+            type="button"
+            className="link attention"
+            onClick={(e) => openReportFrom(e.currentTarget)}
+          >
             {attentionText(report.attention)}
           </button>
         )}

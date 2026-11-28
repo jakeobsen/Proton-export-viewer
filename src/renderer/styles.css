@@ -870,6 +870,9 @@ body,
   font-size: 11.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* A name's own direction stays inside its cell; the column stays aligned. */
+  unicode-bidi: isolate;
+  text-align: left;
 }
 
 .conv .snip mark {

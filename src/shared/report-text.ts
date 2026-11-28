@@ -99,6 +99,24 @@ function byCode<K extends string>(counts: Partial<Record<K, number>>): string {
   return parts.length > 0 ? `${count(total)} (${parts.join(', ')})` : count(total);
 }
 
+/**
+ * A file name as one field of a tab-separated line: each C0 control (tab and
+ * newline among them) and DEL as its Control Pictures symbol, and each C1
+ * control and line or paragraph separator as U+FFFD, so a name can never
+ * split its line or field.
+ */
+export function fieldText(name: string): string {
+  let out = '';
+  for (const c of name) {
+    const code = c.charCodeAt(0);
+    if (code < 0x20) out += String.fromCharCode(0x2400 + code);
+    else if (code === 0x7f) out += '\u2421';
+    else if ((code >= 0x80 && code <= 0x9f) || code === 0x2028 || code === 0x2029) out += '\ufffd';
+    else out += c;
+  }
+  return out;
+}
+
 /** The report as plain text, with counts, codes and one line per file. */
 export function reportText(report: IndexReport): string {
   const lines = [
@@ -120,9 +138,8 @@ export function reportText(report: IndexReport): string {
   );
   for (const row of report.rows) {
     const code = row.reason === 'capped' ? `capped: ${(row.lists ?? []).join(', ')}` : row.reason;
-    lines.push(`${RESULT_TEXT[row.result]}\t${row.file}\t${reasonText(row)} (${code})`);
+    lines.push(`${RESULT_TEXT[row.result]}\t${fieldText(row.file)}\t${reasonText(row)} (${code})`);
   }
-  const more = report.attention - report.rows.length;
-  if (more > 0) lines.push(`and ${count(more)} more`);
+  if (report.more > 0) lines.push(`and ${count(report.more)} more`);
   return `${lines.join('\n')}\n`;
 }

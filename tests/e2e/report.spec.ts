@@ -1,14 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The index report in the shell: opened from the list header once the export
 // is loaded and from the loading line while it loads, its counts and rows for
-// a generated export with files that need attention, "Copy report", and the
-// checks on its channel.
+// a generated export with files that need attention, focus moving to it and
+// back, "Copy report" with no file name in the logs, and the checks on its
+// channel.
 
-import { readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import type { Page } from '@playwright/test';
 import type { IndexProgress, IndexTotals } from '../../src/shared/index-types';
 import { writeExport } from '../exports';
+import { MARKERS, findMarkers } from '../markers';
 import { testDir } from '../paths';
 import { expect, test, type PevApp } from './app';
 
@@ -52,7 +61,9 @@ test('the report lists the files that need attention, and copies them as text', 
   rmSync(join(written.run, `${ids[0]}.metadata.json`));
   rmSync(join(written.run, `${ids[1]}.eml`));
   writeFileSync(join(written.run, `${ids[2]}.metadata.json`), '{"Version": 1, "Payload": {');
-  symlinkSync(join(written.run, `${ids[3]}.eml`), join(written.run, 'zz-link.metadata.json'));
+  // A refused file named with personal data: it is shown and copied, never logged.
+  const marked = `${MARKERS.filter((m) => !m.includes('/')).join(' | ')}.metadata.json`;
+  symlinkSync(join(written.run, `${ids[3]}.eml`), join(written.run, marked));
 
   await pev.main('queuePick', root, 'bm1');
   await pev.shell('chooseFolder', []);
@@ -62,8 +73,10 @@ test('the report lists the files that need attention, and copies them as text', 
   await expect(link).toHaveText('4 files need attention');
   await press(pev.page, '.list-head .attention');
 
+  // The link is hidden under the report: focus moves to the card's heading.
   const card = pev.page.locator('.ix-card');
   await expect(card.locator('h1')).toHaveText('Index report');
+  await expect(card.locator('h1')).toBeFocused();
   await expect(card.locator('.phase h3 .pill')).toHaveText('Done');
   // 12 pairs, less the two whose metadata is missing or isn't JSON.
   await expect(card.locator('.ix-stats')).toContainText('10 messages');
@@ -77,13 +90,17 @@ test('the report lists the files that need attention, and copies them as text', 
     }),
   );
   expect(rows).toEqual([
-    ['Skipped', 'zz-link.metadata.json', 'Symbolic link. Not read.'],
+    ['Skipped', marked, 'Symbolic link. Not read.'],
     ['Skipped', `${ids[2]}.metadata.json`, 'Invalid JSON. Not listed.'],
     ['Skipped', `${ids[0]}.eml`, 'Metadata missing. Not listed.'],
     ['Listed', `${ids[1]}.metadata.json`, 'Message file missing.'],
   ]);
   // Long names show their start and end; the whole name is the title.
   await expect(card.locator('.report tbody tr').nth(1).locator('.file')).toContainText('…');
+  // Each name keeps its own direction inside its cell.
+  const name = card.locator('.report tbody tr').first().locator('.file');
+  await expect(name).toHaveAttribute('dir', 'auto');
+  expect(await name.evaluate((td) => getComputedStyle(td).unicodeBidi)).toBe('isolate');
 
   await press(pev.page, '.ix-foot button:text("Copy report")');
   await expect(card.locator('.ix-foot .note')).toHaveText('Report copied.');
@@ -92,15 +109,22 @@ test('the report lists the files that need attention, and copies them as text', 
   const text = copies[0]!;
   expect(text).toContain('Messages: 10\n');
   expect(text).toContain('4 files need attention\n');
-  expect(text).toContain('Skipped\tzz-link.metadata.json\tSymbolic link. Not read. (symlink)\n');
+  expect(text).toContain(`Skipped\t${marked}\tSymbolic link. Not read. (symlink)\n`);
   expect(text).not.toContain(root);
   expect(text).not.toContain(written.account);
   expect(text).not.toContain(written.runName);
   await expect.poll(() => pev.hasLog('report.copied', { proc: 'main', count: 4 })).toBe(true);
+  // The file names went to the screen and the clipboard, and into no log.
+  const dir = pev.logsDir();
+  for (const file of readdirSync(dir)) {
+    expect(findMarkers(readFileSync(join(dir, file), 'utf8')), file).toEqual([]);
+  }
 
+  // Closed, focus goes back to the link that opened it.
   await press(pev.page, '.ix-foot button:text("Start browsing")');
   await expect(card).toHaveCount(0);
   await expect(pev.page.locator('.list-scroll')).toBeVisible();
+  await expect(link).toBeFocused();
 });
 
 test('the loading line opens the report while the export loads', async ({ pev }) => {

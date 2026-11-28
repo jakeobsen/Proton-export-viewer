@@ -72,7 +72,10 @@ export function indexReport(db: Db, systemIds: readonly string[], limit = REPORT
     hiddenLabelIds: side.hiddenIds,
     attention: 0,
     rows: [],
+    more: 0,
   };
+  // Every file below has one row per reason; only a listed message can have two.
+  let rowCount = 0;
 
   // Metadata that couldn't be used or is missing; a listed (or still to be
   // read) message without its message file.
@@ -94,7 +97,7 @@ export function indexReport(db: Db, systemIds: readonly string[], limit = REPORT
       else if (how.kind === 'rejected') bump(report.rejected, how.reason, n);
       else bump(report.failed, how.reason, n);
     }
-    report.attention += n;
+    rowCount += n;
   }
 
   let cappedMessages = 0;
@@ -110,7 +113,19 @@ export function indexReport(db: Db, systemIds: readonly string[], limit = REPORT
       if (n > 0) report.capped[list] = n;
     }
   }
-  report.attention += cappedMessages;
+  rowCount += cappedMessages;
+  // A listed message with no message file and a list cut to its limit is
+  // counted once.
+  const both =
+    cappedMessages > 0
+      ? scalar(
+          db,
+          `SELECT count(*) FROM messages m JOIN pairs p ON p.proton_id = m.proton_id
+           WHERE m.capped != 0 AND p.body_state = ${BODY_STATE.emlMissing}
+             AND p.meta_state IN (${META_STATE.pending}, ${META_STATE.indexed})`,
+        )
+      : 0;
+  report.attention = rowCount - both;
 
   // The rows: metadata that couldn't be used, then missing metadata, then
   // missing message files, then cut lists; each by file name.
@@ -168,6 +183,7 @@ export function indexReport(db: Db, systemIds: readonly string[], limit = REPORT
       });
     }
   }
+  report.more = rowCount - rows.length;
   return report;
 }
 
@@ -190,11 +206,13 @@ export function withScan(
     .sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0))
     .slice(0, limit)
     .map((r) => ({ result: 'skipped', file: r.rel, reason: r.kind }));
+  const rows = [...scanRows, ...part.rows].slice(0, limit);
   return {
     ...part,
     took,
     rejected,
     attention: part.attention + refused.length,
-    rows: [...scanRows, ...part.rows].slice(0, limit),
+    rows,
+    more: refused.length + part.rows.length + part.more - rows.length,
   };
 }

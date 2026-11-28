@@ -3,14 +3,35 @@
 // each file that needs attention. File names are relative to the export's
 // folder.
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { IndexProgress, IndexReport } from '../shared/index-types';
 import { RESULT_TEXT, attentionText, count, reasonText, tookText } from '../shared/report-text';
 import type { ActiveExport } from '../shared/sources';
 import { loadingText } from './format';
 import { exportLabel } from './labels';
-import { closeReport, useMailbox } from './mailbox-state';
+import { closeReport, openReport, useMailbox } from './mailbox-state';
 import { getShellState } from './shell';
+
+/** The control that opened the report: focus goes back to it on close. */
+let opener: HTMLElement | null = null;
+
+/** Opens the report from `from`, which gets focus back when the report closes. */
+export function openReportFrom(from: HTMLElement): void {
+  opener = from;
+  openReport();
+}
+
+/**
+ * Where focus goes when the report closes: its opener, or, if that is gone
+ * (the loading line goes when loading ends), the list header's link.
+ */
+function focusBack(): void {
+  const back =
+    opener?.isConnected && opener.closest('[hidden]') === null
+      ? opener
+      : document.querySelector<HTMLElement>('.list-head .attention');
+  back?.focus();
+}
 
 const PILL: Record<string, string> = {
   skipped: 'pill warn',
@@ -96,7 +117,6 @@ function Messages({
 }
 
 function Files({ report }: { report: IndexReport }) {
-  const more = report.attention - report.rows.length;
   return (
     <div className="report">
       <h2>{attentionText(report.attention)}</h2>
@@ -119,7 +139,7 @@ function Files({ report }: { report: IndexReport }) {
               <td>
                 <span className={PILL[row.result]}>{RESULT_TEXT[row.result]}</span>
               </td>
-              <td className="file" title={row.file}>
+              <td className="file" dir="auto" title={row.file}>
                 {shortName(row.file)}
               </td>
               <td className="rs">{reasonText(row)}</td>
@@ -127,7 +147,7 @@ function Files({ report }: { report: IndexReport }) {
           ))}
         </tbody>
       </table>
-      {more > 0 && <p className="more">and {count(more)} more</p>}
+      {report.more > 0 && <p className="more">and {count(report.more)} more</p>}
     </div>
   );
 }
@@ -136,6 +156,14 @@ export function ReportView({ active }: { active: ActiveExport }) {
   const { progress, report } = useMailbox();
   const [note, setNote] = useState('');
   const loading = progress?.phase === 'loading' || progress?.phase === 'opening';
+  const heading = useRef<HTMLHeadingElement>(null);
+
+  // The control that opened the report is hidden under it: focus moves to the
+  // card's heading, and back when the report closes.
+  useEffect(() => {
+    heading.current?.focus();
+    return focusBack;
+  }, []);
 
   const copy = async () => {
     const generation = getShellState().generation;
@@ -148,7 +176,9 @@ export function ReportView({ active }: { active: ActiveExport }) {
     <main className="center">
       <section className="ix-card" aria-label="Index report">
         <div className="ix-head">
-          <h1>{loading ? 'Indexing' : 'Index report'}</h1>
+          <h1 ref={heading} tabIndex={-1}>
+            {loading ? 'Indexing' : 'Index report'}
+          </h1>
           <div className="sub">{exportLabel(active.runName)}</div>
         </div>
         <Messages progress={progress} report={report} />

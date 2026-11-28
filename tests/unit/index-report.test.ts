@@ -24,7 +24,13 @@ import type { ThreadRole } from '../../src/core/index/pool';
 import type { IndexReport } from '../../src/shared/index-types';
 import { REPORT_ROWS } from '../../src/shared/index-types';
 import type { Logger } from '../../src/shared/log/writer';
-import { LIST_LIMITS, reasonText, reportText, tookText } from '../../src/shared/report-text';
+import {
+  LIST_LIMITS,
+  fieldText,
+  reasonText,
+  reportText,
+  tookText,
+} from '../../src/shared/report-text';
 import { writeExport } from '../exports';
 import { InlineThread, STAMP } from '../index-helpers';
 import { testDir } from '../paths';
@@ -68,6 +74,7 @@ describe('the index report', () => {
     expect(ids).toHaveLength(30);
     const [metaGone, emlGone, badJson, badShape, badId, swapped, slow, wide, unknown, jsonNoEml] =
       ids as [string, string, string, string, string, string, string, string, string, string];
+    const wideNoEml = ids[11]!;
     rmSync(join(run, `${metaGone}.metadata.json`));
     rmSync(join(run, `${emlGone}.eml`));
     writeFileSync(join(run, `${badJson}.metadata.json`), '{"Version": 1, "Payload": {');
@@ -82,6 +89,14 @@ describe('the index report', () => {
         Address: `t${i}@example.com`,
       }));
     });
+    // A cut list and no message file: one file with two rows.
+    editMeta(run, wideNoEml, (p) => {
+      p.ToList = Array.from({ length: MAX_RECIPIENTS + 1 }, (_, i) => ({
+        Name: '',
+        Address: `w${i}@example.com`,
+      }));
+    });
+    rmSync(join(run, `${wideNoEml}.eml`));
     editMeta(run, unknown, (p) => {
       p.LabelIDs = [...(p.LabelIDs as string[]), 'not-in-labels-json'];
     });
@@ -111,12 +126,14 @@ describe('the index report', () => {
     expect(report.messages).toBe(23);
     expect(report.rejected).toEqual({ symlink: 1, directory: 1, fifo: 2 });
     expect(report.metaMissing).toBe(1);
-    expect(report.emlMissing).toBe(1);
+    expect(report.emlMissing).toBe(2);
     expect(report.failed).toEqual({ meta_json: 2, meta_shape: 1, meta_id: 1 });
     expect(report.timeouts).toBe(1);
-    expect(report.capped).toEqual({ to: 1 });
+    expect(report.capped).toEqual({ to: 2 });
     expect(report.hiddenLabelIds).toBe(1);
-    expect(report.attention).toBe(12);
+    // 14 rows for 13 files: the message with no file and a cut list has two.
+    expect(report.attention).toBe(13);
+    expect(report.more).toBe(0);
     expect(report.took).toBe(s.took);
 
     const meta = (id: string) => `${id}.metadata.json`;
@@ -132,7 +149,9 @@ describe('the index report', () => {
       { result: 'skipped', file: meta(jsonNoEml), reason: 'meta_json' },
       { result: 'skipped', file: `${metaGone}.eml`, reason: 'meta_missing' },
       { result: 'listed', file: meta(emlGone), reason: 'eml_missing' },
+      { result: 'listed', file: meta(wideNoEml), reason: 'eml_missing' },
       { result: 'truncated', file: meta(wide), reason: 'capped', lists: ['to'] },
+      { result: 'truncated', file: meta(wideNoEml), reason: 'capped', lists: ['to'] },
     ]);
 
     // The text names files relative to the run: no path, no account.
@@ -143,9 +162,11 @@ describe('the index report', () => {
     expect(text).toContain('Messages: 23\n');
     expect(text).toContain('Files refused: 4 (directory 1, fifo 2, symlink 1)\n');
     expect(text).toContain('Metadata not usable: 4 (meta_id 1, meta_json 2, meta_shape 1)\n');
-    expect(text).toContain('Lists cut to their limit: 1 (to 1)\n');
+    expect(text).toContain('Message file missing: 2\n');
+    expect(text).toContain('Lists cut to their limit: 2 (to 2)\n');
     expect(text).toContain('Unknown label IDs hidden: 1\n');
-    expect(text).toContain('12 files need attention\n');
+    expect(text).toContain('13 files need attention\n');
+    expect(text).not.toContain(' more\n');
     expect(text).toContain(
       `Truncated\t${meta(wide)}\tOver 1,000 To addresses. First 1,000 kept. (capped: to)\n`,
     );
@@ -157,8 +178,18 @@ describe('the index report', () => {
     const db = openDb(join(dir, 'index', file!), true);
     try {
       const own = report.rows.slice(3);
-      expect(indexReport(db, SYSTEM_IDS, 3).rows).toEqual(own.slice(0, 3));
-      expect(indexReport(db, SYSTEM_IDS, own.length).rows).toEqual(own);
+      expect(indexReport(db, SYSTEM_IDS, 3)).toMatchObject({
+        rows: own.slice(0, 3),
+        attention: 10,
+        more: own.length - 3,
+      });
+      expect(indexReport(db, SYSTEM_IDS, own.length)).toMatchObject({ rows: own, more: 0 });
+      // Cut where the file's second row would come, the rest is still counted in rows.
+      expect(indexReport(db, SYSTEM_IDS, own.length - 1)).toMatchObject({
+        rows: own.slice(0, -1),
+        attention: 10,
+        more: 1,
+      });
     } finally {
       db.close();
     }
@@ -181,16 +212,47 @@ describe('the index report', () => {
       hiddenLabelIds: 0,
       attention: 1,
       rows: [{ result: 'skipped' as const, file: 'p.metadata.json', reason: 'fifo' as const }],
+      // Core's own rows: one shown and one left out, both for the same file.
+      more: 1,
     };
     // The scan's order isn't the rows' order: they go by name.
     const report = withScan(part, [...refused].reverse(), null);
     expect(report.rows).toHaveLength(REPORT_ROWS);
     expect(report.rows.map((r) => r.file)).toEqual(refused.slice(0, REPORT_ROWS).map((r) => r.rel));
     expect(report.attention).toBe(REPORT_ROWS + 6);
+    expect(report.more).toBe(7);
     expect(report.rejected).toEqual({ symlink: REPORT_ROWS + 5, fifo: 1 });
     const text = reportText(report);
     expect(text).not.toContain('Took:');
-    expect(text.trimEnd().split('\n').at(-1)).toBe('and 6 more');
+    expect(text.trimEnd().split('\n').at(-1)).toBe('and 7 more');
+  });
+
+  it('keeps each copied row on one line, with control characters shown as symbols', () => {
+    expect(fieldText('a\tb\nc\rd\u0000e\u007ff\u0085g\u2028h\u2029i.eml')).toBe(
+      'a\u2409b\u240ac\u240dd\u2400e\u2421f\ufffdg\ufffdh\ufffdi.eml',
+    );
+    // Other names, bidi controls among them, are copied as they are.
+    expect(fieldText('Grüße \u202eabc.eml')).toBe('Grüße \u202eabc.eml');
+    const report: IndexReport = {
+      messages: 0,
+      folders: 0,
+      took: null,
+      rejected: { symlink: 1 },
+      metaMissing: 0,
+      emlMissing: 0,
+      failed: {},
+      timeouts: 0,
+      capped: {},
+      hiddenLabelIds: 0,
+      attention: 1,
+      rows: [{ result: 'skipped', file: 'tab\there\nnew line.eml', reason: 'symlink' }],
+      more: 0,
+    };
+    const lines = reportText(report).trimEnd().split('\n');
+    expect(lines.at(-1)).toBe(
+      'Skipped\ttab\u2409here\u240anew line.eml\tSymbolic link. Not read. (symlink)',
+    );
+    expect(lines.at(-1)!.split('\t')).toHaveLength(3);
   });
 
   it('maps every pair code to a reason', () => {

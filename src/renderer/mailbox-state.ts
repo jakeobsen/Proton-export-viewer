@@ -267,6 +267,7 @@ export function syncMailbox(): void {
   // Results belong to the generation that answered them.
   search.clear();
   update({ key, sidebar: null, progress: null, folder, report: null, reportOpen: false });
+  reportStamp = '';
   list.reset(key === null ? null : folder);
   // A new export or generation: main revoked the reader's view, and nothing is selected.
   cards.hide();
@@ -283,12 +284,26 @@ export function indexChanged(update_: IndexUpdate): void {
   refreshReport();
 }
 
-/** The report is read at most this often while phase 1 runs. */
+/** The report is read at most this often. */
 export const REPORT_MS = 1000;
 let readingReport = false;
 let reportAgain = false;
 let lastReport = -Infinity;
 let reportTimer: ReturnType<typeof setTimeout> | null = null;
+/** The counts the last report read started from (see stampOf). */
+let reportStamp = '';
+
+/**
+ * What the list header's count can move with, as index updates carry it:
+ * the phase (a new scan, or reconcile), metadata that couldn't be used,
+ * timeouts, lists cut to their limit (phase 2 cuts attachment lists) and
+ * message files whose text couldn't be read.
+ */
+function stampOf(progress: IndexProgress | null): string {
+  if (progress === null) return '';
+  const { phase, failed, timeouts, capped, bodiesFailed } = progress;
+  return `${phase}:${failed}:${timeouts}:${capped}:${bodiesFailed}`;
+}
 
 async function readReport(): Promise<void> {
   if (readingReport) {
@@ -297,6 +312,7 @@ async function readReport(): Promise<void> {
   }
   readingReport = true;
   lastReport = performance.now();
+  reportStamp = stampOf(state.progress);
   const key = state.key;
   try {
     const answer = await ask((generation) => window.pev.indexReport(generation));
@@ -311,11 +327,21 @@ async function readReport(): Promise<void> {
 }
 
 /**
- * Reads the report again if it is on screen, or if phase 1 is done (the list
- * header names the files that need attention): at most once per REPORT_MS.
+ * Reads the report again, at most once per REPORT_MS: on every index update
+ * while it is on screen, and once phase 1 is done (the list header names the
+ * files that need attention) only when an update moved the counts it
+ * depends on.
  */
 function refreshReport(): void {
-  if (state.key === null || !(state.reportOpen || state.progress?.phase === 'done')) return;
+  if (state.key === null) return;
+  if (!state.reportOpen) {
+    if (state.progress?.phase !== 'done') {
+      // A new scan or reconcile: the next 'done' is read whatever its counts.
+      reportStamp = '';
+      return;
+    }
+    if (stampOf(state.progress) === reportStamp) return;
+  }
   if (reportTimer) return;
   // The monotonic clock: a wall clock set back can't hold the next read.
   const wait = lastReport + REPORT_MS - performance.now();
