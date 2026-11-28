@@ -7,6 +7,7 @@ import { ALLOWED_REQUEST_SCHEMES, devShellCsp } from '../shared/constants';
 import { PERMISSIONS, SCHEMES } from '../shared/log/codes';
 import type { Logger } from '../shared/log/writer';
 import { appHandler, assetHandler, bodyHandler } from './protocols';
+import type { RemoteImages } from './remote-images';
 import type { ViewRegistry } from './views';
 
 /** Hooks a build with test hooks uses to observe the policy. Release builds leave them unset. */
@@ -25,6 +26,8 @@ export interface HardenOptions {
   rendererDir: string;
   shellCsp: string;
   log: Logger;
+  /** Serves the window's remote images once a view allows them. */
+  remote?: Pick<RemoteImages, 'serve'> | undefined;
   observer?: PolicyObserver | undefined;
   /** Extra origins allowed while running under the dev server. */
   devAllow?: ((url: string) => boolean) | undefined;
@@ -78,6 +81,7 @@ export function hardenSession(ses: Session, options: HardenOptions): void {
       log,
       windowId,
       onRequest: observer?.onAssetRequest,
+      remote: options.remote,
     }),
   );
 

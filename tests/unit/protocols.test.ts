@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { appHandler, assetHandler, bodyHandler } from '../../src/main/protocols';
 import { ViewRegistry } from '../../src/main/views';
 import { samplePng } from '../../src/core/png';
@@ -137,6 +137,66 @@ describe('mail-body: and mail-asset: handlers', () => {
     views.revokeAll();
     expect((await body({ url: `mail-body://v/${open.token}` })).status).toBe(404);
     expect((await asset({ url: `mail-asset://v/${open.token}/c1` })).status).toBe(404);
+  });
+});
+
+describe('mail-asset: remote images', () => {
+  const placeholder = samplePng();
+  function setUp(served: unknown) {
+    const views = new ViewRegistry();
+    const open = views.accept();
+    views.install(open.openId, open.token, 1, 1, {
+      html: '<p>body</p>',
+      assets: [
+        { id: 'r1', contentType: 'image/png', bytes: placeholder },
+        { id: 'c1', contentType: 'image/png', bytes: samplePng() },
+      ],
+      remoteRefs: ['https://a.test/1.png'],
+    });
+    const log = recording();
+    const remote = { serve: vi.fn(() => Promise.resolve(served)) };
+    const asset = assetHandler({ views, log, windowId: 1, remote: remote as never });
+    return { asset, remote, log, url: (id: string) => `mail-asset://v/${open.token}/${id}` };
+  }
+
+  it('serves the registered placeholder while the view has no consent', async () => {
+    const t = setUp({ kind: 'placeholder' });
+    const res = await t.asset({ url: t.url('r1') });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('image/png');
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(placeholder);
+    expect(t.remote.serve).toHaveBeenCalledTimes(1);
+  });
+
+  it('serves a fetched image with the type main found, no-store and nosniff', async () => {
+    const bytes = new Uint8Array([9, 8, 7]);
+    const t = setUp({ kind: 'image', bytes, contentType: 'image/webp' });
+    const res = await t.asset({ url: t.url('r1') });
+    expect(res.status).toBe(200);
+    expect(Object.fromEntries(res.headers.entries())).toEqual({
+      'content-type': 'image/webp',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+    });
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(bytes);
+  });
+
+  it('gives 404 to an image whose view was revoked while it waited', async () => {
+    const t = setUp({ kind: 'revoked' });
+    expect((await t.asset({ url: t.url('r1') })).status).toBe(404);
+    expect(t.log.events).toEqual([
+      {
+        code: 'protocol.not_found',
+        data: { scheme: 'mail-asset', reason: 'unknown_token', windowId: 1 },
+      },
+    ]);
+  });
+
+  it('asks only for registered remote ids', async () => {
+    const t = setUp({ kind: 'image', bytes: new Uint8Array([1]), contentType: 'image/png' });
+    expect((await t.asset({ url: t.url('c1') })).status).toBe(200);
+    expect((await t.asset({ url: t.url('r2') })).status).toBe(404);
+    expect(t.remote.serve).not.toHaveBeenCalled();
   });
 });
 

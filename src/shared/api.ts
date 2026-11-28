@@ -44,6 +44,8 @@ export const IPC = {
   indexChanged: 'pev:index-changed',
   search: 'pev:search',
   searchSnippets: 'pev:search-snippets',
+  allowRemote: 'pev:allow-remote',
+  remoteStatus: 'pev:remote-status',
   leads: 'pev:leads',
   showInFolder: 'pev:show-in-folder',
   copyMessageId: 'pev:copy-message-id',
@@ -87,7 +89,9 @@ export type RejectCode =
   | 'unknown_dialog'
   | 'refused'
   | 'not_deleted'
-  | 'failed';
+  | 'failed'
+  | 'not_live'
+  | 'unavailable';
 
 export type Rejected = { ok: false; code: RejectCode };
 
@@ -153,6 +157,8 @@ export type MessageOpenResult =
       hasHtml: boolean;
       /** How many distinct remote images the body refers to; they show as placeholders. */
       remote: number;
+      /** The remote images can be loaded, with the user's consent for this view. */
+      remoteLoadable: boolean;
       /** HTML was asked for but is too large to show by default; "html-anyway" shows it. */
       htmlTooLarge: boolean;
       /** Why only part of the body is shown: its size, or its number of parts; null if whole. */
@@ -290,6 +296,22 @@ export type DoneResult = { ok: true; generation: number } | Rejected;
 export type RecentSearchesResult =
   { ok: true; generation: number; entries: SearchSpec[] } | Rejected;
 
+/**
+ * Consent to one view's remote images. `reload` is true for the one answer
+ * that granted it: the body frame then loads the same URL again, once.
+ */
+export type AllowRemoteResult = { ok: true; reload: boolean } | Rejected;
+
+/** How a view's remote images went, sent by main as they settle: counts only. */
+export interface RemoteStatusUpdate {
+  generation: number;
+  openId: number;
+  /** Images loaded over plain http. */
+  insecure: number;
+  /** Images that couldn't load. */
+  refused: number;
+}
+
 export type ErrorKind = 'uncaught' | 'rejection' | 'error';
 
 export interface ErrorReport {
@@ -315,6 +337,10 @@ export interface PevApi {
   ): Promise<MessageOpenResult>;
   /** Closes the reader: its view and any open still under way are revoked. */
   closeView(generation: number): Promise<CloseViewResult>;
+  /** Loads the remote images of the live view `openId`, with the user's consent. */
+  allowRemote(openId: number, generation: number): Promise<AllowRemoteResult>;
+  /** Called as a view's remote images settle. */
+  onRemoteStatus(listener: (update: RemoteStatusUpdate) => void): () => void;
   /** Shows the open message's file in Finder. */
   showInFolder(openId: number, generation: number): Promise<ReaderActionResult>;
   /** Copies the open message's Message-ID. */

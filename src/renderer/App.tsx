@@ -7,7 +7,7 @@ import { indexChanged, syncMailbox, useCards, useMailbox, useSearch } from './ma
 import { ConversationList, Sidebar } from './Mailbox';
 import { SearchBox, SearchResults } from './SearchResults';
 import { LinkDialog } from './LinkDialog';
-import { generationChanged, useReaderState } from './reader';
+import { generationChanged, remoteStatus, useReaderState } from './reader';
 import { ReaderPane } from './ReaderPane';
 import { ReportView } from './Report';
 import { Settings } from './Settings';
@@ -63,6 +63,7 @@ export function App() {
   useEffect(() => window.pev.onLinkDialog(showLink), []);
   useEffect(() => window.pev.onSourcesChanged(() => void refreshSources()), []);
   useEffect(() => window.pev.onIndexChanged(indexChanged), []);
+  useEffect(() => window.pev.onRemoteStatus(remoteStatus), []);
   // Shortcuts: typed in the shell, or in the body frame and passed on by main.
   // The shell's are read before any other handler sees the key (capture), so
   // a dialog's own Escape is still on screen when the dispatch checks for it.

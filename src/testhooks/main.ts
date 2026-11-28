@@ -164,6 +164,7 @@ export async function install(ctx: AppContext): Promise<boolean> {
   /** When each window's body requests came, in ms on main's clock. */
   const bodyTimes = new Map<number, number[]>();
   let bodyCsp = true;
+  let releaseConsent: (() => void) | null = null;
 
   const recordsFor = (windowId: number): WindowRequests => {
     let rec = requests.get(windowId);
@@ -556,6 +557,35 @@ export async function install(ctx: AppContext): Promise<boolean> {
     fetcherDestinations: () => ctx.fetcher.testCall('destinations'),
     fetcherPid: () => ctx.fetcher.pid ?? null,
     fetcherStop: () => ctx.fetcher.stop(),
+    /** Holds every consent attempt before it starts the fetcher, until released. */
+    holdRemoteConsent: () => {
+      if (ctx.remote.testHold) return;
+      ctx.remote.testHold = new Promise<void>((resolve) => {
+        releaseConsent = resolve;
+      });
+    },
+    releaseRemoteConsent: () => {
+      ctx.remote.testHold = null;
+      releaseConsent?.();
+      releaseConsent = null;
+    },
+    remoteAttempts: () => ctx.remote.attempts,
+    /** The live view's remote state, without its URLs. */
+    remoteView: (windowId: number) => {
+      const view = byId(windowId).views.liveViews()[0];
+      if (!view) return null;
+      const { consent, viewKey, counts, served } = view.remote;
+      return {
+        openId: view.openId,
+        consent,
+        hasKey: viewKey !== null,
+        keyIsToken: viewKey === view.token,
+        loads: view.loads,
+        refs: view.remote.refs?.length ?? 0,
+        ...counts,
+        served,
+      };
+    },
     /** The theme Electron gives every frame: `system`, `light` or `dark`. */
     themeSource: () => nativeTheme.themeSource,
     /**

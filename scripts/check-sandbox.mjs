@@ -5,8 +5,9 @@
 //    executable and every other executable carry exactly the entitlements
 //    expected for that flavor, and no login-item helper is shipped;
 // 2. the in-app self-test passes in the sandbox: core and its worker answer,
-//    the protocols serve, and both a write outside the container and a
-//    loopback connect fail with a sandbox denial;
+//    the protocols serve, a write outside the container fails with a sandbox
+//    denial, and a loopback connect does what the build's entitlements say:
+//    it succeeds with outgoing connections allowed, and is denied without;
 // 3. positive control: the same self-test unsandboxed makes the write and the
 //    connect succeed, and the listener sees the connection;
 // 4. smoke: the sandboxed self-test opens a small generated export from its
@@ -31,38 +32,17 @@ import { createConnection, createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { RUN_FOLDER, accountAddress, entries } from '../tools/gen-export/generator.mjs';
-import { APP_ID, LOCAL_APP_ID, PRODUCT_NAME, appPath } from './package.mjs';
+import {
+  APP_ENTITLEMENTS_OF,
+  HELPER_ENTITLEMENTS,
+  PROOF_FLAVORS,
+  connectsOut,
+} from './entitlements.mjs';
+import { APP_ID, PRODUCT_NAME, appPath } from './package.mjs';
 import { bundleContents } from './bundle-contents.mjs';
 import { removeOutputDir, testOutputOf } from './test-output.mjs';
 
 const require = createRequire(join(process.cwd(), 'package.json'));
-
-// The application group is required by Electron's Mac App Store build: Chromium
-// registers the Mach service `<group>.MachPortRendezvousServer.<pid>`, and the
-// sandbox only allows names prefixed by one of the app's groups.
-export const APP_ENTITLEMENTS = {
-  'com.apple.security.app-sandbox': true,
-  'com.apple.security.application-groups': [APP_ID],
-  'com.apple.security.files.bookmarks.app-scope': true,
-  'com.apple.security.files.downloads.read-write': true,
-  'com.apple.security.files.user-selected.read-only': true,
-};
-// The local build: its own app group, and no Downloads write access.
-export const LOCAL_APP_ENTITLEMENTS = {
-  'com.apple.security.app-sandbox': true,
-  'com.apple.security.application-groups': [LOCAL_APP_ID],
-  'com.apple.security.files.bookmarks.app-scope': true,
-  'com.apple.security.files.user-selected.read-only': true,
-};
-const APP_ENTITLEMENTS_OF = {
-  'mas-selftest': APP_ENTITLEMENTS,
-  'mas-release': APP_ENTITLEMENTS,
-  'mas-local': LOCAL_APP_ENTITLEMENTS,
-};
-export const HELPER_ENTITLEMENTS = {
-  'com.apple.security.app-sandbox': true,
-  'com.apple.security.inherit': true,
-};
 
 const DENIED = new Set(['EPERM', 'EACCES']);
 
@@ -204,7 +184,15 @@ async function startListener() {
   await new Promise((done) => setTimeout(done, 100));
   const accepted = connections === 1;
   connections = 0;
-  return { server, port, accepted, count: () => connections };
+  return {
+    server,
+    port,
+    accepted,
+    count: () => connections,
+    reset: () => {
+      connections = 0;
+    },
+  };
 }
 
 function run(executable, args, timeoutMs = 60_000) {
@@ -250,6 +238,11 @@ async function main() {
   checkEntitlements('mas-selftest');
   checkEntitlements('mas-release');
   checkEntitlements('mas-local');
+  // The proofs, with the store set and outgoing connections, when packaged.
+  for (const flavor of PROOF_FLAVORS) {
+    if (existsSync(appPath(flavor))) checkEntitlements(flavor);
+    else console.log(`skip ${flavor}: not packaged`);
+  }
 
   const sandboxOutput = join(testOutputOf(), 'sandbox');
   const outDir = join(sandboxOutput, `${Date.now()}`);
@@ -290,10 +283,14 @@ async function main() {
       !sandboxed.write.ok && DENIED.has(sandboxed.write.code),
       `sandboxed: write denied (${sandboxed.write.code})`,
     );
-    check(
-      !sandboxed.connect.ok && DENIED.has(sandboxed.connect.code),
-      `sandboxed: connect denied (${sandboxed.connect.code})`,
-    );
+    if (connectsOut('mas-selftest')) {
+      check(sandboxed.connect.ok === true, 'sandboxed: connect allowed, as the entitlements say');
+    } else {
+      check(
+        !sandboxed.connect.ok && DENIED.has(sandboxed.connect.code),
+        `sandboxed: connect denied (${sandboxed.connect.code})`,
+      );
+    }
     check(sandboxed.error === null, `sandboxed: no self-test error (${sandboxed.error})`);
     check(sandboxed.shownWindows === 0, 'sandboxed: no window was shown or focused');
     check(
@@ -306,7 +303,12 @@ async function main() {
     );
   }
   check(!existsSync(sandboxTarget), 'sandboxed: the write target does not exist');
-  check(listener.count() === 0, `sandboxed: the listener saw ${listener.count()} connections`);
+  const expected = connectsOut('mas-selftest') ? 1 : 0;
+  check(
+    listener.count() === expected,
+    `sandboxed: the listener saw ${listener.count()} connections (expected ${expected})`,
+  );
+  listener.reset();
 
   // Smoke: a generated export in the container, opened as a user would.
   const smokeNonce = randomBytes(8).toString('hex');

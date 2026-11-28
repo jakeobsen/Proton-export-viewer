@@ -107,7 +107,7 @@ test('a message opens in the pane as HTML first, with its header fields', async 
   await expect(pane(pev).locator('.rp-to')).toHaveText('to owner@example.com, cc@example.com');
   await expect(pane(pev).locator('.rp-html')).toHaveAttribute('aria-pressed', 'true');
   await expect(pane(pev).locator('.rp-plain')).toHaveAttribute('aria-pressed', 'false');
-  await expect(pane(pev).locator('.rp-images')).toHaveText('2 external images blocked');
+  await expect(pane(pev).locator('.rp-images b')).toHaveText('2 external images blocked');
   const frame = await pev.bodyFrame(url);
   expect(await frame.locator('#p').textContent()).toBe('Hello in HTML.');
 
@@ -135,9 +135,10 @@ test('a message opens in the pane as HTML first, with its header fields', async 
     'Show in folder',
     'Message-ID',
     'Details',
+    'Load external images',
   ]);
   expect(await pane(pev).locator('.rp-line').allTextContents()).toEqual([
-    '2 external images blocked',
+    '2 external images blocked·Load external images',
   ]);
 });
 

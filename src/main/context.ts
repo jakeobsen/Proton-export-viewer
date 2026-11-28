@@ -8,6 +8,7 @@ import type { CoreHost } from './core-host';
 import type { FetcherHost } from './fetcher-host';
 import type { PolicyObserver } from './harden';
 import type { LinkDialog } from './link-dialog';
+import type { RemoteImages } from './remote-images';
 import type { SettingsStore } from './settings';
 import type { SourceManager } from './sources/manager';
 import type { ViewRegistry } from './views';
@@ -47,6 +48,8 @@ export interface AppContext {
   core: CoreHost;
   /** The remote-image fetcher: started on demand, never holding the export's folder access. */
   fetcher: FetcherHost;
+  /** Consent to remote images, per view, and serving them. */
+  remote: RemoteImages;
   /** The export sources: picks, runs, scopes and the open one. */
   sources: SourceManager;
   linkDialog: LinkDialog;

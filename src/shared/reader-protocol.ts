@@ -115,6 +115,11 @@ export interface RenderedMessage {
   format: 'plain' | 'html';
   /** How many distinct remote images and media the body refers to, each shown as a placeholder. */
   remote: number;
+  /**
+   * What each `r<n>` names, `remoteRefs[n - 1]`: its absolute `http` or
+   * `https` URL. Main keeps it with the view; it never reaches the shell.
+   */
+  remoteRefs: string[];
   /** How many `cid:` ids (`c1`…) the body refers to. */
   cids: number;
   /** The `c<n>` ids that show an image; every other one shows the placeholder. */

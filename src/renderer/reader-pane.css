@@ -258,6 +258,15 @@
   background: var(--rp-hover);
 }
 
+.rp-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.rp-images-failed {
+  color: var(--rp-danger);
+}
+
 .rp-body {
   display: flex;
   flex: 1;

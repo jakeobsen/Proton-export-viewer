@@ -37,13 +37,15 @@ export function createAppWindow(ctx: AppContext, options: WindowOptions = {}): A
   const windowId = nextWindowId;
   nextWindowId += 1;
   const ses = session.fromPartition(`win-${randomUUID()}`, { cache: false });
-  const views = new ViewRegistry();
+  // A revoked view's remote images stop at once.
+  const views = new ViewRegistry(undefined, (view) => ctx.remote.revoked(view));
   hardenSession(ses, {
     views,
     windowId,
     rendererDir: ctx.paths.rendererDir,
     shellCsp: ctx.shellCsp,
     log: ctx.log,
+    remote: ctx.remote,
     observer: ctx.observerFor?.(windowId),
     devAllow: __PEV_DEV__ ? devAllow : undefined,
   });

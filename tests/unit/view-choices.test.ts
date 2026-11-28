@@ -14,6 +14,7 @@ const BASE: ReaderState = {
   fallback: false,
   fileRefused: false,
   refused: null,
+  remote: { asking: false, allowed: false, failed: false, reloads: 0, insecure: 0, refused: 0 },
   openId: 1,
   source: null,
   queryId: null,

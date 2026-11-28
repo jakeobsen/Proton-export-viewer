@@ -20,18 +20,22 @@ import {
   fileSize,
   fullDate,
   initialsOf,
+  loadedImages,
   senderOf,
   shortDate,
 } from './reader-format';
 import { indexedPartText, matchLine, type MatchLine } from './match-line';
 import {
   copyMessageId,
+  frameKey,
+  loadRemoteImages,
   openInReader,
   openSource,
   showInFolder,
   useReaderState,
   viewChoices,
   type ReaderView,
+  type RemoteState,
 } from './reader';
 import { useShellState } from './shell';
 import { SourceView } from './SourceView';
@@ -191,6 +195,54 @@ function Who({ headers, details: more }: { headers: MessageHeaders; details: Mes
   );
 }
 
+function ImageIcon() {
+  return (
+    <svg className="rp-icon" {...ICON} width={16} height={16}>
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <circle cx="8.5" cy="8.5" r="1.5" />
+      <polyline points="21 15 16 10 5 21" />
+    </svg>
+  );
+}
+
+function RemoteLine({ view, remote }: { view: ReaderView; remote: RemoteState }) {
+  if (remote.allowed) {
+    return (
+      <div className="rp-line rp-images" role="status">
+        <ImageIcon />
+        <b>{loadedImages(remote.insecure, remote.refused)}</b>
+      </div>
+    );
+  }
+  return (
+    <div className="rp-line rp-images">
+      <ImageOffIcon />
+      <b>{blockedImages(view.remote)}</b>
+      {view.remoteLoadable && (
+        <>
+          <span aria-hidden="true">·</span>
+          <button
+            type="button"
+            className="rp-btn rp-load-images"
+            disabled={remote.asking}
+            onClick={() => void loadRemoteImages()}
+          >
+            Load external images
+          </button>
+        </>
+      )}
+      {remote.failed && (
+        <>
+          <span aria-hidden="true">·</span>
+          <span className="rp-images-failed" role="alert">
+            Couldn&apos;t load external images
+          </span>
+        </>
+      )}
+    </div>
+  );
+}
+
 /** The match line of an open from search; the plain view it offers carries the same search. */
 function MatchBar({ rowid, line }: { rowid: number; line: MatchLine }) {
   if (line.kind === 'none') return null;
@@ -216,20 +268,17 @@ function MatchBar({ rowid, line }: { rowid: number; line: MatchLine }) {
 function Lines({
   rowid,
   view,
+  remote,
   indexedPart,
 }: {
   rowid: number;
   view: ReaderView;
+  remote: RemoteState;
   indexedPart: string | null;
 }) {
   return (
     <>
-      {view.format === 'html' && view.remote > 0 && (
-        <div className="rp-line rp-images">
-          <ImageOffIcon />
-          <b>{blockedImages(view.remote)}</b>
-        </div>
-      )}
+      {view.format === 'html' && view.remote > 0 && <RemoteLine view={view} remote={remote} />}
       {view.htmlTooLarge && (
         <div className="rp-line rp-too-large">
           <button
@@ -467,6 +516,7 @@ export function MessageBody() {
         <Lines
           rowid={rowid}
           view={view}
+          remote={reader.remote}
           indexedPart={indexedPartText(reader.match, view.highlighted)}
         />
       )}
@@ -491,7 +541,7 @@ export function MessageBody() {
       <div className="rp-body">
         {view && (
           <iframe
-            key={view.url}
+            key={frameKey(view, reader.remote)}
             className="rp-frame"
             title="Message body"
             sandbox={BODY_IFRAME_SANDBOX}

@@ -15,6 +15,7 @@ import {
   notifySettings,
   notifySources,
   type AppContext,
+  type AppWindow,
   type DataDirs,
   type Paths,
 } from './context';
@@ -24,6 +25,7 @@ import { systemPicker, systemScopes } from './sources/access';
 import { SourceManager } from './sources/manager';
 import { registerIpc } from './ipc';
 import { LinkDialog } from './link-dialog';
+import { RemoteImages } from './remote-images';
 import { SettingsStore } from './settings';
 import { applySwitches } from './switches';
 import { followTheme } from './theme';
@@ -148,19 +150,26 @@ async function start(): Promise<void> {
     picker: systemPicker,
     scopes: systemScopes,
   });
+  const fetcher = new FetcherHost({
+    fetcherPath: paths.fetcherPath,
+    log,
+    relay: log.forProc('fetcher'),
+    spawnGuard: (spawn) => sources.withScopeReleased(spawn),
+  });
+  const windows = new Map<number, AppWindow>();
   const ctx: AppContext = {
     paths,
     log,
     rendererLog,
     frameRoots,
     generation: 1,
-    windows: new Map(),
+    windows,
     core,
-    fetcher: new FetcherHost({
-      fetcherPath: paths.fetcherPath,
+    fetcher,
+    remote: new RemoteImages({
+      fetcher,
       log,
-      relay: log.forProc('fetcher'),
-      spawnGuard: (spawn) => sources.withScopeReleased(spawn),
+      liveViews: () => [...windows.values()].flatMap((appWin) => appWin.views.liveViews()),
     }),
     sources,
     linkDialog: new LinkDialog(log),

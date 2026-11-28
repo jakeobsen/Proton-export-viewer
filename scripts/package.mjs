@@ -19,16 +19,15 @@
 import { existsSync, readdirSync, rmSync, rmdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { Arch, Platform, build } from 'electron-builder';
+import { APP_ID, APP_PLIST, APP_PLIST_OF, HELPER_PLIST, LOCAL_APP_ID } from './entitlements.mjs';
 import { signAdHoc } from './sign-adhoc.mjs';
 import { appName } from './vite-plugins.mjs';
 
-export const APP_ID = 'com.example.pev';
+export { APP_ID, LOCAL_APP_ID };
 // The app group in the entitlements, APP_ID, is a prefix of this bundle ID, as
 // the Mac App Store build of Electron requires.
 export const FOLDER_PROOF_APP_ID = `${APP_ID}.folderproof2`;
 export const FETCHER_PROOF_APP_ID = `${APP_ID}.fetcherproof`;
-// The local build's bundle ID is also its own app group.
-export const LOCAL_APP_ID = `${APP_ID}.viewer`;
 export const PRODUCT_NAME = appName();
 
 export const FUSES = {
@@ -46,13 +45,23 @@ const FLAVORS = {
   'mas-release': { out: 'out', mas: true },
   'mas-selftest': { out: 'out-test', mas: true },
   test: { out: 'out-test', mas: false },
-  'mas-folderproof': { out: 'out-proof', mas: true, appId: FOLDER_PROOF_APP_ID },
-  'mas-fetcherproof': { out: 'out-proof', mas: true, appId: FETCHER_PROOF_APP_ID },
+  'mas-folderproof': {
+    out: 'out-proof',
+    mas: true,
+    appId: FOLDER_PROOF_APP_ID,
+    entitlements: APP_PLIST_OF['mas-folderproof'],
+  },
+  'mas-fetcherproof': {
+    out: 'out-proof',
+    mas: true,
+    appId: FETCHER_PROOF_APP_ID,
+    entitlements: APP_PLIST_OF['mas-fetcherproof'],
+  },
   'mas-local': {
     out: 'out',
     mas: true,
     appId: LOCAL_APP_ID,
-    entitlements: 'build/entitlements.mas-local.plist',
+    entitlements: APP_PLIST_OF['mas-local'],
   },
 };
 
@@ -104,8 +113,8 @@ export async function packageFlavor(flavor) {
     app,
     spec.mas
       ? {
-          app: spec.entitlements ?? 'build/entitlements.mas.plist',
-          helper: 'build/entitlements.mas.inherit.plist',
+          app: spec.entitlements ?? APP_PLIST,
+          helper: HELPER_PLIST,
         }
       : null,
   );
