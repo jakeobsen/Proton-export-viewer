@@ -131,6 +131,8 @@ export interface IndexOptions {
   beforeWrite?: () => Promise<void>;
   /** Builds with test hooks only: awaited before a scan lists the run's folder, and after. */
   beforeScan?: () => Promise<void>;
+  /** Builds with test hooks only: awaited before the index opens. */
+  beforeIndexOpen?: () => Promise<void>;
   /**
    * Builds with test hooks only: read new metadata files in name order, and
    * write their batches in that order.

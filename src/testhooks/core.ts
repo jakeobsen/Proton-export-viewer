@@ -51,6 +51,8 @@ export interface CoreTestDeps {
   writeGate: WriteGate | null;
   /** Holds scans before they list the run's folder, the same way. */
   scanGate: WriteGate | null;
+  /** Holds index opens before they start, the same way. */
+  indexGate: WriteGate | null;
 }
 
 /** Holds work (phase 1's writes, or scans), while holding, until a test lets it through. */
@@ -165,6 +167,21 @@ export function handleCoreTest(request: TestRequest, deps: CoreTestDeps): void {
     }
     case 'held-scans':
       ok(deps.scanGate?.held ?? 0);
+      return;
+    case 'release-index-opens': {
+      const count = (request.payload as { count?: unknown } | undefined)?.count;
+      const valid =
+        count === null || (typeof count === 'number' && Number.isSafeInteger(count) && count > 0);
+      if (!deps.indexGate || !valid) {
+        deps.reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
+        return;
+      }
+      deps.indexGate.release(count as number | null);
+      ok();
+      return;
+    }
+    case 'held-index-opens':
+      ok(deps.indexGate?.held ?? 0);
       return;
     case 'log':
       deps.log.info('test.log', {

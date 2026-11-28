@@ -50,9 +50,11 @@ const FORBIDDEN_CONTENT = [
   'sessionPreconnects',
   'readByName',
   'openGapMs',
-  // Core's test hold for scans, and the shell's test render fault.
+  // Core's test holds for scans and index opens, and the shell's test render fault.
   'beforeScan',
   'holdScans',
+  'beforeIndexOpen',
+  'holdIndexOpens',
   '__pevTestRenderFault',
   // The self-test's smoke drives the body frame through the DevTools protocol.
   ...SELFTEST_ONLY,

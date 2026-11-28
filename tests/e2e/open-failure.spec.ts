@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // What the shell shows while an export opens and when that stops short: the
-// loading line from the moment the export opens, then the files read; on a
+// loading line from the moment the export opens, before core has answered
+// for the index and then with the files read; on a
 // reopen, the stored list and the reader while the run is still scanned; an
 // index that can't be made as an export closed after an error with Reopen;
 // and a throw while the shell renders as a line with Reopen instead of an
@@ -40,6 +41,22 @@ async function openExport(pev: PevApp, name: string, seed: number) {
   await pev.shell('chooseFolder', []);
   return written;
 }
+
+test('the loading line shows while core has not answered for the index yet', async ({ pev }) => {
+  await pev.main('indexTestSettings', { holdIndexOpens: true });
+  const written = await openExport(pev, 'fail-opening', 51);
+  // The export is open; core holds the index open, so nothing about it has come back.
+  await expect.poll(() => pev.main<number>('heldIndexOpens')).toBe(1);
+  expect((await view(pev)).active).toMatchObject({ status: 'online', closed: false, index: null });
+  const foot = pev.page.locator('.sidebar .side-foot');
+  await expect(foot.locator('.bar-track[role="progressbar"]')).toHaveCount(1);
+  await expect(foot.locator('.loading-text')).toHaveCount(0);
+  await expect(foot.locator('.bar-track')).not.toHaveAttribute('aria-valuenow');
+
+  await pev.main('releaseIndexOpens', null);
+  await phase1Done(pev, written.pairs);
+  await expect(foot).toHaveCount(0);
+});
 
 test('the loading line shows from the moment the export opens, then the files read', async ({
   pev,

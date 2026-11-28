@@ -277,6 +277,7 @@ export class SourceSession {
       this.send({ type: 'result', reqId: request.reqId, ok: false, code, stamp });
       return false;
     };
+    if (__PEV_TEST_HOOKS__) await this.indexSetup?.options?.beforeIndexOpen?.();
     const answered = await this.lock.run(async (): Promise<boolean> => {
       const setup = this.indexSetup;
       if (!setup) return failed('invalid');

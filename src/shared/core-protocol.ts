@@ -42,6 +42,8 @@ export interface CoreTestInit {
   holdWrites?: boolean;
   /** Scans wait before they list the run's folder, and once they have, until a test lets them on. */
   holdScans?: boolean;
+  /** Index opens wait before they start, until a test lets them on. */
+  holdIndexOpens?: boolean;
   /** New metadata files are read in name order, and their batches written in that order. */
   readByName?: boolean;
 }
