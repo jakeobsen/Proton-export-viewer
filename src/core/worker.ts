@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Reader worker. It builds message bodies: rendered messages, and the fixed
-// placeholder bodies.
+// Reader worker. It renders message bodies, and in builds with test hooks it
+// also builds the test hooks' fixed placeholder bodies.
 
 import { sep } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -19,7 +19,6 @@ import { fdRead, fdReread } from './reader/fd-input';
 import type { Reread } from './reader/images';
 import { renderMessage } from './reader/render';
 import { messageHeaderBlock, messageStructure, partHeaderBlock } from './reader/source-view';
-import { STUBS, type StubBuilder } from './stubs';
 
 const appRoot = (workerData as { appRoot?: string } | null)?.appRoot ?? '';
 const roots: Array<[string, string]> = appRoot
@@ -47,13 +46,6 @@ function crash(code: 'worker.uncaught' | 'worker.rejection', err: unknown): void
 
 process.on('uncaughtException', (err) => crash('worker.uncaught', err));
 process.on('unhandledRejection', (reason) => crash('worker.rejection', reason));
-
-async function builderFor(stubId: string): Promise<StubBuilder | undefined> {
-  const own = Object.prototype.hasOwnProperty.call(STUBS, stubId) ? STUBS[stubId] : undefined;
-  if (own || !__PEV_TEST_HOOKS__) return own;
-  const { TEST_STUBS } = await import('../testhooks/stubs');
-  return Object.prototype.hasOwnProperty.call(TEST_STUBS, stubId) ? TEST_STUBS[stubId] : undefined;
-}
 
 async function inputStream(input: ReaderInput): Promise<Readable | null> {
   // The file is core's: read it by position and leave it open for core to
@@ -161,15 +153,8 @@ parentPort?.on('message', (request: WorkerRequest) => {
     void source(request).then(post);
     return;
   }
-  if (request.type === 'build') {
-    void builderFor(request.stubId).then((builder) => {
-      if (!builder) {
-        post({ type: 'result', reqId: request.reqId, ok: false, code: 'unknown_stub' });
-        return;
-      }
-      const body = builder(`mail-asset://v/${request.token}`);
-      post({ type: 'result', reqId: request.reqId, ok: true, body });
-    });
+  if (__PEV_TEST_HOOKS__ && request.type === 'build') {
+    void import('../testhooks/stubs').then((hooks) => post(hooks.buildStub(request)));
     return;
   }
   if (__PEV_TEST_HOOKS__ && request.type === 'test') {

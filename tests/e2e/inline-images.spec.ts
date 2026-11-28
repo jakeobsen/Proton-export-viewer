@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Inline images end to end, on the hostile corpus's inline-image messages:
-// every image the raster check refuses, as a cid: part and as a data: image,
-// shows the placeholder and logs its reason; the valid ones render, checked
-// by their pixels in a capture of the hidden window; each alternative shows
-// its own image; a revoked view's images are gone; and nothing is requested
-// outside the view's own URLs.
+// Inline images end to end, in the reader pane's body frame, on the hostile
+// corpus's inline-image messages: every image the raster check refuses, as a
+// cid: part and as a data: image, shows the placeholder and logs its reason;
+// the valid ones render, checked by their pixels in a capture of the hidden
+// window; each alternative shows its own image; a revoked view's images are
+// gone; and nothing is requested outside the view's own URLs.
 
 import { randomBytes } from 'node:crypto';
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
@@ -58,26 +58,14 @@ async function source(pev: PevApp, plans: Map<string, HostilePlan>): Promise<Map
   return rows;
 }
 
-/** The view of a message in the window's body frame. */
+/** The view of a message in the reader pane's body frame. */
 async function view(
   pev: PevApp,
   rowid: number,
 ): Promise<{ opened: MessageOpenResult & { url: string }; frame: Frame }> {
-  if ((await pev.shell('frameSrc')) === null) {
-    const sample = await pev.open('sample');
-    await pev.bodyFrame(sample.url as string);
-  }
   await pev.main('clearRequests');
-  const opened = await pev.page.evaluate(async (r) => {
-    const state = await window.pev.state();
-    if (!state.ok) return state;
-    return window.pev.open(r, 'html', state.generation);
-  }, rowid);
-  expect(opened.ok && opened.outcome === 'view').toBe(true);
-  const url = (opened as { url: string }).url;
-  await pev.shell('setFrameSrc', [url]);
-  const frame = await pev.bodyFrame(url);
-  return { opened: opened as MessageOpenResult & { url: string }, frame };
+  const { result, frame } = await pev.showInPane(rowid, 'html');
+  return { opened: result, frame };
 }
 
 /** How wide an image in the body came out once loaded, or -1 while it loads. */
@@ -125,7 +113,7 @@ async function ownRequestsOnly(pev: PevApp, opened: { url: string }): Promise<vo
   expect(seen.app.filter((u) => !u.startsWith('app://shell/'))).toEqual([]);
 }
 
-test('every refused inline image shows the placeholder and logs its reason, as cid: and as data:', async ({
+test('every refused inline image shows the placeholder and logs its reason, as cid: and as data: @pane', async ({
   pev,
 }) => {
   test.setTimeout(240_000);
@@ -145,7 +133,7 @@ test('every refused inline image shows the placeholder and logs its reason, as c
   }
 });
 
-test('a valid cid: PNG and a valid data: GIF render, pixel-checked, with the detected type', async ({
+test('a valid cid: PNG and a valid data: GIF render, pixel-checked, with the detected type @pane', async ({
   pev,
 }) => {
   const rows = await source(pev, corpus());
@@ -165,7 +153,7 @@ test('a valid cid: PNG and a valid data: GIF render, pixel-checked, with the det
   await ownRequestsOnly(pev, data.opened);
 });
 
-test('each alternative shows its own image for a shared Content-ID, with and without related parts', async ({
+test('each alternative shows its own image for a shared Content-ID, with and without related parts @pane', async ({
   pev,
 }) => {
   const rows = await source(pev, corpus());
@@ -183,7 +171,7 @@ test('each alternative shows its own image for a shared Content-ID, with and wit
   }
 });
 
-test('a data: image stays only in <img src>', async ({ pev }) => {
+test('a data: image stays only in <img src> @pane', async ({ pev }) => {
   const rows = await source(pev, corpus());
   const { frame, opened } = await view(pev, rows.get('data-places') as number);
   const places = await frame.evaluate(() => {
@@ -199,7 +187,7 @@ test('a data: image stays only in <img src>', async ({ pev }) => {
   await ownRequestsOnly(pev, opened);
 });
 
-test("a revoked view's inline images are gone", async ({ pev }) => {
+test("a revoked view's inline images are gone @pane", async ({ pev }) => {
   const rows = await source(pev, corpus());
   const first = await view(pev, rows.get('cid-valid') as number);
   const url = `mail-asset://v/${tokenOf(first.opened.url)}/c1`;
@@ -211,7 +199,9 @@ test("a revoked view's inline images are gone", async ({ pev }) => {
   );
 });
 
-test('no Content-ID, file name or data: URL of a refused image reaches a log', async ({ pev }) => {
+test('no Content-ID, file name or data: URL of a refused image reaches a log @pane', async ({
+  pev,
+}) => {
   const [id0 = '', id1 = '', id2 = '', name = ''] = MARKERS;
   const cid = (id: string) => `cid:${encodeURIComponent(id)}`;
   const bomb = gifImage(1, 1, 1001).toString('base64');

@@ -20,6 +20,8 @@ import {
   type Frame,
   type Page,
 } from '@playwright/test';
+import type { MessageOpenResult } from '../../src/shared/api';
+import type { OpenMode } from '../../src/shared/reader-protocol';
 import { REPO_ROOT, TEST_OUTPUT, removeTestDirs, takeTestDirs, testDir } from '../paths';
 import { closeAndConfirm, type CloseWait } from './close-wait';
 import { startTimeOf, waitGone } from './process-wait';
@@ -36,6 +38,13 @@ function recordCloseWait(entry: CloseWait): void {
     // The record is for reading afterwards; a test never depends on it.
   }
 }
+
+/**
+ * The tag, in its title, of a test that runs on the reader pane's body frame,
+ * the one the shell ships. After it passes, the fixture checks that it used no
+ * stub open and that no window has the test hooks' stub frame.
+ */
+const PANE = '@pane';
 
 export interface LogLine {
   ts: string;
@@ -113,6 +122,38 @@ export class PevApp {
       [stubId],
       page,
     );
+  }
+
+  /** Opens a message in the reader pane, as the shell does. */
+  paneOpen(rowid: number, mode?: OpenMode, page: Page = this.page): Promise<MessageOpenResult> {
+    return this.shell<MessageOpenResult>('openInReader', mode ? [rowid, mode] : [rowid], page);
+  }
+
+  /**
+   * The reader pane's body frame once it shows the given URL and has loaded
+   * it. The frame is taken from the pane's own iframe element, so a test that
+   * uses it runs on the frame the shell ships.
+   */
+  async paneFrame(url: string, page: Page = this.page): Promise<Frame> {
+    const element = page.locator('.reader iframe.rp-frame');
+    await expect(element).toHaveAttribute('src', url, { timeout: 10_000 });
+    const frame = await (await element.elementHandle())?.contentFrame();
+    if (!frame) throw new Error('reader pane frame missing');
+    await expect.poll(() => frame.url(), { timeout: 10_000 }).toBe(url);
+    await frame.waitForLoadState('load');
+    return frame;
+  }
+
+  /**
+   * Opens a message in the reader pane and waits until the pane's frame has
+   * loaded its view.
+   */
+  async showInPane(rowid: number, mode?: OpenMode, page: Page = this.page) {
+    const result = await this.paneOpen(rowid, mode, page);
+    if (!result.ok || result.outcome !== 'view')
+      throw new Error(`no view: ${JSON.stringify(result)}`);
+    const frame = await this.paneFrame(result.url, page);
+    return { result, url: result.url, token: tokenOf(result.url), frame };
   }
 
   /** The body frame once it has loaded the given URL. */
@@ -313,6 +354,12 @@ export const test = base.extend<{ pev: PevApp; testDirs: void }>({
       expect(windows.filter((w) => w.visible || w.focused)).toEqual([]);
       expect(await pev.main('windowEvents')).toEqual([]);
       expect(await pev.main('dialogCalls')).toEqual([]);
+      if (testInfo.tags.includes(PANE)) {
+        expect(await pev.main('stubOpens')).toBe(0);
+        for (const page of pev.app.windows()) {
+          expect(await page.locator('iframe.body-frame').count()).toBe(0);
+        }
+      }
     }
     await pev.close();
   },

@@ -1,16 +1,37 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Bodies used only by tests. They are deliberately unsanitized.
+// Fixed placeholder bodies, used only by tests. They travel the path of a
+// message view: main -> core -> reader worker -> main -> mail-body:/mail-asset:
+// handlers. They are deliberately unsanitized.
 
 import { samplePng } from '../core/png';
-import type { StubBuilder } from '../core/stubs';
+import type { StubBodyMessage, WorkerBuild, WorkerMessage } from '../shared/core-protocol';
 import { markLoaded } from './marker';
 
 markLoaded();
+
+/** Builds a body; `assetBase` is `mail-asset://v/<token>` for the view being opened. */
+export type StubBuilder = (assetBase: string) => StubBodyMessage;
 
 export const SCRIPT_MARKER = 'pev-script-marker';
 const SCRIPT = `<script>document.documentElement.setAttribute('data-pev-script','ran');console.log('${SCRIPT_MARKER}');</script>`;
 
 export const TEST_STUBS: Record<string, StubBuilder> = {
+  sample: (assetBase) => ({
+    html: [
+      '<!doctype html>',
+      '<html><head><style>',
+      'body { font: 15px/1.5 -apple-system, BlinkMacSystemFont, sans-serif; margin: 16px; color: #1d1d1f; }',
+      '.stub-title { color: rgb(18, 52, 86); font-weight: 700; }',
+      '</style></head><body>',
+      '<p class="stub-title" id="stub-title">Sample message</p>',
+      '<p id="stub-inline" style="color: rgb(120, 30, 60); letter-spacing: 2px">Placeholder body.</p>',
+      `<img id="stub-cid" alt="" width="16" height="16" src="${assetBase}/c1">`,
+      `<p><a id="stub-link" href="${assetBase}/l1" target="_blank" rel="noopener noreferrer">example.com</a></p>`,
+      '</body></html>',
+    ].join('\n'),
+    assets: [{ id: 'c1', contentType: 'image/png', bytes: samplePng() }],
+    links: [{ id: 'l1', url: 'https://example.com/', text: 'example.com' }],
+  }),
   hostile: (assetBase) => ({
     html: [
       '<!doctype html>',
@@ -84,3 +105,13 @@ export const TEST_STUBS: Record<string, StubBuilder> = {
     ],
   }),
 };
+
+/** The worker's answer to a build request: the body, or `invalid` for an unknown id. */
+export function buildStub(request: WorkerBuild): WorkerMessage {
+  const builder = Object.prototype.hasOwnProperty.call(TEST_STUBS, request.stubId)
+    ? TEST_STUBS[request.stubId]
+    : undefined;
+  if (!builder) return { type: 'result', reqId: request.reqId, ok: false, code: 'invalid' };
+  const body = builder(`mail-asset://v/${request.token}`);
+  return { type: 'result', reqId: request.reqId, ok: true, body };
+}

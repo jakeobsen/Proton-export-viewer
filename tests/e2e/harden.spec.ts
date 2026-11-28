@@ -4,6 +4,7 @@
 import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { expect, test } from './app';
+import { SAMPLE, paneSource } from './pane-messages';
 
 interface SandboxEvidence {
   pid: number;
@@ -18,11 +19,12 @@ interface SandboxState {
   renderers: SandboxEvidence[];
 }
 
-test('every renderer runs in the OS sandbox', async ({ pev }) => {
-  // A second window and an open body, so every kind of renderer process exists.
+test('every renderer runs in the OS sandbox @pane', async ({ pev }) => {
+  // A second window and a body open in the reader pane, so every kind of
+  // renderer process exists.
   await pev.openWindow('shell');
-  const opened = await pev.open('sample');
-  await pev.bodyFrame(opened.url as string);
+  await paneSource(pev, SAMPLE);
+  await pev.showInPane(1, 'html');
 
   const state = await pev.main<SandboxState>('rendererSandbox');
   // Chromium's Linux sandbox installs a seccomp-bpf filter (mode 2) in each
@@ -42,8 +44,9 @@ test('every renderer runs in the OS sandbox', async ({ pev }) => {
   }
 });
 
-test('a second window gets the same session policy', async ({ pev }) => {
+test('a second window gets the same session policy @pane', async ({ pev }) => {
   const second = await pev.openWindow('shell');
+  await paneSource(pev, SAMPLE);
   const page = second.page;
 
   const permissions = await page.evaluate(async () => {
@@ -65,7 +68,7 @@ test('a second window gets the same session policy', async ({ pev }) => {
   expect(await pev.main('spellcheck', second.windowId)).toBe(false);
 
   // Protocols are scoped: each session serves only its own views.
-  const own = await pev.open('sample', page);
+  const own = await pev.showInPane(1, 'html', page);
   expect((await pev.main<{ status: number }>('fetchIn', second.windowId, own.url)).status).toBe(
     200,
   );

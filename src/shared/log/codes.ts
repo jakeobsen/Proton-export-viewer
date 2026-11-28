@@ -155,7 +155,6 @@ export const REASONS = [
   'stale',
   'wipe_owed',
   'superseded',
-  'unknown_stub',
   'core_unavailable',
   'unknown_source',
   'unknown_run',

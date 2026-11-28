@@ -6,7 +6,8 @@
 // 2. the packaged main bundle carries the production shell CSP literal and no
 //    development CSP (the e2e suite checks that this same code serves it);
 // 3. no test hook, probe, test page or local path is in the package; the test
-//    build, as a control, holds the self-test's own strings.
+//    build, as a control, holds the self-test's own strings and those of the
+//    test hooks' stub open (its channel and the bodies it builds).
 
 import { readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -32,6 +33,12 @@ const EXPECTED_FUSES = {
 
 // Strings only the self-test's smoke has; the test build must hold them (a control).
 const SELFTEST_ONLY = ['debugger.attach', 'Page.createIsolatedWorld'];
+
+// Strings only the test hooks' stub open has: its IPC channel, its name, and
+// the body the stub builder makes. The test build must hold them too (a
+// control), the channel in each of its main, preload and renderer bundles.
+const STUB_CHANNEL = 'pev:open-stub';
+const STUB_ONLY = [STUB_CHANNEL, 'openStub', 'stub-title', 'Placeholder body.'];
 
 // Strings that only exist in test hooks, test pages, test stubs or the dev server setup.
 const FORBIDDEN_CONTENT = [
@@ -61,6 +68,9 @@ const FORBIDDEN_CONTENT = [
   '__pevTestRenderFault',
   // The self-test's smoke drives the body frame through the DevTools protocol.
   ...SELFTEST_ONLY,
+  ...STUB_ONLY,
+  // The stub open's old refusal code, gone with it from the release code.
+  'unknown_stub',
   // Core's hold of a read once its message file is open.
   'holdingOpened',
   'hold-opened',
@@ -138,14 +148,28 @@ async function checkFlavor(flavor) {
 
 for (const flavor of ['release', 'mas-release', 'mas-local']) await checkFlavor(flavor);
 
-// Control: the test build holds the self-test's strings, so the scan above
-// would find them if they ever reached a release package.
-const testMain = readdirSync(join('out-test', 'main'), { recursive: true })
-  .filter((f) => String(f).endsWith('.js'))
-  .map((f) => readFileSync(join('out-test', 'main', String(f)), 'utf8'))
-  .join('\n');
+// Control: the test build holds the self-test's and the stub open's strings, so
+// the scan above would find them if they ever reached a release package.
+const testCode = Object.fromEntries(
+  ['main', 'preload', 'renderer'].map((dir) => [
+    dir,
+    readdirSync(join('out-test', dir), { recursive: true })
+      .filter((f) => /\.c?js$/.test(String(f)))
+      .map((f) => readFileSync(join('out-test', dir, String(f)), 'utf8'))
+      .join('\n'),
+  ]),
+);
 for (const s of SELFTEST_ONLY) {
-  check(testMain.includes(s), `control: the test build holds ${s}`);
+  check(testCode.main.includes(s), `control: the test build holds ${s}`);
+}
+for (const s of STUB_ONLY) {
+  check(
+    Object.values(testCode).some((code) => code.includes(s)),
+    `control: the test build holds ${s}`,
+  );
+}
+for (const [dir, code] of Object.entries(testCode)) {
+  check(code.includes(STUB_CHANNEL), `control: the test build's ${dir} holds ${STUB_CHANNEL}`);
 }
 
 if (failures.length > 0) {

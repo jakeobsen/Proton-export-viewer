@@ -101,7 +101,7 @@ async function gateWaiting(pev: PevApp, name: string): Promise<number> {
   return (await pev.main<{ value: number }>('readerGateWaiting', name)).value;
 }
 
-test('a message opens as plain text, served by mail-body: with its body headers', async ({
+test('a message opens as plain text, served by mail-body: with its body headers @pane', async ({
   pev,
 }) => {
   await source(pev, { 'plain.eml': PLAIN }, [[1, { file: 'plain.eml' }]]);
@@ -146,12 +146,8 @@ test('a message opens as plain text, served by mail-body: with its body headers'
     expect(asset.status).toBe(404);
   }
 
-  // The body renders in the sandboxed frame: text only, links by id.
-  await pev.open('sample');
-  const second = await openRow(pev, 1);
-  const secondUrl = viewUrl(second);
-  await pev.shell('setFrameSrc', [secondUrl]);
-  const frame = await pev.bodyFrame(secondUrl);
+  // The body renders in the reader pane's sandboxed frame: text only, links by id.
+  const { url: secondUrl, frame } = await pev.showInPane(1, 'plain');
   const rendered = await frame.evaluate(() => ({
     text: document.querySelector('pre')?.textContent ?? '',
     hrefs: [...document.querySelectorAll('a')].map((a) => a.getAttribute('href')),
@@ -214,16 +210,13 @@ const HTML = [
   '',
 ].join('\r\n');
 
-test('an HTML message opens sanitized, with placeholders, and requests nothing remote', async ({
+test('an HTML message opens sanitized, with placeholders, and requests nothing remote @pane', async ({
   pev,
 }) => {
   await source(pev, { 'html.eml': HTML }, [[1, { file: 'html.eml' }]]);
-  // A first body puts the frame in place; let it finish loading before the record starts.
-  const sample = await pev.open('sample');
-  await pev.bodyFrame(sample.url as string);
   await pev.main('clearRequests');
   const before = pev.consoleMessages.length;
-  const opened = await openRow(pev, 1, 'html');
+  const { result: opened, url, token, frame } = await pev.showInPane(1, 'html');
   expect(opened).toMatchObject({
     ok: true,
     outcome: 'view',
@@ -231,10 +224,6 @@ test('an HTML message opens sanitized, with placeholders, and requests nothing r
     hasHtml: true,
     remote: 2,
   });
-  const url = viewUrl(opened);
-  const token = tokenOf(url);
-  await pev.shell('setFrameSrc', [url]);
-  const frame = await pev.bodyFrame(url);
   await expect
     .poll(() =>
       frame.evaluate(() => {

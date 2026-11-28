@@ -127,7 +127,7 @@ async function workerRead(reqId: number, paths: string[]): Promise<ProofFileRead
   return message?.type === 'proof-read' ? message.reads : null;
 }
 
-/** Builds a fixed placeholder body. */
+/** Test builds only: builds one of the test hooks' fixed placeholder bodies. */
 function build(request: OpenRequest): void {
   const { reqId, stubId, token } = request;
   void lane.job({ type: 'build', reqId, stubId, token }).then((outcome) => {
@@ -135,7 +135,7 @@ function build(request: OpenRequest): void {
     if (message?.type === 'result' && message.ok) {
       reply({ type: 'result', reqId, ok: true, body: message.body });
     } else {
-      reply({ type: 'result', reqId, ok: false, code: 'unknown_stub' });
+      reply({ type: 'result', reqId, ok: false, code: 'invalid' });
     }
   });
 }
@@ -273,8 +273,9 @@ async function readOpen(request: ReadRequest, stale: () => boolean): Promise<voi
 }
 
 function startOpen(request: OpenRequest | ReadRequest): void {
-  if (request.type === 'open') build(request);
-  else void read(request);
+  if (request.type === 'read') void read(request);
+  else if (__PEV_TEST_HOOKS__) build(request);
+  else reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
 }
 
 function handle(request: CoreRequest): void {

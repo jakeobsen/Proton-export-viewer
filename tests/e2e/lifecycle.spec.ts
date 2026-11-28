@@ -18,7 +18,7 @@ import {
 import { join } from 'node:path';
 import { openDb } from '../../src/core/index/sql';
 import type { SourceActionResult } from '../../src/shared/api';
-import type { IndexProgress, IndexTotals } from '../../src/shared/index-types';
+import type { IndexProgress, IndexTotals, ListWindow } from '../../src/shared/index-types';
 import type { SourcesView, Stamp } from '../../src/shared/sources';
 import { digest } from '../../tools/gen-export/tree.mjs';
 import { writeExport } from '../exports';
@@ -26,6 +26,9 @@ import { damageTablePage } from '../index-helpers';
 import { testDir } from '../paths';
 import { CORE_EXIT_MS, expect, launch, test, type PevApp } from './app';
 import { isGone, startTimeOf, waitGone } from './process-wait';
+
+/** All Mail's label id. */
+const ALL_MAIL = '5';
 
 type Answer<T> = { answer: T; progress: IndexProgress } | null;
 
@@ -311,7 +314,7 @@ test('core that exits on its own is restarted for the open export, and a switch 
   await checkHidden(pev);
 });
 
-test('after 3 restarts within a minute the export is closed, and Reopen opens it again', async ({
+test('after 3 restarts within a minute the export is closed, and Reopen opens it again @pane', async ({
   pev,
 }) => {
   const root = realpathSync(testDir('life-restart-limit'));
@@ -328,10 +331,17 @@ test('after 3 restarts within a minute the export is closed, and Reopen opens it
     await phase1Done(pev, written.pairs);
   }
   const { generation } = await pev.main<Stamp>('sourceStamp');
-  // A body view is open when core goes for the fourth time.
-  const opened = await pev.open('sample');
-  expect(opened).toMatchObject({ ok: true });
-  expect((await pev.main<{ status: number }>('fetchIn', 1, opened.url!)).status).toBe(200);
+  // A message is open in the reader pane when core goes for the fourth time.
+  const listed = await pev.main<{ answer: ListWindow } | null>('indexQuery', {
+    op: 'window',
+    labelId: ALL_MAIL,
+    anchor: { index: 0 },
+    before: 0,
+    after: 1,
+    selected: null,
+  });
+  const opened = await pev.showInPane(listed!.answer.rows[0]!.newestRowid);
+  expect((await pev.main<{ status: number }>('fetchIn', 1, opened.url)).status).toBe(200);
   await pev.main('core', 'exit');
   await expect.poll(() => pev.hasLog('core.restart_gave_up')).toBe(true);
   const banner = pev.page.locator('.banner[role="alert"]');
@@ -339,7 +349,7 @@ test('after 3 restarts within a minute the export is closed, and Reopen opens it
   // The open view went with it: a new generation, and its token is gone.
   expect((await pev.main<Stamp>('sourceStamp')).generation).toBe(generation + 1);
   expect(pev.hasLog('view.revoked', { reason: 'generation' })).toBe(true);
-  expect((await pev.main<{ status: number }>('fetchIn', 1, opened.url!)).status).toBe(404);
+  expect((await pev.main<{ status: number }>('fetchIn', 1, opened.url)).status).toBe(404);
   expect(pev.logs('main').filter((l) => l.code === 'core.restart')).toHaveLength(3);
 
   await banner.locator('button:text("Reopen")').dispatchEvent('click');

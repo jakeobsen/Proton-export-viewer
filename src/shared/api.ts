@@ -25,7 +25,6 @@ import type { SourceOutcome, SourcesView } from './sources';
 export const IPC = {
   state: 'pev:state',
   ping: 'pev:ping',
-  openStub: 'pev:open-stub',
   open: 'pev:open',
   closeView: 'pev:close-view',
   log: 'pev:log',
@@ -75,7 +74,6 @@ export type RejectCode =
   | 'bad_origin'
   | 'stale_generation'
   | 'superseded'
-  | 'unknown_stub'
   | 'core_unavailable'
   | 'unknown_source'
   | 'unknown_run'
@@ -302,7 +300,6 @@ export interface ErrorReport {
 export interface PevApi {
   state(): Promise<StateResult>;
   ping(generation: number): Promise<PingResult>;
-  openStub(id: string, generation: number): Promise<OpenResult>;
   /**
    * Opens a message; with `queryId`, as part of that search's results, so its
    * matches are marked or listed. Only the ID goes to main, never the text.

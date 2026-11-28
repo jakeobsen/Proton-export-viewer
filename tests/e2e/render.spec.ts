@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Positive render through the real protocol path, and the exact response headers.
+// Positive render through the real protocol path, and the exact response
+// headers, in the reader pane's body frame.
 
 import { BODY_CSP } from '../../src/shared/constants';
-import { expect, test, tokenOf } from './app';
+import { expect, test } from './app';
+import { SAMPLE, paneSource } from './pane-messages';
 
-test('a body with <style>, a style attribute and a cid image renders', async ({ pev }) => {
-  const opened = await pev.open('sample');
-  expect(opened.ok).toBe(true);
-  const frame = await pev.bodyFrame(opened.url as string);
+test('a body with <style>, a style attribute and a remote image placeholder renders @pane', async ({
+  pev,
+}) => {
+  await paneSource(pev, SAMPLE);
+  const { frame } = await pev.showInPane(1, 'html');
 
   const styles = await frame.evaluate(() => {
-    const title = document.getElementById('stub-title') as HTMLElement;
-    const inline = document.getElementById('stub-inline') as HTMLElement;
+    const title = document.getElementById('heading') as HTMLElement;
+    const inline = document.getElementById('inline') as HTMLElement;
     return {
       titleColor: getComputedStyle(title).color,
       titleWeight: getComputedStyle(title).fontWeight,
@@ -26,25 +29,23 @@ test('a body with <style>, a style attribute and a cid image renders', async ({ 
     inlineSpacing: '2px',
   });
 
+  // The remote image shows as the view's 1 x 1 placeholder, from mail-asset:.
+  expect(
+    await frame.evaluate(() => document.getElementById('remote')?.getAttribute('src')),
+  ).toMatch(/^mail-asset:\/\/v\/[0-9a-f]{32}\/r1$/);
   await expect
     .poll(() =>
       frame.evaluate(() => {
-        const img = document.getElementById('stub-cid') as HTMLImageElement;
-        return img.complete ? img.naturalWidth : -1;
+        const img = document.getElementById('remote') as HTMLImageElement;
+        return img.complete ? [img.naturalWidth, img.naturalHeight] : null;
       }),
     )
-    .toBe(16);
-  expect(
-    await frame.evaluate(
-      () => (document.getElementById('stub-cid') as HTMLImageElement).naturalHeight,
-    ),
-  ).toBe(16);
+    .toEqual([1, 1]);
 });
 
-test('mail-body: and mail-asset: send the exact headers', async ({ pev }) => {
-  const opened = await pev.open('sample');
-  const url = opened.url as string;
-  const token = tokenOf(url);
+test('mail-body: and mail-asset: send the exact headers @pane', async ({ pev }) => {
+  await paneSource(pev, SAMPLE);
+  const { url, token } = await pev.showInPane(1, 'html');
 
   const body = await pev.main<{ status: number; headers: Record<string, string> }>(
     'fetchIn',
@@ -63,7 +64,7 @@ test('mail-body: and mail-asset: send the exact headers', async ({ pev }) => {
   const asset = await pev.main<{ status: number; headers: Record<string, string>; length: number }>(
     'fetchIn',
     1,
-    `mail-asset://v/${token}/c1`,
+    `mail-asset://v/${token}/r1`,
   );
   expect(asset.status).toBe(200);
   expect(asset.headers['content-type']).toBe('image/png');

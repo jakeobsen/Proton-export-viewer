@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Negative CSP control with its positive controls: the body's header CSP and the
 // iframe sandbox are what stop the probes and the script, not a broken probe.
+// The hostile body goes through the reader's unsanitized path into the reader
+// pane's body frame, so nothing but the CSP and the sandbox stands in its way.
 
 import type { Frame, Page } from '@playwright/test';
 import { expect, test, type PevApp } from './app';
+import { HOSTILE, paneSource, unsanitized } from './pane-messages';
 
 const SCRIPT_MARKER = 'pev-script-marker';
 
@@ -26,15 +29,23 @@ async function scriptRan(target: Frame | Page): Promise<boolean> {
   return target.evaluate(() => document.documentElement.getAttribute('data-pev-script') === 'ran');
 }
 
-test('the header CSP blocks both probes and the script does not run', async ({ pev }) => {
+/** Opens the hostile body, unsanitized, in the reader pane, with a fresh request record. */
+async function openHostile(pev: PevApp) {
+  await paneSource(pev, HOSTILE);
+  await unsanitized(pev);
   await pev.main('clearRequests');
-  const opened = await pev.open('hostile');
-  expect(opened.ok).toBe(true);
-  const frame = await pev.bodyFrame(opened.url as string);
+  return pev.showInPane(1, 'html');
+}
 
-  // The probe elements are really in the loaded body.
+test('the header CSP blocks both probes and the script does not run @pane', async ({ pev }) => {
+  const { frame, token } = await openHostile(pev);
+
+  // The probe elements are really in the loaded body, the style sheet on the
+  // view's own asset base.
   expect(await frame.locator('#probe-img').count()).toBe(1);
-  expect(await frame.locator('#probe-css').count()).toBe(1);
+  expect(await frame.locator('#probe-css').getAttribute('href')).toBe(
+    `mail-asset://v/${token}/probe.css`,
+  );
   expect(await frame.locator('#hostile-title').textContent()).toBe('Hostile body');
 
   // CSP violations are reported for both probes.
@@ -56,11 +67,9 @@ test('the header CSP blocks both probes and the script does not run', async ({ p
   expect(await pev.shell<string | null>('frameSandbox')).toBe('allow-popups');
 });
 
-test('positive control: without the CSP header each probe is hit', async ({ pev }) => {
+test('positive control: without the CSP header each probe is hit @pane', async ({ pev }) => {
   await pev.main('setBodyCsp', false);
-  await pev.main('clearRequests');
-  const opened = await pev.open('hostile');
-  const frame = await pev.bodyFrame(opened.url as string);
+  const { frame } = await openHostile(pev);
 
   await expect.poll(() => probeHits(pev)).toEqual({ img: 1, css: 1 });
   // The sandbox still stops the script without any CSP.
