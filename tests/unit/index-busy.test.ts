@@ -7,7 +7,7 @@
 import { lstatSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { QueryState, WriterState, codeOf } from '../../src/core/index/ops';
+import { QueryState, WriterState, codeOf, quickCheck } from '../../src/core/index/ops';
 import { ThreadError } from '../../src/core/index/pool';
 import {
   SCHEMA_VERSION,
@@ -173,6 +173,16 @@ describe("the writer's open", () => {
       writer.close();
     }
     await lock.released;
+  });
+});
+
+describe('the quick check', () => {
+  it('held past its timeout leaves the index unchecked, never damaged, and keeps its files', async () => {
+    const { dbPath, dir, uuid } = newIndex('busy-check-held');
+    await held(dbPath, 5000);
+    const before = files(dir);
+    expect(quickCheck(dbPath, uuid, 200)).toEqual({ ok: null, reason: null });
+    expect(files(dir)).toEqual(before);
   });
 });
 

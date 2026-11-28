@@ -51,12 +51,6 @@ import { ThreadError, type IndexThread, type ThreadRole } from './index/pool';
 import { BODY_STATE, mismatchOf, probeIdentity } from './index/schema';
 import { IndexBusy } from './index/sql';
 
-/**
- * How long the look at a damaged index's file waits for another connection's
- * lock. It runs on core's main thread, so it waits briefly: busy means the
- * open is refused, never that the file is damaged.
- */
-const DAMAGED_PROBE_BUSY_MS = 100;
 import type { LocatedFile, OpenedMessage } from './reader/source';
 import { overlaps } from '../shared/overlap';
 import { ConnectionRegistry, IndexService, type IndexOptions } from './index/service';
@@ -64,6 +58,13 @@ import { withScan } from './index/report';
 
 /** Entries scanned between yields, so core keeps answering during a long scan. */
 const SCAN_SLICE = 2000;
+
+/**
+ * How long the look at a damaged index's file waits for another connection's
+ * lock. It runs on core's main thread, so it waits briefly: busy means the
+ * open is refused, never that the file is damaged.
+ */
+const DAMAGED_PROBE_BUSY_MS = 100;
 
 const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 

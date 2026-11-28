@@ -48,6 +48,7 @@ import {
   type Mismatch,
 } from './schema';
 import {
+  INDEX_BUSY_MS,
   IndexBusy,
   SQLITE_CORRUPT,
   SQLITE_FULL,
@@ -490,14 +491,19 @@ export interface CheckResult {
 
 /**
  * Runs SQLite's quick check on its own read-only connection, after the same
- * identity check every connection makes, and closes it again.
+ * identity check every connection makes, and closes it again. A lock held
+ * past the busy timeout leaves it unchecked (`ok: null`), never damaged.
  */
-export function quickCheck(dbPath: string, expectedUuid: string): CheckResult {
+export function quickCheck(
+  dbPath: string,
+  expectedUuid: string,
+  busyMs: number = INDEX_BUSY_MS,
+): CheckResult {
   if (!isFile(dbPath)) return { ok: null, reason: null };
   let db: Db | null = null;
   try {
     db = openDb(dbPath, true);
-    setBusyTimeout(db);
+    setBusyTimeout(db, busyMs);
     const mismatch = mismatchOf(identityOf(db), expectedUuid);
     if (mismatch) return { ok: false, reason: mismatch };
     const rows = db.stmt('PRAGMA quick_check').all();

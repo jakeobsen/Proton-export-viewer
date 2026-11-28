@@ -380,8 +380,10 @@ setTimeout(() => {
 
 /**
  * A child process holding an exclusive lock on the database at `path` for
- * `holdMs`, then releasing it. Resolves once the lock is held. A child is
- * used because a connection waiting on a lock blocks its own thread.
+ * `holdMs`, then releasing it. Resolves once the lock is held. `released`
+ * resolves once the child has exited, whether it released the lock itself or
+ * was killed. A child is used because a connection waiting on a lock blocks
+ * its own thread.
  */
 export async function holdIndexLock(
   path: string,
@@ -393,23 +395,17 @@ export async function holdIndexLock(
     ['-e', LOCK_HOLDER, path, String(holdMs), options.sidecars === false ? '0' : '1'],
     { stdio: ['ignore', 'pipe', 'inherit'] },
   );
+  const released = once(child, 'exit').then(
+    () => undefined,
+    () => undefined,
+  );
   let out = '';
-  let heard: () => void = () => {};
-  child.stdout!.on('data', (chunk: Buffer) => {
-    out += chunk.toString('utf8');
-    heard();
-  });
-  const waitFor = (line: string) =>
-    new Promise<void>((resolve, reject) => {
-      heard = () => {
-        if (out.includes(`${line}\n`)) resolve();
-      };
-      child.once('exit', () =>
-        out.includes(`${line}\n`) ? resolve() : reject(new Error('holder exited')),
-      );
-      heard();
+  await new Promise<void>((resolve, reject) => {
+    child.stdout!.on('data', (chunk: Buffer) => {
+      out += chunk.toString('utf8');
+      if (out.includes('held\n')) resolve();
     });
-  await waitFor('held');
-  const released = Promise.all([waitFor('released'), once(child, 'exit')]).then(() => undefined);
+    void released.then(() => reject(new Error('holder exited before holding the lock')));
+  });
   return { child, released };
 }
