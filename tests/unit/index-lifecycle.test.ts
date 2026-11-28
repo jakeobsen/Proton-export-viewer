@@ -973,6 +973,74 @@ describe("the reader's open of a message file", () => {
     await c.session.close();
   });
 
+  it('from search, says how the message matched, and drops the body of a file that changed since', async () => {
+    const e = exportAt('lc-reader-search', 6, 24);
+    const c = core({ root: e.run, indexDir: e.indexDir });
+    expect(await c.openIndex(null)).toMatchObject({ ok: true });
+    await c.session.index!.settled();
+    const generation = c.stamp.generation;
+    const file = (await eml(c, 1))!;
+    const path = join(e.run, file.rel!);
+    const subject = /^Subject: (.*)$/m.exec(readFileSync(path, 'latin1'))![1]!;
+    const word = [...subject.matchAll(/[A-Za-z]{4,}/g)]
+      .map((m) => m[0])
+      .sort((a, b) => b.length - a.length)[0]!;
+
+    const plain = await c.session.openForReader(1, generation, () => false);
+    expect(plain.ok && 'match' in plain).toBe(false);
+    if (plain.ok) await plain.opened.close();
+
+    const found = await c.session.openForReader(1, generation, () => false, word);
+    expect(found).toMatchObject({ ok: true, match: { changed: false } });
+    if (found.ok) {
+      expect(found.match!.columns).toContain('subject');
+      await found.opened.close();
+    }
+
+    // The file is rewritten in place after the scan (same inode): it opens without the stored body.
+    const original = readFileSync(path);
+    writeFileSync(path, Buffer.concat([original, Buffer.from('\r\nmore text\r\n')]));
+    const changed = await c.session.openForReader(1, generation, () => false, word);
+    expect(changed).toMatchObject({
+      ok: true,
+      match: { changed: true, bodyMatches: 0, body: null },
+    });
+    if (changed.ok) {
+      expect(changed.match!.columns).toContain('subject');
+      await changed.opened.close();
+    }
+    // Replaced by another file (a new inode): examined again, and opened the same way.
+    rmSync(path);
+    writeFileSync(path, original);
+    const replaced = await c.session.openForReader(1, generation, () => false, word);
+    expect(replaced).toMatchObject({ ok: true, match: { changed: true, body: null } });
+    if (replaced.ok) await replaced.opened.close();
+
+    // Refused (a link took the file's place): the fallback still says how the message matched.
+    rmSync(path);
+    symlinkSync(join(e.run, (await eml(c, 2))!.rel!), path);
+    const refused = await c.session.openForReader(1, generation, () => false, word);
+    expect(refused).toMatchObject({ ok: false, code: 'refused', match: { changed: false } });
+    expect(await c.session.openForReader(1, generation, () => false)).toEqual({
+      ok: false,
+      code: 'refused',
+    });
+
+    // Removed after indexing: the refusal still says how the message matched.
+    rmSync(path);
+    const gone = await c.session.openForReader(1, generation, () => false, word);
+    expect(gone).toMatchObject({
+      ok: false,
+      code: 'eml_missing',
+      match: { state: file.bodyState },
+    });
+    expect(await c.session.openForReader(1, generation, () => false)).toEqual({
+      ok: false,
+      code: 'eml_missing',
+    });
+    await c.session.close();
+  });
+
   it('opens nothing while the run is unavailable, or without a source', async () => {
     const e = exportAt('lc-reader-none', 3, 23);
     const c = core({ root: null, indexDir: e.indexDir });

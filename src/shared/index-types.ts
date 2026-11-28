@@ -4,6 +4,7 @@
 // indexing stands. Shared by core, main and the shell.
 
 import type { CAPPED_LIST_NAMES } from './log/codes';
+import type { ReaderMatch, StoredBody } from './reader-protocol';
 import type { RejectKind } from './sources';
 
 export type FolderKind = 'system' | 'folder' | 'label';
@@ -306,7 +307,7 @@ export type IndexQuery =
   | { op: 'details'; threadIds: number[] }
   | { op: 'resolve'; rowid: number }
   | { op: 'totals' }
-  | { op: 'eml'; rowid: number }
+  | { op: 'eml'; rowid: number; search?: string }
   | { op: 'report' }
   | WindowQuery
   | SearchQuery
@@ -339,6 +340,15 @@ export interface EmlFile {
   dev: string;
   ino: string;
   bodyState: number;
+  /** With a search: how the message matched it, or null if it didn't match or has nothing to mark. */
+  match?: IndexMatch | null;
+}
+
+/** How a message matched a search, with its stored body and ranges when the body matched. Core only. */
+export interface IndexMatch extends ReaderMatch {
+  body: StoredBody | null;
+  /** Columns whose marks failed the range check and were dropped. */
+  dropped: number;
 }
 
 /** A list of a message whose entries were cut to a limit when it was indexed. */

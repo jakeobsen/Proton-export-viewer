@@ -64,12 +64,14 @@ const PingArgs = z.tuple([z.object({ generation: Generation }).strict()]);
 const OpenArgs = z.tuple([
   z.object({ id: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/), generation: Generation }).strict(),
 ]);
+const QueryId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const MessageOpenArgs = z.tuple([
   z
     .object({
       rowid: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
       mode: z.enum(OPEN_MODES),
       generation: Generation,
+      queryId: QueryId.optional(),
     })
     .strict(),
 ]);
@@ -207,7 +209,7 @@ const SearchArgs = z.tuple([
 const SnippetsArgs = z.tuple([
   z
     .object({
-      queryId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      queryId: QueryId,
       threadIds: z.array(SearchThreadId).min(1).max(MAX_SNIPPET_THREADS),
       generation: Generation,
     })
@@ -343,14 +345,39 @@ export function registerIpc(ctx: AppContext): void {
     return { ok: true };
   });
 
+  let lastQueryId = 0;
+  /** Per window, its latest search's text, and the first query ID made with that text. */
+  const currentSearch = new WeakMap<
+    AppWindow,
+    { text: string; firstQueryId: number; generation: number }
+  >();
+  /**
+   * The text of the window's current search, if `queryId` is one of its IDs
+   * in this generation; null for an older search's ID or an unknown one.
+   */
+  const searchTextOf = (appWin: AppWindow, queryId: number, generation: number): string | null => {
+    const search = currentSearch.get(appWin);
+    if (
+      !search ||
+      search.generation !== generation ||
+      queryId < search.firstQueryId ||
+      queryId > lastQueryId
+    ) {
+      return null;
+    }
+    return search.text;
+  };
+
   const openPacer = new OpenPacer<AppWindow>(() =>
     __PEV_TEST_HOOKS__ ? (ctx.openGapMs ?? OPEN_GAP_MS) : OPEN_GAP_MS,
   );
   guarded<MessageOpenResult>(IPC.open, async (appWin, raw) => {
     const args = MessageOpenArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
-    const [{ rowid, mode, generation }] = args.data;
+    const [{ rowid, mode, generation, queryId }] = args.data;
     if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    // From an older search, or an unknown one, the message still opens, without its matches.
+    const searchText = queryId === undefined ? null : searchTextOf(appWin, queryId, generation);
 
     const { openId, token, revoked } = appWin.views.accept();
     if (revoked > 0) {
@@ -383,7 +410,16 @@ export function registerIpc(ctx: AppContext): void {
     let result;
     try {
       result = await ctx.core.requestRunning(
-        { type: 'read', openId, generation, token, rowid, mode, lane: appWin.id },
+        {
+          type: 'read',
+          openId,
+          generation,
+          token,
+          rowid,
+          mode,
+          lane: appWin.id,
+          ...(searchText === null ? {} : { search: { text: searchText } }),
+        },
         ctx.sources.stamp(),
       );
     } catch (err) {
@@ -394,11 +430,17 @@ export function registerIpc(ctx: AppContext): void {
     }
     if (appWin.win.isDestroyed()) return reject('superseded', appWin);
 
+    // Only an open from search has a match, and only a view, the fallback and a missing file carry it.
+    const match = searchText === null ? null : (result.match ?? null);
     if (!result.ok) {
       appWin.views.abandon(openId);
+      if (result.code === 'eml_missing') {
+        reject('eml_missing', appWin);
+        return { ok: false, code: 'eml_missing', match };
+      }
       if (result.code !== 'reader_failed') {
         if (result.code === 'unavailable') return reject('offline', appWin);
-        const known = ['no_source', 'not_found', 'eml_missing', 'superseded'] as const;
+        const known = ['no_source', 'not_found', 'superseded'] as const;
         const code = known.find((c) => c === result.code);
         return reject(code ?? 'invalid', appWin);
       }
@@ -413,7 +455,13 @@ export function registerIpc(ctx: AppContext): void {
         openId,
         windowId: appWin.id,
       });
-      return { ok: true, openId, outcome: 'fallback' };
+      return {
+        ok: true,
+        openId,
+        outcome: 'fallback',
+        match,
+        fileRefused: result.reason === 'file',
+      };
     }
     const message = result.read;
     if (!message) return reject('invalid', appWin);
@@ -460,6 +508,8 @@ export function registerIpc(ctx: AppContext): void {
         imageFormat: a.imageFormat,
       })),
       details: message.details,
+      highlighted: message.highlighted,
+      match,
     };
   });
 
@@ -558,12 +608,6 @@ export function registerIpc(ctx: AppContext): void {
    * superseded, which isn't logged, since it is how typing works.
    */
   const searchLanes = new SearchLanes<AppWindow>();
-  let lastQueryId = 0;
-  /** Per window, its latest search's text, and the first query ID made with that text. */
-  const currentSearch = new WeakMap<
-    AppWindow,
-    { text: string; firstQueryId: number; generation: number }
-  >();
   guarded<SearchResult>(IPC.search, async (appWin, raw) => {
     const args = SearchArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
@@ -601,18 +645,11 @@ export function registerIpc(ctx: AppContext): void {
     if (!args.success) return reject('invalid', appWin);
     const [{ queryId, threadIds, generation }] = args.data;
     if (generation !== ctx.generation) return reject('stale_generation', appWin);
-    const search = currentSearch.get(appWin);
-    if (
-      !search ||
-      search.generation !== generation ||
-      queryId < search.firstQueryId ||
-      queryId > lastQueryId
-    ) {
-      return { ok: false, code: 'superseded' };
-    }
+    const text = searchTextOf(appWin, queryId, generation);
+    if (text === null) return { ok: false, code: 'superseded' };
     const outcome = await snippetLanes.run(appWin, async () =>
       generation === ctx.generation
-        ? ctx.sources.queryIndex({ op: 'snippets', queryId, text: search.text, threadIds })
+        ? ctx.sources.queryIndex({ op: 'snippets', queryId, text, threadIds })
         : null,
     );
     if (outcome === SUPERSEDED) return { ok: false, code: 'superseded' };

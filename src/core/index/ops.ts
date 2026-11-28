@@ -43,7 +43,7 @@ import {
   threadOfMessage,
 } from './queries';
 import { indexReport } from './report';
-import { searchPage, searchSnippets } from './search';
+import { matchInfo, searchPage, searchSnippets } from './search';
 import {
   META,
   createSchema,
@@ -454,8 +454,12 @@ export class QueryState {
         return listWindow(db, call);
       case 'cards':
         return cardsWindow(db, call);
-      case 'eml':
-        return emlFile(db, call.rowid);
+      case 'eml': {
+        // With a search, the match comes from the same snapshot as the file.
+        const file = emlFile(db, call.rowid);
+        if (file && call.search !== undefined) file.match = matchInfo(db, call.rowid, call.search);
+        return file;
+      }
       case 'search':
         return searchPage(db, call);
       case 'snippets':
@@ -799,6 +803,7 @@ export function threadHandler(role: ThreadRole): (op: string, args: unknown) => 
       files?: ListedFile[];
       fd?: number;
       item?: BodyJobItem;
+      stall?: boolean;
     };
     switch (op) {
       case 'meta':
@@ -808,6 +813,8 @@ export function threadHandler(role: ThreadRole): (op: string, args: unknown) => 
       case 'stat':
         return statJob(a.root, a.files ?? []);
       case 'body':
+        // Test builds: a body job that never ends, to run past its limit.
+        if (__PEV_TEST_HOOKS__ && a.stall) return new Promise<never>(() => undefined);
         return bodyJob(a.fd as number, a.item as BodyJobItem);
     }
     throw new Error('UNKNOWN_OP');

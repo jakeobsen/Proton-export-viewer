@@ -66,6 +66,7 @@ export const LOG_CODES = [
   'reader.parse_failed',
   'reader.worker_retired',
   'reader.images_refused',
+  'reader.marks_dropped',
   'index.created',
   'index.opened',
   'index.open_failed',

@@ -101,6 +101,10 @@ async function render(request: WorkerRender): Promise<WorkerRendered> {
         }
       },
       ...(sanitize ? { sanitize } : {}),
+      ...(request.stored ? { stored: request.stored } : {}),
+      onMarksDropped: (count) => {
+        post({ type: 'log', level: 'warn', code: 'reader.marks_dropped', data: { count } });
+      },
     });
     return { type: 'rendered', reqId: request.reqId, heldBytes: heldBytes(), ok: true, message };
   } catch (err) {
