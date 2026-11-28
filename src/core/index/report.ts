@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The index's part of the index report: what was indexed, and the pairs that
 // need attention (metadata that couldn't be used or is missing, a missing
-// message file, a list cut to its limit), counted and listed by file name.
-// Files the scan refused are added by the source, which holds the scan.
+// message file, a list cut to its limit, text that couldn't be read or was cut
+// to the search limit), counted and listed by file name. Files the scan
+// refused are added by the source, which holds the scan.
 
 import { CAPPED_LIST_NAMES } from '../../shared/log/codes';
 import { REJECT_KINDS, type RejectKind } from '../../shared/sources';
@@ -15,7 +16,9 @@ import {
 } from '../../shared/index-types';
 import { CAPPED, META_STATE, BODY_STATE } from './schema';
 import { sidebar } from './queries';
+import { coverageOf } from './search';
 import { asNumber, scalar, type Db } from './sql';
+import { BODY_TOO_LARGE } from './writer';
 
 /** The report as the index alone knows it: no scan and no timing yet. */
 export type IndexPart = Omit<IndexReport, 'took'>;
@@ -45,6 +48,36 @@ export function pairReason(
   }
 }
 
+/** The log reason for a pair's code. */
+export function reasonOf(code: string): string {
+  if (code.startsWith('FILE_')) return code.slice('FILE_'.length).toLowerCase();
+  switch (code) {
+    case 'META_JSON':
+      return 'meta_json';
+    case 'META_SHAPE':
+      return 'meta_shape';
+    case 'META_ID':
+      return 'meta_id';
+    case 'META_TIMEOUT':
+    case 'BODY_TIMEOUT':
+      return 'timeout';
+    case BODY_TOO_LARGE:
+      return 'too_large';
+    default:
+      return 'worker_failed';
+  }
+}
+
+/**
+ * The code a text row carries in the copied report: `truncated` for text cut
+ * to the limit (it has no pair code), else the log reason of the pair's code,
+ * with no code read as a failed read.
+ */
+export function bodyCode(state: number, code: string | null): string {
+  if (state === BODY_STATE.truncated) return 'truncated';
+  return reasonOf(code ?? '');
+}
+
 const bump = <K extends string>(counts: Partial<Record<K, number>>, key: K, by: number) => {
   counts[key] = (counts[key] ?? 0) + by;
 };
@@ -71,6 +104,7 @@ export function indexReport(db: Db, systemIds: readonly string[], limit = REPORT
     capped: {},
     cappedMessages: 0,
     hiddenLabelIds: side.hiddenIds,
+    fullText: { indexed: 0, total: 0, truncated: 0, skipped: 0, skippedBy: {} },
     attention: 0,
     rows: [],
     more: 0,
@@ -116,6 +150,36 @@ export function indexReport(db: Db, systemIds: readonly string[], limit = REPORT
   }
   report.cappedMessages = cappedMessages;
   rowCount += cappedMessages;
+
+  // The text of listed messages: indexed and total as search counts them;
+  // text cut to the limit, and text that couldn't be read, by code. Each of
+  // these rows names the message file, which no other row does.
+  const coverage = coverageOf(db);
+  const fullText = report.fullText;
+  fullText.indexed = coverage.indexed;
+  fullText.total = coverage.total;
+  for (const r of db
+    .stmt(
+      `SELECT body_state, error_code, count(*) AS n FROM pairs
+       WHERE meta_state = ${META_STATE.indexed}
+         AND body_state IN (${BODY_STATE.truncated}, ${BODY_STATE.failed})
+       GROUP BY body_state, error_code`,
+    )
+    .all()) {
+    const n = asNumber(r.n);
+    const state = asNumber(r.body_state);
+    if (state === BODY_STATE.truncated) fullText.truncated += n;
+    else {
+      fullText.skipped += n;
+      bump(
+        fullText.skippedBy,
+        bodyCode(state, r.error_code === null ? null : String(r.error_code)),
+        n,
+      );
+    }
+  }
+  rowCount += fullText.truncated + fullText.skipped;
+
   // A listed message with no message file and a list cut to its limit is
   // counted once.
   const both =
@@ -129,8 +193,10 @@ export function indexReport(db: Db, systemIds: readonly string[], limit = REPORT
       : 0;
   report.attention = rowCount - both;
 
-  // The rows: metadata that couldn't be used, then missing metadata, then
-  // missing message files, then cut lists; each by file name.
+  // The rows: metadata that couldn't be used, missing metadata, text that
+  // couldn't be read, then missing message files, then cut lists and text cut
+  // to the limit; each by file name. Within its result, text comes after the
+  // metadata rows, so many unreadable bodies can't push those past the limit.
   const rows = report.rows;
   const room = () => limit - rows.length;
   if (room() > 0) {
@@ -158,6 +224,23 @@ export function indexReport(db: Db, systemIds: readonly string[], limit = REPORT
       rows.push({ result: 'skipped', file: String(r.eml_rel ?? ''), reason: 'meta_missing' });
     }
   }
+  if (room() > 0 && fullText.skipped > 0) {
+    for (const r of db
+      .stmt(
+        `SELECT eml_rel, error_code FROM pairs
+         WHERE meta_state = ${META_STATE.indexed} AND body_state = ${BODY_STATE.failed}
+         ORDER BY eml_rel LIMIT ?`,
+      )
+      .all(room())) {
+      const code = r.error_code === null ? null : String(r.error_code);
+      rows.push({
+        result: 'skipped',
+        file: String(r.eml_rel ?? ''),
+        reason: code === 'BODY_TIMEOUT' ? 'body_timeout' : 'body_failed',
+        code: bodyCode(BODY_STATE.failed, code),
+      });
+    }
+  }
   if (room() > 0) {
     for (const r of db
       .stmt(
@@ -182,6 +265,22 @@ export function indexReport(db: Db, systemIds: readonly string[], limit = REPORT
         file: String(r.meta_rel ?? ''),
         reason: 'capped',
         lists: cappedLists(asNumber(r.capped)),
+      });
+    }
+  }
+  if (room() > 0 && fullText.truncated > 0) {
+    for (const r of db
+      .stmt(
+        `SELECT eml_rel FROM pairs
+         WHERE meta_state = ${META_STATE.indexed} AND body_state = ${BODY_STATE.truncated}
+         ORDER BY eml_rel LIMIT ?`,
+      )
+      .all(room())) {
+      rows.push({
+        result: 'truncated',
+        file: String(r.eml_rel ?? ''),
+        reason: 'body_truncated',
+        code: bodyCode(BODY_STATE.truncated, null),
       });
     }
   }
