@@ -8,7 +8,14 @@ import { displayText } from '../shared/header-text';
 import type { ActiveExport } from '../shared/sources';
 import { Chips } from './Chips';
 import type { SidebarEntry, SidebarModel } from './folders';
-import { formatCount, fullDate, listDate, loadingText, participantsText } from './format';
+import {
+  formatCount,
+  fullDate,
+  listDate,
+  loadingText,
+  participantsText,
+  readingText,
+} from './format';
 import { exportLabel } from './labels';
 import { ROW_HEIGHT, type Row } from './list';
 import { list, selectRow, showFolder, useList, useMailbox } from './mailbox-state';
@@ -116,24 +123,30 @@ function FolderGroup({
   );
 }
 
-function IndexStatus() {
+function IndexStatus({ active }: { active: ActiveExport }) {
   const { progress } = useMailbox();
-  if (!progress) return null;
-  if (progress.phase === 'loading' || progress.phase === 'opening') {
-    // Until the scan has counted the files, the bar shows without numbers.
-    const counted = progress.total > 0;
+  // From the moment the export opens until core reports, it is loading too.
+  const opening = progress === null && active.status === 'online' && !active.closed;
+  const phase = progress?.phase;
+  if (opening || phase === 'scanning' || phase === 'opening' || phase === 'loading') {
+    // Until something is counted, the bar shows without numbers.
+    const counted = progress !== null && progress.total > 0;
     const share = counted ? progress.loaded / progress.total : 0;
     return (
       <div className="side-foot" role="status">
-        {counted && (
-          <button
-            type="button"
-            className="link loading-text"
-            onClick={(e) => openReportFrom(e.currentTarget)}
-          >
-            {loadingText(progress.loaded, progress.total)}
-          </button>
-        )}
+        {counted &&
+          (phase === 'scanning' ? (
+            // The folder is still being read: there is no index to report on yet.
+            <span className="loading-text">{readingText(progress.loaded, progress.total)}</span>
+          ) : (
+            <button
+              type="button"
+              className="link loading-text"
+              onClick={(e) => openReportFrom(e.currentTarget)}
+            >
+              {loadingText(progress.loaded, progress.total)}
+            </button>
+          ))}
         <div
           className="bar-track"
           role="progressbar"
@@ -151,7 +164,7 @@ function IndexStatus() {
       </div>
     );
   }
-  if (progress.condition === 'verifying') {
+  if (progress?.condition === 'verifying') {
     return (
       <div className="side-foot" role="status">
         Verifying index…
@@ -167,7 +180,7 @@ export function Sidebar({ active, busy }: { active: ActiveExport; busy: boolean 
     <aside className="sidebar" aria-label="Folders and labels">
       <AccountBox active={active} busy={busy} />
       <div className="side-scroll">{sidebar && <Folders sidebar={sidebar} folder={folder} />}</div>
-      <IndexStatus />
+      <IndexStatus active={active} />
     </aside>
   );
 }

@@ -41,6 +41,33 @@ export interface InlineImage {
   bytes: Uint8Array;
 }
 
+/** The text columns, other than the body, that a search can match in a message. */
+export const MATCH_COLUMNS = ['subject', 'sender', 'recipients', 'attachments'] as const;
+export type MatchColumn = (typeof MATCH_COLUMNS)[number];
+
+/**
+ * How an open from search matched its message, for the reader's match line.
+ * Counts and column names only: never the search text or the matched words.
+ */
+export interface ReaderMatch {
+  /** Where the message's text stands in the index: 0 not read yet … 4 file missing. */
+  state: number;
+  /** For state 3: why its text couldn't be read. */
+  reason: 'timeout' | 'unreadable' | null;
+  /** The columns other than the body that matched, in index order. */
+  columns: MatchColumn[];
+  /** How many matches the stored body has; 0 when it has none or isn't used. */
+  bodyMatches: number;
+  /** The file opened isn't the one that was indexed, so its body isn't matched. */
+  changed: boolean;
+}
+
+/** A stored body with its match ranges, in UTF-16 code units, for the plain view. */
+export interface StoredBody {
+  text: string;
+  ranges: Array<[number, number]>;
+}
+
 /** One attachment of a rendered message, in the order the message has its parts. */
 export interface AttachmentEntry {
   /** The part's dotted path in the message: `1.2` is the second part of the first. */
@@ -103,6 +130,8 @@ export interface RenderedMessage {
    * are read. Null when the body is shown whole.
    */
   cut: 'size' | 'parts' | null;
+  /** The plain body is the stored text with the search's matches marked. */
+  highlighted: boolean;
 }
 
 /** A large synthetic message, generated while a test runs (test builds only). */
@@ -159,6 +188,8 @@ export interface ReadRequest {
   mode: OpenMode;
   /** The window the open is for. Its newer opens, by openId, drop this one while it waits. */
   lane: number;
+  /** The search the message was opened from: its matches are marked or listed. */
+  search?: { text: string };
 }
 
 /** The most of one header block the source view shows. */
@@ -247,6 +278,8 @@ export interface WorkerRender {
   assetBase: string;
   /** Test builds only: serve the HTML body without the sanitizer and the CSS filter. */
   unsanitized?: true;
+  /** The stored body with its matches: a plain view shows it, marked, instead of the file's text. */
+  stored?: StoredBody;
 }
 
 /**

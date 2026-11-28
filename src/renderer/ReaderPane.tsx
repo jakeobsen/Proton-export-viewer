@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The reader pane: one message with its sender, date and recipients, the
 // plain text and HTML switch, the actions on the message, the body frame, the
-// lines for blocked images, size limits and the fallback, and the attachments.
-// The source view of the message takes the pane's place while it shows.
+// lines for search matches, blocked images, size limits and the fallback, and
+// the attachments. The source view of the message takes the pane's place
+// while it shows.
 
 import { useEffect, useMemo, useState } from 'react';
 import type { AttachmentItem, RejectCode } from '../shared/api';
@@ -22,6 +23,7 @@ import {
   senderOf,
   shortDate,
 } from './reader-format';
+import { indexedPartText, matchLine, type MatchLine } from './match-line';
 import {
   copyMessageId,
   openInReader,
@@ -188,7 +190,37 @@ function Who({ headers, details: more }: { headers: MessageHeaders; details: Mes
   );
 }
 
-function Lines({ rowid, view }: { rowid: number; view: ReaderView }) {
+/** The match line of an open from search; the plain view it offers carries the same search. */
+function MatchBar({ rowid, line }: { rowid: number; line: MatchLine }) {
+  if (line.kind === 'none') return null;
+  return (
+    <div className="rp-line rp-matches" role="status">
+      <b>{line.text}</b>
+      {line.kind === 'matches' && (
+        <>
+          <span aria-hidden="true">·</span>
+          <button
+            type="button"
+            className="rp-btn"
+            onClick={() => void openInReader(rowid, 'plain')}
+          >
+            Show highlights in plain text
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+function Lines({
+  rowid,
+  view,
+  indexedPart,
+}: {
+  rowid: number;
+  view: ReaderView;
+  indexedPart: string | null;
+}) {
   return (
     <>
       {view.format === 'html' && view.remote > 0 && (
@@ -211,6 +243,11 @@ function Lines({ rowid, view }: { rowid: number; view: ReaderView }) {
       {view.cut && (
         <div className="rp-line rp-truncated">
           <b>{view.cut === 'size' ? 'First 1 MB shown' : 'Only part of this message shown'}</b>
+        </div>
+      )}
+      {indexedPart !== null && (
+        <div className="rp-line rp-truncated">
+          <b>{indexedPart}</b>
         </div>
       )}
     </>
@@ -348,10 +385,24 @@ export function MessageBody() {
   const reader = useReaderState();
   const { rowid, view, pending } = reader;
   if (rowid === null) return null;
+  const line = pending
+    ? ({ kind: 'none' } as const)
+    : matchLine({
+        match: reader.match,
+        refused: reader.refused,
+        fallback: reader.fallback,
+        mode: reader.mode,
+        fileRefused: reader.fileRefused,
+        view: view && { format: view.format, highlighted: view.highlighted },
+      });
   if (reader.refused !== null) {
-    const text = refusedText(reader.refused);
+    // A missing file's match line says it is missing, so the pane doesn't say it twice.
+    const text = line.kind === 'none' ? refusedText(reader.refused) : line.text;
     return text === null ? null : (
-      <div className="rp-line rp-state" role="status">
+      <div
+        className={line.kind === 'none' ? 'rp-line rp-state' : 'rp-line rp-state rp-matches'}
+        role="status"
+      >
         <b>{text}</b>
       </div>
     );
@@ -410,7 +461,14 @@ export function MessageBody() {
         {view && <MessageActions key={view.url} view={view} />}
       </div>
       {view && <Who headers={view.headers} details={view.details} />}
-      {view && <Lines rowid={rowid} view={view} />}
+      <MatchBar rowid={rowid} line={line} />
+      {view && (
+        <Lines
+          rowid={rowid}
+          view={view}
+          indexedPart={indexedPartText(reader.match, view.highlighted)}
+        />
+      )}
       {reader.fallback && (
         <div className="rp-line rp-fallback" role="alert">
           <WarnIcon />

@@ -98,6 +98,14 @@ function near(actual: Rgb, expected: readonly number[]): boolean {
   return actual.every((c, i) => Math.abs(c - (expected[i] ?? -1)) <= 3);
 }
 
+/** Fails, naming both colours, unless each channel of `actual` is within 3 of `expected`. */
+function expectNear(actual: Rgb, expected: readonly number[], label: string): void {
+  expect(
+    near(actual, expected),
+    `${label}: got ${actual.join(',')}, expected ${expected.join(',')}`,
+  ).toBe(true);
+}
+
 /** The reasons logged for refused inline images so far, one per log line. */
 function refusals(pev: PevApp): string[] {
   return pev
@@ -142,7 +150,7 @@ test('a valid cid: PNG and a valid data: GIF render, pixel-checked, with the det
 }) => {
   const rows = await source(pev, corpus());
   const cid = await view(pev, rows.get('cid-valid') as number);
-  expect(near(await colorOf(cid.frame, 'inline'), INLINE_COLORS.cid)).toBe(true);
+  expectNear(await colorOf(cid.frame, 'inline'), INLINE_COLORS.cid, 'cid');
   const asset = await pev.main<{ status: number; headers: Record<string, string> }>(
     'fetchIn',
     1,
@@ -153,7 +161,7 @@ test('a valid cid: PNG and a valid data: GIF render, pixel-checked, with the det
   await ownRequestsOnly(pev, cid.opened);
 
   const data = await view(pev, rows.get('data-valid') as number);
-  expect(near(await colorOf(data.frame, 'inline'), INLINE_COLORS.data)).toBe(true);
+  expectNear(await colorOf(data.frame, 'inline'), INLINE_COLORS.data, 'data');
   await ownRequestsOnly(pev, data.opened);
 });
 
@@ -163,11 +171,8 @@ test('each alternative shows its own image for a shared Content-ID, with and wit
   const rows = await source(pev, corpus());
   for (const name of ['scope-related', 'scope-mixed']) {
     const { frame } = await view(pev, rows.get(name) as number);
-    expect([name, near(await colorOf(frame, 'first'), INLINE_COLORS.first)]).toEqual([name, true]);
-    expect([name, near(await colorOf(frame, 'second'), INLINE_COLORS.second)]).toEqual([
-      name,
-      true,
-    ]);
+    expectNear(await colorOf(frame, 'first'), INLINE_COLORS.first, `${name} first`);
+    expectNear(await colorOf(frame, 'second'), INLINE_COLORS.second, `${name} second`);
   }
   for (const [name, id] of [
     ['scope-duplicate', 'duplicate'],
