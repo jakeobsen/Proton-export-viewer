@@ -365,6 +365,16 @@ test('on the fallback, View source shows the headers; the tree shows when the st
   await pev.main('readerLimits', { heapMb: 512, timeoutMs: 100 });
   await openInReader(pev, 2);
   await expect(pev.page.locator('.rp-fallback')).toHaveCount(1);
+  // The open's worker ended with it, and its replacement starts at once. The
+  // limit also counts a worker's start, so it gets time to start first.
+  await expect
+    .poll(
+      async () =>
+        (await pev.main<{ data: { threadId: number | null } }>('core', 'reader-lane')).data
+          .threadId,
+    )
+    .not.toBeNull();
+  await pev.page.waitForTimeout(2000);
   await press(pev.page, '.rp-view-source');
   expect(await frameText(pev, await sourceShown(pev, 1))).toContain('Subject: Big');
   await expect.poll(async () => (await reader(pev)).source?.tree).toBe('none');
