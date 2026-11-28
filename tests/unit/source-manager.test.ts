@@ -1475,6 +1475,17 @@ describe('spawning with the folder access released', () => {
     expect(t.lines.some((l) => l.includes('"scope.failed"'))).toBe(true);
   });
 
+  it('a quit during the spawn starts nothing again: no scope and no core', async () => {
+    const t = await opened('mgr-fetcher-quit');
+    const starts = t.core.started.length;
+    await t.manager.withScopeReleased(async () => {
+      t.manager.close();
+    });
+    expect(steps(t.order)).toEqual(['scope.release', 'fetcher.spawn']);
+    expect([...t.live.values()]).toEqual([]);
+    expect(t.core.started).toHaveLength(starts);
+  });
+
   it('a folder gone during the spawn takes the source offline and releases the scope again', async () => {
     const t = await opened('mgr-fetcher-gone');
     await t.manager.withScopeReleased(async () => {

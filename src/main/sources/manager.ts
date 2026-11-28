@@ -487,12 +487,17 @@ export class SourceManager {
     });
   }
 
-  /** Starts a released scope again; the open source goes unavailable if that fails. */
+  /**
+   * Starts a released scope again; the open source goes unavailable if that
+   * fails. Once the app is quitting, nothing is started again: quit has let
+   * go of the access, and no core may start.
+   */
   private async restartScope(
     pickId: string,
     pick: PickRecord | undefined,
     generation: number,
   ): Promise<void> {
+    if (!this.admitting) return;
     let started = false;
     if (pick) {
       try {

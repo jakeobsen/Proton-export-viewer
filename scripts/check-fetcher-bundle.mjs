@@ -4,7 +4,9 @@
 // modules it imports pull in, so this checks what actually ships. The only
 // modules from outside the bundle it may load are Node's HTTP, HTTPS and DNS
 // clients: no file system, process, worker, Electron or other network module,
-// and no require, getBuiltinModule or process.binding.
+// and no require, getBuiltinModule or process.binding. Node's global fetch and
+// sockets are refused too: they don't resolve through the fetcher's checked
+// lookup.
 //
 //   node scripts/check-fetcher-bundle.mjs [outRoot]   (default: out)
 
@@ -26,7 +28,11 @@ const FORBIDDEN_CALLS = [
   /\brequire\s*\(/,
   /\bgetBuiltinModule\b/,
   /\bprocess\s*\.\s*(?:binding|_linkedBinding|dlopen)\b/,
+  /\bprocess\s*\[/, // a computed member: process['binding'] and the like
   /\bcreateRequire\b/,
+  /\b(?:WebSocket|EventSource|XMLHttpRequest|undici)\b/,
+  /\bglobalThis\s*(?:\.\s*fetch\b|\[)/,
+  /(?<![.\w$'"`])fetch\s*\((?![^()]*\)\s*\{)/, // the global fetch called, not a method defined
 ];
 
 /** The module specifiers a bundle file names. */

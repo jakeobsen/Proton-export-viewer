@@ -45,6 +45,26 @@ export const FETCHER_ENV: Readonly<Record<string, string>> = Object.freeze({
   PEV_PROCESS: 'fetcher',
 });
 
+/**
+ * After this many crashes within the window, a request is refused with
+ * `crashed` without a spawn until the window has passed: each spawn holds
+ * the source queue and cycles the folder access, so a message whose images
+ * crash the fetcher each time can't stall the app.
+ */
+export const CRASH_LIMIT = { crashes: 3, windowMs: 60_000 };
+
+/**
+ * The only codes the fetcher may send, each with the only fields it may
+ * carry; main's own fetcher.* codes are refused, and any other field is left
+ * out before the log schema checks the rest.
+ */
+export const RELAYED: Readonly<Record<string, readonly string[]>> = {
+  'fetcher.fetched': ['statusClass', 'bytes', 'ms'],
+  'fetcher.refused': ['reason', 'ms', 'statusClass'],
+  'fetcher.uncaught': ['errorClass'],
+  'fetcher.rejection': ['errorClass'],
+};
+
 /** At most this many relayed log events per window; the rest are counted and dropped. */
 export const RELAY_LIMIT = { events: 200, windowMs: 10_000 };
 
@@ -63,6 +83,7 @@ export interface FetcherHostOptions {
   readyTimeoutMs?: number;
   stopTimeoutMs?: number;
   relayLimit?: { events: number; windowMs: number };
+  crashLimit?: { crashes: number; windowMs: number };
   now?: () => number;
   /** Tests only: ends a process for good once its kill went unanswered. */
   killProcess?: (pid: number) => void;
@@ -99,6 +120,9 @@ export class FetcherHost {
   private readonly stopping = new WeakMap<UtilityProcess, FetchRefusal>();
   private readonly pending = new Map<string, Pending>();
   private relayWindow = { start: 0, events: 0, dropped: 0 };
+  /** When recent fetchers crashed, oldest first. */
+  private crashes: number[] = [];
+  private crashHeld = false;
   private testSeq = 0;
   private readonly testPending = new Map<number, (reply: FetcherTestReply) => void>();
   /** Builds with test hooks only: what the next fetcher gets for its tests. */
@@ -117,6 +141,10 @@ export class FetcherHost {
   /** Makes sure a fetcher is up and ready, starting one through the guard if needed. */
   ensure(): Promise<void> {
     if (this.starting) return this.starting;
+    // Ready already: a start whose guard failed afterwards (the folder access
+    // couldn't be started again) still left a fetcher that holds no access.
+    if (this.child && this.port && !this.failStart) return Promise.resolve();
+    if (this.crashLimited()) return Promise.reject(new FetcherUnavailableError());
     const starting = this.options.spawnGuard(() => this.spawn());
     this.starting = starting;
     starting.catch(() => {
@@ -193,6 +221,19 @@ export class FetcherHost {
     entry.resolve(result);
   }
 
+  /** True while recent crashes hold spawns back; logs the hold once. */
+  private crashLimited(): boolean {
+    const limit = this.options.crashLimit ?? CRASH_LIMIT;
+    const now = (this.options.now ?? Date.now)();
+    this.crashes = this.crashes.filter((t) => now - t < limit.windowMs);
+    const held = this.crashes.length >= limit.crashes;
+    if (held && !this.crashHeld) {
+      this.options.log.warn('fetcher.crash_limit', { count: this.crashes.length });
+    }
+    this.crashHeld = held;
+    return held;
+  }
+
   private spawn(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       let child: UtilityProcess;
@@ -207,6 +248,7 @@ export class FetcherHost {
           env: { ...FETCHER_ENV },
         });
       } catch (err) {
+        this.crashes.push((this.options.now ?? Date.now)());
         reject(err instanceof Error ? err : new FetcherUnavailableError());
         return;
       }
@@ -259,6 +301,7 @@ export class FetcherHost {
   private release(child: UtilityProcess): void {
     if (this.child !== child) return;
     const reason = this.stopping.get(child) ?? 'crashed';
+    if (reason === 'crashed') this.crashes.push((this.options.now ?? Date.now)());
     this.child = null;
     this.port?.close();
     this.port = null;
@@ -336,10 +379,15 @@ export class FetcherHost {
   private relay(message: Record<string, unknown>): void {
     const { level, code, data } = message;
     if (typeof level !== 'string' || !(LOG_LEVELS as readonly string[]).includes(level)) return;
-    if (typeof code !== 'string' || !code.startsWith('fetcher.') || !isLogCode(code)) return;
+    if (typeof code !== 'string' || !Object.hasOwn(RELAYED, code) || !isLogCode(code)) return;
     if (data !== undefined && !isPlainObject(data)) return;
     if (!this.withinRelayLimit()) return;
-    this.options.relay.log(level as (typeof LOG_LEVELS)[number], code, data);
+    const fields = RELAYED[code]!;
+    const kept =
+      data === undefined
+        ? undefined
+        : Object.fromEntries(Object.entries(data).filter(([key]) => fields.includes(key)));
+    this.options.relay.log(level as (typeof LOG_LEVELS)[number], code, kept);
   }
 
   private withinRelayLimit(): boolean {

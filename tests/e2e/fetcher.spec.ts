@@ -147,6 +147,10 @@ test('no marker in a URL or host name reaches a log through the fetcher', async 
     const fetched = pev.logs('main').filter((l) => l.code === 'fetcher.fetched');
     expect(fetched).toHaveLength(2);
     expect(fetched.every((l) => l.proc === 'fetcher')).toBe(true);
+    // A response's status is logged as its class, never exactly.
+    expect(fetched.map((l) => l.data.statusClass)).toEqual(['2xx', '2xx']);
+    expect(pev.hasLog('fetcher.refused', { proc: 'fetcher', statusClass: '4xx' })).toBe(true);
+    expect(pev.logs('main').filter((l) => l.proc === 'fetcher' && 'status' in l.data)).toEqual([]);
     for (const reason of ['status', 'port', 'userinfo', 'timeout']) {
       expect(pev.hasLog('fetcher.refused', { proc: 'fetcher', reason })).toBe(true);
     }

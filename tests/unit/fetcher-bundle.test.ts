@@ -83,12 +83,35 @@ describe('fetcher bundle check', () => {
     }
   });
 
+  it('passes a method named fetch, a call of it, and the word as a message type', () => {
+    const dir = bundle({
+      'fetcher.js': [
+        'class Views { fetch(request) { return request; } async fetchAll(r) { return r; } }',
+        'const views = new Views();',
+        'views.fetch({ type: "fetch" });',
+        "if (message.type === 'fetch') views.fetch(message);",
+        'const fetchImage = (u) => u; fetchImage("x");',
+      ].join('\n'),
+    });
+    expect(checkBundle(dir).failures).toEqual([]);
+  });
+
   it('refuses loading by name, test hooks, and a missing chunk', () => {
     const cases: Array<[string, string]> = [
       ['const f = require("fs");', 'uses'],
       ['const f = (n) => import(n);', 'uses'],
       ['const f = process.getBuiltinModule("fs");', 'uses'],
       ['const f = process.binding("fs");', 'uses'],
+      ['const f = process["binding"]("fs");', 'uses'],
+      ["const f = process['getBuiltinModule'];", 'uses'],
+      ['const r = fetch("https://example.com/");', 'uses'],
+      ['const r = await fetch(url, { method: "GET" });', 'uses'],
+      ['const r = globalThis.fetch;', 'uses'],
+      ['const r = globalThis["fetch"];', 'uses'],
+      ['const s = new WebSocket("wss://example.com/");', 'uses'],
+      ['const s = new EventSource("https://example.com/");', 'uses'],
+      ['const s = new XMLHttpRequest();', 'uses'],
+      ['const { request } = undici;', 'uses'],
       ['globalThis.__pevTestMarker = "pev-testhooks-present";', 'holds test hooks'],
     ];
     for (const [source, expected] of cases) {

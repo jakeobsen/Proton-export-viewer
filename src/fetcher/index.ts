@@ -24,7 +24,7 @@ import {
   type FromFetcher,
   type ToFetcher,
 } from '../shared/fetcher-protocol';
-import { errorClassOf } from '../shared/log/schema';
+import { errorClassOf, statusClass } from '../shared/log/schema';
 import { fetchImage, type FetchEnv, type ImageOutcome } from './request';
 import { ViewScheduler } from './views';
 
@@ -48,8 +48,9 @@ process.on('unhandledRejection', (reason) =>
 function report(request: FetchRequest, outcome: ImageOutcome): void {
   const { viewKey, ref } = request;
   if (outcome.ok) {
+    const cls = statusClass(outcome.status);
     log('info', 'fetcher.fetched', {
-      status: outcome.status,
+      ...(cls === null ? {} : { statusClass: cls }),
       bytes: outcome.bytes.length,
       ms: Math.round(outcome.ms),
     });
@@ -64,10 +65,12 @@ function report(request: FetchRequest, outcome: ImageOutcome): void {
     });
     return;
   }
+  // The status's class only: an exact status can carry what a server chose.
+  const cls = statusClass(outcome.status);
   log('info', 'fetcher.refused', {
     reason: outcome.reason,
     ms: Math.round(outcome.ms),
-    ...(outcome.status === null ? {} : { status: outcome.status }),
+    ...(cls === null ? {} : { statusClass: cls }),
   });
   post({
     type: 'result',

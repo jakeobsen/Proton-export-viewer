@@ -86,6 +86,9 @@ function make(
     readyTimeoutMs?: number;
     stopTimeoutMs?: number;
     relayLimit?: { events: number; windowMs: number };
+    crashLimit?: { crashes: number; windowMs: number };
+    /** The folder access can't be started again after a spawn. */
+    restartFails?: boolean;
   } = {},
 ) {
   const codes: string[] = [];
@@ -113,10 +116,14 @@ function make(
       } finally {
         guard.push('restart');
       }
+      if (options.restartFails) throw new Error('restart failed');
     },
     killProcess: (pid) => killed.push(pid),
     now: () => now,
-    ...options,
+    readyTimeoutMs: options.readyTimeoutMs,
+    stopTimeoutMs: options.stopTimeoutMs,
+    relayLimit: options.relayLimit,
+    crashLimit: options.crashLimit,
   });
   return { host, codes, relayed, guard, killed, advance: (ms: number) => (now += ms) };
 }
@@ -410,6 +417,75 @@ describe('fetching', () => {
     expect(await b).toMatchObject({ ok: true });
   });
 
+  it('keeps a ready fetcher when the access can’t be started again after its spawn: no second one', async () => {
+    const { host } = make({ restartFails: true });
+    const a = host.fetch('v1', 'a', 'https://example.com/a.png');
+    ready(0);
+    expect(await a).toEqual({ ok: false, reason: 'crashed', insecure: false });
+    expect(host.running).toBe(true);
+    const b = host.fetch('v1', 'b', 'https://example.com/b.png');
+    await tick();
+    expect(fake.forks).toHaveLength(1);
+    expect(children()[0]!.kills).toBe(0);
+    expect(ports()[0]!.posted).toEqual([
+      { type: 'fetch', viewKey: 'v1', ref: 'b', url: 'https://example.com/b.png' },
+    ]);
+    send(0, {
+      type: 'result',
+      viewKey: 'v1',
+      ref: 'b',
+      ok: true,
+      bytes: new Uint8Array(PNG),
+      insecure: false,
+    });
+    expect(await b).toMatchObject({ ok: true });
+  });
+
+  it('after three crashes within a minute, refuses with crashed and spawns nothing until it has passed', async () => {
+    const { host, codes, guard, advance } = make();
+    for (let i = 0; i < 3; i += 1) {
+      const p = host.fetch('v1', `r${i}`, 'https://example.com/a.png');
+      ready(i);
+      await tick();
+      children()[i]!.emit('exit', 9);
+      expect(await p).toEqual({ ok: false, reason: 'crashed', insecure: false });
+      advance(10_000);
+    }
+    const crashed = { ok: false, reason: 'crashed', insecure: false };
+    expect(await host.fetch('v1', 'held1', 'https://example.com/a.png')).toEqual(crashed);
+    expect(await host.fetch('v1', 'held2', 'https://example.com/a.png')).toEqual(crashed);
+    expect(fake.forks).toHaveLength(3);
+    expect(guard).toHaveLength(6);
+    expect(codes.filter((c) => c.startsWith('fetcher.crash_limit'))).toEqual([
+      'fetcher.crash_limit {"count":3}',
+    ]);
+    // A minute after the first crash, the next fetch spawns again.
+    advance(30_000);
+    const again = host.fetch('v1', 'again', 'https://example.com/a.png');
+    expect(fake.forks).toHaveLength(4);
+    ready(3);
+    await tick();
+    expect(ports()[3]!.posted).toEqual([
+      { type: 'fetch', viewKey: 'v1', ref: 'again', url: 'https://example.com/a.png' },
+    ]);
+    host.abort('v1');
+    expect(await again).toMatchObject({ ok: false, reason: 'aborted' });
+  });
+
+  it('a fetcher stopped on purpose is no crash', async () => {
+    const { host } = make({ crashLimit: { crashes: 1, windowMs: 60_000 } });
+    const started = host.ensure();
+    ready(0);
+    await started;
+    await host.stop();
+    const p = host.fetch('v1', 'a', 'https://example.com/a.png');
+    expect(fake.forks).toHaveLength(2);
+    ready(1);
+    await tick();
+    host.abort('v1');
+    expect(await p).toMatchObject({ ok: false, reason: 'aborted' });
+  });
+
   it('a fetch while the fetcher can’t start resolves crashed', async () => {
     const { host } = make();
     fake.throwOnFork = true;
@@ -467,15 +543,19 @@ describe('relayed log events', () => {
     return t;
   }
 
-  it('relays only fetcher codes at known levels, with plain data', async () => {
+  it('relays only the fetcher’s own codes and their fields, at known levels, with plain data', async () => {
     const { relayed } = await running();
     send(0, {
       type: 'log',
       level: 'info',
       code: 'fetcher.fetched',
-      data: { status: 200, bytes: 10, ms: 3 },
+      data: { statusClass: '2xx', status: 200, url: 'x', bytes: 10, ms: 3 },
     });
     send(0, { type: 'log', level: 'info', code: 'app.reset' });
+    // Main's own lifecycle codes can't come from the fetcher.
+    for (const code of ['fetcher.spawn', 'fetcher.ready', 'fetcher.exit', 'fetcher.relay_dropped'])
+      send(0, { type: 'log', level: 'info', code, data: { count: 1 } });
+    send(0, { type: 'log', level: 'info', code: 'constructor' });
     send(0, { type: 'log', level: 'info', code: 'fetcher.not-a-code' });
     send(0, { type: 'log', level: 'debug', code: 'fetcher.fetched' });
     send(0, { type: 'log', level: 'info', code: 'fetcher.fetched', data: [1, 2] });
@@ -486,7 +566,7 @@ describe('relayed log events', () => {
       data: 'https://marker.example/',
     });
     expect(relayed).toEqual([
-      { level: 'info', code: 'fetcher.fetched', data: { status: 200, bytes: 10, ms: 3 } },
+      { level: 'info', code: 'fetcher.fetched', data: { statusClass: '2xx', bytes: 10, ms: 3 } },
     ]);
   });
 
@@ -543,7 +623,7 @@ describe('relayed log events', () => {
       .map((l) => JSON.parse(l) as { proc: string; code: string; data: Record<string, unknown> });
     const relayed = lines.filter((l) => l.proc === 'fetcher');
     expect(relayed.map((l) => [l.code, l.data])).toEqual([
-      ['fetcher.refused', { status: 404, ms: 3, dropped: 4 }],
+      ['fetcher.refused', { ms: 3, dropped: 1 }],
       ['fetcher.uncaught', { dropped: 1 }],
     ]);
   });

@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { describe, expect, it } from 'vitest';
-import { appFrames, errorClassOf, errorData, sanitizeEvent } from '../../src/shared/log/schema';
+import {
+  appFrames,
+  errorClassOf,
+  errorData,
+  sanitizeEvent,
+  statusClass,
+} from '../../src/shared/log/schema';
 import { MARKER_TEXT, MARKERS, findMarkers } from '../markers';
 
 const ROOTS: Array<[string, string]> = [
@@ -17,6 +23,33 @@ describe('sanitizeEvent', () => {
       data: { openId: 3, windowId: 1, reason: 'superseded', scheme: 'https' },
     });
     expect(event?.data).toEqual({ openId: 3, windowId: 1, reason: 'superseded', scheme: 'https' });
+  });
+
+  it('an HTTP status as its class only', () => {
+    expect([100, 200, 204, 301, 404, 451, 599].map(statusClass)).toEqual([
+      '1xx',
+      '2xx',
+      '2xx',
+      '3xx',
+      '4xx',
+      '4xx',
+      '5xx',
+    ]);
+    expect([null, 99, 600, 200.5, -1].map(statusClass)).toEqual([null, null, null, null, null]);
+    const event = sanitizeEvent({
+      level: 'info',
+      proc: 'fetcher',
+      code: 'fetcher.refused',
+      data: { reason: 'status', statusClass: '4xx', ms: 3 },
+    });
+    expect(event?.data).toEqual({ reason: 'status', statusClass: '4xx', ms: 3 });
+    const exact = sanitizeEvent({
+      level: 'info',
+      proc: 'fetcher',
+      code: 'fetcher.refused',
+      data: { statusClass: '404' },
+    });
+    expect(exact?.data).toEqual({ dropped: 1 });
   });
 
   it('drops unknown fields and invalid values, and counts them', () => {

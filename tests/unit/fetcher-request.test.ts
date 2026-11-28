@@ -226,6 +226,32 @@ describe('the request', () => {
     expect(reason(await get(s.url('/a.png'), env))).toBe('address');
     expect(destinations).toEqual([]);
   });
+
+  it('a name whose looked-up address wasn’t checked is refused before the socket connects', async () => {
+    let connections = 0;
+    const other = createHttpServer(png);
+    other.on('connection', () => (connections += 1));
+    other.listen(0, '::1');
+    await once(other, 'listening');
+    closers.push(() => new Promise((r) => other.close(() => r())));
+    const s = await serve({ '/a.png': png });
+    // As if the lookup Node calls handed over an address the policy never
+    // checked; it answers later, as a resolver does.
+    hooks.rewrite = (o) => ({
+      ...o,
+      port: (other.address() as AddressInfo).port,
+      lookup: (_h: string, opts: { all?: boolean }, cb: (...a: unknown[]) => void) =>
+        setImmediate(() =>
+          opts?.all ? cb(null, [{ address: '::1', family: 6 }]) : cb(null, '::1', 6),
+        ),
+    });
+    const { env, destinations } = envFor(s.port);
+    expect(reason(await get(s.url('/a.png', 'http', 'localhost'), env))).toBe('address');
+    expect(destinations).toEqual([]);
+    // A connect would have reached the server's accept by now.
+    await new Promise((r) => setTimeout(r, 200));
+    expect(connections).toBe(0);
+  });
 });
 
 describe('the policy lookup', () => {

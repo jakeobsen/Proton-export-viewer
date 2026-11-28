@@ -101,6 +101,7 @@ export const LOG_CODES = [
   'fetcher.uncaught',
   'fetcher.rejection',
   'fetcher.relay_dropped',
+  'fetcher.crash_limit',
 ] as const;
 
 /** Codes that only exist in builds with test hooks. */
@@ -225,6 +226,10 @@ export const REASONS = [
   'aborted',
   'fetcher',
 ] as const;
+
+/** HTTP status classes: the fetcher logs a response's class, never its exact status. */
+export const STATUS_CLASSES = ['1xx', '2xx', '3xx', '4xx', '5xx'] as const;
+export type StatusClass = (typeof STATUS_CLASSES)[number];
 
 /** The lists of a message whose entries can be cut to a limit when indexed. */
 export const CAPPED_LIST_NAMES = ['labels', 'attachments', 'to', 'cc', 'bcc', 'replyTo'] as const;

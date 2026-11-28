@@ -5,9 +5,12 @@
 // request's `lookup` resolves it, checks every answer, and hands Node only
 // checked addresses, so the address connected to is the address checked and
 // a second resolution can't change it. Node never calls `lookup` for an IP
-// literal, so a literal is checked before the request is made. When the
-// socket connects, its remote address is compared with the checked ones
-// once more.
+// literal, so a literal is checked before the request is made. The address
+// a name resolved to is checked again as the socket reports it, before the
+// socket connects (the resolver answers after the socket is handed over), so
+// no packet, nor a TLS hello, goes anywhere unchecked.
+// When the socket connects, its remote address is compared with the checked
+// ones once more.
 //
 // Requests use Node's own HTTP/1.1 client with a fresh agent per request, so
 // no connection, proxy or cookie is shared or reused; TLS uses Node's default
@@ -250,6 +253,14 @@ function requestOnce(
     }
 
     req.once('socket', (socket) => {
+      socket.once('lookup', (err: Error | null, address: string) => {
+        if (err) return;
+        const ip = parseIp(address);
+        if (ip === null || !checked.some((c) => sameIp(c, ip))) {
+          failure = 'address';
+          req?.destroy(new PolicyError('address'));
+        }
+      });
       socket.once('connect', () => {
         const remote = socket.remoteAddress === undefined ? null : parseIp(socket.remoteAddress);
         if (remote === null || !checked.some((ip) => sameIp(ip, remote))) {
