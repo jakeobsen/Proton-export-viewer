@@ -7,6 +7,7 @@
 
 import { readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileSize } from '../../src/renderer/reader-format';
 import type { MessageOpenResult, PreviewResult, SaveResult } from '../../src/shared/api';
 import { BODY_CSP, BODY_IFRAME_REFERRER, BODY_IFRAME_SANDBOX } from '../../src/shared/constants';
 import { PREVIEW_MAX_BYTES } from '../../src/shared/reader-protocol';
@@ -123,7 +124,7 @@ test('a valid image previews in a confined frame, served with the body CSP and t
 
   const dialog = pev.page.locator('.pv-dialog[role="dialog"]');
   await expect(dialog.locator('#pv-title')).toHaveText(name);
-  await expect(dialog.locator('.pv-line')).toHaveText(`PNG · ${PNG.length} bytes · 40 × 30`);
+  await expect(dialog.locator('.pv-line')).toHaveText(`PNG · ${fileSize(PNG.length)} · 40 × 30`);
   await expect(dialog.locator('.pv-cancel')).toBeFocused();
   expect(await pev.shell('previewFrames')).toEqual([
     {
@@ -220,7 +221,9 @@ test('the preview goes with its view: another open, or a source change, closes i
   expect(await status(pev, assetOf(first))).toBe(404);
 
   const second = await previewed(pev, 0);
+  // Main moves on, as after a source change, and tells the shell.
   await pev.main('bumpGeneration');
+  await pev.main('notifySources');
   await expect(pev.page.locator('.pv-dialog')).toHaveCount(0);
   expect(await status(pev, second)).toBe(404);
   expect(await status(pev, assetOf(second))).toBe(404);
