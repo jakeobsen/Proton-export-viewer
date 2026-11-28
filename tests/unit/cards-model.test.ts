@@ -367,6 +367,30 @@ describe('the cards model', () => {
     db.close();
   });
 
+  it('moves that add up past either end during that read stop at the end card', async () => {
+    for (const [start, step, end] of [
+      [398, 1, 399],
+      [1, -1, 0],
+    ] as const) {
+      const { db, ids, model, actions, settle, holdReads, releaseReads } = setup(400);
+      model.show(ids[start]!, null);
+      await settle();
+      model.setViewport(200, 210);
+      await settle();
+      holdReads();
+      model.move(step);
+      model.move(step);
+      model.move(step);
+      await releaseReads();
+      expect(model.snapshot.expanded).toBe(ids[end]);
+      expect(actions).toEqual([
+        ['open', ids[start]],
+        ['open', ids[end]],
+      ]);
+      db.close();
+    }
+  });
+
   it('a card expanded by hand while that read is under way replaces the move', async () => {
     const { db, ids, model, actions, settle, holdReads, releaseReads } = setup(400);
     model.show(ids[0]!, null);
