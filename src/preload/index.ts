@@ -32,12 +32,22 @@ const api: PevApi = {
   state: () => ipcRenderer.invoke(IPC.state),
   ping: (generation) => ipcRenderer.invoke(IPC.ping, { generation }),
   openStub: (id, generation) => ipcRenderer.invoke(IPC.openStub, { id, generation }),
-  open: (rowid, mode, generation) => ipcRenderer.invoke(IPC.open, { rowid, mode, generation }),
+  open: (rowid, mode, generation, queryId) =>
+    ipcRenderer.invoke(
+      IPC.open,
+      queryId === undefined ? { rowid, mode, generation } : { rowid, mode, generation, queryId },
+    ),
   closeView: (generation) => ipcRenderer.invoke(IPC.closeView, { generation }),
   showInFolder: (openId, generation) =>
     ipcRenderer.invoke(IPC.showInFolder, { openId, generation }),
   copyMessageId: (openId, generation) =>
     ipcRenderer.invoke(IPC.copyMessageId, { openId, generation }),
+  viewSource: (openId, generation) => ipcRenderer.invoke(IPC.viewSource, { openId, generation }),
+  sourceTree: (openId, generation) => ipcRenderer.invoke(IPC.sourceTree, { openId, generation }),
+  sourcePart: (openId, path, generation) =>
+    ipcRenderer.invoke(IPC.sourcePart, { openId, path, generation }),
+  copyHeaders: (openId, generation) => ipcRenderer.invoke(IPC.copyHeaders, { openId, generation }),
+  sourceBack: (openId, generation) => ipcRenderer.invoke(IPC.sourceBack, { openId, generation }),
   log: (level, code, generation, data) =>
     ipcRenderer.send(
       IPC.log,

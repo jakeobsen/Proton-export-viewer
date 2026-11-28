@@ -139,3 +139,54 @@ describe('mail-body: and mail-asset: handlers', () => {
     expect((await asset({ url: `mail-asset://v/${open.token}/c1` })).status).toBe(404);
   });
 });
+
+describe('mail-body: source documents', () => {
+  it('serves only the current source document of a view, with the body headers', async () => {
+    const views = new ViewRegistry();
+    const open = views.accept();
+    views.install(open.openId, open.token, 1, 1, {
+      html: '<p>body</p>',
+      assets: [],
+      message: { rowid: 17, file: null, messageId: '', attachments: [] },
+    });
+    const body = bodyHandler({ views, log: quiet, windowId: 1 });
+    const view = views.beginSource(open.openId)!;
+    // None before the first block shows.
+    expect((await body({ url: `mail-body://v/${open.token}/source/0` })).status).toBe(404);
+    expect((await body({ url: `mail-body://v/${open.token}/source/1` })).status).toBe(404);
+    const session = view.source!.session;
+    views.showSource(view, session, views.select(view)!, '<pre>one</pre>', 'one');
+    const first = await body({ url: `mail-body://v/${open.token}/source/1` });
+    expect(first.status).toBe(200);
+    expect(await first.text()).toBe('<pre>one</pre>');
+    expect(Object.fromEntries(first.headers.entries())).toEqual({
+      'content-security-policy': BODY_CSP,
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+      'referrer-policy': 'no-referrer',
+      'content-type': 'text/html; charset=utf-8',
+    });
+    views.showSource(view, session, views.select(view)!, '<pre>two</pre>', 'two');
+    expect((await body({ url: `mail-body://v/${open.token}/source/1` })).status).toBe(404);
+    expect(await (await body({ url: `mail-body://v/${open.token}/source/2` })).text()).toBe(
+      '<pre>two</pre>',
+    );
+    // The body itself is still the view's.
+    expect((await body({ url: `mail-body://v/${open.token}` })).status).toBe(200);
+    // After Back, no source document is served.
+    views.leaveSource(view);
+    expect((await body({ url: `mail-body://v/${open.token}/source/2` })).status).toBe(404);
+  });
+
+  it("serves a source-only view's document, and never a body for it", async () => {
+    const views = new ViewRegistry();
+    const open = views.accept();
+    views.markFallback(open.openId, 1, 17);
+    const body = bodyHandler({ views, log: quiet, windowId: 1 });
+    const view = views.beginSource(open.openId)!;
+    expect(view.sourceOnly).toBe(true);
+    views.showSource(view, view.source!.session, views.select(view)!, '<pre>h</pre>', 'h');
+    expect((await body({ url: `mail-body://v/${open.token}/source/1` })).status).toBe(200);
+    expect((await body({ url: `mail-body://v/${open.token}` })).status).toBe(404);
+  });
+});

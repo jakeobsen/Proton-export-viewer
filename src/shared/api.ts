@@ -16,7 +16,7 @@ import type {
   WindowQuery,
 } from './index-types';
 import type { RasterFormat } from './attachment-types';
-import type { MessageDetails, MessageHeaders, OpenMode } from './reader-protocol';
+import type { MessageDetails, MessageHeaders, OpenMode, ReaderMatch } from './reader-protocol';
 import type { SourceOutcome, SourcesView } from './sources';
 
 export const IPC = {
@@ -44,6 +44,11 @@ export const IPC = {
   showInFolder: 'pev:show-in-folder',
   copyMessageId: 'pev:copy-message-id',
   copyReport: 'pev:copy-report',
+  viewSource: 'pev:source',
+  sourceTree: 'pev:source-tree',
+  sourcePart: 'pev:source-part',
+  copyHeaders: 'pev:copy-headers',
+  sourceBack: 'pev:source-back',
 } as const;
 
 export type RejectCode =
@@ -88,6 +93,32 @@ export interface AttachmentItem {
 /** The outcome of an action on the open message, such as Show in folder. */
 export type ReaderActionResult = { ok: true } | Rejected;
 
+/** One part of the open message in the source view's tree. Main has checked every field. */
+export interface SourceNode {
+  /** Dotted path: `1` is the message. A part is named to main only by it. */
+  path: string;
+  /** The parent's index in the list, or -1 for the message. */
+  parent: number;
+  /** A lower-case `type/subtype`, or "unknown type". */
+  type: string;
+  charset: string | null;
+  /** The cleaned file name, or ''. */
+  name: string;
+  inline: boolean;
+  /** Decoded bytes; a container's is the sum of its parts'. */
+  size: number;
+  /** The read stopped inside this part: `size` is only what was read. */
+  cut: boolean;
+  risky: boolean;
+}
+
+/** A header block shown in the body frame: the URL to load there. */
+export type SourceResult = { ok: true; url: string; truncated: boolean } | Rejected;
+/** The tree, or null when the message's structure couldn't be read within the limits. */
+export type SourceTreeResult = { ok: true; parts: SourceNode[] | null } | Rejected;
+/** Back to the message: its body URL, or null for a message the reader couldn't render. */
+export type SourceBackResult = { ok: true; url: string | null } | Rejected;
+
 /**
  * The outcome of opening a message: its body view, or the fallback when the
  * reader couldn't render it.
@@ -110,8 +141,21 @@ export type MessageOpenResult =
       /** The attachments, by their index in this view's list; never their place in the message. */
       attachments: AttachmentItem[];
       details: MessageDetails;
+      /** The plain body is the indexed text with the search's matches marked. */
+      highlighted: boolean;
+      /** For an open from search: how the message matched; null otherwise. */
+      match: ReaderMatch | null;
     }
-  | { ok: true; openId: number; outcome: 'fallback' }
+  | {
+      ok: true;
+      openId: number;
+      outcome: 'fallback';
+      match: ReaderMatch | null;
+      /** The message file itself couldn't be opened, so no other view of it opens either. */
+      fileRefused: boolean;
+    }
+  /** A missing message file opened from search says how the message matched. */
+  | { ok: false; code: 'eml_missing'; match: ReaderMatch | null }
   | Rejected;
 
 /** What the shell reads from the open export's index. */
@@ -184,13 +228,35 @@ export interface PevApi {
   state(): Promise<StateResult>;
   ping(generation: number): Promise<PingResult>;
   openStub(id: string, generation: number): Promise<OpenResult>;
-  open(rowid: number, mode: OpenMode, generation: number): Promise<MessageOpenResult>;
+  /**
+   * Opens a message; with `queryId`, as part of that search's results, so its
+   * matches are marked or listed. Only the ID goes to main, never the text.
+   */
+  open(
+    rowid: number,
+    mode: OpenMode,
+    generation: number,
+    queryId?: number,
+  ): Promise<MessageOpenResult>;
   /** Closes the reader: its view and any open still under way are revoked. */
   closeView(generation: number): Promise<CloseViewResult>;
   /** Shows the open message's file in Finder. */
   showInFolder(openId: number, generation: number): Promise<ReaderActionResult>;
   /** Copies the open message's Message-ID. */
   copyMessageId(openId: number, generation: number): Promise<ReaderActionResult>;
+  /**
+   * Shows the source of the open `openId`, or of its fallback: the message's
+   * raw headers in the body frame.
+   */
+  viewSource(openId: number, generation: number): Promise<SourceResult>;
+  /** The message's parts for the source view's tree. */
+  sourceTree(openId: number, generation: number): Promise<SourceTreeResult>;
+  /** Shows the raw headers of one part, by its path from the tree; null for the message's. */
+  sourcePart(openId: number, path: string | null, generation: number): Promise<SourceResult>;
+  /** Copies the header block the source view shows. */
+  copyHeaders(openId: number, generation: number): Promise<ReaderActionResult>;
+  /** Leaves the source view. */
+  sourceBack(openId: number, generation: number): Promise<SourceBackResult>;
   log(
     level: 'error' | 'warn' | 'info',
     code: string,
