@@ -408,7 +408,8 @@ describe('an index found damaged by the check', () => {
     expect(family(indexDir)).toEqual([]);
     expect(c.session.connections.size).toBe(0);
 
-    // Main rebuilds it under a new generation: rebuilding while it fills, then ok once.
+    // Main rebuilds it under a new generation: rebuilding while it fills, then
+    // ok from then on (phase 2 reports after phase 1).
     const again = core({ root: run, indexDir, generation: 3 });
     expect(await again.openIndex(null, true)).toMatchObject({
       ok: true,
@@ -418,8 +419,10 @@ describe('an index found damaged by the check', () => {
     await again.session.settled();
     expect(await again.totals()).toMatchObject({ messages: pairs });
     const conditions = again.events.map((e) => e.progress.condition);
-    expect(conditions.filter((condition) => condition !== 'rebuilding')).toEqual(['ok']);
-    expect(conditions.at(-1)).toBe('ok');
+    const ok = conditions.indexOf('ok');
+    expect(ok).toBeGreaterThan(0);
+    expect(conditions.slice(0, ok).every((condition) => condition === 'rebuilding')).toBe(true);
+    expect(conditions.slice(ok).every((condition) => condition === 'ok')).toBe(true);
     expect(again.events.some((e) => e.damaged)).toBe(false);
     await again.session.close();
     expect(digest(root)).toBe(before);
@@ -493,7 +496,7 @@ describe('an index found damaged by the check', () => {
         reason: 'schema',
       });
       expect(back.logs.map((l) => l.code)).not.toContain('index.damaged');
-      await back.session.index!.settled();
+      await back.session.settled();
       expect(await back.totals()).toMatchObject({ messages: pairs, pairs });
       expect(back.events.filter((e) => e.damaged || e.progress.condition !== 'ok')).toEqual([]);
       await back.session.close();
@@ -987,7 +990,7 @@ describe("the reader's open of a message file", () => {
     const e = exportAt('lc-locate', 6, 24);
     const c = core({ root: e.run, indexDir: e.indexDir });
     expect(await c.openIndex(null)).toMatchObject({ ok: true });
-    await c.session.index!.settled();
+    await c.session.settled();
     const generation = c.stamp.generation;
     const files = new Map<number, EmlFile>();
     for (let rowid = 1; rowid <= 6; rowid += 1) files.set(rowid, (await eml(c, rowid))!);

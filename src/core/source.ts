@@ -320,7 +320,7 @@ export class SourceSession {
                 { schemaVersion: found?.version ?? 0 },
                 { src: stamp.sourceKey },
               );
-              return fail('unavailable');
+              return failed('unavailable');
             }
             this.log.warn('index.damaged', { reason }, { src: stamp.sourceKey });
             this.removeFamily(stamp.sourceKey, true);
