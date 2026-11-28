@@ -35,6 +35,8 @@ export interface HostilePlan {
   skipEml?: boolean;
   skipMetadata?: boolean;
   refs: HostileRefs;
+  /** The attachments the message carries, as its metadata lists them. */
+  attachments: Array<{ name: string; type: string; bytes: number }>;
 }
 
 export function hostileMessages(options: {

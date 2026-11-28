@@ -1,21 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The reader pane: one message with its sender, date and recipients, the
-// plain text and HTML switch, the body frame, and the lines for blocked
-// images, size limits and the fallback.
+// plain text and HTML switch, the actions on the message, the body frame, the
+// lines for blocked images, size limits and the fallback, and the attachments.
 
-import { useState } from 'react';
-import type { RejectCode } from '../shared/api';
+import { useEffect, useMemo, useState } from 'react';
+import type { AttachmentItem, RejectCode } from '../shared/api';
 import { BODY_IFRAME_REFERRER, BODY_IFRAME_SANDBOX } from '../shared/constants';
-import type { MessageHeaders } from '../shared/reader-protocol';
+import type { MessageDetails, MessageHeaders } from '../shared/reader-protocol';
 import {
+  ATT_ROW,
+  attachmentCount,
+  attachmentRowAt,
+  attachmentRowTops,
   avatarColor,
   blockedImages,
+  fileSize,
   fullDate,
   initialsOf,
   senderOf,
   shortDate,
 } from './reader-format';
-import { openInReader, useReaderState, type ReaderView } from './reader';
+import {
+  copyMessageId,
+  openInReader,
+  showInFolder,
+  useReaderState,
+  type ReaderView,
+} from './reader';
+import { useShellState } from './shell';
 import './reader-pane.css';
 
 const ICON = {
@@ -95,7 +107,7 @@ function Header({ headers }: { headers: MessageHeaders }) {
   );
 }
 
-function Who({ headers }: { headers: MessageHeaders }) {
+function Who({ headers, details: more }: { headers: MessageHeaders; details: MessageDetails }) {
   const [details, setDetails] = useState(false);
   const sender = senderOf(headers.from);
   const recipients = [headers.to, headers.cc].filter((r) => r !== '').join(', ');
@@ -135,6 +147,25 @@ function Who({ headers }: { headers: MessageHeaders }) {
               <dd>{fullDate(headers.date)}</dd>
             </>
           )}
+          {more.messageId !== '' && (
+            <>
+              <dt>Message-ID</dt>
+              <dd className="rp-mono">{more.messageId}</dd>
+            </>
+          )}
+          {more.references.length > 0 && (
+            <>
+              <dt>References</dt>
+              <dd className="rp-mono">
+                {more.references.map((id, i) => (
+                  <div key={i}>{id}</div>
+                ))}
+                {more.moreReferences > 0 && <div>and {more.moreReferences} more</div>}
+              </dd>
+            </>
+          )}
+          <dt>Format</dt>
+          <dd>{more.format}</dd>
         </dl>
       )}
     </div>
@@ -167,6 +198,111 @@ function Lines({ rowid, view }: { rowid: number; view: ReaderView }) {
         </div>
       )}
     </>
+  );
+}
+
+/** How many plain rows high the attachment list is once virtual. */
+const ATT_SHOWN = 6;
+/** Past this many attachments, only the rows in view and a few around them are made. */
+const ATT_VIRTUAL_AFTER = 50;
+const ATT_OVERSCAN = 4;
+
+function AttachmentRow({ item, top }: { item: AttachmentItem; top: number | null }) {
+  return (
+    <div
+      className={item.risky ? 'rp-att rp-att-risky' : 'rp-att'}
+      role="listitem"
+      style={top === null ? undefined : { position: 'absolute', top, left: 0, right: 0 }}
+    >
+      <div className="rp-att-name">{item.name}</div>
+      <div className="rp-att-meta">
+        {item.label} · {fileSize(item.size)}
+      </div>
+      {item.risky && (
+        <div className="rp-att-warn">
+          <WarnIcon />
+          <span>Program file. It can harm your computer.</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Attachments({ items }: { items: AttachmentItem[] }) {
+  const [top, setTop] = useState(0);
+  const virtual = items.length > ATT_VIRTUAL_AFTER;
+  const tops = useMemo(
+    () => (virtual ? attachmentRowTops(items.map((item) => item.risky)) : []),
+    [items, virtual],
+  );
+  if (items.length === 0) return null;
+  const height = ATT_SHOWN * ATT_ROW;
+  const first = virtual ? Math.max(0, attachmentRowAt(tops, top) - ATT_OVERSCAN) : 0;
+  const end = virtual
+    ? Math.min(items.length, attachmentRowAt(tops, top + height) + 1 + ATT_OVERSCAN)
+    : items.length;
+  return (
+    <section className="rp-atts" aria-label="Attachments">
+      <div className="rp-att-title">{attachmentCount(items.length)}</div>
+      <div
+        className={virtual ? 'rp-att-list rp-att-virtual' : 'rp-att-list'}
+        role="list"
+        style={virtual ? { height } : undefined}
+        onScroll={virtual ? (e) => setTop(e.currentTarget.scrollTop) : undefined}
+      >
+        <div style={virtual ? { position: 'relative', height: tops[items.length] } : undefined}>
+          {items.slice(first, end).map((item) => (
+            <AttachmentRow key={item.index} item={item} top={virtual ? tops[item.index]! : null} />
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/** How long "Message-ID copied." stays. */
+const NOTE_MS = 2500;
+
+/** Show in folder and Copy Message-ID, for the message the pane shows. */
+function MessageActions({ view }: { view: ReaderView }) {
+  const { sources } = useShellState();
+  const offline = sources?.active?.status === 'offline';
+  const [note, setNote] = useState<string | null>(null);
+  useEffect(() => {
+    if (note === null) return;
+    const timer = setTimeout(() => setNote(null), NOTE_MS);
+    return () => clearTimeout(timer);
+  }, [note]);
+  return (
+    <div className="rp-acts" role="group" aria-label="Message">
+      <button
+        type="button"
+        className="rp-act rp-show"
+        disabled={offline}
+        title="Show in folder"
+        onClick={() => void showInFolder()}
+      >
+        Show in folder
+      </button>
+      <button
+        type="button"
+        className="rp-act rp-copy-id"
+        disabled={view.details.messageId === ''}
+        title="Copy Message-ID"
+        onClick={() =>
+          void copyMessageId().then((r) => {
+            if (r.ok) setNote('Message-ID copied.');
+          })
+        }
+      >
+        Message-ID
+      </button>
+      {note !== null && (
+        <span className="rp-note" role="status">
+          {note}
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -234,8 +370,9 @@ export function MessageBody() {
             HTML
           </button>
         </div>
+        {view && <MessageActions key={view.url} view={view} />}
       </div>
-      {view && <Who headers={view.headers} />}
+      {view && <Who headers={view.headers} details={view.details} />}
       {view && <Lines rowid={rowid} view={view} />}
       {reader.fallback && (
         <div className="rp-line rp-fallback" role="alert">
@@ -263,6 +400,7 @@ export function MessageBody() {
           />
         )}
       </div>
+      {view && <Attachments key={view.url} items={view.attachments} />}
     </>
   );
 }
