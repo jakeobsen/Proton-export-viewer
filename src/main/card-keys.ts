@@ -16,13 +16,19 @@ export function cardKeyOf(input: Input): CardKeyName | null {
   return input.key === 'n' || input.key === 'p' ? input.key : null;
 }
 
-/** Sends the shell the card keys typed while the body frame has the focus. */
-export function forwardCardKeys(contents: WebContents): void {
+/**
+ * Sends the shell the card keys typed while the body frame has the focus:
+ * the shell's direct child frame that shows the body URL main last
+ * authorized for the window (`authorizedUrl`), and no other frame.
+ */
+export function forwardCardKeys(contents: WebContents, authorizedUrl: () => string | null): void {
   contents.on('before-input-event', (_event, input) => {
     const key = cardKeyOf(input);
     if (key === null) return;
     const frame = contents.focusedFrame;
     if (!frame || !sameFrame(frame.parent, contents.mainFrame)) return;
+    const url = authorizedUrl();
+    if (url === null || frame.url !== url) return;
     contents.send(IPC.cardKey, key);
   });
 }

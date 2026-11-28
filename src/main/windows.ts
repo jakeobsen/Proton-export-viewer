@@ -87,7 +87,7 @@ export function createAppWindow(ctx: AppContext, options: WindowOptions = {}): A
     openLink: (url) => ctx.linkDialog.request(contents, appWin, url, ctx.generation),
     allowFrameUrl: options.allowFrameUrl,
   });
-  forwardCardKeys(contents);
+  forwardCardKeys(contents, () => views.authorizedUrl());
   contents.on('render-process-gone', (_event, details) => {
     ctx.log.error('renderer.gone', {
       reason: details.reason,
