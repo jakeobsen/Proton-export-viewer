@@ -28,6 +28,9 @@ function frame(): HTMLIFrameElement | null {
   return document.querySelector('iframe.body-frame');
 }
 
+/** The first load of the latest stub frame, waited for from the moment it was made. */
+let stubLoaded: Promise<number> | null = null;
+
 /**
  * Opens a stub body in a frame of its own, with the attributes of the body
  * frame the shell ships. The old frame goes at once; main has revoked it.
@@ -46,6 +49,7 @@ async function openStub(id: string): Promise<OpenResult> {
     f.referrerPolicy = BODY_IFRAME_REFERRER;
     f.style.cssText = 'position:fixed;right:0;bottom:0;width:640px;height:480px;border:0';
     f.src = result.url;
+    stubLoaded = nextLoad(f);
     document.body.append(f);
   } else if (result.code === 'stale_generation') {
     await refreshGeneration();
@@ -64,24 +68,15 @@ function nextLoad(f: HTMLIFrameElement): Promise<number> {
 }
 
 /**
- * Gives the shell a body frame that has finished loading: the sample open
- * makes one. Hidden windows get no animation frames, so this polls on a timer.
+ * Gives the shell a body frame that has finished loading: a new sample open
+ * makes one, and this waits for its load. A view's URL loads only once, so
+ * the frame is never loaded again for this.
  */
 async function readyFrame(): Promise<void> {
-  if (!frame()) {
-    const opened = await openStub('sample');
-    if (!opened.ok) throw new Error(`sample open refused: ${opened.code}`);
-    for (let i = 0; i < 100 && !frame(); i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-  }
-  const f = frame();
-  const src = f?.getAttribute('src');
-  if (!f || !src) throw new Error('no body frame');
-  // Loads it again, so its load is one this hook waited for.
-  const loaded = nextLoad(f);
-  f.src = src;
-  await loaded;
+  const opened = await openStub('sample');
+  if (!opened.ok) throw new Error(`sample open refused: ${opened.code}`);
+  if (!frame() || !stubLoaded) throw new Error('no body frame');
+  await stubLoaded;
 }
 
 /**

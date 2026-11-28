@@ -79,7 +79,7 @@ async function source(pev: PevApp, messages: string[]): Promise<void> {
 async function openShown(pev: PevApp, rowid: number) {
   const opened = await pev.shell<MessageOpenResult>('openInReader', [rowid]);
   if (!opened.ok || opened.outcome !== 'view') throw new Error('not opened');
-  await expect.poll(() => pev.shell<string | null>('frameSrc')).toBe(opened.url);
+  await expect.poll(() => pev.page.locator('.rp-frame').getAttribute('src')).toBe(opened.url);
   await pev.bodyFrame(opened.url);
   return opened;
 }
@@ -426,7 +426,10 @@ test('after the consent reload, a third load of the body is refused and the imag
     await button(pev).click();
     await expect.poll(() => widths(pev, opened.url)).toEqual([2]);
     expect(await bodyLoads(pev, opened.url)).toBe(2);
-    await pev.shell('setFrameSrc', [opened.url]);
+    // The shell loads the same URL again.
+    await pev.page
+      .locator('.rp-frame')
+      .evaluate((f, url) => ((f as HTMLIFrameElement).src = url), opened.url);
     await expect.poll(() => pev.hasLog('nav.denied', { reason: 'reload_spent' })).toBe(true);
     expect(await bodyLoads(pev, opened.url)).toBe(2);
     expect(await widths(pev, opened.url)).toEqual([2]);
