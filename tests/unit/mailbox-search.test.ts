@@ -48,7 +48,16 @@ const pev = {
   ),
   searchSnippets: vi.fn(async () => ({ ok: true, generation: GENERATION, snippets: [] })),
   leads: vi.fn(async () => ({ ok: false, code: 'core_unavailable' })),
-  open: vi.fn(async () => ({ ok: true, outcome: 'view', url: 'about:blank' })),
+  // From search, the view says how the message matched: as many body matches as the search's ID.
+  open: vi.fn(async (_rowid: number, _mode: string, _generation: number, queryId?: number) => ({
+    ok: true,
+    outcome: 'view',
+    url: 'about:blank',
+    match:
+      queryId === undefined
+        ? null
+        : { state: 1, reason: null, columns: [], bodyMatches: queryId, changed: false },
+  })),
   closeView: vi.fn(async () => ({ ok: true })),
 };
 (globalThis as unknown as { window: { pev: typeof pev } }).window = { pev };
@@ -212,18 +221,83 @@ describe('cards a search result opened', () => {
     setup();
     mailbox.selectRow({ threadId: threadOf('s0'), newestRowid: rowidOf('s0') } as Row);
     await flush();
-    expect(reader.getReaderState().rowid).toBe(rowidOf('s0'));
+    expect(reader.getReaderState()).toMatchObject({ rowid: rowidOf('s0'), queryId: null });
+    expect(reader.getReaderState().match).toBeNull();
+    const showing = mailbox.cards.showing;
     page = resultFor('s0');
     await searchFor('small');
     mailbox.selectResult(mailbox.search.snapshot.rows[0]!);
     await flush();
-    // Shown already: no second open.
-    expect(pev.open).toHaveBeenCalledTimes(1);
+    // Shown already, but opened from the folder: it opens again, from the
+    // search, so the reader shows how it matched. The cards stay.
+    expect(pev.open).toHaveBeenCalledTimes(2);
+    expect(pev.open).toHaveBeenLastCalledWith(rowidOf('s0'), 'html', GENERATION, 1);
+    expect(reader.getReaderState()).toMatchObject({ rowid: rowidOf('s0'), queryId: 1 });
+    expect(reader.getReaderState().match).toMatchObject({ bodyMatches: 1 });
+    expect(mailbox.cards.showing).toBe(showing);
     expect(mailbox.list.snapshot.selected).toBeNull();
+
+    // The same result again: shown for this search already, so no open.
+    mailbox.selectResult(mailbox.search.snapshot.rows[0]!);
+    await flush();
+    expect(pev.open).toHaveBeenCalledTimes(2);
 
     mailbox.clearSearch();
     expect(mailbox.cards.snapshot.shown).toBe(false);
     expect(reader.getReaderState().rowid).toBeNull();
+  });
+
+  it("a result shown for another search opens again for this one, with this search's matches", async () => {
+    setup();
+    page = { ...resultFor('s0'), queryId: 3 };
+    await searchFor('small');
+    mailbox.selectResult(mailbox.search.snapshot.rows[0]!);
+    await flush();
+    expect(pev.open).toHaveBeenCalledTimes(1);
+    expect(reader.getReaderState().match).toMatchObject({ bodyMatches: 3 });
+    const showing = mailbox.cards.showing;
+
+    page = { ...resultFor('s0'), queryId: 4 };
+    await searchFor('smaller');
+    expect(mailbox.search.currentQueryId).toBe(4);
+    mailbox.selectResult(mailbox.search.snapshot.rows[0]!);
+    await flush();
+    expect(pev.open).toHaveBeenCalledTimes(2);
+    expect(pev.open).toHaveBeenLastCalledWith(rowidOf('s0'), 'html', GENERATION, 4);
+    expect(reader.getReaderState()).toMatchObject({ rowid: rowidOf('s0'), queryId: 4 });
+    expect(reader.getReaderState().match).toMatchObject({ bodyMatches: 4 });
+    expect(mailbox.cards.showing).toBe(showing);
+
+    mailbox.selectResult(mailbox.search.snapshot.rows[0]!);
+    await flush();
+    expect(pev.open).toHaveBeenCalledTimes(2);
+  });
+
+  it("opens in a result's conversation name its search; outside search they don't", async () => {
+    setup();
+    page = { ...resultFor('b2'), queryId: 7 };
+    await searchFor('big');
+    expect(mailbox.search.currentQueryId).toBe(7);
+    mailbox.selectResult(mailbox.search.snapshot.rows[0]!);
+    await flush();
+    expect(pev.open).toHaveBeenLastCalledWith(rowidOf('b2'), 'html', GENERATION, 7);
+    expect(reader.getReaderState().queryId).toBe(7);
+    // Another card, and the body switch, keep it.
+    const older = mailbox.cards.snapshot.cards.find((c) => c.rowid === rowidOf('b1'))!;
+    mailbox.expandCard(older);
+    await flush();
+    expect(pev.open).toHaveBeenLastCalledWith(rowidOf('b1'), 'html', GENERATION, 7);
+    await reader.openInReader(rowidOf('b1'), 'plain');
+    expect(pev.open).toHaveBeenLastCalledWith(rowidOf('b1'), 'plain', GENERATION, 7);
+
+    // Leaving search drops it: any later open goes without it, a row of the folder's list too.
+    mailbox.clearSearch();
+    await reader.openInReader(rowidOf('b0'));
+    expect(pev.open).toHaveBeenLastCalledWith(rowidOf('b0'), 'html', GENERATION);
+    mailbox.selectRow({ threadId: threadOf('s0'), newestRowid: rowidOf('s0') } as Row);
+    await flush();
+    expect(pev.open).toHaveBeenLastCalledWith(rowidOf('s0'), 'html', GENERATION);
+    expect(reader.getReaderState().queryId).toBeNull();
   });
 });
 

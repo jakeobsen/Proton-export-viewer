@@ -9,6 +9,7 @@ import {
   type LinkPrompt,
   type PevApi,
 } from '../shared/api';
+import { MESSAGE_VIEWS, THEMES, type AppSettings } from '../shared/settings';
 
 /** True for a link prompt as main sends it. */
 function isPrompt(value: unknown): value is LinkPrompt {
@@ -28,16 +29,36 @@ function isPrompt(value: unknown): value is LinkPrompt {
   );
 }
 
+/** True for settings as main sends them. */
+function isSettings(value: unknown): value is AppSettings {
+  if (typeof value !== 'object' || value === null) return false;
+  const s = value as Record<string, unknown>;
+  return (
+    (THEMES as readonly unknown[]).includes(s.theme) &&
+    (MESSAGE_VIEWS as readonly unknown[]).includes(s.messageView)
+  );
+}
+
 const api: PevApi = {
   state: () => ipcRenderer.invoke(IPC.state),
   ping: (generation) => ipcRenderer.invoke(IPC.ping, { generation }),
   openStub: (id, generation) => ipcRenderer.invoke(IPC.openStub, { id, generation }),
-  open: (rowid, mode, generation) => ipcRenderer.invoke(IPC.open, { rowid, mode, generation }),
+  open: (rowid, mode, generation, queryId) =>
+    ipcRenderer.invoke(
+      IPC.open,
+      queryId === undefined ? { rowid, mode, generation } : { rowid, mode, generation, queryId },
+    ),
   closeView: (generation) => ipcRenderer.invoke(IPC.closeView, { generation }),
   showInFolder: (openId, generation) =>
     ipcRenderer.invoke(IPC.showInFolder, { openId, generation }),
   copyMessageId: (openId, generation) =>
     ipcRenderer.invoke(IPC.copyMessageId, { openId, generation }),
+  viewSource: (openId, generation) => ipcRenderer.invoke(IPC.viewSource, { openId, generation }),
+  sourceTree: (openId, generation) => ipcRenderer.invoke(IPC.sourceTree, { openId, generation }),
+  sourcePart: (openId, path, generation) =>
+    ipcRenderer.invoke(IPC.sourcePart, { openId, path, generation }),
+  copyHeaders: (openId, generation) => ipcRenderer.invoke(IPC.copyHeaders, { openId, generation }),
+  sourceBack: (openId, generation) => ipcRenderer.invoke(IPC.sourceBack, { openId, generation }),
   log: (level, code, generation, data) =>
     ipcRenderer.send(
       IPC.log,
@@ -112,6 +133,38 @@ const api: PevApi = {
       ...(request.queryId === undefined ? {} : { queryId: request.queryId }),
       generation,
     }),
+  settings: (generation) => ipcRenderer.invoke(IPC.settings, { generation }),
+  setSetting: (key, value, generation) =>
+    ipcRenderer.invoke(IPC.setSetting, { key, value, generation }),
+  onSettingsChanged: (listener) => {
+    const handler = (_event: unknown, settings: unknown) => {
+      if (isSettings(settings))
+        listener({ theme: settings.theme, messageView: settings.messageView });
+    };
+    ipcRenderer.on(IPC.settingsChanged, handler);
+    return () => {
+      ipcRenderer.off(IPC.settingsChanged, handler);
+    };
+  },
+  onShowSettings: (listener) => {
+    const handler = () => listener();
+    ipcRenderer.on(IPC.showSettings, handler);
+    return () => {
+      ipcRenderer.off(IPC.showSettings, handler);
+    };
+  },
+  onAppReset: (listener) => {
+    const handler = () => listener();
+    ipcRenderer.on(IPC.appReset, handler);
+    return () => {
+      ipcRenderer.off(IPC.appReset, handler);
+    };
+  },
+  rebuildIndex: (sourceKey, generation) =>
+    ipcRenderer.invoke(IPC.rebuildIndex, { sourceKey, generation }),
+  resetApp: (generation) => ipcRenderer.invoke(IPC.resetApp, { generation }),
+  openLogs: (generation) => ipcRenderer.invoke(IPC.openLogs, { generation }),
+  copyDiagnostics: (generation) => ipcRenderer.invoke(IPC.copyDiagnostics, { generation }),
 };
 
 contextBridge.exposeInMainWorld('pev', api);

@@ -4,6 +4,7 @@
 // indexing stands. Shared by core, main and the shell.
 
 import type { CAPPED_LIST_NAMES } from './log/codes';
+import type { ReaderMatch, StoredBody } from './reader-protocol';
 import type { RejectKind } from './sources';
 
 export type FolderKind = 'system' | 'folder' | 'label';
@@ -365,7 +366,7 @@ export type IndexQuery =
   | { op: 'details'; threadIds: number[] }
   | { op: 'resolve'; rowid: number }
   | { op: 'totals' }
-  | { op: 'eml'; rowid: number }
+  | { op: 'eml'; rowid: number; search?: string }
   | { op: 'report' }
   | WindowQuery
   | SearchQuery
@@ -400,6 +401,15 @@ export interface EmlFile {
   dev: string;
   ino: string;
   bodyState: number;
+  /** With a search: how the message matched it, or null if it didn't match or has nothing to mark. */
+  match?: IndexMatch | null;
+}
+
+/** How a message matched a search, with its stored body and ranges when the body matched. Core only. */
+export interface IndexMatch extends ReaderMatch {
+  body: StoredBody | null;
+  /** Columns whose marks failed the range check and were dropped. */
+  dropped: number;
 }
 
 /** A list of a message whose entries were cut to a limit when it was indexed. */
@@ -462,6 +472,8 @@ export interface IndexReport {
   timeouts: number;
   /** Messages with a list cut to its limit, by list. */
   capped: Partial<Record<CappedListName, number>>;
+  /** Messages with at least one list cut to its limit, each counted once. */
+  cappedMessages: number;
   /** Label IDs on messages that labels.json doesn't name; they aren't shown. */
   hiddenLabelIds: number;
   /**
@@ -486,10 +498,12 @@ export type IndexCondition = 'ok' | 'verifying' | 'rebuilding' | 'damaged';
 /**
  * Where indexing stands. During phase 1, list pages hold the rows loaded so
  * far; during phase 2, searches find the text of the messages read so far.
+ * 'scanning': the run's folder is being read, before its index is open;
+ * `loaded` counts the entries looked at and `total` the entries listed.
  * 'unavailable': the export can't be read, and the index shows what it holds.
  */
 export interface IndexProgress {
-  phase: 'opening' | 'loading' | 'done' | 'failed' | 'unavailable';
+  phase: 'scanning' | 'opening' | 'loading' | 'done' | 'failed' | 'unavailable';
   /** Metadata files handled so far (indexed or failed). */
   loaded: number;
   /** Metadata files the scan found. */

@@ -119,6 +119,11 @@ export class SearchModel {
     private readonly pauseMs: number = TYPING_PAUSE_MS,
   ) {}
 
+  /** The ID of the search whose results are shown; null with none. */
+  get currentQueryId(): number | null {
+    return this.queryId;
+  }
+
   get snapshot(): SearchSnapshot {
     return this.snap;
   }
@@ -332,11 +337,6 @@ export class SearchModel {
   /** The row at a position, if it is held. */
   rowAt(index: number): ResultRow | null {
     return this.snap.rows[index] ?? null;
-  }
-
-  /** The shown search's latest query ID, which a conversation opened from its results names; null if none. */
-  currentQueryId(): number | null {
-    return this.queryId;
   }
 
   select(row: ResultRow): void {

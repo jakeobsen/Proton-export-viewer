@@ -5,24 +5,31 @@
 // rejected. The one exception is `state`, the bootstrap call: it takes no
 // arguments and returns the current generation.
 
+import { lstatSync, mkdirSync } from 'node:fs';
 import { clipboard, ipcMain, shell, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
 import { z } from 'zod';
 import {
   IPC,
   type CloseViewResult,
   type CopyResult,
+  type DoneResult,
   type ErrorKind,
   type IndexResult,
   type LeadsResult,
   type LinkActionResult,
   type MessageOpenResult,
   type ReaderActionResult,
+  type SourceBackResult,
+  type SourceResult,
+  type SourceTreeResult,
   type OpenResult,
   type PingResult,
   type Rejected,
   type RejectCode,
   type SearchResult,
   type SnippetsResult,
+  type SetSettingResult,
+  type SettingsResult,
   type SourceActionResult,
   type SourcesResult,
   type StateResult,
@@ -43,19 +50,30 @@ import {
   type SearchSnippets,
 } from '../shared/index-types';
 import { reportText } from '../shared/report-text';
+import { SETTING_KEYS } from '../shared/settings';
 import type { SourceOutcome } from '../shared/sources';
-import { STALE, type Stale } from './sources/manager';
+import { RESET_FAILED, STALE, type Stale } from './sources/manager';
 import { APP_ORIGIN, LINK_ACTIONS } from '../shared/constants';
 import { isRendererLogCode } from '../shared/log/codes';
-import { OPEN_MODES, type RenderedMessage } from '../shared/reader-protocol';
+import {
+  OPEN_MODES,
+  PART_PATH_RE,
+  SOURCE_HEADER_BYTES,
+  type RenderedMessage,
+  type SourcePart,
+  type SourceWhat,
+} from '../shared/reader-protocol';
 import { CoreUnavailableError } from './core-host';
-import type { AppContext, AppWindow } from './context';
+import { notifySettings, type AppContext, type AppWindow } from './context';
 import { DIALOG_ID_RE } from './link-dialog';
 import { sameFrame } from './navigation';
 import { OPEN_GAP_MS, OpenPacer } from './open-pacer';
 import { PLACEHOLDER } from '../shared/placeholder';
 import { SUPERSEDED, SearchLanes } from './search-lane';
-import { bodyUrl, type ViewBody } from './views';
+import { diagnosticsSummary, settingsView } from './settings-view';
+import { headerDocument } from './source-doc';
+import { sourceNodes } from './source-parts';
+import { bodyUrl, type View, type ViewBody } from './views';
 
 const Generation = z
   .number()
@@ -68,12 +86,14 @@ const PingArgs = z.tuple([z.object({ generation: Generation }).strict()]);
 const OpenArgs = z.tuple([
   z.object({ id: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/), generation: Generation }).strict(),
 ]);
+const QueryId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const MessageOpenArgs = z.tuple([
   z
     .object({
       rowid: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
       mode: z.enum(OPEN_MODES),
       generation: Generation,
+      queryId: QueryId.optional(),
     })
     .strict(),
 ]);
@@ -86,6 +106,35 @@ const ViewActionArgs = z.tuple([
     })
     .strict(),
 ]);
+// A part is named by its dotted path only, and only one from main's own tree.
+const SourcePartArgs = z.tuple([
+  z
+    .object({
+      openId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      path: z.string().regex(PART_PATH_RE).nullable(),
+      generation: Generation,
+    })
+    .strict(),
+]);
+// The parts core read, checked before any of it reaches the shell.
+const MAX_SOURCE_PARTS = 200_000;
+const SourcePartsReply = z
+  .array(
+    z
+      .object({
+        path: z.string().regex(PART_PATH_RE),
+        parent: z.number().int().min(-1),
+        contentType: z.string().max(1024),
+        charset: z.string().max(1024).nullable(),
+        name: z.string().max(1024),
+        inline: z.boolean(),
+        size: z.number().int().nonnegative(),
+        cut: z.boolean(),
+      })
+      .strict(),
+  )
+  .max(MAX_SOURCE_PARTS)
+  .refine((parts) => parts.every((p, i) => p.parent < i && (i === 0) === (p.parent === -1)));
 // The shell names the dialog and the choice; main keeps the URL.
 const LinkActionArgs = z.tuple([
   z
@@ -220,7 +269,7 @@ const SearchArgs = z.tuple([
 const SnippetsArgs = z.tuple([
   z
     .object({
-      queryId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      queryId: QueryId,
       threadIds: z.array(SearchThreadId).min(1).max(MAX_SNIPPET_THREADS),
       generation: Generation,
     })
@@ -245,6 +294,10 @@ const RunId = z.string().regex(/^[0-9a-f]{16}$/);
 const GenerationArgs = z.tuple([z.object({ generation: Generation }).strict()]);
 const SourceArgs = z.tuple([z.object({ sourceKey: SourceKey, generation: Generation }).strict()]);
 const RunArgs = z.tuple([z.object({ runId: RunId, generation: Generation }).strict()]);
+// Main checks the value against the setting's own rule.
+const SettingArgs = z.tuple([
+  z.object({ key: z.enum(SETTING_KEYS), value: z.unknown(), generation: Generation }).strict(),
+]);
 
 const REPORT_CODES: Record<ErrorKind, string> = {
   uncaught: 'renderer.uncaught',
@@ -369,14 +422,39 @@ export function registerIpc(ctx: AppContext): void {
     return { ok: true };
   });
 
+  let lastQueryId = 0;
+  /** Per window, its latest search's text, and the first query ID made with that text. */
+  const currentSearch = new WeakMap<
+    AppWindow,
+    { text: string; firstQueryId: number; generation: number }
+  >();
+  /**
+   * The text of the window's current search, if `queryId` is one of its IDs
+   * in this generation; null for an older search's ID or an unknown one.
+   */
+  const searchTextOf = (appWin: AppWindow, queryId: number, generation: number): string | null => {
+    const search = currentSearch.get(appWin);
+    if (
+      !search ||
+      search.generation !== generation ||
+      queryId < search.firstQueryId ||
+      queryId > lastQueryId
+    ) {
+      return null;
+    }
+    return search.text;
+  };
+
   const openPacer = new OpenPacer<AppWindow>(() =>
     __PEV_TEST_HOOKS__ ? (ctx.openGapMs ?? OPEN_GAP_MS) : OPEN_GAP_MS,
   );
   guarded<MessageOpenResult>(IPC.open, async (appWin, raw) => {
     const args = MessageOpenArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
-    const [{ rowid, mode, generation }] = args.data;
+    const [{ rowid, mode, generation, queryId }] = args.data;
     if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    // From an older search, or an unknown one, the message still opens, without its matches.
+    const searchText = queryId === undefined ? null : searchTextOf(appWin, queryId, generation);
 
     const { openId, token, revoked } = appWin.views.accept();
     if (revoked > 0) {
@@ -409,7 +487,16 @@ export function registerIpc(ctx: AppContext): void {
     let result;
     try {
       result = await ctx.core.requestRunning(
-        { type: 'read', openId, generation, token, rowid, mode, lane: appWin.id },
+        {
+          type: 'read',
+          openId,
+          generation,
+          token,
+          rowid,
+          mode,
+          lane: appWin.id,
+          ...(searchText === null ? {} : { search: { text: searchText } }),
+        },
         ctx.sources.stamp(),
       );
     } catch (err) {
@@ -420,16 +507,24 @@ export function registerIpc(ctx: AppContext): void {
     }
     if (appWin.win.isDestroyed()) return reject('superseded', appWin);
 
+    // Only an open from search has a match, and only a view, the fallback and a missing file carry it.
+    const match = searchText === null ? null : (result.match ?? null);
     if (!result.ok) {
-      appWin.views.abandon(openId);
+      if (result.code === 'eml_missing') {
+        appWin.views.abandon(openId);
+        reject('eml_missing', appWin);
+        return { ok: false, code: 'eml_missing', match };
+      }
       if (result.code !== 'reader_failed') {
+        appWin.views.abandon(openId);
         if (result.code === 'unavailable') return reject('offline', appWin);
-        const known = ['no_source', 'not_found', 'eml_missing', 'superseded'] as const;
+        const known = ['no_source', 'not_found', 'superseded'] as const;
         const code = known.find((c) => c === result.code);
         return reject(code ?? 'invalid', appWin);
       }
       // The fallback stands in for a view, so it follows the same rules.
       if (generation !== ctx.generation || openId !== appWin.views.latest) {
+        appWin.views.abandon(openId);
         const reason = generation !== ctx.generation ? 'generation' : 'open_id';
         ctx.log.info('open.stale', { reason, openId, windowId: appWin.id });
         return reject(reason === 'generation' ? 'stale_generation' : 'superseded', appWin);
@@ -439,7 +534,16 @@ export function registerIpc(ctx: AppContext): void {
         openId,
         windowId: appWin.id,
       });
-      return { ok: true, openId, outcome: 'fallback' };
+      // View source still works for it: the open's token is kept for that,
+      // and is never installed as a view.
+      appWin.views.markFallback(openId, generation, rowid);
+      return {
+        ok: true,
+        openId,
+        outcome: 'fallback',
+        match,
+        fileRefused: result.reason === 'file',
+      };
     }
     const message = result.read;
     if (!message) return reject('invalid', appWin);
@@ -486,6 +590,8 @@ export function registerIpc(ctx: AppContext): void {
         imageFormat: a.imageFormat,
       })),
       details: message.details,
+      highlighted: message.highlighted,
+      match,
     };
   });
 
@@ -546,6 +652,166 @@ export function registerIpc(ctx: AppContext): void {
     return { ok: true };
   });
 
+  // --- The source view ----------------------------------------------------------
+
+  /** Asks core to read for the source view of `view`; null when core isn't up for the source. */
+  const askSource = async (appWin: AppWindow, view: View, what: SourceWhat, order?: number) => {
+    const source = view.source;
+    if (!source) return null;
+    try {
+      return await ctx.core.requestRunning(
+        {
+          type: 'source',
+          openId: view.openId,
+          generation: ctx.generation,
+          rowid: source.rowid,
+          file: source.file,
+          what,
+          lane: appWin.id,
+          ...(order !== undefined ? { order } : {}),
+        },
+        ctx.sources.stamp(),
+      );
+    } catch (err) {
+      if (!(err instanceof CoreUnavailableError)) throw err;
+      return null;
+    }
+  };
+
+  /**
+   * True while `view` is live in a window still there, for the current
+   * generation, in the showing of its source named `session`: a read started
+   * for an earlier showing never counts in a later one.
+   */
+  const stillShowing = (appWin: AppWindow, view: View, session: number) =>
+    !appWin.win.isDestroyed() &&
+    view.generation === ctx.generation &&
+    appWin.views.inSession(view, session);
+
+  /** The view in the source view for an action on it, with its showing, or why there is none. */
+  const sourceView = (appWin: AppWindow, openId: number, generation: number) => {
+    if (generation !== ctx.generation) return 'stale_generation' as const;
+    const view = appWin.views.byOpenId(openId);
+    const session = view?.source?.session;
+    if (!view || session === undefined || !stillShowing(appWin, view, session)) {
+      return 'superseded' as const;
+    }
+    return { view, session };
+  };
+
+  /**
+   * Reads a header block and shows it as the view's next source document,
+   * for selection `seq` of the showing `session`.
+   */
+  const showBlock = async (
+    appWin: AppWindow,
+    view: View,
+    session: number,
+    seq: number,
+    what: SourceWhat,
+  ): Promise<SourceResult> => {
+    const result = await askSource(appWin, view, what, what.kind === 'part' ? seq : undefined);
+    if (!stillShowing(appWin, view, session)) return reject('superseded', appWin);
+    if (!result) return reject('core_unavailable', appWin);
+    if (!result.ok) {
+      const known = ['changed', 'eml_missing', 'not_found', 'superseded'] as const;
+      const code = known.find((c) => c === result.code);
+      return reject(result.code === 'unavailable' ? 'offline' : (code ?? 'not_found'), appWin);
+    }
+    const headers = result.headers;
+    if (!headers) return reject('not_found', appWin);
+    if (!(headers.bytes instanceof Uint8Array) || headers.bytes.length > SOURCE_HEADER_BYTES) {
+      return reject('invalid', appWin);
+    }
+    const { html, text } = headerDocument(headers.bytes, headers.truncated === true);
+    const url = appWin.views.showSource(view, session, seq, html, text);
+    if (url === null) return reject('superseded', appWin);
+    return { ok: true, url, truncated: headers.truncated === true };
+  };
+
+  guarded<SourceResult>(IPC.viewSource, async (appWin, raw) => {
+    const args = ViewActionArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ openId, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    if (ctx.sources.isOffline()) return reject('offline', appWin);
+    const view = appWin.views.beginSource(openId);
+    if (!view?.source || view.generation !== ctx.generation) return reject('superseded', appWin);
+    const { session } = view.source;
+    const seq = appWin.views.select(view);
+    if (seq === null) return reject('superseded', appWin);
+    ctx.log.info('reader.source', { windowId: appWin.id });
+    return showBlock(appWin, view, session, seq, { kind: 'headers' });
+  });
+
+  guarded<SourceTreeResult>(IPC.sourceTree, async (appWin, raw) => {
+    const args = ViewActionArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ openId, generation }] = args.data;
+    const shown = sourceView(appWin, openId, generation);
+    if (typeof shown === 'string') return reject(shown, appWin);
+    const { view, session } = shown;
+    const result = await askSource(appWin, view, { kind: 'structure' });
+    if (!stillShowing(appWin, view, session)) return reject('superseded', appWin);
+    if (!result) return reject('core_unavailable', appWin);
+    if (!result.ok) {
+      if (result.code === 'changed') return reject('changed', appWin);
+      if (result.code === 'superseded') return reject('superseded', appWin);
+      // The structure couldn't be read within the limits: the headers stand alone.
+      return { ok: true, parts: null };
+    }
+    const parts = SourcePartsReply.safeParse(result.parts);
+    if (!parts.success || parts.data.length === 0) return { ok: true, parts: null };
+    const read: SourcePart[] = parts.data;
+    // Still the showing that asked: checked above, with nothing awaited since.
+    if (view.source) view.source.paths = new Set(read.map((p) => p.path));
+    return { ok: true, parts: sourceNodes(read) };
+  });
+
+  guarded<SourceResult>(IPC.sourcePart, async (appWin, raw) => {
+    const args = SourcePartArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ openId, path, generation }] = args.data;
+    const shown = sourceView(appWin, openId, generation);
+    if (typeof shown === 'string') return reject(shown, appWin);
+    const { view, session } = shown;
+    // The message's own block is read as it is, without a parse.
+    const message = path === null || path === '1';
+    if (!message && !view.source?.paths?.has(path)) return reject('invalid', appWin);
+    const seq = appWin.views.select(view);
+    if (seq === null) return reject('superseded', appWin);
+    return showBlock(
+      appWin,
+      view,
+      session,
+      seq,
+      message ? { kind: 'headers' } : { kind: 'part', path },
+    );
+  });
+
+  guarded<ReaderActionResult>(IPC.copyHeaders, (appWin, raw) => {
+    const args = ViewActionArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ openId, generation }] = args.data;
+    const shown = sourceView(appWin, openId, generation);
+    if (typeof shown === 'string') return reject(shown, appWin);
+    const text = appWin.views.shownText(shown.view);
+    if (text === null) return reject('superseded', appWin);
+    clipboard.writeText(text);
+    ctx.log.info('reader.copy_headers', { windowId: appWin.id });
+    return { ok: true };
+  });
+
+  guarded<SourceBackResult>(IPC.sourceBack, (appWin, raw) => {
+    const args = ViewActionArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ openId, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    const view = appWin.views.byOpenId(openId);
+    if (!view || view.source === null) return reject('superseded', appWin);
+    return { ok: true, url: appWin.views.leaveSource(view) };
+  });
+
   guarded<LinkActionResult>(IPC.linkAction, async (appWin, raw) => {
     const args = LinkActionArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
@@ -562,29 +828,6 @@ export function registerIpc(ctx: AppContext): void {
     return { ok: true, generation: ctx.generation, sources: ctx.sources.view() };
   });
 
-  let lastQueryId = 0;
-  /** Per window, its latest search's text, and the first query ID made with that text. */
-  const currentSearch = new WeakMap<
-    AppWindow,
-    { text: string; firstQueryId: number; generation: number }
-  >();
-  /**
-   * The text of one of the window's searches, by a query ID made with the
-   * window's latest text in this generation; null for an older or unknown one.
-   */
-  const searchText = (appWin: AppWindow, generation: number, queryId: number): string | null => {
-    const search = currentSearch.get(appWin);
-    if (
-      !search ||
-      search.generation !== generation ||
-      queryId < search.firstQueryId ||
-      queryId > lastQueryId
-    ) {
-      return null;
-    }
-    return search.text;
-  };
-
   /**
    * A read from the open export's index. Before its index is open there is
    * nothing to read; that answer isn't logged, as the shell asks again when
@@ -599,7 +842,7 @@ export function registerIpc(ctx: AppContext): void {
     let query: IndexQuery = asked;
     if (asked.op === 'cards' && asked.search) {
       const { search, ...plain } = asked;
-      const text = searchText(appWin, generation, search.queryId);
+      const text = searchTextOf(appWin, search.queryId, generation);
       query = text === null ? plain : { ...plain, search: { ...search, text } };
     }
     const result = await ctx.sources.queryIndex(query);
@@ -651,7 +894,7 @@ export function registerIpc(ctx: AppContext): void {
     if (!args.success) return reject('invalid', appWin);
     const [{ queryId, threadIds, generation }] = args.data;
     if (generation !== ctx.generation) return reject('stale_generation', appWin);
-    const text = searchText(appWin, generation, queryId);
+    const text = searchTextOf(appWin, queryId, generation);
     if (text === null) return { ok: false, code: 'superseded' };
     const outcome = await snippetLanes.run(appWin, async () =>
       generation === ctx.generation
@@ -680,7 +923,7 @@ export function registerIpc(ctx: AppContext): void {
     if (!args.success) return reject('invalid', appWin);
     const [{ requester, rowids, queryId, generation }] = args.data;
     if (generation !== ctx.generation) return reject('stale_generation', appWin);
-    const text = queryId === undefined ? null : searchText(appWin, generation, queryId);
+    const text = queryId === undefined ? null : searchTextOf(appWin, queryId, generation);
     const outcome = await leadLanes.run(
       appWin,
       async () =>
@@ -754,6 +997,74 @@ export function registerIpc(ctx: AppContext): void {
     'unknown_source',
     (_appWin, { sourceKey, generation }) => ctx.sources.forget(sourceKey, generation),
   );
+
+  /**
+   * Settings: what it shows, the settings themselves, and its actions. Every
+   * action carries the generation Settings was read under; Rebuild and Forget
+   * also the export it showed.
+   */
+  guarded<SettingsResult>(IPC.settings, (appWin, raw) => {
+    const args = GenerationArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
+    return { ok: true, generation: ctx.generation, view: settingsView(ctx) };
+  });
+
+  guarded<SetSettingResult>(IPC.setSetting, (appWin, raw) => {
+    const args = SettingArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ key, value, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    if (!ctx.settings.set(key, value)) return reject('invalid', appWin);
+    notifySettings(ctx);
+    return { ok: true, settings: ctx.settings.get() };
+  });
+
+  sourceAction(
+    IPC.rebuildIndex,
+    SourceArgs,
+    'unknown_source',
+    (_appWin, { sourceKey, generation }) => ctx.sources.rebuildIndex(sourceKey, generation),
+  );
+
+  guarded<DoneResult>(IPC.resetApp, async (appWin, raw) => {
+    const args = GenerationArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
+    // Checked again when its turn comes: an operation queued before it may move the generation on.
+    const done = await ctx.sources.reset(args.data[0].generation);
+    if (done === STALE) return reject('stale_generation', appWin);
+    if (done === RESET_FAILED) return reject('not_deleted', appWin);
+    if (!done) return reject('refused', appWin);
+    return { ok: true, generation: ctx.generation };
+  });
+
+  guarded<DoneResult>(IPC.openLogs, async (appWin, raw) => {
+    const args = GenerationArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
+    // Only the app's own folder: never a link, or anything but a folder.
+    let folder = false;
+    try {
+      mkdirSync(ctx.dirs.logs, { recursive: true, mode: 0o700 });
+      folder = lstatSync(ctx.dirs.logs).isDirectory();
+    } catch {
+      // Refused below.
+    }
+    if (!folder || (await ctx.openPath(ctx.dirs.logs)) !== '') {
+      ctx.log.warn('logs.open_failed', { windowId: appWin.id });
+      return { ok: false, code: 'failed' };
+    }
+    return { ok: true, generation: ctx.generation };
+  });
+
+  guarded<DoneResult>(IPC.copyDiagnostics, (appWin, raw) => {
+    const args = GenerationArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
+    ctx.writeClipboard(diagnosticsSummary(ctx));
+    return { ok: true, generation: ctx.generation };
+  });
 
   /** Like `guarded`, for one-way sends; also drops a send made for a stale generation. */
   const guardedSend = <A extends { generation: number }>(

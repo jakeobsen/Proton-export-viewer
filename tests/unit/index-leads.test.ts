@@ -374,7 +374,7 @@ describe('the snapshot revision', () => {
     h.query.open(h.dbPath, h.uuid);
     expect(h.ask(null).rev).toBe(first.rev + 1);
     const replacement = new QueryState();
-    replacement.open(h.dbPath, h.uuid, first.rev + 1);
+    replacement.open(h.dbPath, h.uuid, undefined, first.rev + 1);
     const read = replacement.run(
       cardsQuery(h.other, rowidOf(h.other, 'c4'), { text: 'invoice', countRev: null }),
     ) as CardsWindow;

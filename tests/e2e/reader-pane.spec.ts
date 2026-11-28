@@ -131,6 +131,7 @@ test('a message opens in the pane as HTML first, with its header fields', async 
   expect(await pane(pev).locator('button').allTextContents()).toEqual([
     'Plain text',
     'HTML',
+    'Source',
     'Show in folder',
     'Message-ID',
     'Details',
@@ -260,10 +261,16 @@ test('the fallback offers the message as plain text', async ({ pev }) => {
   await pev.main('readerLimits', { heapMb: 64 });
   await openInReader(pev, 3, 'html-anyway');
   await expect(pane(pev).locator('.rp-fallback')).toContainText("Couldn't render this message");
-  await expect(pane(pev).locator('.rp-fallback button')).toHaveText('View as plain text');
+  await expect(pane(pev).locator('.rp-fallback button')).toHaveText([
+    'View as plain text',
+    'View source',
+  ]);
   await expect(pane(pev).locator('.rp-frame')).toHaveCount(0);
 
-  await pane(pev).locator('.rp-fallback button').click();
+  await pane(pev)
+    .locator('.rp-fallback')
+    .getByRole('button', { name: 'View as plain text' })
+    .click();
   await shownUrl(pev);
   await expect(pane(pev).locator('.rp-fallback')).toHaveCount(0);
   await expect(pane(pev).locator('.rp-plain')).toHaveAttribute('aria-pressed', 'true');
