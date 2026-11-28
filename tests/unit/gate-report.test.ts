@@ -14,9 +14,6 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { budgetCheck, freeSpace } from '../../tools/bench/run-bench.mjs';
 import {
-  CHECK_SHARE,
-  LONG_INTERVAL,
-  MAX_FRAME_MS,
   OPEN_GAP_MS,
   TARGETS,
   batchNumbers,
@@ -165,7 +162,7 @@ describe('frames after a DOM change', () => {
   const probe = (samples: number[], timeouts = 0) => ({ samples, timeouts, timeoutMs: 250 });
   const p95Of = (ms: number) => Array.from({ length: 50 }, (_, i) => (i < 45 ? 8 : ms));
 
-  it(`are prompt when p95 is within ${LONG_INTERVAL} frame intervals of the launch's cadence and none is missing`, () => {
+  it("are prompt when p95 is within 1.5 frame intervals of the launch's cadence and none is missing", () => {
     expect(rafVerdict([probe(p95Of(15)), probe(p95Of(15))], 10)).toMatchObject({
       samples: 100,
       timeouts: 0,
@@ -206,7 +203,7 @@ describe('the frame cadence', () => {
     });
   });
 
-  it(`is trusted at a frame every ${MAX_FRAME_MS} ms or less, and not slower`, () => {
+  it('is trusted at a frame every 18.4 ms or less, and not slower', () => {
     expect(cadenceOf(steady(18.375), null)).toMatchObject({ frameMs: 18.375, trusted: true });
     const slow = cadenceOf(steady(18.5), null);
     expect(slow.trusted).toBe(false);
@@ -219,7 +216,7 @@ describe('the frame cadence', () => {
     expect(cadenceOf(steady(20), 0).trusted).toBe(false);
   });
 
-  it(`is not trusted with a timeout, too few frames or gaps over ${LONG_INTERVAL} × F`, () => {
+  it('is not trusted with a timeout, too few frames or gaps over 1.5 × F', () => {
     const timedOut = cadenceOf(steady(16, 120, 1), 60);
     expect(timedOut.trusted).toBe(false);
     expect(timedOut.reasons.join()).toContain('no frame within 250 ms, 1 times');
@@ -249,7 +246,7 @@ describe('the frame cadence', () => {
     expect(c.check.frameMs).toBe(17);
   });
 
-  it(`of a launch is not trusted when the check differs by ${CHECK_SHARE * 100}% or more, or isn't trusted, or is missing`, () => {
+  it("of a launch is not trusted when the check differs by 10% or more, or isn't trusted, or is missing", () => {
     const at = (check: number) =>
       launchCadence(
         [
@@ -278,7 +275,7 @@ describe('the frame cadence', () => {
 });
 
 describe('missed frames', () => {
-  it(`count round(Δ / F) − 1 for each interval over ${LONG_INTERVAL} × F, and none at it`, () => {
+  it('count round(Δ / F) − 1 for each interval over 1.5 × F, and none at it', () => {
     expect(missedIn([10, 15], 10)).toEqual({ intervals: 2, long: 0, missed: 0 });
     expect(missedIn([15.125], 10)).toEqual({ intervals: 1, long: 1, missed: 1 });
     expect(missedIn([30, 10, 20], 10)).toEqual({ intervals: 3, long: 2, missed: 3 });
@@ -408,7 +405,7 @@ describe("the shell's waits", () => {
     expect(await stepStamp(() => Promise.resolve(null), 2000, 100)).toBeNull();
   });
 
-  it(`start a timed expansion at least ${OPEN_PACE_MS} ms after the shown body loaded`, async () => {
+  it('start a timed expansion at least 60 ms after the shown body loaded', async () => {
     expect(OPEN_GAP_MS).toBe(OPEN_PACE_MS);
     let now = 130;
     const slept: number[] = [];
@@ -482,7 +479,7 @@ describe('a launch', () => {
     }
   });
 
-  it(`is invalid when an expansion started less than ${OPEN_GAP_MS} ms after the shown body loaded`, () => {
+  it('is invalid when an expansion started less than 60 ms after the shown body loaded', () => {
     const opens = (gaps: Array<number | null>) => ({
       ...clean,
       result: {
@@ -623,11 +620,12 @@ describe('the numbers of a launch', () => {
       ...Array.from({ length: 19 }, (_, i) => ({
         rowid: i + 1,
         ms: 10 + i,
+        gapMs: 61,
         outcome: 'view' as const,
       })),
-      { rowid: 30, ms: null, outcome: 'timeout' },
-      { rowid: 31, ms: null, outcome: 'not-held' },
-      { rowid: 32, ms: null, outcome: 'not-expanded' },
+      { rowid: 30, ms: null, gapMs: 61, outcome: 'timeout' },
+      { rowid: 31, ms: null, gapMs: null, outcome: 'not-held' },
+      { rowid: 32, ms: null, gapMs: 62, outcome: 'not-expanded' },
     ];
     expect(opensNumbers(opens)).toEqual({
       opens: 22,
