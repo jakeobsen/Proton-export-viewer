@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest';
 import { LEAD_READ, leadText, leads } from '../../src/core/index/leads';
 import { QueryState, WriterState } from '../../src/core/index/ops';
 import { BODY_STATE } from '../../src/core/index/schema';
-import { cardsAnswer, searchPage } from '../../src/core/index/search';
+import { cardsAnswer, matchedSnippets, searchPage } from '../../src/core/index/search';
 import { asNumber, configure, openDb, type Db } from '../../src/core/index/sql';
 import { localDay } from '../../src/core/search/query';
 import { validRanges } from '../../src/core/search/ranges';
@@ -193,6 +193,17 @@ describe('lead lines', () => {
       text: 'invoice from:lee@example.com before:2026-02-01',
     });
     expect(answer.leads.map((l) => l.snippet !== null)).toEqual([true, false, false, false]);
+    db.close();
+  });
+
+  it('builds snippets only for the messages asked for', () => {
+    const { db, ids } = thread();
+    const o1 = rowidOf(db, 'o1');
+    // o1 matches "invoice" too, in another conversation.
+    expect([...matchedSnippets(db, 'invoice', [o1]).byRowid.keys()]).toEqual([o1]);
+    const { byRowid, dropped } = matchedSnippets(db, 'invoice', [ids[0]!, ids[1]!]);
+    expect([...byRowid.keys()]).toEqual([ids[0]]);
+    expect(dropped).toBe(0);
     db.close();
   });
 
