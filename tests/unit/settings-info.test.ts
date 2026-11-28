@@ -18,30 +18,28 @@ const KEY = '3f9c2a71-8d4e-4b6a-9c1f-52e07d1ab3c4';
 
 describe('homeRelative', () => {
   it('shows the home folder as ~, and nothing else', () => {
-    expect(homeRelative('/Users/sam/Library/App/index/a.sqlite', '/Users/sam')).toBe(
+    expect(homeRelative('/home/sam/Library/App/index/a.sqlite', '/home/sam')).toBe(
       '~/Library/App/index/a.sqlite',
     );
-    expect(homeRelative('/Users/sam/x', '/Users/sam/')).toBe('~/x');
-    expect(homeRelative('/Users/sam', '/Users/sam')).toBe('~');
+    expect(homeRelative('/home/sam/x', '/home/sam/')).toBe('~/x');
+    expect(homeRelative('/home/sam', '/home/sam')).toBe('~');
     // A sibling whose name starts with the home folder's is not inside it.
-    expect(homeRelative('/Users/samuel/x', '/Users/sam')).toBe('/Users/samuel/x');
-    expect(homeRelative('/var/x', '/Users/sam')).toBe('/var/x');
+    expect(homeRelative('/home/samuel/x', '/home/sam')).toBe('/home/samuel/x');
+    expect(homeRelative('/var/x', '/home/sam')).toBe('/var/x');
     expect(homeRelative('/var/x', '')).toBe('/var/x');
     expect(homeRelative('/var/x', '/')).toBe('/var/x');
   });
 
   it('ends a folder with a separator', () => {
-    expect(folderLocation('/Users/sam/Library/App/logs', '/Users/sam')).toBe('~/Library/App/logs/');
-    expect(folderLocation('/Users/sam/Library/App/logs/', '/Users/sam')).toBe(
-      '~/Library/App/logs/',
-    );
+    expect(folderLocation('/home/sam/Library/App/logs', '/home/sam')).toBe('~/Library/App/logs/');
+    expect(folderLocation('/home/sam/Library/App/logs/', '/home/sam')).toBe('~/Library/App/logs/');
   });
 });
 
 describe('accountHome', () => {
   it("is the account's home, not HOME, which is the container in the sandbox", () => {
     const saved = process.env.HOME;
-    process.env.HOME = '/Users/sam/Library/Containers/com.example.app/Data';
+    process.env.HOME = '/home/sam/Library/Containers/com.example.app/Data';
     try {
       expect(accountHome()).toBe(userInfo().homedir);
       expect(accountHome()).not.toBe(process.env.HOME);
@@ -55,7 +53,7 @@ describe('accountHome', () => {
       throw new Error('no entry');
     });
     expect(home).toBe('');
-    expect(homeRelative('/Users/sam/Library/x', home)).toBe('/Users/sam/Library/x');
+    expect(homeRelative('/home/sam/Library/x', home)).toBe('/home/sam/Library/x');
   });
 });
 
