@@ -58,6 +58,12 @@ const FORBIDDEN_CONTENT = [
   '__pevTestRenderFault',
   // The self-test's smoke drives the body frame through the DevTools protocol.
   ...SELFTEST_ONLY,
+  // Core's hold of a read once its message file is open.
+  'holdingOpened',
+  'hold-opened',
+  // Core's hold of the shell's cards queries.
+  'holdCardsAt',
+  'hold-cards',
   'better-sqlite3',
   'ws://localhost',
   "style-src 'self' 'unsafe-inline'",

@@ -5,10 +5,11 @@
 
 import { useSyncExternalStore } from 'react';
 import type { IndexResult, IndexUpdate } from '../shared/api';
-import type { IndexProgress, Sidebar } from '../shared/index-types';
+import type { CardRow, IndexProgress, Sidebar } from '../shared/index-types';
 import { INBOX, sidebarModel, type SidebarModel } from './folders';
+import { CardsModel } from './cards';
 import { ListModel, type Row } from './list';
-import { closeReader, getReaderState, openInReader } from './reader';
+import { closeReaderAndView, getReaderState, openInReader } from './reader';
 import { getShellState, refreshGeneration } from './shell';
 
 export interface MailboxState {
@@ -90,6 +91,22 @@ export function useList() {
   return useSyncExternalStore(subscribe, () => list.snapshot);
 }
 
+/** The selected conversation's cards; the expanded one is open in the reader. */
+export const cards = new CardsModel(
+  (query) => ask((generation) => window.pev.cards(query, generation)),
+  () => {
+    for (const listener of listeners) listener();
+  },
+  {
+    open: (rowid) => void openInReader(rowid),
+    close: closeReaderAndView,
+  },
+);
+
+export function useCards() {
+  return useSyncExternalStore(subscribe, () => cards.snapshot);
+}
+
 const keyOf = (generation: number | null): string | null => {
   const active = getShellState().sources?.active;
   return active && generation !== null ? `${active.sourceKey}:${generation}` : null;
@@ -127,6 +144,7 @@ export function syncMailbox(): void {
     if (key !== null) {
       void readSidebar();
       list.refresh();
+      cards.refresh();
     }
     return;
   }
@@ -134,6 +152,8 @@ export function syncMailbox(): void {
   const folder = sameExport ? state.folder : INBOX;
   update({ key, sidebar: null, progress: null, folder });
   list.reset(key === null ? null : folder);
+  // A new export or generation: main revoked the reader's view, and nothing is selected.
+  cards.hide();
   if (key !== null) void readSidebar();
 }
 
@@ -145,6 +165,7 @@ export function indexChanged(update_: IndexUpdate): void {
   if (update_.progress.phase === 'scanning') return;
   void readSidebar();
   list.refresh();
+  cards.refresh();
 }
 
 export function showFolder(id: string): void {
@@ -152,17 +173,34 @@ export function showFolder(id: string): void {
   update({ folder: id });
   list.reset(id);
   // Nothing is selected in the new folder, so nothing is open.
-  closeReader();
+  cards.hide();
+  closeReaderAndView();
 }
 
 /**
- * Selects a conversation, by a click or a key, and opens its newest message,
- * in whatever folder or label it is, in the reader. The message already open
- * there stays as it is, unless its open was refused.
+ * Selects a conversation, by a click or a key, and shows its cards with its
+ * newest message, in whatever folder or label it is, expanded in the reader.
+ * The conversation already shown stays as it is, unless its open was refused.
  */
 export function selectRow(row: Row): void {
   list.select(row);
   const reader = getReaderState();
-  if (reader.rowid === row.newestRowid && reader.refused === null) return;
-  void openInReader(row.newestRowid);
+  const shown = cards.snapshot;
+  if (
+    shown.shown &&
+    shown.expanded === row.newestRowid &&
+    reader.rowid === row.newestRowid &&
+    reader.refused === null
+  ) {
+    return;
+  }
+  cards.show(row.newestRowid, row.threadId);
+}
+
+/** Expands a card: its message opens in the reader, and the old view is revoked. */
+export function expandCard(card: CardRow): void {
+  if (cards.expand(card)) return;
+  // The card already expanded: open it again only if its open was refused.
+  const reader = getReaderState();
+  if (reader.rowid === card.rowid && reader.refused !== null) void openInReader(card.rowid);
 }
