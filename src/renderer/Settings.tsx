@@ -48,6 +48,7 @@ const VIEW_CHOICES: ReadonlyArray<{ value: MessageView; label: string }> = [
 function actionNotice(result: SourceActionResult | DoneResult): string | null {
   if (!result.ok) {
     if (result.code === 'refused') return "Not reset: an export is inside the app's data folder.";
+    if (result.code === 'not_deleted') return "Some app files couldn't be deleted.";
     if (result.code === 'failed') return "Couldn't open the logs folder.";
     return 'Export changed. Try again.';
   }

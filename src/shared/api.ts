@@ -74,6 +74,7 @@ export type RejectCode =
   | 'changed'
   | 'unknown_dialog'
   | 'refused'
+  | 'not_deleted'
   | 'failed';
 
 export type Rejected = { ok: false; code: RejectCode };

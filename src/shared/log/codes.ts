@@ -95,6 +95,7 @@ export const LOG_CODES = [
   'index.open_refused',
   'app.reset',
   'app.reset_refused',
+  'app.reset_failed',
   'settings.invalid',
   'settings.write_failed',
   'logs.open_failed',
@@ -214,6 +215,7 @@ export const REASONS = [
   'file',
   'manual',
   'refused',
+  'not_deleted',
   'failed',
 ] as const;
 

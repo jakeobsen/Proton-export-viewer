@@ -45,7 +45,7 @@ import {
 import { reportText } from '../shared/report-text';
 import { SETTING_KEYS } from '../shared/settings';
 import type { SourceOutcome } from '../shared/sources';
-import { STALE, type Stale } from './sources/manager';
+import { RESET_FAILED, STALE, type Stale } from './sources/manager';
 import { APP_ORIGIN, LINK_ACTIONS } from '../shared/constants';
 import { isRendererLogCode } from '../shared/log/codes';
 import { OPEN_MODES, type RenderedMessage } from '../shared/reader-protocol';
@@ -724,7 +724,11 @@ export function registerIpc(ctx: AppContext): void {
     const args = GenerationArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
     if (args.data[0].generation !== ctx.generation) return reject('stale_generation', appWin);
-    if (!(await ctx.sources.reset())) return reject('refused', appWin);
+    // Checked again when its turn comes: an operation queued before it may move the generation on.
+    const done = await ctx.sources.reset(args.data[0].generation);
+    if (done === STALE) return reject('stale_generation', appWin);
+    if (done === RESET_FAILED) return reject('not_deleted', appWin);
+    if (!done) return reject('refused', appWin);
     return { ok: true, generation: ctx.generation };
   });
 

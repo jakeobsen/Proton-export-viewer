@@ -5,6 +5,7 @@
 
 import { randomUUID } from 'node:crypto';
 import {
+  chmodSync,
   cpSync,
   existsSync,
   readdirSync,
@@ -24,6 +25,7 @@ import type { Logger } from '../../src/shared/log/writer';
 import type { IndexCondition, IndexProgress } from '../../src/shared/index-types';
 import type { ScanSummary, Stamp } from '../../src/shared/sources';
 import {
+  RESET_FAILED,
   STALE,
   SourceManager,
   type CoreControl,
@@ -1568,6 +1570,50 @@ describe('Reset', () => {
     t.picks.push({ path: tool('mgr-reset-quit-tool-2'), bookmark: 'bm2' });
     expect(await t.manager.chooseFolder(null, t.generation())).toBe('closed');
     expect(t.core.started).toHaveLength(starts);
+  });
+
+  it('runs one of two Resets made for one generation while the queue is held: the other is stale', async () => {
+    const t = setup('mgr-reset-twice');
+    const root = tool('mgr-reset-twice-tool');
+    t.picks.push({ path: root, bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    // An open holds the queue (its dialog is up) while two windows ask for a Reset.
+    let pick: ((p: Picked | null) => void) | undefined;
+    t.manager.setAccess({ picker: () => new Promise((r) => (pick = r)) });
+    const inProgress = t.manager.chooseFolder(null, t.generation());
+    await vi.waitFor(() => expect(pick).toBeDefined(), WAIT);
+    const shown = t.generation();
+    const first = t.manager.reset(shown);
+    const second = t.manager.reset(shown);
+    pick!({ path: root, bookmark: 'bm2' });
+    expect(await inProgress).toBe('closed');
+    expect(await first).toBe(true);
+    // The first moved the generation on before the second's turn.
+    expect(await second).toBe(STALE);
+    expect(t.lines.filter((l) => l.includes('"app.reset"'))).toHaveLength(1);
+    expect(t.core.resets).toBe(1);
+    // Opens are admitted again after the stale one.
+    t.manager.setAccess({ picker: () => Promise.resolve({ path: root, bookmark: 'bm3' }) });
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('opened');
+  });
+
+  it('fails, with its own answer and log code, when a file of the app's stays', async () => {
+    const t = setup('mgr-reset-left');
+    writeFileSync(join(t.userData, 'sources.json'), '{}');
+    // A folder that can't be changed: its files can't be deleted.
+    chmodSync(t.userData, 0o555);
+    try {
+      expect(await t.manager.reset(t.generation())).toBe(RESET_FAILED);
+    } finally {
+      chmodSync(t.userData, 0o755);
+    }
+    expect(existsSync(join(t.userData, 'sources.json'))).toBe(true);
+    const failed = t.lines.filter((l) => l.includes('"app.reset_failed"'));
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).not.toContain(t.userData);
+    // Opens are admitted again, and core is up.
+    expect(t.core.running).toBe(true);
   });
 
   it('starts the logs again and restores the default settings once the data is gone', async () => {

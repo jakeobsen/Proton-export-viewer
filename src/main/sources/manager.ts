@@ -152,6 +152,9 @@ export const RESTART_WINDOW_MS = 60_000;
 /** The answer to an operation made for a generation that has moved on before it ran. */
 export const STALE = 'stale_generation';
 export type Stale = typeof STALE;
+/** A Reset that couldn't delete every file of the app's. */
+export const RESET_FAILED = 'reset_failed';
+export type ResetFailed = typeof RESET_FAILED;
 
 /**
  * Account folder names agree unless both are known and differ: a run picked by
@@ -943,11 +946,23 @@ export class SourceManager {
    * Resets the app. From now until it's done nothing opens. After the
    * operation in progress, the open source is torn down in core and core is
    * stopped; only then is the app's data deleted. Then the app starts afresh,
-   * as at a launch with nothing to reopen. True if the data was deleted.
+   * as at a launch with nothing to reopen. True if the data was deleted,
+   * false if an export overlaps it (nothing is deleted), RESET_FAILED if a
+   * file of the app's couldn't be deleted.
+   *
+   * One made for a generation is checked again when its turn comes: if an
+   * operation before it moved the generation on (another Reset too), it is
+   * stale, nothing is deleted, and opens are admitted again.
    */
-  reset(): Promise<boolean> {
+  reset(): Promise<boolean | ResetFailed>;
+  reset(expected: number): Promise<boolean | Stale | ResetFailed>;
+  reset(expected?: number): Promise<boolean | Stale | ResetFailed> {
     this.admitting = false;
     return this.serial(async () => {
+      if (expected !== undefined && this.deps.generation() !== expected) {
+        if (!this.closed) this.admitting = true;
+        return STALE;
+      }
       try {
         return await this.resetNow();
       } finally {
@@ -959,7 +974,7 @@ export class SourceManager {
     });
   }
 
-  private async resetNow(): Promise<boolean> {
+  private async resetNow(): Promise<boolean | ResetFailed> {
     const exports = this.exportRoots();
     const generation = this.deps.bumpGeneration();
     this.active = null;
@@ -984,10 +999,12 @@ export class SourceManager {
     this.registry.clear();
     this.deps.log.info('app.reset', { generation });
     this.deps.stopLogs?.();
-    removeAppData(this.deps.userData);
+    const left = removeAppData(this.deps.userData);
     this.deps.afterReset?.();
+    // Logged once the logs have started again.
+    if (left > 0) this.deps.log.warn('app.reset_failed', { count: left });
     this.deps.notify();
-    return true;
+    return left === 0 ? true : RESET_FAILED;
   }
 
   /** The run folder of every export the app knows, the open one included. */
