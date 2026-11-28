@@ -224,18 +224,23 @@ test('Reset deletes the app data once the open export is torn down, and nothing 
   await pev.shell('chooseFolder', []);
   await phase1Done(pev, written.pairs);
   const registry = await pev.main<string>('registryFile');
-  const logsDir = pev.logsDir();
   const settings = join(pev.userData, 'settings.json');
   writeFileSync(settings, '{}');
   expect(existsSync(registry)).toBe(true);
-  expect(readdirSync(logsDir).length).toBeGreaterThan(0);
+  // Main, core and the shell have each logged before the reset.
+  await pev.shell('log', ['before-reset']);
+  await expect.poll(() => pev.logs().some((l) => l.code === 'test.log')).toBe(true);
+  const earlier = ['source.opened', 'index.created', 'test.log'];
+  for (const code of earlier) expect(pev.hasLog(code)).toBe(true);
 
   await pev.main('resetApp');
   // The index folder keeps only what the app didn't make there.
   expect(readdirSync(indexDir)).toEqual(['nested']);
   expect(existsSync(registry)).toBe(false);
   expect(existsSync(settings)).toBe(false);
-  expect(existsSync(logsDir)).toBe(false);
+  // Every log from before is gone. Main and core log again at once, so new
+  // files may already be there, with nothing in them from before.
+  expect(pev.logs().filter((l) => [...earlier, 'app.reset'].includes(l.code))).toEqual([]);
   expect(await view(pev)).toEqual({ restoring: false, active: null, recent: [] });
   expect(await pev.main('liveScopes')).toEqual([]);
   // Nothing comes back on its own: not the index or the registry. The logs
@@ -244,7 +249,7 @@ test('Reset deletes the app data once the open export is torn down, and nothing 
   expect(readdirSync(indexDir)).toEqual(['nested']);
   expect(existsSync(registry)).toBe(false);
   await pev.shell('log', ['after-reset']);
-  await expect.poll(() => existsSync(logsDir)).toBe(true);
+  await expect.poll(() => pev.logs().filter((l) => l.code === 'test.log').length).toBe(1);
   expect(pev.logs().filter((l) => ['app.reset', 'source.opened'].includes(l.code))).toEqual([]);
   // Then the app starts afresh: an export opens as a new one.
   await pev.main('queuePick', root, 'bm2');
