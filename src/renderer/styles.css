@@ -238,6 +238,12 @@ body,
   font-size: 12px;
 }
 
+.recent-hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
 .recent-actions {
   display: flex;
   flex: none;

@@ -4,7 +4,7 @@
 // with its own token. The old body frame goes as soon as an open starts.
 
 import { useSyncExternalStore } from 'react';
-import type { MessageOpenResult, ReaderActionResult, RejectCode } from '../shared/api';
+import type { MessageOpenResult, ReaderActionResult, RejectCode, SaveResult } from '../shared/api';
 import type { OpenMode } from '../shared/reader-protocol';
 import { clearLink, getShellState, refreshGeneration } from './shell';
 
@@ -22,6 +22,8 @@ export interface ReaderState {
   fallback: boolean;
   /** Main refused the open. */
   refused: RejectCode | null;
+  /** How the last save from the shown view ended. */
+  saved: { openId: number; saveId: number } | 'failed' | null;
 }
 
 const CLOSED: ReaderState = {
@@ -31,6 +33,7 @@ const CLOSED: ReaderState = {
   view: null,
   fallback: false,
   refused: null,
+  saved: null,
 };
 
 let state: ReaderState = CLOSED;
@@ -65,7 +68,7 @@ export async function openInReader(
   latest += 1;
   const mine = latest;
   clearLink();
-  update({ rowid, mode, pending: true, view: null, fallback: false, refused: null });
+  update({ rowid, mode, pending: true, view: null, fallback: false, refused: null, saved: null });
   const generation = getShellState().generation ?? (await refreshGeneration().catch(() => null));
   if (generation === null) {
     if (mine === latest) update({ pending: false, refused: 'stale_generation' });
@@ -93,9 +96,9 @@ export async function openInReader(
 }
 
 /** An action on the message the pane shows, such as Show in folder, by its view's open. */
-async function viewAction(
-  act: (openId: number, generation: number) => Promise<ReaderActionResult>,
-): Promise<ReaderActionResult> {
+async function viewAction<T extends { ok: boolean }>(
+  act: (openId: number, generation: number) => Promise<T | ReaderActionResult>,
+): Promise<T | ReaderActionResult> {
   const view = state.view;
   if (!view || openGeneration === null) return { ok: false, code: 'superseded' };
   try {
@@ -103,6 +106,42 @@ async function viewAction(
   } catch {
     return { ok: false, code: 'core_unavailable' };
   }
+}
+
+/** Saves to the downloads folder, then shows how it ended while the same view is shown. */
+async function saveFromView(
+  act: (openId: number, generation: number) => Promise<SaveResult>,
+): Promise<SaveResult> {
+  const openId = state.view?.openId;
+  const result = (await viewAction(act)) as SaveResult;
+  // A save the view moved on from, or a source change, shows nothing.
+  if (openId === undefined || state.view?.openId !== openId) return result;
+  if (result.ok) update({ saved: { openId, saveId: result.saveId } });
+  else if (result.code !== 'superseded' && result.code !== 'stale_generation') {
+    update({ saved: 'failed' });
+  }
+  return result;
+}
+
+/** Saves attachment `index` of the pane's message to the downloads folder. */
+export function saveAttachment(index: number): Promise<SaveResult> {
+  return saveFromView((openId, generation) => window.pev.save(openId, index, generation));
+}
+
+/** Saves the pane's message file to the downloads folder. */
+export function saveMessageFile(): Promise<SaveResult> {
+  return saveFromView((openId, generation) => window.pev.saveEml(openId, generation));
+}
+
+/** Shows the file the last save from the pane's view published, in Finder. */
+export function showSaved(): Promise<ReaderActionResult> {
+  const saved = state.saved;
+  if (saved === null || saved === 'failed') {
+    return Promise.resolve({ ok: false, code: 'not_found' });
+  }
+  return viewAction((openId, generation) =>
+    window.pev.showSaved(openId, saved.saveId, generation),
+  ) as Promise<ReaderActionResult>;
 }
 
 /** Shows the pane's message file in Finder. */

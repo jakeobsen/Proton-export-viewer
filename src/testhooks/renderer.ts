@@ -14,7 +14,14 @@ import {
   refreshSources,
   switchRun,
 } from '../renderer/shell';
-import { closeReader, getReaderState, openInReader } from '../renderer/reader';
+import {
+  closeReader,
+  getReaderState,
+  openInReader,
+  saveAttachment,
+  saveMessageFile,
+  showSaved,
+} from '../renderer/reader';
 import type { OpenResult } from '../shared/api';
 import { BODY_IFRAME_REFERRER, BODY_IFRAME_SANDBOX } from '../shared/constants';
 import type { OpenMode } from '../shared/reader-protocol';
@@ -140,6 +147,10 @@ export function install(): void {
     openInReader: (rowid: number, mode?: OpenMode) => openInReader(rowid, mode),
     closeReader,
     reader: () => getReaderState(),
+    /** Saves an attachment, or the message file, of the pane's message; resolves when done. */
+    saveAttachment: (index: number) => saveAttachment(index),
+    saveMessageFile: () => saveMessageFile(),
+    showSaved: () => showSaved(),
     refreshSources,
     chooseFolder,
     openExport,

@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- The local build: read-only access to the folder the user picks, kept across
-     launches by a bookmark, and its own app group. No Downloads write access, so
-     an export in Downloads stays read-only for the app. -->
+     launches by a bookmark, write access to Downloads for saved attachments, and
+     its own app group. An export kept inside Downloads is therefore writable at
+     the macOS level; the app itself never writes to an export. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -11,6 +12,8 @@
   <key>com.apple.security.files.user-selected.read-only</key>
   <true/>
   <key>com.apple.security.files.bookmarks.app-scope</key>
+  <true/>
+  <key>com.apple.security.files.downloads.read-write</key>
   <true/>
   <key>com.apple.security.application-groups</key>
   <array>

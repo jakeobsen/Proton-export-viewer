@@ -114,6 +114,8 @@ function make() {
       message: {
         rowid: 17,
         file: message.file === undefined ? FILE : message.file,
+        version: null,
+        subject: '',
         messageId: message.messageId ?? MESSAGE_ID,
         attachments: [],
       },

@@ -11,6 +11,17 @@ import type { ViewRegistry } from './views';
 
 export interface RequestLike {
   url: string;
+  /**
+   * Set (to an origin, or null for an opaque one) when a page made the
+   * request; absent when the browser started it, as for a download main began.
+   */
+  initiatorOrigin?: string | null;
+}
+
+/** Serves the one-shot assets of a window's saves. */
+export interface SaveAssets {
+  /** The body of save asset `id` under `token`, once; null if there is none. */
+  serve(token: string, id: string, initiated: boolean): Response | null;
 }
 
 export type Handler = (request: RequestLike) => Promise<Response>;
@@ -110,6 +121,8 @@ export interface ViewHandlerOptions {
   bodyCspEnabled?: (() => boolean) | undefined;
   /** Called for every request before the token check. */
   onRequest?: ((url: string) => void) | undefined;
+  /** The window's saves, whose assets are kept apart from any view's. */
+  saves?: SaveAssets | undefined;
 }
 
 /** Serves `mail-body://v/<token>` for live views of this window only. */
@@ -141,7 +154,8 @@ export function bodyHandler(options: ViewHandlerOptions): Handler {
 /**
  * Serves `mail-asset://v/<token>/<id>` for assets registered with a live view
  * of this window. An inline image (`c<n>`) passes the raster check again here,
- * and is served with the type of the format it found.
+ * and is served with the type of the format it found. A save's asset has a
+ * token of its own, outlives the view it was asked from, and is served once.
  */
 export function assetHandler(options: ViewHandlerOptions): Handler {
   const reject = (reason: string): Response => {
@@ -157,6 +171,11 @@ export function assetHandler(options: ViewHandlerOptions): Handler {
     const url = parse(request.url);
     const match = url && url.host === VIEW_HOST ? ASSET_PATH_RE.exec(url.pathname) : null;
     if (!match?.[1] || !match[2]) return reject('bad_path');
+    if (options.saves) {
+      const initiated = 'initiatorOrigin' in request && request.initiatorOrigin !== undefined;
+      const saved = options.saves.serve(match[1], match[2], initiated);
+      if (saved) return saved;
+    }
     const view = options.views.lookup(match[1]);
     if (!view) return reject('unknown_token');
     const id = match[2];

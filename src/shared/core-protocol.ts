@@ -5,6 +5,7 @@ import type { IndexAnswer, IndexOpened, IndexProgress, IndexQuery } from './inde
 import type {
   BodyLink,
   FileIdentity,
+  FileVersion,
   LocateRequest,
   ReadRequest,
   ReaderFailure,
@@ -12,6 +13,7 @@ import type {
   WorkerRender,
   WorkerRendered,
 } from './reader-protocol';
+import type { SaveRequest } from './save-protocol';
 import type { RunIdentity, ScanSummary, Stamp } from './sources';
 
 /** The export run core serves. `root` is null while the run is unavailable. */
@@ -225,7 +227,8 @@ export type CoreRequest =
   | IndexRequest
   | IndexQueryRequest
   | ForgetRequest
-  | ResetRequest;
+  | ResetRequest
+  | SaveRequest;
 
 export type CoreResult =
   | {
@@ -245,6 +248,17 @@ export type CoreResult =
       read?: RenderedMessage;
       /** The identity of the file a `read` came from; null for a test input. */
       file?: FileIdentity | null;
+      /**
+       * The size and time of that file, the same before and after the read;
+       * null when the file changed meanwhile, or for a test input.
+       */
+      version?: FileVersion | null;
+      /** The bytes a `save-open` will stream. */
+      size?: number;
+      /** The next bytes of a save, from `save-pull`. */
+      chunk?: Uint8Array;
+      /** `chunk` completes the save. */
+      done?: boolean;
       /** The path a `locate` found. */
       path?: string;
       index?: IndexOpened;
@@ -270,7 +284,10 @@ export type CoreResult =
         | 'no_index'
         | 'damaged'
         | 'closed'
-        | 'busy';
+        | 'busy'
+        | 'unreadable'
+        | 'stalled'
+        | 'cancelled';
       /** Why the reader gave no body, for `reader_failed`. */
       reason?: ReaderFailure;
       /** Test builds only: why a test action failed. */

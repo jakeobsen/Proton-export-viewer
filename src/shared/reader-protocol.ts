@@ -137,6 +137,15 @@ export interface FileIdentity {
 }
 
 /**
+ * A file's size and modification time (ns) as decimal strings, as the reader
+ * found them before and after its read. A save checks that they are unchanged.
+ */
+export interface FileVersion {
+  size: string;
+  mtimeNs: string;
+}
+
+/**
  * main -> core: the path of the file a view was read from, for Show in folder.
  * Core answers only while the message's file is still that same file.
  */

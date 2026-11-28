@@ -7,7 +7,7 @@
 import { constants } from 'node:fs';
 import { lstat, open, realpath, type FileHandle } from 'node:fs/promises';
 import { isAbsolute, join, sep } from 'node:path';
-import type { LocatedFile, OpenedMessage, ReaderSource } from '../core/reader/source';
+import type { LocatedFile, OpenedMessage, ReaderSource, SaveOpen } from '../core/reader/source';
 import type { FileIdentity, TestInput } from '../shared/reader-protocol';
 import { markLoaded } from './marker';
 
@@ -189,5 +189,18 @@ export class TestReaderSource implements ReaderSource {
     } finally {
       await handle.close();
     }
+  }
+
+  async openForSave(rowid: number, want: FileIdentity): Promise<SaveOpen> {
+    const entry = this.entries.get(rowid);
+    if (!entry || 'test' in entry) return { ok: false, code: 'not_found' };
+    const handle = await openContained(this.root, entry.file);
+    if (!handle) return { ok: false, code: 'changed' };
+    const st = await handle.stat({ bigint: true }).catch(() => null);
+    if (!st || st.dev.toString() !== want.dev || st.ino.toString() !== want.ino) {
+      await handle.close();
+      return { ok: false, code: 'changed' };
+    }
+    return { ok: true, fd: handle.fd, close: () => void handle.close().catch(() => undefined) };
   }
 }

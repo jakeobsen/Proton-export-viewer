@@ -38,6 +38,10 @@ const api: PevApi = {
     ipcRenderer.invoke(IPC.showInFolder, { openId, generation }),
   copyMessageId: (openId, generation) =>
     ipcRenderer.invoke(IPC.copyMessageId, { openId, generation }),
+  save: (openId, index, generation) => ipcRenderer.invoke(IPC.save, { openId, index, generation }),
+  saveEml: (openId, generation) => ipcRenderer.invoke(IPC.saveEml, { openId, generation }),
+  showSaved: (openId, saveId, generation) =>
+    ipcRenderer.invoke(IPC.showSaved, { openId, saveId, generation }),
   log: (level, code, generation, data) =>
     ipcRenderer.send(
       IPC.log,

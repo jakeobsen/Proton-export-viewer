@@ -5,6 +5,7 @@
 // rejected. The one exception is `state`, the bootstrap call: it takes no
 // arguments and returns the current generation.
 
+import { lstatSync } from 'node:fs';
 import { clipboard, ipcMain, shell, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
 import { z } from 'zod';
 import {
@@ -17,6 +18,7 @@ import {
   type MessageOpenResult,
   type ReaderActionResult,
   type OpenResult,
+  type SaveResult,
   type PingResult,
   type Rejected,
   type RejectCode,
@@ -51,7 +53,9 @@ import { sameFrame } from './navigation';
 import { OPEN_GAP_MS, OpenPacer } from './open-pacer';
 import { PLACEHOLDER } from '../shared/placeholder';
 import { SUPERSEDED, SearchLanes } from './search-lane';
-import { bodyUrl, type ViewBody } from './views';
+import { attachmentName, emlName } from './saves/names';
+import type { SaveAsk, SaveWindow } from './saves/manager';
+import { bodyUrl, type ViewBody, type ViewMessage } from './views';
 
 const Generation = z
   .number()
@@ -74,6 +78,25 @@ const MessageOpenArgs = z.tuple([
     .strict(),
 ]);
 // An action on the open message names its view by the open that installed it.
+const OpenId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+const SaveArgs = z.tuple([
+  z
+    .object({
+      openId: OpenId,
+      index: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      generation: Generation,
+    })
+    .strict(),
+]);
+const ShowSavedArgs = z.tuple([
+  z
+    .object({
+      openId: OpenId,
+      saveId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      generation: Generation,
+    })
+    .strict(),
+]);
 const ViewActionArgs = z.tuple([
   z
     .object({
@@ -425,6 +448,8 @@ export function registerIpc(ctx: AppContext): void {
       message: {
         rowid,
         file: result.file ?? null,
+        version: result.version ?? null,
+        subject: message.headers.subject,
         messageId: message.details.messageId,
         attachments: message.attachments.map((a) => ({
           path: a.path,
@@ -517,6 +542,106 @@ export function registerIpc(ctx: AppContext): void {
     if (message.messageId === '') return reject('not_found', appWin);
     clipboard.writeText(message.messageId);
     ctx.log.info('reader.copy_message_id', { windowId: appWin.id });
+    return { ok: true };
+  });
+
+  /** The live view of an open, for the current generation, or why there is none. */
+  const liveView = (appWin: AppWindow, openId: number, generation: number) => {
+    if (generation !== ctx.generation) return 'stale_generation' as const;
+    const view = appWin.views.byOpenId(openId);
+    if (!view?.message || view.generation !== ctx.generation) return 'superseded' as const;
+    return { view, message: view.message };
+  };
+
+  /** The window a save is for: main starts its download there. */
+  const saveWindow = (appWin: AppWindow): SaveWindow => ({
+    id: appWin.id,
+    download: (url) => appWin.win.webContents.downloadURL(url),
+  });
+
+  /**
+   * Saves one thing from the window's live view: what to save comes from the
+   * view main keeps, never from the shell. Resolves when the save has ended.
+   */
+  const startSave = async (
+    appWin: AppWindow,
+    live: Exclude<ReturnType<typeof liveView>, string>,
+    what: (message: ViewMessage) => Pick<SaveAsk, 'target' | 'assetId' | 'name'> | null,
+  ): Promise<SaveResult> => {
+    const { view, message } = live;
+    if (!ctx.saves) return reject('invalid', appWin);
+    if (ctx.sources.isOffline()) return reject('offline', appWin);
+    if (!message.file || !message.version) return reject('changed', appWin);
+    const item = what(message);
+    if (!item) return reject('not_found', appWin);
+    const outcome = await ctx.saves.request(saveWindow(appWin), {
+      openId: view.openId,
+      generation: view.generation,
+      rowid: message.rowid,
+      file: message.file,
+      version: message.version,
+      ...item,
+    });
+    // The save logged how it ended; the shell gets the outcome alone.
+    return outcome;
+  };
+
+  guarded<SaveResult>(IPC.save, async (appWin, raw) => {
+    const args = SaveArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ openId, index, generation }] = args.data;
+    const live = liveView(appWin, openId, generation);
+    if (typeof live === 'string') return reject(live, appWin);
+    return startSave(appWin, live, (message) => {
+      const attachment = message.attachments[index];
+      if (!attachment) return null;
+      return {
+        target: {
+          kind: 'part',
+          path: attachment.path,
+          contentType: attachment.contentType,
+          size: attachment.size,
+        },
+        assetId: `a${index}`,
+        name: attachmentName(attachment.name),
+      };
+    });
+  });
+
+  guarded<SaveResult>(IPC.saveEml, async (appWin, raw) => {
+    const args = ViewActionArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ openId, generation }] = args.data;
+    const live = liveView(appWin, openId, generation);
+    if (typeof live === 'string') return reject(live, appWin);
+    return startSave(appWin, live, (message) => ({
+      target: { kind: 'eml', size: Number(message.version?.size ?? 0) },
+      assetId: 'e',
+      name: emlName(message.subject),
+    }));
+  });
+
+  /**
+   * Shows a file a save from this view published, only while the file at
+   * that path is still the one it published.
+   */
+  guarded<ReaderActionResult>(IPC.showSaved, (appWin, raw) => {
+    const args = ShowSavedArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ openId, saveId, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    const saved = ctx.saves?.forWindow(appWin.id).savedFile(saveId, openId);
+    if (!saved) return reject('not_found', appWin);
+    let same: boolean;
+    try {
+      const st = lstatSync(saved.path, { bigint: true });
+      same = st.isFile() && st.dev.toString() === saved.dev && st.ino.toString() === saved.ino;
+    } catch {
+      same = false;
+    }
+    if (!same) return reject('changed', appWin);
+    shell.showItemInFolder(saved.path);
+    ctx.log.info('save.shown', { windowId: appWin.id });
     return { ok: true };
   });
 

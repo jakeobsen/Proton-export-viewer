@@ -38,6 +38,11 @@ export const LOG_CODES = [
   'perm.denied',
   'device.denied',
   'download.cancelled',
+  'save.started',
+  'save.done',
+  'save.failed',
+  'save.queue_full',
+  'save.shown',
   'protocol.not_found',
   'view.installed',
   'reader.show_in_folder',
@@ -208,6 +213,15 @@ export const REASONS = [
   'eml_missing',
   'offline',
   'file',
+  'export_root',
+  'stalled',
+  'short',
+  'publish',
+  'exists',
+  'foreign',
+  'cancelled',
+  'link',
+  'copy',
 ] as const;
 
 /** The lists of a message whose entries can be cut to a limit when indexed. */

@@ -38,8 +38,10 @@ export function createAppWindow(ctx: AppContext, options: WindowOptions = {}): A
   nextWindowId += 1;
   const ses = session.fromPartition(`win-${randomUUID()}`, { cache: false });
   const views = new ViewRegistry();
+  const saves = ctx.saves?.forWindow(windowId);
   hardenSession(ses, {
     views,
+    saves,
     windowId,
     rendererDir: ctx.paths.rendererDir,
     shellCsp: ctx.shellCsp,
@@ -97,6 +99,7 @@ export function createAppWindow(ctx: AppContext, options: WindowOptions = {}): A
   });
   win.on('closed', () => {
     ctx.linkDialog.forget(windowId);
+    ctx.saves?.closeWindow(windowId);
     const revoked = views.revokeAll();
     if (revoked > 0)
       ctx.log.info('view.revoked', { reason: 'window_closed', count: revoked, windowId });

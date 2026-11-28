@@ -4,7 +4,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { BODY_SCHEME, VIEW_HOST } from '../shared/constants';
-import type { FileIdentity } from '../shared/reader-protocol';
+import type { FileIdentity, FileVersion } from '../shared/reader-protocol';
 
 export interface ViewAsset {
   contentType: string;
@@ -35,6 +35,13 @@ export interface ViewMessage {
   rowid: number;
   /** The identity of the file the view was read from; null for a test input. */
   file: FileIdentity | null;
+  /**
+   * That file's size and time, unchanged across the read; null when it
+   * changed meanwhile, or for a test input. A view without one can't save.
+   */
+  version: FileVersion | null;
+  /** The subject as the header shows it: a saved message file is named after it. */
+  subject: string;
   /** The Message-ID as Details shows it, or '' when the message has none. */
   messageId: string;
   /** Each listed attachment, by its index in the list the shell shows. */

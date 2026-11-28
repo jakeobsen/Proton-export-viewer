@@ -44,6 +44,9 @@ export const IPC = {
   showInFolder: 'pev:show-in-folder',
   copyMessageId: 'pev:copy-message-id',
   copyReport: 'pev:copy-report',
+  save: 'pev:save',
+  saveEml: 'pev:save-eml',
+  showSaved: 'pev:show-saved',
 } as const;
 
 export type RejectCode =
@@ -62,7 +65,9 @@ export type RejectCode =
   | 'eml_missing'
   | 'offline'
   | 'changed'
-  | 'unknown_dialog';
+  | 'unknown_dialog'
+  | 'save_failed'
+  | 'queue_full';
 
 export type Rejected = { ok: false; code: RejectCode };
 
@@ -87,6 +92,9 @@ export interface AttachmentItem {
 
 /** The outcome of an action on the open message, such as Show in folder. */
 export type ReaderActionResult = { ok: true } | Rejected;
+
+/** A save that ended with its file in the downloads folder; `saveId` names it for Show in Finder. */
+export type SaveResult = { ok: true; saveId: number } | Rejected;
 
 /**
  * The outcome of opening a message: its body view, or the fallback when the
@@ -191,6 +199,12 @@ export interface PevApi {
   showInFolder(openId: number, generation: number): Promise<ReaderActionResult>;
   /** Copies the open message's Message-ID. */
   copyMessageId(openId: number, generation: number): Promise<ReaderActionResult>;
+  /** Saves attachment `index` of the open message to the downloads folder; resolves when done. */
+  save(openId: number, index: number, generation: number): Promise<SaveResult>;
+  /** Saves the open message's file to the downloads folder; resolves when done. */
+  saveEml(openId: number, generation: number): Promise<SaveResult>;
+  /** Shows a file saved from the open message in Finder. */
+  showSaved(openId: number, saveId: number, generation: number): Promise<ReaderActionResult>;
   log(
     level: 'error' | 'warn' | 'info',
     code: string,
