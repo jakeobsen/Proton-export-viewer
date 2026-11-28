@@ -5,7 +5,13 @@
 // main reports that the index moved on, and results are not.
 
 import { useSyncExternalStore } from 'react';
-import type { IndexResult, IndexUpdate, SearchRequest, SnippetsRequest } from '../shared/api';
+import type {
+  CardKeyName,
+  IndexResult,
+  IndexUpdate,
+  SearchRequest,
+  SnippetsRequest,
+} from '../shared/api';
 import type {
   CardRow,
   IndexProgress,
@@ -306,4 +312,13 @@ export function expandCard(card: CardRow): void {
   // The card already expanded: open it again only if its open was refused.
   const reader = getReaderState();
   if (reader.rowid === card.rowid && reader.refused !== null) void openInReader(card.rowid);
+}
+
+/**
+ * `n` expands the next newer card, `p` the next older one, stopping at either
+ * end; the list selection stays. Nothing moves while the link dialog is open.
+ */
+export function moveCard(key: CardKeyName): void {
+  if (getShellState().link !== null) return;
+  cards.move(key === 'n' ? 1 : -1);
 }
