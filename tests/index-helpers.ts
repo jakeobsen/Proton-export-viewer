@@ -204,6 +204,20 @@ export function checkAgainstScratch(db: Db, rows: MessageRow[]): void {
     const t = db.stmt('SELECT thread_id FROM messages WHERE proton_id = ?').get(owner!.protonId);
     if (asNumber(t?.thread_id) !== asNumber(r.thread_id)) throw new Error('key points elsewhere');
   }
+  // Every key of every member is stored, for its member's conversation, and no other.
+  const wantKeys = new Map<string, number>();
+  for (const [threadId, list] of members) {
+    for (const m of list) for (const key of keysOf(m)) wantKeys.set(key, threadId);
+  }
+  const haveKeys = new Map(
+    db
+      .stmt('SELECT key, thread_id FROM thread_keys')
+      .all()
+      .map((r) => [String(r.key), asNumber(r.thread_id)] as const),
+  );
+  if (JSON.stringify([...haveKeys].sort()) !== JSON.stringify([...wantKeys].sort())) {
+    throw new Error('conversation keys differ');
+  }
 }
 
 export function shuffled<T>(list: T[], seed: number): T[] {
@@ -248,7 +262,8 @@ export function ingest(
 /**
  * A thread that runs the index's operations in this process. `hang` makes a
  * call never answer, so its time limit ends it; the thread is then replaced,
- * as a worker thread would be.
+ * as a worker thread would be. A call past its limit says, as `exited`, when
+ * the operation it started has ended: nothing of it runs after that.
  */
 export class InlineThread implements IndexThread {
   respawns = 0;
@@ -268,16 +283,21 @@ export class InlineThread implements IndexThread {
     return new Promise<T>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | null = null;
       let timedOut = false;
+      let ended: () => void = () => {};
+      const exited = new Promise<void>((done) => (ended = done));
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           timedOut = true;
           this.respawns += 1;
           this.handle = threadHandler(this.role);
           this.onRespawn?.();
-          reject(new ThreadError(TIMEOUT));
+          reject(new ThreadError(TIMEOUT, exited));
         }, timeoutMs);
       }
-      if (this.hang(op, args)) return;
+      if (this.hang(op, args)) {
+        ended();
+        return;
+      }
       const handle = this.handle;
       setImmediate(() => {
         // An operation may answer with a promise, as in the worker thread.
@@ -289,6 +309,8 @@ export class InlineThread implements IndexThread {
             if (timer) clearTimeout(timer);
             if (!timedOut) reject(new ThreadError(codeOf(err)));
             return;
+          } finally {
+            ended();
           }
           if (timer) clearTimeout(timer);
           if (!timedOut) resolve(value as T);

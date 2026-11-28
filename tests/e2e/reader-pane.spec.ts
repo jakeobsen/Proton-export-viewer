@@ -113,7 +113,13 @@ test('a message opens in the pane as HTML first, with its header fields', async 
 
   // Details: the full fields, and back.
   await pane(pev).locator('.rp-linkish').click();
-  await expect(pane(pev).locator('.rp-details dt')).toHaveText(['From', 'To', 'Cc', 'Date']);
+  await expect(pane(pev).locator('.rp-details dt')).toHaveText([
+    'From',
+    'To',
+    'Cc',
+    'Date',
+    'Format',
+  ]);
   await expect(pane(pev).locator('.rp-details dd').first()).toHaveText(
     '"Ana Lee" <ana@example.org>',
   );
@@ -125,6 +131,8 @@ test('a message opens in the pane as HTML first, with its header fields', async 
   expect(await pane(pev).locator('button').allTextContents()).toEqual([
     'Plain text',
     'HTML',
+    'Show in folder',
+    'Message-ID',
     'Details',
   ]);
   expect(await pane(pev).locator('.rp-line').allTextContents()).toEqual([

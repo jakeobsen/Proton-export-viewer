@@ -110,3 +110,46 @@ export function fullDate(iso: string | null, timeZone?: string): string {
 export function blockedImages(count: number): string {
   return count === 1 ? '1 external image blocked' : `${count} external images blocked`;
 }
+
+/** A file size as the attachment list shows it, in decimal units: "182 KB", "1.2 MB". */
+export function fileSize(bytes: number): string {
+  if (bytes < 1000) return bytes === 1 ? '1 byte' : `${bytes} bytes`;
+  if (bytes < 999_500) return `${Math.round(bytes / 1000)} KB`;
+  if (bytes < 999_950_000) return `${(bytes / 1_000_000).toFixed(1)} MB`;
+  return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
+}
+
+/** "1 attachment", "3 attachments". */
+export function attachmentCount(n: number): string {
+  return n === 1 ? '1 attachment' : `${n} attachments`;
+}
+
+/** A virtual attachment row's height and the gap below it, with and without the risk warning. */
+export const ATT_ROW = 56;
+export const ATT_RISKY_ROW = 72;
+
+/**
+ * Where each row of a virtual attachment list starts, and, last, the list's
+ * height: a row with the risk warning has a line more than one without.
+ */
+export function attachmentRowTops(risky: readonly boolean[]): number[] {
+  const tops = new Array<number>(risky.length + 1);
+  tops[0] = 0;
+  for (let i = 0; i < risky.length; i += 1) {
+    tops[i + 1] = tops[i]! + (risky[i] ? ATT_RISKY_ROW : ATT_ROW);
+  }
+  return tops;
+}
+
+/** The row at offset `y` of a list with these row tops: the last row starting at or above it. */
+export function attachmentRowAt(tops: readonly number[], y: number): number {
+  let lo = 0;
+  let hi = tops.length - 2;
+  if (hi < 0) return 0;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (tops[mid]! <= y) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
+}

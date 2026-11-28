@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The index's threads as seen from core: request/response calls with an
 // optional wall-clock limit. A call past its limit terminates the thread and
-// starts a new one in its place; the call fails with TIMEOUT. The index pool
+// starts a new one in its place; the call fails with TIMEOUT. A call a thread
+// took and lost says when that thread has exited, so a caller that lent it a
+// file descriptor knows when nothing can read it any more. The index pool
 // runs jobs on its threads, first come first served.
 
 import type { Worker } from 'node:worker_threads';
@@ -23,6 +25,12 @@ export interface ThreadReply {
 
 /** What the index needs of a thread; tests run the operations in process instead. */
 export interface IndexThread {
+  /**
+   * Runs one operation. A call the thread took and then lost (TIMEOUT,
+   * THREAD_EXIT, THREAD_STOPPED) fails with a ThreadError whose `exited`
+   * resolves once that thread has exited, with nothing of the call still
+   * running; a call refused before any thread took it has no `exited`.
+   */
   call<T>(op: string, args?: unknown, timeoutMs?: number): Promise<T>;
   stop(): Promise<void>;
   /** How many times the thread was replaced after a breach or a crash. */
@@ -32,7 +40,11 @@ export interface IndexThread {
 }
 
 export class ThreadError extends Error {
-  constructor(readonly code: string) {
+  constructor(
+    readonly code: string,
+    /** For a call a thread took and lost: resolves once that thread has exited. */
+    readonly exited?: Promise<void>,
+  ) {
     super(code);
   }
 }
@@ -47,8 +59,10 @@ export class WorkerThread implements IndexThread {
   private seq = 0;
   private readonly pending = new Map<
     number,
-    { resolve: (r: ThreadReply) => void; reject: (e: Error) => void }
+    { resolve: (r: ThreadReply) => void; reject: (e: Error) => void; worker: Worker }
   >();
+  /** Each worker's exit, whether or not it is still the current one. */
+  private readonly exits = new WeakMap<Worker, Promise<void>>();
   respawns = 0;
   onRespawn: (() => void) | null = null;
 
@@ -58,6 +72,7 @@ export class WorkerThread implements IndexThread {
 
   private spawn(): Worker {
     const w = this.spawnWorker();
+    this.exits.set(w, new Promise<void>((resolve) => w.once('exit', () => resolve())));
     w.on('message', (r: ThreadReply) => {
       if (this.worker !== w) return;
       const p = this.pending.get(r.id);
@@ -79,7 +94,8 @@ export class WorkerThread implements IndexThread {
   private failAll(code: string): void {
     const waiting = [...this.pending.values()];
     this.pending.clear();
-    for (const p of waiting) p.reject(new ThreadError(code));
+    // Each call says when the worker it was sent to has gone, even after a replacement.
+    for (const p of waiting) p.reject(new ThreadError(code, this.exits.get(p.worker)));
   }
 
   private replace(): void {
@@ -104,6 +120,7 @@ export class WorkerThread implements IndexThread {
           if (timer) clearTimeout(timer);
           reject(e);
         },
+        worker,
       });
       worker.postMessage({ id, op, args } satisfies ThreadRequest);
       if (timeoutMs > 0) {

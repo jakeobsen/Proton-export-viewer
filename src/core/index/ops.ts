@@ -8,7 +8,7 @@ import { chmodSync, closeSync, fstatSync, openSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { overlaps } from '../../shared/overlap';
 import type { Stamp } from '../../shared/sources';
-import { ContainmentError, openContained, readWithRescan, type FileRef } from '../containment';
+import { readWithRescan, type FileRef } from '../containment';
 import { borrowedFdStream } from '../fd-stream';
 import { extractBody, type AttachmentRow } from './body';
 import { FamilyInUse, deleteFamily, familyBytes } from './family';
@@ -586,24 +586,18 @@ function asScanned(fd: number, ref: FileRef): boolean {
 }
 
 /**
- * Reads one message file for the full-text index, as a stream through the
- * contained open. A file the containment checks refuse gets its code. Once
- * read, a file whose size or time differ from the scan's gets BODY_CHANGED,
- * so the text kept always belongs to the rev.
+ * Reads one message file for the full-text index, as a stream over a
+ * descriptor core opened through the containment checks and lent to this job.
+ * Once read, a file whose size or time differ from the scan's gets
+ * BODY_CHANGED, so the text kept always belongs to the rev. The job never
+ * closes the descriptor: core does, once the job has settled or its thread
+ * has exited.
  */
-export async function bodyJob(root: string, item: BodyJobItem): Promise<BodyJobResult> {
+export async function bodyJob(fd: number, item: BodyJobItem): Promise<BodyJobResult> {
   const { protonId, rev } = item;
-  let fd: number;
-  try {
-    fd = openContained(root, item.ref);
-  } catch (err) {
-    if (!(err instanceof ContainmentError)) throw err;
-    const kind = err.kind === 'root_unavailable' ? 'unreadable' : err.kind;
-    return { protonId, rev, ok: false, error: rejectCode(kind) };
-  }
   // The stream never closes the file, not even when a read error destroys
-  // it, so the file can be checked again once read; it is closed below. It
-  // reads no more than the scan saw: a file that grew is left as changed.
+  // it, so the file can be checked again once read. It reads no more than the
+  // scan saw: a file that grew is left as changed.
   const input = borrowedFdStream(fd, { start: 0, end: Math.max(item.ref.size, 1) - 1 });
   try {
     const text = await extractBody(input);
@@ -617,14 +611,13 @@ export async function bodyJob(root: string, item: BodyJobItem): Promise<BodyJobR
       error: codeOf(err) === 'FAILED' ? 'BODY_FAILED' : codeOf(err),
     };
   } finally {
-    // The file is closed once no read is running on it.
+    // The job settles only once no read is running on the file.
     if (!input.closed) {
       await new Promise<void>((resolve) => {
         input.once('close', () => resolve());
         input.destroy();
       });
     }
-    closeSync(fd);
   }
 }
 
@@ -701,14 +694,20 @@ export function threadHandler(role: ThreadRole): (op: string, args: unknown) => 
     };
   }
   return (op, args) => {
-    const a = args as { root: string; items?: MetaJobItem[]; ref?: FileRef; item?: BodyJobItem };
+    const a = args as {
+      root: string;
+      items?: MetaJobItem[];
+      ref?: FileRef;
+      fd?: number;
+      item?: BodyJobItem;
+    };
     switch (op) {
       case 'meta':
         return parseMetaJob(a.root, a.items ?? []);
       case 'labels':
         return parseLabelsJob(a.root, a.ref as FileRef);
       case 'body':
-        return bodyJob(a.root, a.item as BodyJobItem);
+        return bodyJob(a.fd as number, a.item as BodyJobItem);
     }
     throw new Error('UNKNOWN_OP');
   };
