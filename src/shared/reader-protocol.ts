@@ -43,8 +43,12 @@ export interface RenderedMessage {
   hasHtml: boolean;
   /** True when HTML was asked for but its size alone kept it from being shown; it can be asked for anyway. */
   htmlTooLarge: boolean;
-  /** True when the body is so large that only the first part of its plain text is shown. */
-  truncated: boolean;
+  /**
+   * Why only part of the body is shown: 'size', it is so large that only the
+   * first part of its plain text is; 'parts', the message has more parts than
+   * are read. Null when the body is shown whole.
+   */
+  cut: 'size' | 'parts' | null;
 }
 
 /** A large synthetic message, generated while a test runs (test builds only). */
