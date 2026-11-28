@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import type { LeadsRequest } from '../../src/shared/api';
 import type { Lead } from '../../src/shared/index-types';
-import { LeadsModel } from '../../src/renderer/leads';
+import { LeadsModel, MAX_LINES } from '../../src/renderer/leads';
 
 function setup() {
   const requests: LeadsRequest[] = [];
@@ -118,6 +118,27 @@ describe('lead lines in the shell', () => {
     t.text.set(1, 'plain again');
     await t.answer();
     expect(lines(t.model)).toEqual({ 1: 'plain again' });
+  });
+
+  it(`asks again for a message whose line was let go past ${MAX_LINES} lines, once it is back on screen`, async () => {
+    const t = setup();
+    const rows = Array.from({ length: MAX_LINES + 50 }, (_, i) => i + 1);
+    for (const r of rows) t.text.set(r, `line ${r}`);
+    // The first 50 messages are answered, then the screen moves on, 50 at a time.
+    for (let first = 0; first < rows.length; first += 50) {
+      t.model.show(rows.slice(first, first + 50));
+      await t.answer();
+    }
+    // Past the limit, only the lines on screen were kept.
+    expect(t.model.snapshot.has(1)).toBe(false);
+    expect(t.model.snapshot.has(MAX_LINES + 1)).toBe(true);
+    const asked = t.requests.length;
+    // Back at the top, with no index change: the messages are asked for again and shown.
+    t.model.show(rows.slice(0, 50));
+    expect(t.requests).toHaveLength(asked + 1);
+    expect(t.requests[asked]!.rowids).toEqual(rows.slice(0, 50));
+    await t.answer();
+    expect(lines(t.model)[1]).toBe('line 1');
   });
 
   it('drops an answer for a generation left behind', async () => {

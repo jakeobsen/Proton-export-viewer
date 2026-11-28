@@ -105,6 +105,10 @@ export class LeadsModel {
           this.lines.size + want.length > MAX_LINES
             ? new Map([...this.lines].filter(([r]) => this.onScreen.includes(r)))
             : new Map(this.lines);
+        // A message whose line was let go is asked for again once it is back on screen.
+        if (lines.size < this.lines.size) {
+          this.fresh = new Set([...this.fresh].filter((r) => lines.has(r)));
+        }
         for (const lead of leads) {
           if (!want.includes(lead.rowid)) continue;
           // Read before the index moved on: shown now, and asked for again.
