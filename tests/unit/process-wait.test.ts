@@ -13,6 +13,7 @@ import {
   MAX_Z_PROBES,
   isGone,
   killIfSame,
+  linuxProbe,
   linuxState,
   processState,
   statThreads,
@@ -180,6 +181,47 @@ describe('process-wait', () => {
     expect(linuxState('4242 (core) Z 1 2')).toBe('running');
     expect(statThreads('4242 (core) Z 1 2')).toBeNull();
     expect(linuxState(stat('S', '1'))).toBe('running');
+  });
+
+  it('takes a failed stat read as gone only when the stat is missing, or probing again says ESRCH', () => {
+    const fail = (code: string) => () => {
+      throw Object.assign(new Error(code), { code });
+    };
+    let probes = 0;
+    const again = (code: string | null) => () => {
+      probes += 1;
+      return code;
+    };
+    // The PID still exists, but its stat couldn't be read: nothing is confirmed.
+    expect(linuxProbe(fail('EACCES'), again(null))).toEqual({ state: 'running' });
+    expect(linuxProbe(fail('EMFILE'), again('EPERM'))).toEqual({ state: 'running' });
+    expect(probes).toBe(2);
+    // Gone in between: probing again says so, or the stat is no longer there.
+    expect(linuxProbe(fail('EACCES'), again('ESRCH'))).toEqual({ state: 'gone' });
+    expect(probes).toBe(3);
+    expect(linuxProbe(fail('ENOENT'), again(null))).toEqual({ state: 'gone' });
+    expect(linuxProbe(fail('ESRCH'), again(null))).toEqual({ state: 'gone' });
+    expect(probes).toBe(3);
+    const line = (state: string, threads: string) =>
+      `7 (core) ${state} ${Array.from({ length: 19 }, (_, i) => (i === 16 ? threads : '0')).join(' ')}`;
+    expect(
+      linuxProbe(
+        () => line('S', '4'),
+        () => 'ESRCH',
+      ),
+    ).toEqual({ state: 'running' });
+    expect(
+      linuxProbe(
+        () => line('Z', '1'),
+        () => null,
+      ),
+    ).toEqual({ state: 'zombie', threads: 1 });
+    expect(
+      linuxProbe(
+        () => line('Z', '3'),
+        () => null,
+      ),
+    ).toEqual({ state: 'running', threads: 3 });
   });
 
   it('waits through a zombie leader with live threads, and records each such probe', async () => {

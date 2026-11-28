@@ -77,16 +77,31 @@ export function probeProcess(pid: number): Probe {
   // EPERM: it exists, but belongs to someone else.
   if (first !== null) return { state: 'running' };
   if (process.platform === 'linux') {
-    let stat: string;
-    try {
-      stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-    } catch {
-      return { state: 'gone' };
-    }
-    if (statState(stat) !== 'Z') return { state: 'running' };
-    return { state: linuxState(stat), threads: statThreads(stat) };
+    return linuxProbe(
+      () => readFileSync(`/proc/${pid}/stat`, 'utf8'),
+      () => probe(pid),
+    );
   }
   return { state: stateFromPs(psState(pid), () => probe(pid)) };
+}
+
+/**
+ * The state of a Linux process that existed a moment ago, from its stat line.
+ * A stat that is no longer there (ENOENT, ESRCH) means it went in between.
+ * Any other failure to read it confirms nothing by itself: it went only if
+ * probing it again says there is no such process (ESRCH).
+ */
+export function linuxProbe(readStat: () => string, probeAgain: () => string | null): Probe {
+  let stat: string;
+  try {
+    stat = readStat();
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ESRCH') return { state: 'gone' };
+    return { state: probeAgain() === 'ESRCH' ? 'gone' : 'running' };
+  }
+  if (statState(stat) !== 'Z') return { state: 'running' };
+  return { state: linuxState(stat), threads: statThreads(stat) };
 }
 
 export function processState(pid: number): ProcessState {
