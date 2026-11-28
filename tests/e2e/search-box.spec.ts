@@ -123,6 +123,29 @@ async function open(pev: PevApp, root: string, pairs: number, bookmark = 'bm1'):
   await phase1Done(pev, pairs);
 }
 
+/**
+ * Opens `root` with no body indexed yet: writes are held, and phase 1's go
+ * through one at a time until it is done. Phase 2's stay held.
+ */
+async function openBodiesHeld(pev: PevApp, root: string, pairs: number): Promise<void> {
+  await pev.main('indexTestSettings', { holdWrites: true });
+  await pev.main('queuePick', root, 'bm1');
+  await pev.shell('chooseFolder', []);
+  await expect
+    .poll(
+      async () => {
+        const progress = (await ask<IndexTotals>(pev, { op: 'totals' }))?.progress;
+        if (progress?.phase === 'done' && progress.loaded === pairs) return true;
+        if ((await pev.main<number>('heldWrites')) > 0) await pev.main('releaseWrites', 1);
+        return false;
+      },
+      { timeout: 20_000 },
+    )
+    .toBe(true);
+  // Later cores index as usual.
+  await pev.main('indexTestSettings', null);
+}
+
 /** Hidden windows get no key events from the system: the box's value is set and its input event sent. */
 function typeText(page: Page, text: string): Promise<void> {
   return page.evaluate((t) => {
@@ -233,7 +256,7 @@ test('a search runs once typing pauses, and its results replace the list until t
   pev,
 }) => {
   const { root, pairs } = animals('sbox-typing');
-  await open(pev, root, pairs);
+  await openBodiesHeld(pev, root, pairs);
   await expect(pev.page.locator('.list-head .cnt')).toHaveText('12 conversations');
   const before = await pev.main<number>('coreSearches');
 
@@ -438,7 +461,7 @@ test('results come a page at a time in both sorts, and rows past the first get t
     time: 1_700_000_000 + i,
   }));
   const { root, pairs } = craft('sbox-pages', specs);
-  await open(pev, root, pairs);
+  await openBodiesHeld(pev, root, pairs);
   await typeText(pev.page, 'zebra');
   const first = await settled(pev, 'zebra');
   expect(first.total).toBe(230);
