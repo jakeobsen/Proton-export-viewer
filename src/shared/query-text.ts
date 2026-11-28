@@ -26,7 +26,7 @@ export function cleanQuery(raw: string): string {
   }
   return text.replace(
     // eslint-disable-next-line no-control-regex
-    /[\u0000-\u001f\u007f-\u009f]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g,
+    /[\u0000-\u001f\u007f-\u009f\ue000\ue001]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g,
     ' ',
   );
 }
