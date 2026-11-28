@@ -128,7 +128,7 @@ describe('mail-body: and mail-asset: handlers', () => {
   ])('returns 404 for an asset with %s, and logs why', async (_name, url, reason) => {
     log.events.length = 0;
     expect((await asset({ url })).status).toBe(404);
-    expect(log.events).toEqual([
+    expect(log.events.filter((e) => e.code !== 'test.log')).toEqual([
       { code: 'protocol.not_found', data: { scheme: 'mail-asset', reason, windowId: 1 } },
     ]);
   });

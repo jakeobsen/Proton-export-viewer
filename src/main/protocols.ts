@@ -40,6 +40,24 @@ const CID_RE = /^c\d{1,4}$/;
 const VIEW_PATH_RE = /^\/([0-9a-f]{32})$/;
 const ASSET_PATH_RE = /^\/([0-9a-f]{32})\/([^/]+)$/;
 
+/**
+ * Test builds only, for a diagnostic run: a request's or download's initiator
+ * origin as a number a log field can carry (0 absent, 1 undefined, 2 null,
+ * 3 empty, 4 opaque "null", 5 the shell, 6 a mail-body: origin, 7 a
+ * mail-asset: origin, 8 another string, 9 another type).
+ */
+export function initiatorCode(present: boolean, value: unknown): number {
+  if (!present) return 0;
+  if (value === undefined) return 1;
+  if (value === null) return 2;
+  if (value === '') return 3;
+  if (value === 'null') return 4;
+  if (value === 'app://shell') return 5;
+  if (typeof value === 'string' && value.startsWith('mail-body:')) return 6;
+  if (typeof value === 'string' && value.startsWith('mail-asset:')) return 7;
+  return typeof value === 'string' ? 8 : 9;
+}
+
 function notFound(): Response {
   return new Response('Not found', {
     status: 404,
@@ -177,7 +195,15 @@ export function assetHandler(options: ViewHandlerOptions): Handler {
       if (saved) return saved;
     }
     const view = options.views.lookup(match[1]);
-    if (!view) return reject('unknown_token');
+    if (!view) {
+      if (__PEV_TEST_HOOKS__) {
+        options.log.info('test.log', {
+          count: initiatorCode('initiatorOrigin' in request, request.initiatorOrigin),
+          windowId: options.windowId,
+        });
+      }
+      return reject('unknown_token');
+    }
     const id = match[2];
     const asset = ASSET_ID_RE.test(id) ? view.assets.get(id) : undefined;
     if (!asset) return reject('unknown_asset');

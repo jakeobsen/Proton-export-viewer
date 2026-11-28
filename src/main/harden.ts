@@ -7,7 +7,7 @@ import type { Session } from 'electron';
 import { ALLOWED_REQUEST_SCHEMES, devShellCsp } from '../shared/constants';
 import { PERMISSIONS, SCHEMES } from '../shared/log/codes';
 import type { Logger } from '../shared/log/writer';
-import { appHandler, assetHandler, bodyHandler } from './protocols';
+import { appHandler, assetHandler, bodyHandler, initiatorCode } from './protocols';
 import type { DownloadLike, WindowSaves } from './saves/manager';
 import type { ViewRegistry } from './views';
 
@@ -138,6 +138,22 @@ export function hardenSession(ses: Session, options: HardenOptions): void {
   // Only a save main started goes ahead; any other download is cancelled, and
   // its URL is never logged.
   ses.on('will-download', (event, item, _webContents, frame) => {
+    if (__PEV_TEST_HOOKS__) {
+      let origin = 10;
+      let chain = 0;
+      try {
+        origin = initiatorCode(true, item.getInitiatorOrigin());
+        chain = item.getURLChain().length;
+      } catch {
+        // Left at 10 and 0.
+      }
+      log.info('test.log', {
+        exitCode: origin,
+        openId: frame === undefined ? 0 : frame === null ? 1 : 2,
+        rowid: chain,
+        windowId,
+      });
+    }
     if (options.saves?.willDownload(item as DownloadLike, frame ?? null)) return;
     event.preventDefault();
     log.info('download.cancelled', { windowId });
