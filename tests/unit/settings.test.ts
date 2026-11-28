@@ -2,6 +2,7 @@
 // The settings file: defaults, how each field is checked, and how it's written.
 
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -77,7 +78,10 @@ describe('SettingsStore', () => {
   });
 
   it('writes settings.json 0600 in a 0700 folder, atomically, and reads it back', () => {
+    // The folder is there already, open to others: it is made private.
     const dir = join(userData(), 'nested');
+    mkdirSync(dir, { mode: 0o755 });
+    chmodSync(dir, 0o755);
     const { log } = logSpy();
     const store = SettingsStore.load(dir, log);
     expect(store.set('theme', 'dark')).toBe(true);

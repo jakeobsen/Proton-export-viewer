@@ -26,6 +26,7 @@ import { byteSize } from '../../src/shared/bytes';
 import type { IndexProgress, IndexTotals } from '../../src/shared/index-types';
 import type { SourcesView, Stamp } from '../../src/shared/sources';
 import { homeRelative } from '../../src/main/settings-info';
+import { changedAt } from '../../src/renderer/format';
 import { digest } from '../../tools/gen-export/tree.mjs';
 import { writeExport, type WrittenExport } from '../exports';
 import { findMarkers, MARKER_TEXT, MARKERS } from '../markers';
@@ -208,6 +209,15 @@ test('Settings shows the open export, and Back to mail keeps the folder and the 
   });
   const db = statSync(join(indexDir, `${stamp.sourceKey}.sqlite`)).mtimeMs;
   expect(read.view.index!.updatedAt).toBeGreaterThanOrEqual(Math.floor(db));
+  // Last updated shows that time as the shell words it.
+  await expect
+    .poll(async () => {
+      const now = await settingsRead(pev.page);
+      const updatedAt = now.ok ? now.view.index?.updatedAt : null;
+      if (updatedAt === null || updatedAt === undefined) return 'no time';
+      return (await field(pev.page, 'Last updated').textContent()) === changedAt(updatedAt);
+    })
+    .toBe(true);
   expect(read.view.logsLocation).toBe(homeRelative(pev.logsDir(), userInfo().homedir) + '/');
 
   // Back to the same folder, conversation and message, with no new open.
@@ -671,7 +681,31 @@ test('the default message view applies to the next message opened, and the switc
     after: 50,
     selected: null,
   }))!.answer.rows;
-  await press(pev.page, `.conv[data-thread="${rows[0]!.threadId}"]`);
+  // Each message opened comes up as plain text; the first with an HTML part
+  // is the one the switch is tried on.
+  let withHtml = false;
+  for (const row of rows) {
+    await press(pev.page, `.conv[data-thread="${row.threadId}"]`);
+    await expect
+      .poll(async () => {
+        const r = await pev.shell<{
+          rowid: number | null;
+          mode: string;
+          pending: boolean;
+          view: { format: string } | null;
+        }>('reader');
+        return r.rowid === row.newestRowid && !r.pending && r.view !== null
+          ? `${r.mode}:${r.view.format}`
+          : null;
+      })
+      .toBe('plain:plain');
+    await expect(pev.page.locator('.rp-plain')).toHaveAttribute('aria-pressed', 'true');
+    withHtml = (await pev.shell<{ view: { hasHtml: boolean } }>('reader')).view.hasHtml;
+    if (withHtml) break;
+  }
+  expect(withHtml).toBe(true);
+  // The switch still changes it, for this message.
+  await press(pev.page, '.rp-html');
   await expect
     .poll(async () => {
       const r = await pev.shell<{
@@ -679,10 +713,10 @@ test('the default message view applies to the next message opened, and the switc
         pending: boolean;
         view: { format: string } | null;
       }>('reader');
-      return !r.pending && r.view !== null ? `${r.mode}:${r.view.format}` : null;
+      return !r.pending && r.view !== null ? r.mode : null;
     })
-    .toBe('plain:plain');
-  await expect(pev.page.locator('.rp-plain')).toHaveAttribute('aria-pressed', 'true');
+    .toBe('html');
+  await expect(pev.page.locator('.rp-html')).toHaveAttribute('aria-pressed', 'true');
   await checkHidden(pev);
 });
 

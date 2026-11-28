@@ -181,6 +181,8 @@ export class SourceManager {
   private restoring = false;
   /** Closed while a reset runs: nothing opens. */
   private admitting = true;
+  /** Closed at quit: final, so a Reset that ends afterwards neither admits opens nor starts core. */
+  private closed = false;
   /** Sources whose index was found damaged: the next index made for them is a rebuild. */
   private readonly rebuilds = new Set<string>();
   private readonly discover: typeof discoverRuns;
@@ -416,6 +418,7 @@ export class SourceManager {
 
   /** At quit: nothing opens or restarts any more, and the folder scope is released. */
   close(): void {
+    this.closed = true;
     this.admitting = false;
     this.releaseScope(this.deps.generation(), 'quit');
   }
@@ -948,8 +951,10 @@ export class SourceManager {
       try {
         return await this.resetNow();
       } finally {
-        this.admitting = true;
-        if (!this.deps.core.running) await this.deps.core.startWith(null).catch(() => false);
+        if (!this.closed) {
+          this.admitting = true;
+          if (!this.deps.core.running) await this.deps.core.startWith(null).catch(() => false);
+        }
       }
     });
   }

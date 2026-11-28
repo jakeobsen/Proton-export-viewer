@@ -1408,6 +1408,8 @@ describe('Rebuild by hand', () => {
     // The Reset closed the app to opens first, so the rebuild doesn't reopen.
     expect(await rebuilding).toBe('closed');
     expect(await resetting).toBe(true);
+    // The rebuild never reached core: it was refused at its turn.
+    expect(t.core.forgets).toEqual([]);
     const calls = t.core.indexCalls.length;
     await settle();
     expect(t.core.indexCalls).toHaveLength(calls);
@@ -1549,6 +1551,23 @@ describe('Reset', () => {
     t.manager.setAccess({ picker: () => Promise.resolve({ path: root, bookmark: 'bm3' }) });
     expect(await t.manager.chooseFolder(null, t.generation())).toBe('opened');
     expect(t.manager.stamp()!.sourceKey).not.toBe(key);
+  });
+
+  it('stays closed when the app quits while it runs: no opens are admitted and core stays down', async () => {
+    const t = setup('mgr-reset-quit');
+    t.picks.push({ path: tool('mgr-reset-quit-tool'), bookmark: 'bm1' });
+    await t.manager.chooseFolder(null, t.generation());
+    await indexOpened(t, t.manager.stamp()!.generation);
+    const starts = t.core.started.length;
+    // The app quits while core tears the source down for the Reset.
+    t.core.onReset = () => t.manager.close();
+    expect(await t.manager.reset()).toBe(true);
+    await settle();
+    expect(t.core.running).toBe(false);
+    expect(t.core.started).toHaveLength(starts);
+    t.picks.push({ path: tool('mgr-reset-quit-tool-2'), bookmark: 'bm2' });
+    expect(await t.manager.chooseFolder(null, t.generation())).toBe('closed');
+    expect(t.core.started).toHaveLength(starts);
   });
 
   it('starts the logs again and restores the default settings once the data is gone', async () => {
