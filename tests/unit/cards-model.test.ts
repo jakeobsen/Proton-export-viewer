@@ -57,6 +57,14 @@ function setup(n = 6) {
       await settle();
       await settle();
     },
+    /** Lets the reads waiting now go, and holds the ones that follow. */
+    releaseHeld: async () => {
+      const waiting = hold ?? [];
+      hold = [];
+      for (const go of waiting) go();
+      await settle();
+      await settle();
+    },
   };
 }
 
@@ -372,7 +380,7 @@ describe('the cards model', () => {
       [398, 1, 399],
       [1, -1, 0],
     ] as const) {
-      const { db, ids, model, actions, settle, holdReads, releaseReads } = setup(400);
+      const { db, ids, model, actions, settle, holdReads, releaseHeld, releaseReads } = setup(400);
       model.show(ids[start]!, null);
       await settle();
       model.setViewport(200, 210);
@@ -381,6 +389,9 @@ describe('the cards model', () => {
       model.move(step);
       model.move(step);
       model.move(step);
+      // The end card is among those read at the expanded one: it opens with no other read.
+      await releaseHeld();
+      expect(model.snapshot.expanded).toBe(ids[end]);
       await releaseReads();
       expect(model.snapshot.expanded).toBe(ids[end]);
       expect(actions).toEqual([
@@ -389,6 +400,110 @@ describe('the cards model', () => {
       ]);
       db.close();
     }
+  });
+
+  it('keeps a move made while a read for the screen is under way, and opens only where it ends', async () => {
+    const { db, ids, model, actions, queries, settle, holdReads, releaseReads } = setup(400);
+    model.show(ids[10]!, null);
+    await settle();
+    model.setViewport(300, 310);
+    await settle();
+    expect(model.expandedIndex()).toBeNull();
+    // The screen moves again: its read is under way when the key comes.
+    holdReads();
+    model.setViewport(200, 210);
+    const reads = queries.length;
+    expect(queries.at(-1)!.anchor).not.toHaveProperty('rowid', ids[10]);
+    expect(model.move(1)).toBe(true);
+    await releaseReads();
+    await settle();
+    // The screen's read came back without the expanded card; the next read is at its place.
+    expect(queries.length).toBe(reads + 1);
+    expect(queries.at(-1)!.anchor).toMatchObject({ rowid: ids[10] });
+    expect(model.snapshot.expanded).toBe(ids[11]);
+    expect(actions).toEqual([
+      ['open', ids[10]],
+      ['open', ids[11]],
+    ]);
+    db.close();
+  });
+
+  it('moves that end past the cards read at the expanded one read there, then open only that card', async () => {
+    for (const [start, step, presses, end] of [
+      [100, -1, 60, 40],
+      [100, 1, 120, 220],
+    ] as const) {
+      const { db, ids, model, actions, queries, settle, holdReads, releaseReads } = setup(400);
+      model.show(ids[start]!, null);
+      await settle();
+      model.setViewport(300, 310);
+      await settle();
+      holdReads();
+      const reads = queries.length;
+      for (let i = 0; i < presses; i += 1) model.move(step);
+      await releaseReads();
+      await settle();
+      await settle();
+      // Read at the expanded card first, then where the moves end.
+      expect(queries[reads]!.anchor).toMatchObject({ rowid: ids[start] });
+      expect(queries[reads + 1]!.anchor).toEqual({ index: end });
+      expect(model.snapshot.expanded).toBe(ids[end]);
+      expect(actions).toEqual([
+        ['open', ids[start]],
+        ['open', ids[end]],
+      ]);
+      db.close();
+    }
+  });
+
+  it('adds moves made while the cards where moves end are read, stopping at either end', async () => {
+    for (const [start, view, step, first, more, end] of [
+      [100, 300, -1, 60, 5, 35],
+      [100, 300, -1, 60, 50, 0],
+      [300, 100, 1, 90, 20, 399],
+    ] as const) {
+      const { db, ids, model, actions, settle, holdReads, releaseHeld, releaseReads } = setup(400);
+      model.show(ids[start]!, null);
+      await settle();
+      model.setViewport(view, view + 10);
+      await settle();
+      holdReads();
+      for (let i = 0; i < first; i += 1) model.move(step);
+      // The read at the expanded card answers; the read where the moves end is held.
+      await releaseHeld();
+      expect(model.snapshot.expanded).toBe(ids[start]);
+      for (let i = 0; i < more; i += 1) model.move(step);
+      await releaseReads();
+      await settle();
+      expect(model.snapshot.expanded).toBe(ids[end]);
+      expect(actions).toEqual([
+        ['open', ids[start]],
+        ['open', ids[end]],
+      ]);
+      db.close();
+    }
+  });
+
+  it('a card expanded by hand while the cards where moves end are read replaces the move', async () => {
+    const { db, ids, model, actions, settle, holdReads, releaseHeld, releaseReads } = setup(400);
+    model.show(ids[100]!, null);
+    await settle();
+    model.setViewport(300, 310);
+    await settle();
+    holdReads();
+    for (let i = 0; i < 60; i += 1) model.move(-1);
+    await releaseHeld();
+    // The read at card 40 is held; card 150 is held from the read at the expanded card.
+    expect(model.expand(model.cardAt(150)!)).toBe(true);
+    await releaseReads();
+    await settle();
+    await settle();
+    expect(model.snapshot.expanded).toBe(ids[150]);
+    expect(actions).toEqual([
+      ['open', ids[100]],
+      ['open', ids[150]],
+    ]);
+    db.close();
   });
 
   it('a card expanded by hand while that read is under way replaces the move', async () => {
