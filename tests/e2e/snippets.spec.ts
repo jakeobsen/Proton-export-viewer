@@ -13,6 +13,7 @@ import { writeExport } from '../exports';
 import { testDir } from '../paths';
 import { writeMessage } from '../thread-export';
 import { expect, test, type PevApp } from './app';
+import { mailboxFollows } from './search-ui';
 
 type Answer<T> = { answer: T; progress: IndexProgress } | null;
 const ask = <T>(pev: PevApp, query: unknown) => pev.main<Answer<T>>('indexQuery', query);
@@ -77,6 +78,7 @@ async function openBodiesHeld(
     )
     .toBe(true);
   await pev.main('indexTestSettings', null);
+  await mailboxFollows(pev);
 }
 
 /** Lets the held bodies be written, and waits until all are, as text. */

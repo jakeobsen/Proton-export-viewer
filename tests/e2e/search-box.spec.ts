@@ -18,6 +18,7 @@ import type { Stamp } from '../../src/shared/sources';
 import { writeExport } from '../exports';
 import { testDir } from '../paths';
 import { expect, test, type PevApp } from './app';
+import { mailboxFollows } from './search-ui';
 
 type Answer<T> = { answer: T; progress: IndexProgress } | null;
 const ask = <T>(pev: PevApp, query: unknown) => pev.main<Answer<T>>('indexQuery', query);
@@ -152,6 +153,7 @@ async function open(pev: PevApp, root: string, pairs: number, bookmark = 'bm1'):
   await pev.main('queuePick', root, bookmark);
   await pev.shell('chooseFolder', []);
   await phase1Done(pev, pairs);
+  await mailboxFollows(pev);
 }
 
 /**
@@ -175,6 +177,7 @@ async function openBodiesHeld(pev: PevApp, root: string, pairs: number): Promise
     .toBe(true);
   // Later cores index as usual.
   await pev.main('indexTestSettings', null);
+  await mailboxFollows(pev);
 }
 
 /** Hidden windows get no key events from the system: the box's value is set and its input event sent. */
@@ -546,6 +549,7 @@ async function reopenHeld(pev: PevApp, key: string, other: string): Promise<void
   await pev.main('indexTestSettings', { batchPairs: 1000, holdWrites: true, readByName: true });
   await pev.shell('openExport', [key]);
   await expect.poll(() => pev.main<number>('heldWrites'), { timeout: 20_000 }).toBeGreaterThan(0);
+  await mailboxFollows(pev);
 }
 
 test('by date, a conversation moved behind the cursor between pages is left out, and a page of only those moves on', async ({

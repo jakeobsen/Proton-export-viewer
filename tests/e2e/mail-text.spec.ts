@@ -13,6 +13,7 @@ import { writeExport } from '../exports';
 import { testDir } from '../paths';
 import { writeMessage } from '../thread-export';
 import { expect, test, type PevApp } from './app';
+import { mailboxFollows } from './search-ui';
 
 type Answer<T> = { answer: T; progress: IndexProgress } | null;
 
@@ -137,6 +138,7 @@ test('in the list, the results and the conversation, subjects and names are clea
       timeout: 20_000,
     })
     .toMatchObject({ phase: 'done', loaded: 3, total: 3, failed: 0 });
+  await mailboxFollows(pev);
 
   // The folder list.
   const list = pev.page.locator('.conv:not(.result)');

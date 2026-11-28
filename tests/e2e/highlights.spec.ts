@@ -14,6 +14,7 @@ import { writeExport } from '../exports';
 import { findMarkers } from '../markers';
 import { testDir } from '../paths';
 import { expect, test, type PevApp } from './app';
+import { mailboxFollows } from './search-ui';
 
 type Answer<T> = { answer: T; progress: IndexProgress } | null;
 const ask = <T>(pev: PevApp, query: unknown) => pev.main<Answer<T>>('indexQuery', query);
@@ -121,6 +122,7 @@ async function openIndexed(pev: PevApp, root: string, pairs: number): Promise<vo
   await expect
     .poll(() => totals(pev), { timeout: 30_000 })
     .toMatchObject({ phase: 'done', loaded: pairs, bodyPhase: 'done' });
+  await mailboxFollows(pev);
 }
 
 /** Hidden windows get no key events from the system: the box's value is set and its input event sent. */
@@ -425,6 +427,7 @@ test('the match line says where else a message matched when its body shows no ma
   // Opened again, the reconcile finds R1's file gone: state 4, the same line.
   const key = (await pev.main<Stamp>('sourceStamp')).sourceKey;
   await pev.shell('openExport', [key]);
+  await mailboxFollows(pev);
   await searchFor(pev, 'invoice');
   const anchor = Number(await resultWith(pev, 'removed').getAttribute('data-rowid'));
   await expect
@@ -457,6 +460,7 @@ test('a message whose body is not indexed yet says so', async ({ pev }) => {
     )
     .toBe(true);
   await pev.main('indexTestSettings', null);
+  await mailboxFollows(pev);
   await searchFor(pev, 'invoice');
   const waiting = await openResult(pev, 'waiting');
   expect(waiting.match).toMatchObject({ state: 0, columns: ['subject'], bodyMatches: 0 });

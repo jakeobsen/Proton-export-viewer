@@ -18,6 +18,7 @@ import type {
 import { testDir } from '../paths';
 import { writeThreads, type ThreadSpec } from '../thread-export';
 import { expect, launch, test, type PevApp } from './app';
+import { mailboxFollows } from './search-ui';
 
 type Answer<T> = { answer: T; progress: IndexProgress } | null;
 
@@ -67,6 +68,7 @@ async function openThreads(pev: PevApp, name: string, threads: ThreadSpec[]) {
   await pev.main('queuePick', root, 'bm1');
   await pev.shell('chooseFolder', []);
   await phase1Done(pev, written.pairs);
+  await mailboxFollows(pev);
   await showAll(pev);
   return written;
 }
@@ -557,6 +559,7 @@ test('Escape closes the overlay, then Settings, then the report, then clears the
   await pev.main('queuePick', root, 'bm1');
   await pev.shell('chooseFolder', []);
   await phase1Done(pev, written.pairs);
+  await mailboxFollows(pev);
 
   await press(pev.page, '.list-head .attention');
   await expect(pev.page.locator('.ix-card')).toBeVisible();
@@ -599,6 +602,7 @@ test('Escape in a list of choices, or on its open button, closes the list and le
   await pev.main('queuePick', root, 'bm1');
   await pev.shell('chooseFolder', []);
   await phase1Done(pev, written.pairs);
+  await mailboxFollows(pev);
   await typeText(pev.page, 'Conversation');
   await expect(pev.page.locator('.results')).toBeVisible();
 
