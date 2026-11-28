@@ -578,6 +578,7 @@ body,
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  unicode-bidi: isolate;
 }
 
 .chip .dot {
