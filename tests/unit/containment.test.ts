@@ -12,6 +12,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -30,6 +31,7 @@ import {
   examine,
   listRunAsync,
   openContained,
+  openContainedAsync,
   openListed,
   pairCounts,
   readCapped,
@@ -513,6 +515,67 @@ describe('the open procedure', () => {
         closeSync(fd);
       }
     }
+  });
+
+  it('opens without blocking with the same checks: the same refusals, and the same file', async () => {
+    const root = run('open-async', ['ok', 'gone', 'link', 'fifo', 'moved', 'dir']);
+    // Each message file with the identity phase 1 records, before the files change.
+    const scan = identified(root);
+    const eml = (id: string) => join(root, `${id}.eml`);
+    rmSync(eml('gone'));
+    rmSync(eml('link'));
+    symlinkSync(eml('ok'), eml('link'));
+    rmSync(eml('fifo'));
+    mkfifo(eml('fifo'));
+    // Another regular file takes its place: same name, new inode.
+    writeFileSync(join(root, 'new.tmp'), 'Subject: moved\r\n\r\n');
+    renameSync(join(root, 'new.tmp'), eml('moved'));
+    rmSync(eml('dir'));
+    mkdirSync(eml('dir'));
+    type Outcome = { ino: bigint } | { kind: string; errno: string | null };
+    const outcome = (fd: number): Outcome => {
+      const ino = fstatSync(fd, { bigint: true }).ino;
+      closeSync(fd);
+      return { ino };
+    };
+    const refused = (err: unknown): Outcome => {
+      expect(err).toBeInstanceOf(ContainmentError);
+      const { kind, errno } = err as ContainmentError;
+      return { kind, errno };
+    };
+    const fds = () => readdirSync('/dev/fd').length;
+    const before = fds();
+    for (const id of ['ok', 'gone', 'link', 'fifo', 'moved', 'dir']) {
+      const ref = scan.eml.get(id)!;
+      let sync: Outcome;
+      try {
+        sync = outcome(openContained(root, ref));
+      } catch (err) {
+        sync = refused(err);
+      }
+      const started = performance.now();
+      const async = await openContainedAsync(root, ref).then(outcome, refused);
+      expect(performance.now() - started, id).toBeLessThan(1000);
+      expect(async, id).toEqual(sync);
+      // A refused file is closed before the refusal.
+      expect(fds(), id).toBe(before);
+    }
+    expect(await openContainedAsync(root, scan.eml.get('ok')!).then(outcome, refused)).toEqual({
+      ino: scan.eml.get('ok')!.ino,
+    });
+    expect(
+      await Promise.all(
+        ['gone', 'link', 'fifo', 'moved', 'dir'].map((id) =>
+          openContainedAsync(root, scan.eml.get(id)!).then(outcome, refused),
+        ),
+      ),
+    ).toEqual([
+      { kind: 'changed', errno: 'ENOENT' },
+      { kind: 'symlink', errno: 'ELOOP' },
+      { kind: 'fifo', errno: null },
+      { kind: 'changed', errno: null },
+      { kind: 'directory', errno: null },
+    ]);
   });
 
   it('examines one name at a time, never a path with a separator', () => {

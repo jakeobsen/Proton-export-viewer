@@ -9,6 +9,7 @@ import type {
   CoreInit,
   CoreRequest,
   CoreResult,
+  IndexQueryRequest,
   OpenRequest,
   ProofFileRead,
   WorkerMessage,
@@ -16,12 +17,12 @@ import type {
 } from '../shared/core-protocol';
 import { errorData } from '../shared/log/schema';
 import { LogWriter, type Logger } from '../shared/log/writer';
-import type { ReadRequest, ReaderFailure } from '../shared/reader-protocol';
+import type { LocateRequest, ReadRequest, ReaderFailure } from '../shared/reader-protocol';
 import { WorkerThread, type ThreadRole } from './index/pool';
 import type { IndexOptions } from './index/service';
 import { READER_RETIRE_MB, ReaderLane } from './reader/lane';
 import { OpenTracker } from './reader/opens';
-import type { ReaderSource } from './reader/source';
+import type { LocatedFile, ReaderSource } from './reader/source';
 import { SourceSession, type ReaderFile } from './source';
 
 process.umask(0o077);
@@ -68,10 +69,22 @@ const testState = {
   /** Message files opened for the reader. */
   fileOpens: 0,
   unsanitized: false,
+  /** Searches that reached core. */
+  searches: 0,
+  /** Searches and snippet requests are held, to answer them late. */
+  holdingSearches: false,
+  heldSearches: [] as IndexQueryRequest[],
+  /** Holds reads once their message file is open, before the parse. */
+  holdingOpened: false,
+  heldOpened: [] as Array<() => void>,
+  /** Holds the shell's cards queries anchored at this message, until a test lets them go. */
+  holdCardsAt: null as number | null,
+  heldCards: [] as Array<() => void>,
 };
 /** Test builds can hold phase 1's writes. */
 let writeGate: import('../testhooks/core').WriteGate | null = null;
 let scanGate: import('../testhooks/core').WriteGate | null = null;
+let indexGate: import('../testhooks/core').WriteGate | null = null;
 
 process.on('uncaughtException', (err) => log?.error('core.uncaught', errorData(err, roots)));
 process.on('unhandledRejection', (reason) =>
@@ -133,6 +146,25 @@ async function openForRead(
     .catch((): ReaderFile => ({ ok: false, code: 'not_found' }));
 }
 
+/** Finds the file a view was read from, for Show in folder: from the test source or the open export. */
+async function locate(request: LocateRequest): Promise<void> {
+  const { reqId, rowid, generation, file } = request;
+  let found: LocatedFile;
+  if (__PEV_TEST_HOOKS__ && readerSource) {
+    found = await readerSource
+      .locate(rowid, file)
+      .catch((): LocatedFile => ({ ok: false, code: 'not_found' }));
+  } else if (!session) {
+    found = { ok: false, code: 'no_source' };
+  } else {
+    found = await session
+      .locateForReader(rowid, generation, file)
+      .catch((): LocatedFile => ({ ok: false, code: 'not_found' }));
+  }
+  if (found.ok) reply({ type: 'result', reqId, ok: true, path: found.path });
+  else reply({ type: 'result', reqId, ok: false, code: found.code });
+}
+
 /** Answers a read that failed. */
 type ReadFail = (
   code: 'no_source' | 'not_found' | 'superseded' | 'unavailable' | 'eml_missing' | 'reader_failed',
@@ -164,6 +196,9 @@ async function readOpen(request: ReadRequest, stale: () => boolean, fail: ReadFa
   if (__PEV_TEST_HOOKS__) testState.fileOpens += 1;
   const opened = found.opened;
   try {
+    if (__PEV_TEST_HOOKS__ && testState.holdingOpened) {
+      await new Promise<void>((resolve) => testState.heldOpened.push(resolve));
+    }
     const outcome = await lane.job(
       {
         type: 'render',
@@ -183,7 +218,7 @@ async function readOpen(request: ReadRequest, stale: () => boolean, fail: ReadFa
     const message = outcome.message;
     if (message.type !== 'rendered') return fail('reader_failed', 'crash');
     if (!message.ok) return fail('reader_failed', 'parse');
-    reply({ type: 'result', reqId, ok: true, read: message.message });
+    reply({ type: 'result', reqId, ok: true, read: message.message, file: opened.file });
   } finally {
     await opened.close().catch(() => undefined);
   }
@@ -226,6 +261,11 @@ function handle(request: CoreRequest): void {
             session,
             writeGate,
             scanGate,
+            indexGate,
+            runSearch: (held) => {
+              if (session) session.handle(held);
+              else reply({ type: 'result', reqId: held.reqId, ok: false, code: 'no_source' });
+            },
           }),
         );
         return;
@@ -244,12 +284,34 @@ function handle(request: CoreRequest): void {
       }
       reply({ type: 'result', reqId: request.reqId, ok: false, code: 'invalid' });
       return;
+    case 'locate':
+      void locate(request);
+      return;
     case 'identify':
     case 'scan':
     case 'index':
     case 'index-query':
+      if (__PEV_TEST_HOOKS__ && request.type === 'index-query') {
+        const { op } = request.query;
+        if (op === 'search') testState.searches += 1;
+        if ((op === 'search' || op === 'snippets') && testState.holdingSearches) {
+          testState.heldSearches.push(request);
+          return;
+        }
+      }
       if (!session) {
         reply({ type: 'result', reqId: request.reqId, ok: false, code: 'no_source' });
+        return;
+      }
+      if (
+        __PEV_TEST_HOOKS__ &&
+        request.type === 'index-query' &&
+        request.query.op === 'cards' &&
+        testState.holdCardsAt !== null &&
+        request.query.anchor.rowid === testState.holdCardsAt
+      ) {
+        const held = session;
+        testState.heldCards.push(() => held.handle(request));
         return;
       }
       session.handle(request);
@@ -277,11 +339,14 @@ async function init(event: Electron.MessageEvent): Promise<void> {
     const hooks = await import('../testhooks/core');
     writeGate = new hooks.WriteGate(init.test.holdWrites === true);
     scanGate = new hooks.WriteGate(init.test.holdScans === true);
+    indexGate = new hooks.WriteGate(init.test.holdIndexOpens === true);
     options = {
       ...(init.test.batchPairs ? { batchPairs: init.test.batchPairs } : {}),
+      ...(init.test.txnBytes ? { txnBytes: init.test.txnBytes } : {}),
       readByName: init.test.readByName === true,
       beforeWrite: writeGate.beforeWrite,
       beforeScan: scanGate.beforeWrite,
+      beforeIndexOpen: indexGate.beforeWrite,
     };
   }
   session = new SourceSession(

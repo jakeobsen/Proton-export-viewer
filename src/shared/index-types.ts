@@ -3,6 +3,9 @@
 // conversation list pages and the details of the rows on screen, plus where
 // indexing stands. Shared by core, main and the shell.
 
+import type { CAPPED_LIST_NAMES } from './log/codes';
+import type { RejectKind } from './sources';
+
 export type FolderKind = 'system' | 'folder' | 'label';
 
 export interface FolderRow {
@@ -178,6 +181,8 @@ export interface SearchRow {
 export interface SearchCoverage {
   /** Messages whose body is in the index (whole or its first part). */
   indexed: number;
+  /** Messages whose body is still waiting to be indexed. */
+  pending: number;
   /** Messages in the index. */
   total: number;
 }
@@ -186,11 +191,113 @@ export interface SearchPage {
   queryId: number;
   /** The sort used: a query with no words to match is sorted by date. */
   sort: SearchSort;
+  /** Whether the query has words that rank its matches, so it can be sorted by relevance. */
+  ranked: boolean;
+  /** Matching conversations in all, on a first page; null on the pages after it. */
+  total: number | null;
   rows: SearchRow[];
+  /** The details of each row, in the same order. */
+  details: RowDetails[];
   next: SearchKey | null;
   coverage: SearchCoverage;
   /** Snippets whose match ranges failed the check and were given without them. */
   dropped: number;
+}
+
+/** The most conversations one snippets request covers. */
+export const MAX_SNIPPET_THREADS = 50;
+
+/** Snippets for result rows that came without one: the best match of each conversation. */
+export interface SnippetsQuery {
+  op: 'snippets';
+  /** The search the rows belong to; the answer carries it back. */
+  queryId: number;
+  text: string;
+  threadIds: number[];
+}
+
+export interface ThreadSnippet {
+  threadId: number;
+  /** Null when the conversation has no match with text to show. */
+  snippet: MarkedSnippet | null;
+}
+
+export interface SearchSnippets {
+  queryId: number;
+  /** One per conversation asked for, in the same order. */
+  snippets: ThreadSnippet[];
+  /** Snippets whose match ranges failed the check and were given without them. */
+  dropped: number;
+}
+
+/** One message of a conversation, as its card shows it. */
+export interface CardRow {
+  rowid: number;
+  time: number;
+  senderName: string;
+  senderAddress: string;
+  /** The message is in Spam (label ID 4). */
+  spam: boolean;
+  /** The message is in Trash (label ID 3). */
+  trash: boolean;
+}
+
+/** Where a card stands in its conversation, oldest first: by date, then by rowid. */
+export interface CardKey {
+  time: number;
+  rowid: number;
+}
+
+/**
+ * Where a cards window is placed: at message `rowid` if it is still in the
+ * conversation, else at the card nearest `key` (the next newer one first),
+ * else at position `index`.
+ */
+export interface CardsAnchor {
+  rowid?: number;
+  key?: CardKey;
+  index: number;
+}
+
+/** The most cards a window holds before its anchor, and from it on. */
+export const CARDS_BEFORE = 100;
+export const CARDS_AFTER = 200;
+/** The most messages a cards query may name to follow. */
+export const CARDS_FOLLOW = 4;
+
+export interface CardsQuery {
+  op: 'cards';
+  /**
+   * Messages that say which conversation to show, in order of preference:
+   * the conversation of the first one still in the index.
+   */
+  follow: number[];
+  /** The conversation to show if none of `follow` is left. */
+  threadId: number | null;
+  anchor: CardsAnchor;
+  before: number;
+  after: number;
+}
+
+/** A stretch of one conversation's cards, oldest first, read from one snapshot. */
+export interface CardsWindow {
+  /** The conversation shown, or null when there is none left. */
+  threadId: number | null;
+  /** The message of `follow` that named it; null if none is left. */
+  followed: number | null;
+  /** The subject of its earliest message. */
+  subject: string;
+  /** Messages in the conversation, from every folder. */
+  total: number;
+  /** Its folder and label IDs: the same as its list row's. */
+  labelIds: string[];
+  /** The position of the first card. */
+  start: number;
+  cards: CardRow[];
+  /** The anchor card's position; null for an empty window. */
+  anchor: number | null;
+  /** The anchor card is message `anchor.rowid` itself. */
+  anchorFound: boolean;
 }
 
 export type IndexQuery =
@@ -200,8 +307,11 @@ export type IndexQuery =
   | { op: 'resolve'; rowid: number }
   | { op: 'totals' }
   | { op: 'eml'; rowid: number }
+  | { op: 'report' }
   | WindowQuery
-  | SearchQuery;
+  | SearchQuery
+  | SnippetsQuery
+  | CardsQuery;
 
 export type IndexAnswer =
   | Sidebar
@@ -211,8 +321,11 @@ export type IndexAnswer =
   | null
   | IndexTotals
   | ListWindow
+  | CardsWindow
   | EmlFile
-  | SearchPage;
+  | SearchPage
+  | SearchSnippets
+  | IndexReport;
 
 /**
  * Where a message's file is, as the scan last saw it: its name relative to the
@@ -228,6 +341,79 @@ export interface EmlFile {
   bodyState: number;
 }
 
+/** A list of a message whose entries were cut to a limit when it was indexed. */
+export type CappedListName = (typeof CAPPED_LIST_NAMES)[number];
+
+/**
+ * Why a file needs attention: a kind of file the checks refused (when the
+ * folder was scanned or when the file was read), a message file without its
+ * metadata or metadata without its message file, metadata that couldn't be
+ * used, or a message with a list cut to its limit.
+ */
+export type ReportReason =
+  | RejectKind
+  | 'meta_missing'
+  | 'eml_missing'
+  | 'meta_json'
+  | 'meta_shape'
+  | 'meta_id'
+  | 'timeout'
+  | 'failed'
+  | 'capped';
+
+/** Metadata that couldn't be used, by reason. */
+export type FailedReason = 'meta_json' | 'meta_shape' | 'meta_id' | 'failed';
+
+/**
+ * What became of a file: 'skipped' files aren't listed, a 'listed' message
+ * has no message file, and a 'truncated' one has a list cut to its limit.
+ */
+export type ReportResult = 'skipped' | 'listed' | 'truncated';
+
+export interface ReportRow {
+  result: ReportResult;
+  /** The file's name, relative to the export's folder. */
+  file: string;
+  reason: ReportReason;
+  /** For 'capped': the lists that were cut. */
+  lists?: CappedListName[];
+}
+
+/** The most rows an index report carries. */
+export const REPORT_ROWS = 500;
+
+/** The index report: what was indexed, and each file that needs attention. */
+export interface IndexReport {
+  messages: number;
+  /** User folders and labels. */
+  folders: number;
+  /** How long phase 1 took when it last ran, in ms; null until it is done. */
+  took: number | null;
+  /** Files refused by the checks, by reason. */
+  rejected: Partial<Record<RejectKind, number>>;
+  /** Message files without their metadata: not listed. */
+  metaMissing: number;
+  /** Metadata without its message file: listed, with no body. */
+  emlMissing: number;
+  /** Metadata that couldn't be used, by reason: not listed. */
+  failed: Partial<Record<FailedReason, number>>;
+  /** Metadata files that took too long to read: not listed. */
+  timeouts: number;
+  /** Messages with a list cut to its limit, by list. */
+  capped: Partial<Record<CappedListName, number>>;
+  /** Label IDs on messages that labels.json doesn't name; they aren't shown. */
+  hiddenLabelIds: number;
+  /**
+   * Files that need attention. A listed message with no message file and a
+   * list cut to its limit is one file with two rows.
+   */
+  attention: number;
+  /** The first rows, at most REPORT_ROWS: one per file and reason. */
+  rows: ReportRow[];
+  /** Rows left out after the first REPORT_ROWS. */
+  more: number;
+}
+
 /**
  * The index's own state: 'verifying' while an index that was already there
  * is checked; 'rebuilding' while an index made in place of a damaged one is
@@ -237,7 +423,8 @@ export interface EmlFile {
 export type IndexCondition = 'ok' | 'verifying' | 'rebuilding' | 'damaged';
 
 /**
- * Where phase 1 stands. During it, list pages hold the rows loaded so far.
+ * Where indexing stands. During phase 1, list pages hold the rows loaded so
+ * far; during phase 2, searches find the text of the messages read so far.
  * 'scanning': the run's folder is being read, before its index is open;
  * `loaded` counts the entries looked at and `total` the entries listed.
  * 'unavailable': the export can't be read, and the index shows what it holds.
@@ -255,6 +442,14 @@ export interface IndexProgress {
   /** Messages with a list cut to its limit. */
   capped: number;
   condition: IndexCondition;
+  /** Where phase 2, the text of the message files, stands: 'waiting' until phase 1 is done. */
+  bodyPhase: 'waiting' | 'indexing' | 'done' | 'failed';
+  /** Message files phase 2 has handled in this run: indexed, cut to the limit, or failed. */
+  bodiesDone: number;
+  /** Message files phase 2 has to read in this run. */
+  bodiesTotal: number;
+  /** Message files whose text couldn't be read. */
+  bodiesFailed: number;
 }
 
 /** What core reports once a source's index is open. */

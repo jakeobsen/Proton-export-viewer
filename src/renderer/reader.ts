@@ -4,7 +4,7 @@
 // with its own token. The old body frame goes as soon as an open starts.
 
 import { useSyncExternalStore } from 'react';
-import type { MessageOpenResult, RejectCode } from '../shared/api';
+import type { MessageOpenResult, ReaderActionResult, RejectCode } from '../shared/api';
 import type { OpenMode } from '../shared/reader-protocol';
 import { clearLink, getShellState, refreshGeneration } from './shell';
 
@@ -92,6 +92,29 @@ export async function openInReader(
   return result;
 }
 
+/** An action on the message the pane shows, such as Show in folder, by its view's open. */
+async function viewAction(
+  act: (openId: number, generation: number) => Promise<ReaderActionResult>,
+): Promise<ReaderActionResult> {
+  const view = state.view;
+  if (!view || openGeneration === null) return { ok: false, code: 'superseded' };
+  try {
+    return await act(view.openId, openGeneration);
+  } catch {
+    return { ok: false, code: 'core_unavailable' };
+  }
+}
+
+/** Shows the pane's message file in Finder. */
+export function showInFolder(): Promise<ReaderActionResult> {
+  return viewAction((openId, generation) => window.pev.showInFolder(openId, generation));
+}
+
+/** Copies the pane's message's Message-ID. */
+export function copyMessageId(): Promise<ReaderActionResult> {
+  return viewAction((openId, generation) => window.pev.copyMessageId(openId, generation));
+}
+
 /** Closes the pane and any link dialog that came from its body. */
 export function closeReader(): void {
   latest += 1;
@@ -101,6 +124,19 @@ export function closeReader(): void {
     state = CLOSED;
     for (const listener of listeners) listener();
   }
+}
+
+/**
+ * Closes the pane and has main revoke its view and any open still under way,
+ * so nothing it was showing or about to show stays reachable.
+ */
+export function closeReaderAndView(): void {
+  const open = state.rowid !== null;
+  closeReader();
+  if (!open) return;
+  const generation = getShellState().generation;
+  if (generation === null) return;
+  void window.pev.closeView(generation).catch(() => undefined);
 }
 
 /** Closes the pane when the generation moved on: main has revoked its view. */

@@ -13,10 +13,13 @@
 // file claims.
 
 import {
+  close,
   closeSync,
   constants,
+  fstat,
   fstatSync,
   lstatSync,
+  open,
   openSync,
   readdirSync,
   readSync,
@@ -328,6 +331,30 @@ export function pairCounts(scan: RunScan): {
   };
 }
 
+/** Read-only, without following a link and without blocking. */
+const CONTAINED_FLAGS =
+  constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+
+/** Why the open of a contained file failed, as a ContainmentError. */
+function openRefused(err: unknown): ContainmentError {
+  // A link swapped in fails with ELOOP; a file that went away, with ENOENT.
+  const code = (err as NodeJS.ErrnoException).code ?? null;
+  const kind = code === 'ELOOP' ? 'symlink' : code === 'ENOENT' ? 'changed' : 'unreadable';
+  return new ContainmentError(kind, code);
+}
+
+/**
+ * Throws unless the open file is a regular file and, for a file with an
+ * identity, still has its device and inode.
+ */
+function checkOpened(st: BigIntStats, file: ListedFile | FileRef): void {
+  const type = entryType(st);
+  if (type !== 'file') throw new ContainmentError(type);
+  if (hasIdentity(file) && (st.dev !== file.dev || st.ino !== file.ino)) {
+    throw new ContainmentError('changed');
+  }
+}
+
 /**
  * Opens a listed file: read-only, without following a link and without
  * blocking (a FIFO put in its place can't hold the open), then checks with
@@ -340,23 +367,13 @@ export function pairCounts(scan: RunScan): {
 export function openListed(root: string, file: ListedFile | FileRef): { fd: number; ref: FileRef } {
   let fd: number;
   try {
-    fd = openSync(
-      join(root, file.rel),
-      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
-    );
+    fd = openSync(join(root, file.rel), CONTAINED_FLAGS);
   } catch (err) {
-    // A link put in its place fails with ELOOP; a file that went away, with ENOENT.
-    const code = (err as NodeJS.ErrnoException).code ?? null;
-    const kind = code === 'ELOOP' ? 'symlink' : code === 'ENOENT' ? 'changed' : 'unreadable';
-    throw new ContainmentError(kind, code);
+    throw openRefused(err);
   }
   try {
     const st = fstatSync(fd, { bigint: true });
-    const type = entryType(st);
-    if (type !== 'file') throw new ContainmentError(type);
-    if (hasIdentity(file) && (st.dev !== file.dev || st.ino !== file.ino)) {
-      throw new ContainmentError('changed');
-    }
+    checkOpened(st, file);
     return { fd, ref: refOf(file.rel, file.kind, st) };
   } catch (err) {
     closeSync(fd);
@@ -367,6 +384,33 @@ export function openListed(root: string, file: ListedFile | FileRef): { fd: numb
 /** Opens a file with an identity, as openListed does; returns the descriptor. */
 export function openContained(root: string, ref: FileRef): number {
   return openListed(root, ref).fd;
+}
+
+/**
+ * openContained without blocking the calling thread: the open and the check
+ * run on the I/O threads, with the same flags and the same checks, and
+ * refusals are the same ContainmentErrors. Resolves with a raw descriptor the
+ * caller closes; a file that fails the checks is closed before the rejection.
+ */
+export function openContainedAsync(root: string, ref: FileRef): Promise<number> {
+  return new Promise((resolve, reject) => {
+    open(join(root, ref.rel), CONTAINED_FLAGS, (openErr, fd) => {
+      if (openErr) {
+        reject(openRefused(openErr));
+        return;
+      }
+      fstat(fd, { bigint: true }, (statErr, st) => {
+        try {
+          if (statErr) throw statErr;
+          checkOpened(st, ref);
+        } catch (err) {
+          close(fd, () => reject(err));
+          return;
+        }
+        resolve(fd);
+      });
+    });
+  });
 }
 
 /** A file the scan accepted, opened; or why not, and whether it is gone. */

@@ -22,6 +22,8 @@ const PROMPT: LinkPrompt = {
   host: { start: 8, end: 20 },
   mismatch: false,
   lookalike: false,
+  mail: false,
+  unclear: false,
 };
 
 beforeEach(async () => {

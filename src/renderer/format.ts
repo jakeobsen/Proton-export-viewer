@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Display text for the list: counts, dates and participants.
 
+import { displayText } from '../shared/header-text';
 import type { Participant } from '../shared/index-types';
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -38,10 +39,13 @@ export function fullDate(time: number): string {
   return `${DAYS[date.getDay()]!} ${date.getDate()} ${MONTHS[date.getMonth()]!} ${date.getFullYear()}, ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-/** A conversation's senders, oldest first: each by name, or by address when it has none. */
+/**
+ * A conversation's senders, oldest first: each by name, or by address when it
+ * has none, each cleaned for display.
+ */
 export function participantsText(participants: readonly Participant[]): string {
   return participants
-    .map((p) => p.name.trim() || p.address)
+    .map((p) => displayText(p.name) || displayText(p.address))
     .filter((s) => s !== '')
     .join(', ');
 }

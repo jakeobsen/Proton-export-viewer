@@ -4,7 +4,7 @@
 // one, and the index pool's threads read and parse export files. These run in
 // worker threads (see thread.ts); tests call them directly.
 
-import { chmodSync, closeSync, openSync, statSync } from 'node:fs';
+import { chmodSync, closeSync, fstatSync, openSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { overlaps } from '../../shared/overlap';
 import type { Stamp } from '../../shared/sources';
@@ -17,6 +17,8 @@ import {
   type ListedFile,
   type Rejection,
 } from '../containment';
+import { borrowedFdStream } from '../fd-stream';
+import { extractBody, type AttachmentRow } from './body';
 import { FamilyInUse, deleteFamily, familyBytes } from './family';
 import { LabelsError, SYSTEM_LABELS, parseLabels, type LabelEntry } from './labels';
 import {
@@ -31,8 +33,17 @@ import {
 } from './limits';
 import { MetadataError, parseMetadata, type MessageRow } from './metadata';
 import type { IndexAnswer, IndexQuery } from '../../shared/index-types';
-import { emlFile, listPage, listWindow, rowDetails, sidebar, threadOfMessage } from './queries';
-import { searchPage } from './search';
+import {
+  cardsWindow,
+  emlFile,
+  listPage,
+  listWindow,
+  rowDetails,
+  sidebar,
+  threadOfMessage,
+} from './queries';
+import { indexReport } from './report';
+import { searchPage, searchSnippets } from './search';
 import {
   META,
   createSchema,
@@ -60,9 +71,12 @@ import {
   StaleBatch,
   type ApplyItem,
   type ApplyStats,
+  type BodyTodo,
   type PairFile,
   type Phase1Item,
   type Phase1Stats,
+  type Phase2Item,
+  type Phase2Stats,
   type ReconcilePlan,
 } from './writer';
 
@@ -349,6 +363,19 @@ export class WriterState {
     this.truncateWal();
   }
 
+  bodyOrder(): number[] {
+    return this.need().writer.bodyOrder();
+  }
+
+  bodyTodo(rowids: number[]): BodyTodo[] {
+    return this.need().writer.bodyTodo(rowids);
+  }
+
+  phase2(stamp: Stamp, items: Phase2Item[], budget?: number): Phase2Stats {
+    const { writer } = this.need();
+    return this.commit(() => writer.phase2Batch(stamp, items, budget));
+  }
+
   shrink(): void {
     this.db?.exec('PRAGMA shrink_memory');
   }
@@ -425,10 +452,17 @@ export class QueryState {
         };
       case 'window':
         return listWindow(db, call);
+      case 'cards':
+        return cardsWindow(db, call);
       case 'eml':
         return emlFile(db, call.rowid);
       case 'search':
         return searchPage(db, call);
+      case 'snippets':
+        return searchSnippets(db, call);
+      case 'report':
+        // The source adds the files its scan refused and the time phase 1 took.
+        return { ...indexReport(db, SYSTEM_IDS), took: null };
     }
   }
 
@@ -617,6 +651,71 @@ export function parseLabelsJob(root: string, ref: FileRef): LabelsJobResult {
   }
 }
 
+export interface BodyJobItem {
+  protonId: string;
+  rev: number;
+  ref: FileRef;
+}
+
+export type BodyJobResult =
+  | {
+      protonId: string;
+      rev: number;
+      ok: true;
+      body: string;
+      truncated: boolean;
+      attachments: AttachmentRow[];
+      attachmentText: string;
+      attachmentsCapped: boolean;
+      inputBytes: number;
+    }
+  | { protonId: string; rev: number; ok: false; error: string };
+
+/** A file that changed or went since the scan is left for the next reconcile. */
+export const BODY_CHANGED = 'FILE_CHANGED';
+
+/** True while the open file still has the size and modification time the scan saw. */
+function asScanned(fd: number, ref: FileRef): boolean {
+  const st = fstatSync(fd, { bigint: true });
+  return st.size === BigInt(ref.size) && st.mtimeNs === ref.mtimeNs;
+}
+
+/**
+ * Reads one message file for the full-text index, as a stream over a
+ * descriptor core opened through the containment checks and lent to this job.
+ * Once read, a file whose size or time differ from the scan's gets
+ * BODY_CHANGED, so the text kept always belongs to the rev. The job never
+ * closes the descriptor: core does, once the job has settled or its thread
+ * has exited.
+ */
+export async function bodyJob(fd: number, item: BodyJobItem): Promise<BodyJobResult> {
+  const { protonId, rev } = item;
+  // The stream never closes the file, not even when a read error destroys
+  // it, so the file can be checked again once read. It reads no more than the
+  // scan saw: a file that grew is left as changed.
+  const input = borrowedFdStream(fd, { start: 0, end: Math.max(item.ref.size, 1) - 1 });
+  try {
+    const text = await extractBody(input);
+    if (!asScanned(fd, item.ref)) return { protonId, rev, ok: false, error: BODY_CHANGED };
+    return { protonId, rev, ok: true, ...text };
+  } catch (err) {
+    return {
+      protonId,
+      rev,
+      ok: false,
+      error: codeOf(err) === 'FAILED' ? 'BODY_FAILED' : codeOf(err),
+    };
+  } finally {
+    // The job settles only once no read is running on the file.
+    if (!input.closed) {
+      await new Promise<void>((resolve) => {
+        input.once('close', () => resolve());
+        input.destroy();
+      });
+    }
+  }
+}
+
 /** The pair code for a file the containment checks refused when it was read. */
 export function rejectCode(kind: string): string {
   return `FILE_${kind.toUpperCase()}`;
@@ -624,7 +723,7 @@ export function rejectCode(kind: string): string {
 
 // --- Dispatch ----------------------------------------------------------------
 
-/** The operations of one thread role, by name. */
+/** The operations of one thread role, by name. An operation may answer with a promise. */
 export function threadHandler(role: ThreadRole): (op: string, args: unknown) => unknown {
   if (role === 'writer') {
     const writer = new WriterState();
@@ -647,6 +746,12 @@ export function threadHandler(role: ThreadRole): (op: string, args: unknown) => 
         case 'finish':
           writer.finish(a.stamp as Stamp);
           return null;
+        case 'bodyOrder':
+          return writer.bodyOrder();
+        case 'bodyTodo':
+          return writer.bodyTodo(a.rowids as number[]);
+        case 'phase2':
+          return writer.phase2(a.stamp as Stamp, a.items as Phase2Item[], a.budget as number);
         case 'shrink':
           writer.shrink();
           return null;
@@ -692,6 +797,8 @@ export function threadHandler(role: ThreadRole): (op: string, args: unknown) => 
       ref?: FileRef;
       budget?: number;
       files?: ListedFile[];
+      fd?: number;
+      item?: BodyJobItem;
     };
     switch (op) {
       case 'meta':
@@ -700,6 +807,8 @@ export function threadHandler(role: ThreadRole): (op: string, args: unknown) => 
         return parseLabelsJob(a.root, a.ref as FileRef);
       case 'stat':
         return statJob(a.root, a.files ?? []);
+      case 'body':
+        return bodyJob(a.fd as number, a.item as BodyJobItem);
     }
     throw new Error('UNKNOWN_OP');
   };

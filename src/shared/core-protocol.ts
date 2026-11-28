@@ -4,6 +4,8 @@
 import type { IndexAnswer, IndexOpened, IndexProgress, IndexQuery } from './index-types';
 import type {
   BodyLink,
+  FileIdentity,
+  LocateRequest,
   ReadRequest,
   ReaderFailure,
   RenderedMessage,
@@ -34,14 +36,18 @@ export interface CoreInit {
   test?: CoreTestInit;
 }
 
-/** Builds with test hooks only: settings for phase 1 in tests. */
+/** Builds with test hooks only: settings for indexing in tests. */
 export interface CoreTestInit {
   /** Pairs per write transaction. */
   batchPairs?: number;
-  /** Phase 1 writes wait until a test lets them through. */
+  /** Bytes of text one phase 2 transaction writes, at most. */
+  txnBytes?: number;
+  /** Writes, phase 1's and phase 2's, wait until a test lets them through. */
   holdWrites?: boolean;
   /** Scans wait before they list the run's folder, and once they have, until a test lets them on. */
   holdScans?: boolean;
+  /** Index opens wait before they start, until a test lets them on. */
+  holdIndexOpens?: boolean;
   /** New metadata files are read in name order, and their batches written in that order. */
   readByName?: boolean;
 }
@@ -219,6 +225,7 @@ export type CoreRequest =
   | IdentifyRequest
   | ScanRequest
   | ReadRequest
+  | LocateRequest
   | IndexRequest
   | IndexQueryRequest
   | ForgetRequest
@@ -240,6 +247,10 @@ export type CoreResult =
       scan?: ScanSummary;
       /** The rendered message of a `read`. */
       read?: RenderedMessage;
+      /** The identity of the file a `read` came from; null for a test input. */
+      file?: FileIdentity | null;
+      /** The path a `locate` found. */
+      path?: string;
       index?: IndexOpened;
       answer?: IndexAnswer;
       progress?: IndexProgress;
@@ -258,6 +269,7 @@ export type CoreResult =
         | 'not_found'
         | 'eml_missing'
         | 'superseded'
+        | 'changed'
         | 'reader_failed'
         | 'no_index'
         | 'damaged'

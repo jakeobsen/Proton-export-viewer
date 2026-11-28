@@ -1,0 +1,168 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/* The conversation: its header and the cards, one of them expanded. */
+
+.cv-head {
+  flex: none;
+  padding: 16px 22px 8px;
+}
+
+/* The header's chips wrap to as many lines as they need. */
+.cv-head .chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  height: auto;
+  margin-top: 6px;
+  overflow: visible;
+}
+
+.cv-head .chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.cv-head .chip-icon {
+  flex: none;
+}
+
+/* A focused chip shows its whole name, on as many lines as it takes. */
+.cv-head .chip:focus-visible {
+  height: auto;
+  min-height: 20px;
+  white-space: normal;
+}
+
+.cv-head .chip:focus-visible .chip-name {
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+
+.cv-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* The expanded card's frame is as high as this pane: 100cqh. */
+  container-type: size;
+}
+
+.cv-inner {
+  position: relative;
+  width: 100%;
+}
+
+.cv-slot {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  padding: 0 14px 8px;
+}
+
+.card {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+}
+
+.card.placeholder {
+  height: 50px;
+}
+
+.card.expanded {
+  border-color: var(--muted);
+}
+
+.card-h {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  height: 48px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.card-h:hover {
+  background: var(--hover);
+}
+
+.card.expanded .card-h {
+  cursor: default;
+}
+
+.card.expanded .card-h:hover {
+  background: transparent;
+}
+
+.ch-l1 {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* The sender's name is mail data: an isolated run of text. */
+.ch-name {
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  unicode-bidi: isolate;
+}
+
+.ch-l1 .pill {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 9px;
+  background: var(--rp-box);
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 650;
+}
+
+.ch-date {
+  flex: none;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.card-body {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--line);
+}
+
+.card-body .rp-actbar {
+  margin-top: 0;
+  border-top: 0;
+}
+
+.card-body .rp-body {
+  flex: none;
+  height: max(160px, 100cqh);
+  border-top: 1px solid var(--line);
+}
+
+.card-body .rp-frame {
+  border-radius: 0 0 10px 10px;
+}
