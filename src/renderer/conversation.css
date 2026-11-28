@@ -126,8 +126,12 @@
   min-width: 0;
 }
 
-/* A lead line or a snippet is mail data: an isolated run of text. */
+/*
+ * A lead line or a snippet is mail data: an isolated run of text. Its line
+ * is kept while empty, so a card's name line doesn't move when it arrives.
+ */
 .ch-snip {
+  height: 16px;
   min-width: 0;
   overflow: hidden;
   color: var(--muted);

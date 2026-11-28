@@ -646,6 +646,30 @@ describe('the header count from a search', () => {
     t.db.close();
   });
 
+  it('takes no count from a read for a search left behind while it was under way', async () => {
+    const t = setup();
+    for (const id of ['t1', 't3']) setBody(t.db, id, 'the invoice');
+    t.texts.set(1, 'invoice');
+    t.texts.set(2, 'invoice');
+    t.model.show(t.ids[0]!, null, 1);
+    await t.settle();
+    expect(t.model.snapshot.count).toEqual({ total: 6, matching: 2, rev: 1 });
+    // A read for search 1 is under way when a result of search 2 takes over.
+    t.holdReads();
+    t.model.refresh();
+    t.index.rev = 2;
+    t.model.setSearch(2);
+    expect(t.model.snapshot.count).toEqual({ total: 6, matching: null, rev: 1 });
+    // Its count is search 1's: the header leaves M out, and the next read counts.
+    await t.releaseHeld();
+    expect(t.queries.at(-2)!.search).toEqual({ queryId: 1, countRev: 1 });
+    expect(t.model.snapshot.count).toEqual({ total: 6, matching: null, rev: 2 });
+    await t.releaseReads();
+    expect(t.queries.at(-1)!.search).toEqual({ queryId: 2, countRev: null });
+    expect(t.model.snapshot.count).toEqual({ total: 6, matching: 2, rev: 2 });
+    t.db.close();
+  });
+
   it('marks the cards that match, and gives the cards on screen', async () => {
     const t = await fromSearch();
     t.model.setViewport(0, 3);

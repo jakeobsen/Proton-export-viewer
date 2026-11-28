@@ -15,8 +15,8 @@ import type { LeadLine } from './leads';
 import { ROW_HEIGHT, type Row } from './list';
 import {
   list,
-  listLeads,
   selectRow,
+  setListShown,
   setListViewport,
   showFolder,
   useList,
@@ -317,7 +317,10 @@ export function ConversationList() {
   }, [reportViewport]);
 
   // Out of sight (results show in its place), no row's line is asked for.
-  useEffect(() => () => listLeads.show([]), []);
+  useEffect(() => {
+    setListShown(true);
+    return () => setListShown(false);
+  }, []);
 
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;

@@ -221,16 +221,17 @@ export class CardsModel {
   }
 
   /**
-   * The header's counts after an answer. An answer from an older snapshot
-   * than the pair shown changes nothing. One with a matching count replaces
-   * both; one without (core counts whenever the snapshot moved on, so it is
-   * from the same snapshot) replaces the message count only.
+   * The header's counts after an answer read for the search `sentFor`. An
+   * answer from an older snapshot than the pair shown changes nothing. One
+   * with a matching count replaces both, unless it was read for a search left
+   * behind since; one without (core counts whenever the snapshot moved on, so
+   * it is from the same snapshot) replaces the message count only.
    */
-  private nextCount(answer: CardsWindow): CountPair {
+  private nextCount(answer: CardsWindow, sentFor: number | null): CountPair {
     const shown = this.snap.count;
     if (shown !== null && answer.rev < shown.rev) return shown;
     if (!answer.searched) return { total: answer.total, matching: null, rev: answer.rev };
-    if (answer.matching !== undefined) {
+    if (answer.matching !== undefined && sentFor === this.snap.queryId) {
       return { total: answer.total, matching: answer.matching, rev: answer.rev };
     }
     return { total: answer.total, matching: shown?.matching ?? null, rev: answer.rev };
@@ -470,7 +471,7 @@ export class CardsModel {
       threadId: answer.threadId,
       subject: answer.subject,
       total: answer.total,
-      count: this.nextCount(answer),
+      count: this.nextCount(answer, queryId),
       labelIds: answer.labelIds,
       start: answer.start,
       cards: answer.cards,

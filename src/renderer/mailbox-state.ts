@@ -131,11 +131,19 @@ export const listLeads = new LeadsModel('list', askLeads, notify);
 /** The lead lines of the cards, or a result's snippets on the cards that match its search. */
 export const cardLeads = new LeadsModel('cards', askLeads, notify);
 
+/** Whether the list is on screen: a search's results show in its place. */
+let listShown = false;
+
+/** Asks for the lead lines of the list's rows on screen, if the list is. */
+function showListLeads(): void {
+  listLeads.show(listShown ? list.visibleRowids() : []);
+}
+
 export const list = new ListModel(
   (query) => ask((generation) => window.pev.listWindow(query, generation)),
   () => {
     notify();
-    listLeads.show(list.visibleRowids());
+    showListLeads();
   },
 );
 
@@ -150,7 +158,13 @@ export function useListLeads() {
 /** The rows on screen changed: more rows may be read, and their lead lines asked for. */
 export function setListViewport(first: number, last: number): void {
   list.setViewport(first, last);
-  listLeads.show(list.visibleRowids());
+  showListLeads();
+}
+
+/** The list came on screen, or left it: out of sight, no row's line is asked for. */
+export function setListShown(shown: boolean): void {
+  listShown = shown;
+  showListLeads();
 }
 
 /** Snippets for rows of the shown search; null if the answer isn't for the current export. */
