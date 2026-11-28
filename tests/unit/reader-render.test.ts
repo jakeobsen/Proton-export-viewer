@@ -16,6 +16,8 @@ import {
   renderMessage,
 } from '../../src/core/reader/render';
 import { htmlToText } from '../../src/core/text/html-to-text';
+import { MAX_MIME_PARTS } from '../../src/core/mime-limits';
+import { bodiesAfter, bodiesAround } from '../mime-parts';
 import { hostileMessages } from '../../tools/gen-export/hostile.mjs';
 
 const BASE = 'mail-asset://v/0123456789abcdef0123456789abcdef';
@@ -252,42 +254,42 @@ function alternative(text: string, html: string, attachment?: Buffer): Buffer {
 describe('the reader ceilings', () => {
   it('shows HTML up to its size limit, and plain text above it, saying the HTML can be shown anyway', async () => {
     const within = await render(sized('text/html', HTML_VIEW_BYTES), 'html');
-    expect(within).toMatchObject({ format: 'html', htmlTooLarge: false, truncated: false });
+    expect(within).toMatchObject({ format: 'html', htmlTooLarge: false, cut: null });
 
     const over = sized('text/html', HTML_VIEW_BYTES + 1);
     const asked = await render(over, 'html');
     expect(asked).toMatchObject({ format: 'plain', hasHtml: true, htmlTooLarge: true });
-    expect(asked.truncated).toBe(false);
+    expect(asked.cut).toBeNull();
     expect(bodyText(asked.html).trim()).toHaveLength(HTML_VIEW_BYTES + 1 - 7);
 
     const anyway = await render(over, 'html-anyway');
-    expect(anyway).toMatchObject({ format: 'html', htmlTooLarge: false, truncated: false });
+    expect(anyway).toMatchObject({ format: 'html', htmlTooLarge: false, cut: null });
 
     // Plain text was asked for: nothing to offer.
     const plain = await render(over, 'plain');
-    expect(plain).toMatchObject({ format: 'plain', htmlTooLarge: false, truncated: false });
+    expect(plain).toMatchObject({ format: 'plain', htmlTooLarge: false, cut: null });
   });
 
   it('shows HTML anyway up to the hard limit, and above it only the first part of its text', async () => {
     const atLimit = await render(sized('text/html', HTML_ANYWAY_BYTES), 'html-anyway');
-    expect(atLimit).toMatchObject({ format: 'html', truncated: false });
+    expect(atLimit).toMatchObject({ format: 'html', cut: null });
 
     const over = sized('text/html', HTML_ANYWAY_BYTES + 1);
     for (const mode of ['html', 'html-anyway', 'plain'] as const) {
       const message = await render(over, mode);
-      expect(message).toMatchObject({ format: 'plain', htmlTooLarge: false, truncated: true });
+      expect(message).toMatchObject({ format: 'plain', htmlTooLarge: false, cut: 'size' });
       expect(bodyText(message.html)).toBe('x'.repeat(FIRST_TEXT_BYTES));
     }
   });
 
   it('shows a text body up to the hard limit whole, and above it only its first part', async () => {
     const whole = await render(sized('text/plain', HTML_ANYWAY_BYTES));
-    expect(whole.truncated).toBe(false);
+    expect(whole.cut).toBeNull();
     expect(bodyText(whole.html)).toHaveLength(HTML_ANYWAY_BYTES);
 
     // Two-byte characters: the cut falls on a character boundary.
     const over = await render(sized('text/plain', HTML_ANYWAY_BYTES + 2, 'é'));
-    expect(over).toMatchObject({ format: 'plain', truncated: true, hasHtml: false });
+    expect(over).toMatchObject({ format: 'plain', cut: 'size', hasHtml: false });
     expect(bodyText(over.html)).toBe('é'.repeat(FIRST_TEXT_BYTES / 2));
   });
 
@@ -298,11 +300,11 @@ describe('the reader ceilings', () => {
     const bigText = alternative('x'.repeat(over), '<p>small</p>');
     for (const mode of ['html', 'html-anyway'] as const) {
       const message = await render(bigText, mode);
-      expect(message).toMatchObject({ format: 'html', htmlTooLarge: false, truncated: false });
+      expect(message).toMatchObject({ format: 'html', htmlTooLarge: false, cut: null });
       expect(htmlToText(message.html).trim()).toBe('small');
     }
     const bigTextPlain = await render(bigText, 'plain');
-    expect(bigTextPlain).toMatchObject({ format: 'plain', hasHtml: true, truncated: true });
+    expect(bigTextPlain).toMatchObject({ format: 'plain', hasHtml: true, cut: 'size' });
     expect(bodyText(bigTextPlain.html)).toBe('x'.repeat(FIRST_TEXT_BYTES));
 
     // HTML over the hard limit, text between the cut and the hard limit: the text shows whole,
@@ -314,16 +316,16 @@ describe('the reader ceilings', () => {
         format: 'plain',
         hasHtml: true,
         htmlTooLarge: false,
-        truncated: false,
+        cut: null,
       });
       expect(bodyText(message.html)).toBe('y'.repeat(2 * FIRST_TEXT_BYTES));
     }
 
     // An attachment over the hard limit counts for neither body.
     const attached = alternative('small', '<p>small</p>', Buffer.alloc(over, 7));
-    expect(await render(attached, 'html')).toMatchObject({ format: 'html', truncated: false });
+    expect(await render(attached, 'html')).toMatchObject({ format: 'html', cut: null });
     const plain = await render(attached, 'plain');
-    expect(plain).toMatchObject({ format: 'plain', truncated: false });
+    expect(plain).toMatchObject({ format: 'plain', cut: null });
     expect(bodyText(plain.html)).toBe('small');
   });
 
@@ -383,4 +385,28 @@ describe('the hostile malformed-MIME and charset messages', () => {
       if (want !== undefined) expect(bodyText(html).trim()).toBe(want);
     });
   }
+});
+
+describe('the part limit', () => {
+  it('shows bodies after more than 1,000 parts whole, in both views', async () => {
+    const eml = Buffer.from(bodiesAfter(1001));
+    const html = await render(eml, 'html');
+    expect(html).toMatchObject({ format: 'html', cut: null });
+    expect(html.html).toContain('HTML after the parts.');
+    const plain = await render(eml, 'plain');
+    expect(plain).toMatchObject({ format: 'plain', cut: null });
+    expect(bodyText(plain.html)).toContain('Text after the parts.');
+  });
+
+  it('shows what came before the limit as part of the message, in both views', async () => {
+    const eml = Buffer.from(bodiesAround(MAX_MIME_PARTS + 10));
+    const html = await render(eml, 'html');
+    expect(html).toMatchObject({ format: 'html', cut: 'parts' });
+    expect(html.html).toContain('HTML before the parts.');
+    expect(html.html).not.toContain('after the parts');
+    const plain = await render(eml, 'plain');
+    expect(plain).toMatchObject({ format: 'plain', cut: 'parts' });
+    expect(bodyText(plain.html)).toContain('Text before the parts.');
+    expect(bodyText(plain.html)).not.toContain('after the parts');
+  });
 });
