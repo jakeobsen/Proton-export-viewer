@@ -366,10 +366,16 @@ describe('SaveManager', () => {
       t.staging.notePartial(partial);
       writeFileSync(partial, 'copy', { flag: 'wx' });
       const st = lstatSync(partial, { bigint: true });
-      t.staging.ownPartial(partial, { dev: st.dev.toString(), ino: st.ino.toString() });
+      t.staging.ownPartial(partial, {
+        dev: st.dev.toString(),
+        ino: st.ino.toString(),
+        birth: st.birthtimeNs.toString(),
+      });
       t.manager.quit();
       expect(existsSync(partial)).toBe(inside);
       expect(existsSync(t.staging.dir)).toBe(false);
+      const kept = t.logged.filter((l) => l.code === 'save.partial_kept');
+      expect(kept.map((l) => l.data)).toEqual(inside ? [{ reason: 'export_root' }] : []);
     }
   });
 

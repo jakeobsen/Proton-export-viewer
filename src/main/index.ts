@@ -124,7 +124,10 @@ async function start(): Promise<void> {
   });
   // Whatever a save left from an earlier run goes before anything else starts.
   const staging = new Staging(app.getPath('userData'));
-  staging.sweep((dir) => !insideExport(dir, sources.exportRoots()));
+  staging.sweep(
+    (dir) => !insideExport(dir, sources.exportRoots()),
+    (reason) => log.warn('save.partial_kept', { reason }),
+  );
   const saves = new SaveManager({
     log,
     request: (call, stamp) => core.requestRunning(call, stamp),

@@ -18,7 +18,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { publish, realPublishFs, type PublishFs } from '../../src/main/saves/publish';
+import { publish, realPublishFs, type FileId, type PublishFs } from '../../src/main/saves/publish';
 import { PARTIAL_RE, Staging } from '../../src/main/saves/staging';
 import { testDir } from '../paths';
 
@@ -33,14 +33,16 @@ function setup(bytes = Buffer.from('saved bytes')) {
   const staged = join(staging, 'a'.repeat(32) + '.part');
   writeFileSync(staged, bytes);
   const notes: string[] = [];
-  const owned: Array<{ path: string; dev: string; ino: string }> = [];
+  const owned: Array<{ path: string } & FileId> = [];
+  const kept: string[] = [];
   const options = {
     partialPath: (d: string) => Staging.partialIn(d),
     notePartial: (p: string) => notes.push(p),
-    ownPartial: (p: string, id: { dev: string; ino: string }) => owned.push({ path: p, ...id }),
+    ownPartial: (p: string, id: FileId) => owned.push({ path: p, ...id }),
     clearNote: () => notes.push('cleared'),
+    onPartialKept: (reason: string) => kept.push(reason),
   };
-  return { dir, staging, dest, staged, bytes, notes, owned, options };
+  return { dir, staging, dest, staged, bytes, notes, owned, kept, options };
 }
 
 const leftovers = (dir: string) => readdirSync(dir).filter((n) => PARTIAL_RE.test(n));
@@ -97,6 +99,11 @@ describe('publish', () => {
     expect(t.owned).toHaveLength(1);
     expect(t.owned[0]!.path).toBe(t.notes[0]);
     expect(t.owned[0]!.ino).toMatch(/^\d+$/);
+    // Its birth time, read from the open file, is the published file's own.
+    const st = lstatSync(join(t.dest, 'big.bin'), { bigint: true });
+    expect(t.owned[0]!.birth).toBe(st.birthtimeNs.toString());
+    expect(t.owned[0]!.birth).not.toBe('0');
+    expect(t.kept).toEqual([]);
   });
 
   it('a link() that fails otherwise (another volume) takes the copy', async () => {
@@ -216,5 +223,39 @@ describe('publish', () => {
     expect(inodes[1]).not.toBe(inodes[0]);
     expect(readFileSync(swapped, 'utf8')).toBe('theirs');
     expect(existsSync(t.staged)).toBe(false);
+  });
+
+  it('cleanup keeps the copy when its birth time differs, with the same device and inode', async () => {
+    const t = setup();
+    // The copy's path reads as a newer file that got the copy's device and inode.
+    const fs: PublishFs = {
+      ...realPublishFs,
+      id: (path) => {
+        const id = realPublishFs.id(path);
+        if (!PARTIAL_RE.test(path.split('/').pop()!)) return id;
+        return { ...id, birth: (BigInt(id.birth) + 1n).toString() };
+      },
+    };
+    const result = await publish(t.staged, t.dest, 'a.txt', { ...t.options, fs, forceCopy: true });
+    expect(result).toMatchObject({ ok: true, method: 'copy' });
+    expect(leftovers(t.dest)).toEqual([t.owned[0]!.path.split('/').pop()]);
+    expect(t.kept).toEqual(['foreign']);
+    expect(existsSync(t.staged)).toBe(false);
+  });
+
+  it('cleanup keeps the copy when the file system reports no birth time', async () => {
+    const t = setup();
+    // Every file reads with a birth time of 0, as where the file system has none.
+    const fs: PublishFs = {
+      ...realPublishFs,
+      copyNew: (from, path, created) =>
+        realPublishFs.copyNew(from, path, (id) => created({ ...id, birth: '0' })),
+      id: (path) => ({ ...realPublishFs.id(path), birth: '0' }),
+    };
+    const result = await publish(t.staged, t.dest, 'a.txt', { ...t.options, fs, forceCopy: true });
+    expect(result).toMatchObject({ ok: true, method: 'copy' });
+    expect(t.owned[0]!.birth).toBe('0');
+    expect(leftovers(t.dest)).toEqual([t.owned[0]!.path.split('/').pop()]);
+    expect(t.kept).toEqual(['incomplete']);
   });
 });

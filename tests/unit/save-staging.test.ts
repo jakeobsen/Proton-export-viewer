@@ -57,9 +57,50 @@ describe('Staging', () => {
 
   it('the sweep empties the folder and removes the fallback copy the app made', () => {
     const t = made();
-    t.staging.sweep(anywhere);
+    const kept: string[] = [];
+    t.staging.sweep(anywhere, (reason) => kept.push(reason));
     expect(existsSync(t.staging.dir)).toBe(false);
     expect(readdirSync(t.dest)).toEqual(['kept.pdf']);
+    expect(kept).toEqual([]);
+  });
+
+  /** Rewrites the fallback copy's note. */
+  function renote(t: ReturnType<typeof made>, change: (note: Record<string, string>) => void) {
+    const file = join(t.staging.dir, PARTIAL_NOTE);
+    const note = JSON.parse(readFileSync(file, 'utf8')) as Record<string, string>;
+    change(note);
+    writeFileSync(file, JSON.stringify(note));
+  }
+
+  it('keeps the copy when its birth time differs from the note, with the same device and inode', () => {
+    const t = made();
+    expect(idOf(t.partial).birth).not.toBe('0');
+    renote(t, (note) => {
+      note.birth = (BigInt(note.birth!) + 1n).toString();
+    });
+    const kept: string[] = [];
+    t.staging.sweep(anywhere, (reason) => kept.push(reason));
+    expect(readFileSync(t.partial, 'utf8')).toBe('copy');
+    expect(kept).toEqual(['foreign']);
+    expect(existsSync(t.staging.dir)).toBe(false);
+  });
+
+  it('keeps the copy when the note has no birth time, or 0', () => {
+    for (const change of [
+      (note: Record<string, string>) => {
+        delete note.birth;
+      },
+      (note: Record<string, string>) => {
+        note.birth = '0';
+      },
+    ]) {
+      const t = made();
+      renote(t, change);
+      const kept: string[] = [];
+      t.staging.sweep(anywhere, (reason) => kept.push(reason));
+      expect(readFileSync(t.partial, 'utf8')).toBe('copy');
+      expect(kept).toEqual(['incomplete']);
+    }
   });
 
   it('the note holds the copy’s identity and its folder’s real path', () => {
@@ -93,8 +134,10 @@ describe('Staging', () => {
     staging.notePartial(partial);
     // The exclusive create was refused: this file is someone else's.
     writeFileSync(partial, 'theirs');
-    staging.sweep(anywhere);
+    const kept: string[] = [];
+    staging.sweep(anywhere, (reason) => kept.push(reason));
     expect(readFileSync(partial, 'utf8')).toBe('theirs');
+    expect(kept).toEqual(['incomplete']);
   });
 
   it('keeps the copy when its folder is now a link to another folder', () => {
@@ -110,12 +153,17 @@ describe('Staging', () => {
   it('keeps the copy when its folder is now in an export', () => {
     const t = made();
     const asked: string[] = [];
-    t.staging.sweep((dir) => {
-      asked.push(dir);
-      return false;
-    });
+    const kept: string[] = [];
+    t.staging.sweep(
+      (dir) => {
+        asked.push(dir);
+        return false;
+      },
+      (reason) => kept.push(reason),
+    );
     expect(asked).toEqual([realpathSync.native(t.dest)]);
     expect(existsSync(t.partial)).toBe(true);
+    expect(kept).toEqual(['export_root']);
     expect(existsSync(t.staging.dir)).toBe(false);
   });
 
@@ -145,7 +193,7 @@ describe('Staging', () => {
   });
 });
 
-function idOf(path: string): { dev: string; ino: string } {
+function idOf(path: string): { dev: string; ino: string; birth: string } {
   const st = lstatSync(path, { bigint: true });
-  return { dev: st.dev.toString(), ino: st.ino.toString() };
+  return { dev: st.dev.toString(), ino: st.ino.toString(), birth: st.birthtimeNs.toString() };
 }

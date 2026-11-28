@@ -43,6 +43,7 @@ export const LOG_CODES = [
   'save.failed',
   'save.queue_full',
   'save.shown',
+  'save.partial_kept',
   'protocol.not_found',
   'view.installed',
   'reader.show_in_folder',
@@ -222,6 +223,7 @@ export const REASONS = [
   'cancelled',
   'link',
   'copy',
+  'incomplete',
 ] as const;
 
 /** The lists of a message whose entries can be cut to a limit when indexed. */

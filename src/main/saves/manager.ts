@@ -291,7 +291,10 @@ export class SaveManager {
   quit(): void {
     for (const job of this.queue.splice(0)) this.drop(job, 'quit');
     if (this.running) this.fail(this.running, 'quit');
-    this.deps.staging.sweep((dir) => !insideExport(dir, this.deps.exportRoots()));
+    this.deps.staging.sweep(
+      (dir) => !insideExport(dir, this.deps.exportRoots()),
+      (reason) => this.deps.log.warn('save.partial_kept', { reason }),
+    );
   }
 
   private drop(job: Job, reason: FailReason): void {
@@ -523,6 +526,8 @@ export class SaveManager {
       notePartial: (path) => staging.notePartial(path),
       ownPartial: (path, id) => staging.ownPartial(path, id),
       clearNote: () => staging.clearNote(),
+      onPartialKept: (reason) =>
+        this.deps.log.warn('save.partial_kept', { reason, windowId: win.id }),
     });
     if (!published.ok) {
       this.fail(save, published.reason);
