@@ -683,6 +683,51 @@ test('by relevance, a page read after more bodies are indexed shows no conversat
   expect(all.threadIds.filter((t_) => t_ === weakened)).toHaveLength(1);
 });
 
+test('by relevance, a lone conversation changed while page 1 shows keeps its ID and shows once', async ({
+  pev,
+}) => {
+  const t = 1_700_000_000;
+  const specs: Spec[] = [];
+  for (let i = 0; i < 200; i += 1) {
+    specs.push({ id: `S${String(i).padStart(3, '0')}`, subject: 'zebra zebra', time: t + i });
+  }
+  for (let j = 0; j < 5; j += 1) {
+    specs.push({ id: `W${j}`, subject: `zebra weaker ${j} match`, time: t + 500 + j });
+  }
+  const { root, run, pairs } = craft('sbox-rank-lone', specs);
+  const other = craft('sbox-rank-lone-other', [{ id: 'X1', subject: 'Other', time: t }]);
+  await open(pev, root, pairs);
+  const key = (await pev.main<Stamp>('sourceStamp')).sourceKey;
+  // S000 is the oldest message, and its conversation's only one.
+  const rows = await folderRows(pev, '5');
+  expect(rows).toHaveLength(205);
+  const oldest = rows[rows.length - 1]!;
+  expect(oldest).toMatchObject({ subject: 'zebra zebra', count: 1 });
+  const lone = oldest.threadId;
+
+  // Its only message now matches weakly: it is placed again, alone, and keeps
+  // its conversation's ID.
+  const weak = 'zebra with a long tail of other words that make it a weak match';
+  resubject(run, [['S000', weak]]);
+  await reopenHeld(pev, key, other.root);
+  await typeText(pev.page, 'zebra');
+  await settled(pev, 'zebra');
+  await chooseSort(pev.page, 'relevance');
+  await expect.poll(async () => (await state(pev)).sort).toBe('relevance');
+  const first = await settled(pev, 'zebra');
+  expect(first.threadIds).toHaveLength(200);
+  expect(first.threadIds).toContain(lone);
+
+  // Page 1 stays shown while the change is written; the next pages follow its cursor.
+  await pev.main('releaseWrites', null);
+  await phase1Done(pev, pairs);
+  expect(await threadBySubject(pev, weak)).toBe(lone);
+  const all = await scrollToEnd(pev, 205);
+  // It came again on core's next page under the same ID, and was left out.
+  expect(all.skipped).toBeGreaterThan(0);
+  expect(new Set(all.threadIds).size).toBe(205);
+  expect(all.threadIds.filter((t_) => t_ === lone)).toHaveLength(1);
+});
 test("by date, bodies indexed between pages that make shown conversations' newest match newer bring none of them again", async ({
   pev,
 }) => {
