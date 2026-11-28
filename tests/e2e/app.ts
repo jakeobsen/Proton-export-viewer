@@ -3,7 +3,14 @@
 // the stock Electron binary. Each launch gets its own userData under test-output/,
 // removed again when the test passes.
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import {
   test as base,

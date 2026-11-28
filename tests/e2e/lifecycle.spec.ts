@@ -360,7 +360,9 @@ test('close returns only once core has exited, and the index is free', async () 
 
     // A stopped process can't exit, so core outlives main for sure. It is
     // let go only once main has exited, and a while after.
-    const mainExited = new Promise<void>((resolve) => pev.app.process().once('exit', () => resolve()));
+    const mainExited = new Promise<void>((resolve) =>
+      pev.app.process().once('exit', () => resolve()),
+    );
     process.kill(pid, 'SIGSTOP');
     stopped = true;
     let closedAt = 0;
