@@ -126,13 +126,13 @@ function textOfHtml(html: string, max: number | null): string {
 /** The plain text shown for a message, and whether it is only the first part of it. */
 function plainText(text: Body, html: Body): { text: string; cut: boolean } {
   const source = text.content.length > 0 || text.cut ? text : html;
-  const cut = source.bytes > HTML_ANYWAY_BYTES;
+  const long = source.bytes > HTML_ANYWAY_BYTES;
   let content = source.content;
   if (source === html) {
     // Text from HTML: twice the bytes shown is more than enough characters to cut from.
-    content = tidy(textOfHtml(html.content, cut ? 2 * FIRST_TEXT_BYTES : null));
+    content = tidy(textOfHtml(html.content, long ? 2 * FIRST_TEXT_BYTES : null));
   }
-  return { text: cut ? firstBytes(content, FIRST_TEXT_BYTES) : content, cut };
+  return { text: long ? firstBytes(content, FIRST_TEXT_BYTES) : content, cut: long || source.cut };
 }
 
 /**
@@ -144,7 +144,7 @@ export async function renderMessage(
   input: Readable,
   options: RenderOptions,
 ): Promise<RenderedMessage> {
-  const { headers: parsedHeaders, lines, text, html } = await extractMessage(input);
+  const { headers: parsedHeaders, lines, text, html, stopped } = await extractMessage(input);
   const headers = headerFields(parsedHeaders, lines);
   const hasHtml = html.content.length > 0 || html.cut;
   const htmlLimit = options.mode === 'html-anyway' ? HTML_ANYWAY_BYTES : HTML_VIEW_BYTES;
@@ -158,7 +158,7 @@ export async function renderMessage(
       remote: body.remote,
       hasHtml,
       htmlTooLarge: false,
-      truncated: false,
+      cut: stopped ? 'parts' : null,
     };
   }
   const plain = plainText(text, html);
@@ -176,6 +176,6 @@ export async function renderMessage(
       hasHtml &&
       html.bytes > HTML_VIEW_BYTES &&
       html.bytes <= HTML_ANYWAY_BYTES,
-    truncated: plain.cut,
+    cut: plain.cut ? 'size' : stopped ? 'parts' : null,
   };
 }
