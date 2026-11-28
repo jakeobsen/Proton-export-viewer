@@ -9,7 +9,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { once } from 'node:events';
-import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
@@ -17,6 +17,7 @@ import type { AllowRemoteResult, MessageOpenResult } from '../../src/shared/api'
 import { apng, dimensionBombPng, solidPng } from '../../tools/gen-export/images.mjs';
 import { MARKERS, findMarkers } from '../markers';
 import { testDir } from '../paths';
+import { writeThreads } from '../thread-export';
 import { expect, test, type PevApp } from './app';
 
 const PNG = solidPng(2, 2, [10, 20, 30]);
@@ -463,6 +464,92 @@ test('nothing else reloads the frame: theme, size, focus and the details line', 
     expect(pev.hasLog('nav.denied', { reason: 'reload_spent' })).toBe(false);
     expect(await widths(pev, opened.url)).toEqual([2]);
     await expect(banner(pev)).toHaveText('External images loaded · 1 not secure');
+  } finally {
+    await s.close();
+  }
+});
+
+/** Hidden windows get no frames to click in: events are sent directly. */
+const press = (pev: PevApp, selector: string) => pev.page.locator(selector).dispatchEvent('click');
+
+test('nothing else reloads the frame in a long conversation: Settings, the report, the cards scrolled away and back', async ({
+  pev,
+}) => {
+  test.setTimeout(90_000);
+  const s = await serve([['/', png]]);
+  try {
+    await pev.main('fetcherAllow', '127.0.0.1', s.port);
+    const root = realpathSync(testDir('remote-conversation'));
+    const written = writeThreads(root, { seed: 74, threads: [{ messages: 60 }, { messages: 1 }] });
+    // The newest message, the one expanded when the conversation opens, is HTML
+    // with one remote image.
+    const newest = join(written.run, `${written.threads[0]!.ids.at(-1)!}.eml`);
+    const eml = readFileSync(newest, 'utf8');
+    const head = eml.slice(0, eml.indexOf('\r\n\r\n'));
+    writeFileSync(
+      newest,
+      `${head.replace('Content-Type: text/plain', 'Content-Type: text/html')}\r\n\r\n` +
+        `<p>Stay</p><img src="${s.url('/a.png')}">\r\n`,
+    );
+    // A message file without its metadata, so the list header links to the report.
+    rmSync(join(written.run, `${written.threads[1]!.ids[0]!}.metadata.json`));
+    await pev.main('queuePick', root, 'bm1');
+    await pev.shell('chooseFolder', []);
+    await expect
+      .poll(
+        async () =>
+          (await pev.main<{ progress: { phase: string } } | null>('indexQuery', { op: 'totals' }))
+            ?.progress.phase,
+        { timeout: 30_000 },
+      )
+      .toBe('done');
+    await press(pev, '[data-folder="5"]');
+    await press(pev, '.list-scroll .conv >> nth=0');
+    await expect
+      .poll(async () => (await pev.shell<{ view: { url: string } | null }>('reader')).view?.url)
+      .toBeTruthy();
+    const url = (await pev.shell<{ view: { url: string } }>('reader')).view.url;
+    const frame = pev.page.locator('.card.expanded .rp-frame');
+    await expect(frame).toHaveAttribute('src', url);
+    await pev.bodyFrame(url);
+    await press(pev, '.card.expanded .rp-load-images');
+    await expect.poll(() => widths(pev, url)).toEqual([2]);
+    expect(await bodyLoads(pev, url)).toBe(2);
+
+    // Settings and back to mail.
+    await pev.page.getByRole('button', { name: 'Settings', exact: true }).dispatchEvent('click');
+    await expect(pev.page.locator('main.settings')).toBeVisible();
+    await pev.page
+      .getByRole('button', { name: 'Back to mail', exact: true })
+      .dispatchEvent('click');
+    await expect(pev.page.locator('main.settings')).toHaveCount(0);
+    await expect(frame).toBeVisible();
+
+    // The index report and back.
+    await expect(pev.page.locator('.list-head .attention')).toHaveCount(1);
+    await press(pev, '.list-head .attention');
+    await expect(pev.page.locator('.ix-card')).toHaveCount(1);
+    await press(pev, '.ix-foot button:text("Start browsing")');
+    await expect(pev.page.locator('.ix-card')).toHaveCount(0);
+    await expect(frame).toBeVisible();
+
+    // The cards scrolled to the oldest message, out of the drawn range, and back.
+    const scrollCards = (to: 'top' | 'end') =>
+      pev.page.locator('.cv-scroll').evaluate((e, where) => {
+        e.scrollTop = where === 'top' ? 0 : e.scrollHeight;
+        e.dispatchEvent(new Event('scroll'));
+      }, to);
+    await scrollCards('top');
+    await expect(pev.page.locator('.card .ch-name').first()).toHaveText('Sender 0');
+    await scrollCards('end');
+    await expect(frame).toHaveAttribute('src', url);
+    await pev.page.waitForTimeout(500);
+
+    expect(await bodyLoads(pev, url)).toBe(2);
+    expect(pev.hasLog('nav.denied', { reason: 'reload_spent' })).toBe(false);
+    expect(await widths(pev, url)).toEqual([2]);
+    await expect(banner(pev)).toHaveText('External images loaded · 1 not secure');
+    expect(s.seen.filter((p) => p === '/a.png')).toHaveLength(1);
   } finally {
     await s.close();
   }
