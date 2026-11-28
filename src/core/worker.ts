@@ -49,7 +49,8 @@ async function builderFor(stubId: string): Promise<StubBuilder | undefined> {
 }
 
 async function inputStream(input: ReaderInput): Promise<Readable | null> {
-  // The file is core's: read it by position and leave it open for core to close.
+  // The file is core's: read it by position and leave it open for core to
+  // close, even when the read fails and its stream is destroyed.
   if (input.kind === 'fd') return fdRead(input.fd);
   if (__PEV_TEST_HOOKS__ && input.kind === 'test') {
     const hooks = await import('../testhooks/reader-input');

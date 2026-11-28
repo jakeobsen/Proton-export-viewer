@@ -384,7 +384,7 @@ async function measured(
   const outcome = !result.ok
     ? result.code
     : result.outcome === 'view'
-      ? `${result.format}${result.htmlTooLarge ? ', HTML too large' : ''}${result.truncated ? ', first 1 MB' : ''}`
+      ? `${result.format}${result.htmlTooLarge ? ', HTML too large' : ''}${result.cut ? `, cut by ${result.cut}` : ''}`
       : 'fallback';
   console.log(
     `${label} (${mode}): ${outcome} in ${ms} ms; worker memory peak ${(workerPeak / MB).toFixed(0)} MB; core RSS +${(rssGrowth / MB).toFixed(0)} MB at peak`,
@@ -416,7 +416,7 @@ test('each reader ceiling: HTML too large, HTML anyway, the first 1 MB, and part
     format: 'plain',
     hasHtml: true,
     htmlTooLarge: true,
-    truncated: false,
+    cut: null,
   });
   const anyway = await measured(pev, 'HTML 6 MB', 2, 'html-anyway');
   expect(anyway.result).toMatchObject({ outcome: 'view', format: 'html', htmlTooLarge: false });
@@ -432,7 +432,7 @@ test('each reader ceiling: HTML too large, HTML anyway, the first 1 MB, and part
         outcome: 'view',
         format: 'plain',
         htmlTooLarge: false,
-        truncated: true,
+        cut: 'size',
       });
       const length = await bodyLength(cut.result);
       expect(length).toBeGreaterThan(0.9 * MB);
@@ -448,7 +448,7 @@ test('each reader ceiling: HTML too large, HTML anyway, the first 1 MB, and part
     outcome: 'view',
     format: 'plain',
     hasHtml: false,
-    truncated: false,
+    cut: null,
   });
   expect(drained.workerPeak).toBeLessThan(128 * MB);
 });
@@ -475,7 +475,7 @@ test('"Show HTML anyway" near 20 MB ends in a view or the fallback, and plain te
     await expect.poll(() => pev.hasLog('reader.worker_retired', { proc: 'core' })).toBe(true);
   }
   const plain = await measured(pev, 'HTML near 20 MB', 2, 'plain');
-  expect(plain.result).toMatchObject({ outcome: 'view', format: 'plain', truncated: false });
+  expect(plain.result).toMatchObject({ outcome: 'view', format: 'plain', cut: null });
   if (anyway.result.ok && anyway.result.outcome === 'view') {
     // Every worker here was ended on purpose (replaced, or for new limits): no exit is a warning.
     const exits = pev.logs('core').filter((l) => l.code === 'core.worker_exit');
@@ -500,7 +500,7 @@ test('a body too heavy to render as HTML gives the fallback, and its plain text 
     ok: true,
     outcome: 'view',
     format: 'plain',
-    truncated: false,
+    cut: null,
   });
 });
 
