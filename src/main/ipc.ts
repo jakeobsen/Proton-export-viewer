@@ -455,7 +455,13 @@ export function registerIpc(ctx: AppContext): void {
         openId,
         windowId: appWin.id,
       });
-      return { ok: true, openId, outcome: 'fallback', match };
+      return {
+        ok: true,
+        openId,
+        outcome: 'fallback',
+        match,
+        fileRefused: result.reason === 'file',
+      };
     }
     const message = result.read;
     if (!message) return reject('invalid', appWin);

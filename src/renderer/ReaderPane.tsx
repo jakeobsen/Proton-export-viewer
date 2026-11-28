@@ -379,6 +379,8 @@ export function MessageBody() {
         match: reader.match,
         refused: reader.refused,
         fallback: reader.fallback,
+        mode: reader.mode,
+        fileRefused: reader.fileRefused,
         view: view && { format: view.format, highlighted: view.highlighted },
       });
   if (reader.refused !== null) {

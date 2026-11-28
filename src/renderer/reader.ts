@@ -22,6 +22,8 @@ export interface ReaderState {
   view: ReaderView | null;
   /** The reader couldn't render the message. */
   fallback: boolean;
+  /** On the fallback: the message file itself couldn't be opened. */
+  fileRefused: boolean;
   /** Main refused the open. */
   refused: RejectCode | null;
   /** The search the latest open was made from; null outside search. */
@@ -36,6 +38,7 @@ const CLOSED: ReaderState = {
   pending: false,
   view: null,
   fallback: false,
+  fileRefused: false,
   refused: null,
   queryId: null,
   match: null,
@@ -89,6 +92,7 @@ export async function openInReader(
     pending: true,
     view: null,
     fallback: false,
+    fileRefused: false,
     refused: null,
     queryId,
     match: null,
@@ -115,7 +119,12 @@ export async function openInReader(
     update({ pending: false, refused: result.code, match });
     if (result.code === 'stale_generation') await refreshGeneration();
   } else if (result.outcome === 'fallback') {
-    update({ pending: false, fallback: true, match: result.match });
+    update({
+      pending: false,
+      fallback: true,
+      fileRefused: result.fileRefused,
+      match: result.match,
+    });
   } else {
     update({ pending: false, view: result, match: result.match });
   }

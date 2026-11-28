@@ -5,7 +5,7 @@
 // names; never the search text.
 
 import type { RejectCode } from '../shared/api';
-import type { MatchColumn, ReaderMatch } from '../shared/reader-protocol';
+import type { MatchColumn, OpenMode, ReaderMatch } from '../shared/reader-protocol';
 import { formatCount } from './format';
 
 /** What the match line shows: nothing, a line of text, or the body's matches with their action. */
@@ -19,6 +19,10 @@ export interface MatchLineInput {
   refused: RejectCode | null;
   /** The reader couldn't render the message. */
   fallback: boolean;
+  /** The mode the open asked for. */
+  mode: OpenMode;
+  /** On the fallback: the message file itself couldn't be opened. */
+  fileRefused: boolean;
   /** The body shown: its format, and whether it is the stored text with marks. */
   view: { format: 'plain' | 'html'; highlighted: boolean } | null;
 }
@@ -37,7 +41,14 @@ function matchesIn(columns: readonly MatchColumn[]): string {
 }
 
 /** The match line for the reader's latest open. */
-export function matchLine({ match, refused, fallback, view }: MatchLineInput): MatchLine {
+export function matchLine({
+  match,
+  refused,
+  fallback,
+  mode,
+  fileRefused,
+  view,
+}: MatchLineInput): MatchLine {
   if (match === null) return NONE;
   const { columns } = match;
   const where = columns.length > 0 ? matchesIn(columns) : null;
@@ -57,10 +68,11 @@ export function matchLine({ match, refused, fallback, view }: MatchLineInput): M
     // The marks are in the body itself.
     if (view?.highlighted) return NONE;
     // HTML, or the fallback: the plain view shows them. A plain view that came
-    // back without marks had them dropped, so it isn't offered again.
-    if (fallback || view?.format === 'html') {
-      return { kind: 'matches', text: matchesText(match.bodyMatches) };
-    }
+    // back without marks had them dropped, so it isn't offered again. Nor is it
+    // on a fallback that a plain open would meet again: the plain open itself
+    // failed, or the file couldn't be opened at all.
+    const plainOpens = fallback ? mode !== 'plain' && !fileRefused : view?.format === 'html';
+    if (plainOpens) return { kind: 'matches', text: matchesText(match.bodyMatches) };
   }
   return where === null ? NONE : { kind: 'text', text: where };
 }

@@ -208,6 +208,9 @@ export function selectResult(row: ResultRow): void {
     // Shown already; with the list's selection gone, the result owns it. Its
     // next open, by a card, a key or the body switch, is made from the search.
     resultShowing = cards.showing;
+    // Opened from the folder or for another search, it opens again for this
+    // one, so the reader shows how it matched.
+    if (reader.queryId !== search.currentQueryId) void openInReader(row.anchorRowid);
     return;
   }
   cards.show(row.anchorRowid, row.threadId);

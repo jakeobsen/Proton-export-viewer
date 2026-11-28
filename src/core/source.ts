@@ -563,7 +563,20 @@ export class SourceSession {
       return { ok: false, code: opened.gone ? 'eml_missing' : 'refused', ...withMatch };
     }
     const fd = opened.fd;
-    const changed = match && !isIndexedFile(fd, indexed);
+    let indexedFile: boolean;
+    try {
+      indexedFile = !match || isIndexedFile(fd, indexed);
+    } catch {
+      // The open file can't be checked: it is closed, and refused like one that can't be opened.
+      try {
+        closeSync(fd);
+      } catch {
+        // Closed already.
+      }
+      this.log.info('open.file_refused', { reason: 'unreadable' });
+      return { ok: false, code: 'refused', ...withMatch };
+    }
+    const changed = match && !indexedFile;
     return {
       ok: true,
       ...(changed ? { match: unindexedBody(match) } : withMatch),

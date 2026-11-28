@@ -115,7 +115,14 @@ export type MessageOpenResult =
       /** For an open from search: how the message matched; null otherwise. */
       match: ReaderMatch | null;
     }
-  | { ok: true; openId: number; outcome: 'fallback'; match: ReaderMatch | null }
+  | {
+      ok: true;
+      openId: number;
+      outcome: 'fallback';
+      match: ReaderMatch | null;
+      /** The message file itself couldn't be opened, so no other view of it opens either. */
+      fileRefused: boolean;
+    }
   /** A missing message file opened from search says how the message matched. */
   | { ok: false; code: 'eml_missing'; match: ReaderMatch | null }
   | Rejected;

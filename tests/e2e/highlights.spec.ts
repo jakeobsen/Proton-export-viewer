@@ -323,6 +323,51 @@ test('from search, the plain view marks the matches and the HTML view counts the
   }
 });
 
+test('a result on the message the reader shows opens it again for its search, once', async ({
+  pev,
+}) => {
+  const mails: Mail[] = [
+    { id: 'D1', subject: 'Delta memo', time: T0 + 1, text: 'The invoice is in the memo folder.' },
+    { id: 'E1', subject: 'Echo note', time: T0 + 2, text: 'Nothing to see here.' },
+  ];
+  const { root } = craft('hl-reopen', mails);
+  await openIndexed(pev, root, mails.length);
+
+  // From the folder: no search, so no marks.
+  const row = pev.page.locator('.list-scroll .conv', {
+    has: pev.page.locator('.subj .t', { hasText: 'Delta' }),
+  });
+  const anchor = Number(await row.getAttribute('data-rowid'));
+  await press(row);
+  const fromFolder = await settledReader(pev, anchor);
+  expect(fromFolder).toMatchObject({ queryId: null, match: null });
+  expect(fromFolder.view).toMatchObject({ format: 'plain', highlighted: false });
+
+  // Its result: the same message opens again, now with the search's marks.
+  await searchFor(pev, 'invoice');
+  await press(resultWith(pev, 'Delta'));
+  await expect.poll(async () => (await reader(pev)).view?.highlighted ?? false).toBe(true);
+  const first = await settledReader(pev, anchor);
+  expect(first.queryId).not.toBeNull();
+  expect(first.match).toMatchObject({ bodyMatches: 1 });
+  expect((await marks(await pev.bodyFrame(first.view!.url))).marked).toEqual(['invoice']);
+
+  // Another search's result on the same message: its marks replace the old ones.
+  await searchFor(pev, 'folder');
+  await press(resultWith(pev, 'Delta'));
+  await expect.poll(async () => (await reader(pev)).queryId).not.toBe(first.queryId);
+  const second = await settledReader(pev, anchor);
+  expect(second.view?.url).not.toBe(first.view!.url);
+  expect((await marks(await pev.bodyFrame(second.view!.url))).marked).toEqual(['folder']);
+
+  // The same result again: shown for this search already, so it isn't opened
+  // again. An open would have started within the click itself.
+  await press(resultWith(pev, 'Delta'));
+  const again = await reader(pev);
+  expect(again).toMatchObject({ pending: false, queryId: second.queryId });
+  expect(again.view?.url).toBe(second.view!.url);
+});
+
 test('the match line says where else a message matched when its body shows no marks', async ({
   pev,
 }) => {

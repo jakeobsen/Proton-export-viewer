@@ -22,7 +22,15 @@ const plain = { format: 'plain', highlighted: false } as const;
 const marked = { format: 'plain', highlighted: true } as const;
 
 const line = (input: Partial<MatchLineInput>) =>
-  matchLine({ match: null, refused: null, fallback: false, view: html, ...input });
+  matchLine({
+    match: null,
+    refused: null,
+    fallback: false,
+    mode: 'html',
+    fileRefused: false,
+    view: html,
+    ...input,
+  });
 
 describe('the match line', () => {
   it('counts body matches in the HTML view and offers the plain view', () => {
@@ -108,6 +116,31 @@ describe('the match line', () => {
       kind: 'matches',
       text: '2 matches',
     });
+    expect(
+      line({ fallback: true, mode: 'html-anyway', view: null, match: match({ bodyMatches: 2 }) }),
+    ).toEqual({ kind: 'matches', text: '2 matches' });
+  });
+
+  it('on the fallback, never offers a plain view that would fail the same way', () => {
+    const fallback = { fallback: true, view: null };
+    // The failed open was the plain view itself.
+    expect(line({ ...fallback, mode: 'plain', match: match({ bodyMatches: 2 }) })).toEqual({
+      kind: 'none',
+    });
+    expect(
+      line({ ...fallback, mode: 'plain', match: match({ bodyMatches: 2, columns: ['subject'] }) }),
+    ).toEqual({ kind: 'text', text: 'Matches in: subject' });
+    // The message file couldn't be opened at all.
+    expect(line({ ...fallback, fileRefused: true, match: match({ bodyMatches: 2 }) })).toEqual({
+      kind: 'none',
+    });
+    expect(
+      line({
+        ...fallback,
+        fileRefused: true,
+        match: match({ bodyMatches: 2, columns: ['sender'] }),
+      }),
+    ).toEqual({ kind: 'text', text: 'Matches in: sender' });
   });
 
   it('lists only the other columns once the file changed since it was indexed', () => {
@@ -116,6 +149,19 @@ describe('the match line', () => {
       text: 'Matches in: subject',
     });
     expect(line({ match: match({ changed: true }) })).toEqual({ kind: 'none' });
+    // Its body matches belong to the old file: never counted, in the HTML view or on the fallback.
+    const changed = match({ changed: true, bodyMatches: 3, columns: ['subject'] });
+    expect(line({ match: changed, view: html })).toEqual({
+      kind: 'text',
+      text: 'Matches in: subject',
+    });
+    expect(line({ match: changed, fallback: true, view: null })).toEqual({
+      kind: 'text',
+      text: 'Matches in: subject',
+    });
+    expect(line({ match: { ...changed, columns: [] }, fallback: true, view: null })).toEqual({
+      kind: 'none',
+    });
   });
 
   it('is never an empty "Matches in": no columns and no body match is no line', () => {
