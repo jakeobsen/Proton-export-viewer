@@ -230,6 +230,40 @@ describe('the owed wipe', () => {
     expect(h.events.slice(-2)).toEqual(['save owed=false', 'send record first']);
   });
 
+  it('shows nothing from a read that was in core when the switch turned off', async () => {
+    const h = harness();
+    h.activate();
+    h.jobs.ready(h.stamp());
+    const list = h.jobs.list(h.stamp());
+    await flush();
+    expect(h.events).toEqual(['send list']);
+    // Off, as main does it: the switch and the owed wipe saved, then the wipe queued.
+    h.reg.keep = false;
+    h.reg.owed = true;
+    const off = h.jobs.wipe(h.stamp());
+    // Core answers the read with a row it found before the wipe.
+    await h.answer();
+    expect(await list).toEqual([]);
+    expect(h.events).toEqual(['send list', 'send wipe']);
+    await h.answer();
+    expect(await off).toBe('ok');
+    expect(h.reg.owed).toBe(false);
+  });
+
+  it('shows nothing from a read that was in core when a wipe became owed', async () => {
+    const h = harness();
+    h.activate();
+    h.jobs.ready(h.stamp());
+    const list = h.jobs.list(h.stamp());
+    await flush();
+    // Turned off and on again while the read was in core: the switch is on, the wipe still owed.
+    h.reg.owed = true;
+    void h.jobs.wipe(h.stamp());
+    await h.answer();
+    expect(await list).toEqual([]);
+    expect(h.events).toEqual(['send list', 'send wipe']);
+  });
+
   it('answers a read while the wipe is held at once, with nothing', async () => {
     const h = harness();
     h.activate();

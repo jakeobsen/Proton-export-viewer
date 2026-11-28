@@ -246,6 +246,12 @@ export class RecentJobs {
       case 'record':
         return;
       case 'list': {
+        // The switch went off, or a wipe became owed, while the read was in
+        // core: the gate is closed now, so its rows are never shown.
+        if (!this.deps.keeps(src) || this.deps.owes(src)) {
+          job.done([]);
+          return;
+        }
         const rows = result.recent?.op === 'list' ? result.recent.rows : [];
         job.done(rows.map((row) => parseRecent(row.q)).filter((s): s is SearchSpec => s !== null));
         return;
