@@ -83,6 +83,8 @@ const testState = {
 };
 /** Test builds can hold phase 1's writes. */
 let writeGate: import('../testhooks/core').WriteGate | null = null;
+let scanGate: import('../testhooks/core').WriteGate | null = null;
+let indexGate: import('../testhooks/core').WriteGate | null = null;
 
 process.on('uncaughtException', (err) => log?.error('core.uncaught', errorData(err, roots)));
 process.on('unhandledRejection', (reason) =>
@@ -258,6 +260,8 @@ function handle(request: CoreRequest): void {
             readerSource: () => readerSource,
             session,
             writeGate,
+            scanGate,
+            indexGate,
             runSearch: (held) => {
               if (session) session.handle(held);
               else reply({ type: 'result', reqId: held.reqId, ok: false, code: 'no_source' });
@@ -334,11 +338,15 @@ async function init(event: Electron.MessageEvent): Promise<void> {
   if (__PEV_TEST_HOOKS__ && init.test) {
     const hooks = await import('../testhooks/core');
     writeGate = new hooks.WriteGate(init.test.holdWrites === true);
+    scanGate = new hooks.WriteGate(init.test.holdScans === true);
+    indexGate = new hooks.WriteGate(init.test.holdIndexOpens === true);
     options = {
       ...(init.test.batchPairs ? { batchPairs: init.test.batchPairs } : {}),
       ...(init.test.txnBytes ? { txnBytes: init.test.txnBytes } : {}),
       readByName: init.test.readByName === true,
       beforeWrite: writeGate.beforeWrite,
+      beforeScan: scanGate.beforeWrite,
+      beforeIndexOpen: indexGate.beforeWrite,
     };
   }
   session = new SourceSession(

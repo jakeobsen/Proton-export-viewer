@@ -160,6 +160,10 @@ export interface IndexOptions {
   batchPairs?: number;
   /** Builds with test hooks only: awaited before each phase 1 write. */
   beforeWrite?: () => Promise<void>;
+  /** Builds with test hooks only: awaited before a scan lists the run's folder, and after. */
+  beforeScan?: () => Promise<void>;
+  /** Builds with test hooks only: awaited before the index opens. */
+  beforeIndexOpen?: () => Promise<void>;
   /**
    * Builds with test hooks only: read new metadata files in name order, and
    * write their batches in that order.
@@ -716,9 +720,11 @@ export class IndexService {
       return true;
     } catch (err) {
       this.progress.phase = 'failed';
-      this.report(true);
-      this.watch(err);
       const code = err instanceof ThreadError ? err.code : 'FAILED';
+      // A damaged index is reported as such once it is torn down, and main
+      // rebuilds it; any other failure is reported now, and main closes the source.
+      if (code !== 'INDEX_CORRUPT') this.report(true);
+      this.watch(err);
       this.deps.log.warn('index.phase1_failed', { reason: failureReason(code) }, this.src);
       return false;
     }
@@ -1230,7 +1236,8 @@ export class IndexService {
   }
 }
 
-function failureReason(code: string): string {
+/** The log reason for a thread error's code. */
+export function failureReason(code: string): string {
   switch (code) {
     case 'STALE':
     case 'CANCELLED':
