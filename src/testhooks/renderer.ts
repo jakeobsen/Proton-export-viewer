@@ -2,7 +2,7 @@
 // Shell test hooks, reached by tests as window.__pevTest.
 
 import { reportError } from '../renderer/errors';
-import { cards, list } from '../renderer/mailbox-state';
+import { cards, list, search } from '../renderer/mailbox-state';
 import {
   chooseFolder,
   clearLink,
@@ -124,6 +124,11 @@ export function install(): void {
   const api = {
     state: () => getShellState(),
     listSelection: () => list.snapshot.selected,
+    /** The search's state, with the shown rows as conversation IDs. */
+    search: () => {
+      const { rows, ...rest } = search.snapshot;
+      return { ...rest, threadIds: rows.map((r) => r.threadId) };
+    },
     /** The conversation's cards: which one is expanded, and what is held. */
     cards: () => cards.snapshot,
     /** Body frames in the shell's own tree, with their URLs. */

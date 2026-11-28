@@ -19,6 +19,7 @@ import {
   type Rejected,
   type RejectCode,
   type SearchResult,
+  type SnippetsResult,
   type SourceActionResult,
   type SourcesResult,
   type StateResult,
@@ -28,9 +29,11 @@ import {
   CARDS_BEFORE,
   CARDS_FOLLOW,
   MAX_QUERY_LENGTH,
+  MAX_SNIPPET_THREADS,
   WINDOW_AFTER,
   WINDOW_BEFORE,
   type SearchPage,
+  type SearchSnippets,
 } from '../shared/index-types';
 import type { SourceOutcome } from '../shared/sources';
 import { STALE, type Stale } from './sources/manager';
@@ -184,6 +187,17 @@ const SearchArgs = z.tuple([
       })
       .strict(),
   ]),
+]);
+
+// Snippets for result rows: the search they belong to and its conversations.
+const SnippetsArgs = z.tuple([
+  z
+    .object({
+      queryId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      threadIds: z.array(SearchThreadId).min(1).max(MAX_SNIPPET_THREADS),
+      generation: Generation,
+    })
+    .strict(),
 ]);
 
 const SourceKey = z.uuid();
@@ -453,6 +467,11 @@ export function registerIpc(ctx: AppContext): void {
    */
   const searchLanes = new SearchLanes<AppWindow>();
   let lastQueryId = 0;
+  /** Per window, its latest search's text, and the first query ID made with that text. */
+  const currentSearch = new WeakMap<
+    AppWindow,
+    { text: string; firstQueryId: number; generation: number }
+  >();
   guarded<SearchResult>(IPC.search, async (appWin, raw) => {
     const args = SearchArgs.safeParse(raw);
     if (!args.success) return reject('invalid', appWin);
@@ -460,6 +479,10 @@ export function registerIpc(ctx: AppContext): void {
     if (generation !== ctx.generation) return reject('stale_generation', appWin);
     lastQueryId += 1;
     const queryId = lastQueryId;
+    const known = currentSearch.get(appWin);
+    if (known?.text !== request.text || known.generation !== generation) {
+      currentSearch.set(appWin, { text: request.text, firstQueryId: queryId, generation });
+    }
     const outcome = await searchLanes.run(appWin, async () =>
       // A search that waited is checked again when its turn comes.
       generation === ctx.generation
@@ -472,6 +495,40 @@ export function registerIpc(ctx: AppContext): void {
     const page = outcome.answer as SearchPage | null;
     if (page?.queryId !== queryId) return reject('invalid', appWin);
     return { ok: true, generation, queryId, page, progress: outcome.progress };
+  });
+
+  /**
+   * Snippets for rows of the window's current search, by its query ID: main
+   * uses the text that search was made with, so the window can't ask for any
+   * other. An older search's ID, or one from another generation, is
+   * superseded. One request runs per window and one waits, as for searches.
+   */
+  const snippetLanes = new SearchLanes<AppWindow>();
+  guarded<SnippetsResult>(IPC.searchSnippets, async (appWin, raw) => {
+    const args = SnippetsArgs.safeParse(raw);
+    if (!args.success) return reject('invalid', appWin);
+    const [{ queryId, threadIds, generation }] = args.data;
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    const search = currentSearch.get(appWin);
+    if (
+      !search ||
+      search.generation !== generation ||
+      queryId < search.firstQueryId ||
+      queryId > lastQueryId
+    ) {
+      return { ok: false, code: 'superseded' };
+    }
+    const outcome = await snippetLanes.run(appWin, async () =>
+      generation === ctx.generation
+        ? ctx.sources.queryIndex({ op: 'snippets', queryId, text: search.text, threadIds })
+        : null,
+    );
+    if (outcome === SUPERSEDED) return { ok: false, code: 'superseded' };
+    if (generation !== ctx.generation) return reject('stale_generation', appWin);
+    if (!outcome) return { ok: false, code: 'no_source' };
+    const answer = outcome.answer as SearchSnippets | null;
+    if (answer?.queryId !== queryId) return reject('invalid', appWin);
+    return { ok: true, generation, queryId, snippets: answer.snippets };
   });
 
   /**

@@ -46,7 +46,7 @@ import { runIdentity } from './identity';
 import { FamilyInUse, deleteFamily } from './index/family';
 import type { CheckResult } from './index/ops';
 import { ThreadError, type IndexThread, type ThreadRole } from './index/pool';
-import { BODY_STATE, probeMismatch } from './index/schema';
+import { BODY_STATE, mismatchOf, probeIdentity } from './index/schema';
 import type { OpenedMessage } from './reader/source';
 import { overlaps } from '../shared/overlap';
 import { ConnectionRegistry, IndexService, type IndexOptions } from './index/service';
@@ -245,7 +245,8 @@ export class SourceSession {
    * and starts phase 1 for the messages it doesn't have yet. While the run is
    * unavailable, only an existing index with the expected identity opens, for
    * browsing; nothing is created or indexed. One there that isn't this index
-   * is damaged: it is deleted, and rebuilt once the run is back.
+   * is damaged: it is deleted, and rebuilt once the run is back. One of
+   * another schema version is kept as it is until then.
    */
   private openIndex(request: IndexRequest, root: string | null, stamp: Stamp): Promise<void> {
     const fail = (code: 'invalid' | 'stale' | 'closed' | 'damaged' | 'unavailable') =>
@@ -277,7 +278,19 @@ export class SourceSession {
           }
           if (err instanceof ThreadError && err.code === 'INDEX_DAMAGED') {
             const dbPath = this.dbPathOf(stamp.sourceKey);
-            const reason = (dbPath && probeMismatch(dbPath, request.dbUuid)) || 'identity';
+            const found = dbPath ? probeIdentity(dbPath) : null;
+            const reason = (dbPath && mismatchOf(found, request.dbUuid)) || 'identity';
+            if (reason === 'schema' && root === null) {
+              // An index of another schema version is no damage: it stays as
+              // it is while the export can't be read, and the next open with
+              // the export there rebuilds it.
+              this.log.info(
+                'index.schema_pending',
+                { schemaVersion: found?.version ?? 0 },
+                { src: stamp.sourceKey },
+              );
+              return fail('unavailable');
+            }
             this.log.warn('index.damaged', { reason }, { src: stamp.sourceKey });
             this.removeFamily(stamp.sourceKey, true);
             this.sendEvent(stamp, { ...fresh.progress, condition: 'damaged' }, true);
@@ -310,7 +323,7 @@ export class SourceSession {
         index: this.opened!,
         progress: { ...service.progress },
       });
-      void service.startPhase1(scan);
+      void service.startIndexing(scan);
     });
   }
 

@@ -49,7 +49,10 @@ const FORBIDDEN_CONTENT = [
   'pev-no-resolver-rule',
   'sessionPreconnects',
   'readByName',
+  'txnBytes',
   'openGapMs',
+  // Core's test hold for searches.
+  'hold-searches',
   // The self-test's smoke drives the body frame through the DevTools protocol.
   ...SELFTEST_ONLY,
   // Core's hold of a read once its message file is open.
