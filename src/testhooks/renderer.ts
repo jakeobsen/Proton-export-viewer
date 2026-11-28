@@ -18,6 +18,7 @@ import { closeReader, getReaderState, openInReader } from '../renderer/reader';
 import type { OpenResult } from '../shared/api';
 import { BODY_IFRAME_REFERRER, BODY_IFRAME_SANDBOX } from '../shared/constants';
 import type { OpenMode } from '../shared/reader-protocol';
+import { gateShell } from './gate-shell';
 import { markLoaded } from './marker';
 import type { TimedOpen } from './open-bench-types';
 
@@ -154,6 +155,8 @@ export function install(): void {
     },
     readyFrame,
     openTimes,
+    /** The gate mode's shell side. */
+    gate: gateShell,
     windowOpen: (url: string) => {
       window.open(url);
     },

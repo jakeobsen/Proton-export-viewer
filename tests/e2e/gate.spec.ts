@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// The gate mode of test builds, on a small export: each launch (the probe, a
+// fresh index, its reopen, and timed expansions) runs hidden, picks or
+// reopens the export as a user does, writes its result into the run's
+// workspace and quits. The export is only read. Timing values aren't judged
+// here; what each launch records, and that every wait ends, is.
+
+import { createHash, randomBytes } from 'node:crypto';
+import { existsSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { _electron as electron } from '@playwright/test';
+import type { GateConfig } from '../../src/testhooks/gate-config';
+import type { FirstRows, RafProbe, TimedExpansion } from '../../src/testhooks/gate-types';
+import {
+  batchNumbers,
+  frameStats,
+  freshNumbers,
+  opensNumbers,
+  rafVerdict,
+  reopenNumbers,
+} from '../../tools/bench/run-gate.mjs';
+import { createWorkspace } from '../../tools/bench/workspace.mjs';
+import { writeExport } from '../exports';
+import { REPO_ROOT, testDir } from '../paths';
+// This test's own folders are removed once it passes.
+import { expect, test } from './app';
+
+/** Every file and folder under the folder, files with the SHA-256 of their content. */
+function snapshot(root: string, at = ''): Record<string, string> {
+  return Object.fromEntries(
+    readdirSync(join(root, at), { withFileTypes: true }).flatMap((entry) => {
+      const rel = join(at, entry.name);
+      if (entry.isDirectory())
+        return [[`${rel}/`, 'folder'], ...Object.entries(snapshot(root, rel))];
+      const hash = createHash('sha256')
+        .update(readFileSync(join(root, rel)))
+        .digest('hex');
+      return [[rel, hash]];
+    }),
+  );
+}
+
+interface Result {
+  ok: boolean;
+  error?: string;
+  mode: string;
+  inputs: { backgroundThrottling: boolean; capBytes: number };
+  window: { visible: boolean; focused: boolean };
+  windowEvents: unknown[];
+  phases: Array<{ phase: string; atEpoch: number }>;
+  progress: Array<{ at: number; phase: string; bodyPhase: string }>;
+  rafBefore?: RafProbe;
+  rafAfter?: RafProbe;
+  firstRows?: FirstRows;
+  pickedAt?: number;
+  phase1DoneAt?: number;
+  indexedAt?: number | null;
+  scrolls?: Array<{
+    name: string;
+    trace: string | null;
+    run: { steps: number; byFrame: number; byTimer: number };
+  }>;
+  idle?: { indexingDuring: number; fromEpoch: number; toEpoch: number } | null;
+  openedAt?: number;
+  verified?: { code: string } | null;
+  batches?: unknown[] | null;
+  sample?: Array<{ rel: string; size: number; rowid: number }>;
+  warmup?: { requested: number; count: number; views: number };
+  opens?: TimedExpansion[];
+  indexingDuringOpens?: number;
+  totals?: { messages: number } | null;
+}
+
+async function launch(
+  name: string,
+  root: string,
+  userData: string,
+  over: Partial<GateConfig>,
+): Promise<{ result: Result; workspace: string }> {
+  const nonce = randomBytes(8).toString('hex');
+  const workspace = join(testDir(`gate-${name}`), 'ws');
+  createWorkspace(workspace, nonce, []);
+  const config = join(workspace, 'config.json');
+  const full: GateConfig = {
+    nonce,
+    workspace,
+    mode: 'fresh',
+    root,
+    capBytes: 300_000_000,
+    stepMs: 60_000,
+    frameMs: 250,
+    rafProbes: 5,
+    scrollSteps: 6,
+    settleMs: 300,
+    idleMs: 700,
+    trace: false,
+    sample: null,
+    ...over,
+  };
+  writeFileSync(config, JSON.stringify(full));
+  const app = await electron.launch({
+    args: [join(REPO_ROOT, 'out-test'), `--pev-user-data=${userData}`, `--pev-gate=${config}`],
+    cwd: REPO_ROOT,
+    chromiumSandbox: true,
+  });
+  await app.waitForEvent('close', { timeout: 180_000 });
+  const file = join(workspace, `gate-result-${nonce}.json`);
+  expect(existsSync(file), name).toBe(true);
+  return { result: JSON.parse(readFileSync(file, 'utf8')) as Result, workspace };
+}
+
+function hidden(result: Result): void {
+  expect(result.error).toBeUndefined();
+  expect(result.ok).toBe(true);
+  expect(result.window).toEqual({ visible: false, focused: false });
+  expect(result.windowEvents).toEqual([]);
+  expect(result.inputs.backgroundThrottling).toBe(false);
+}
+
+test('the gate mode runs each launch hidden, records what the report needs, and reads the export only', async () => {
+  test.setTimeout(600_000);
+  const root = realpathSync(testDir('gate-export'));
+  writeExport(root, { seed: 7, messages: 120 });
+  const before = snapshot(root);
+  const profile = testDir('gate-profile');
+
+  // The probe: frames after DOM changes, and traced scrolls during and after phase 1.
+  const probe = await launch('probe', root, testDir('gate-probe-profile'), {
+    mode: 'probe',
+    trace: true,
+  });
+  hidden(probe.result);
+  for (const p of [probe.result.rafBefore, probe.result.rafAfter]) {
+    expect(p!.samples.length + p!.timeouts).toBe(5);
+  }
+  expect(
+    rafVerdict([probe.result.rafBefore, probe.result.rafAfter]).samples,
+  ).toBeGreaterThanOrEqual(0);
+  const scrolls = probe.result.scrolls!;
+  expect(scrolls.map((s) => s.name)).toEqual(['list-phase1', 'list-after', 'conversation']);
+  for (const s of scrolls) {
+    expect(s.run.byFrame + s.run.byTimer).toBe(6);
+    expect(s.trace).not.toBeNull();
+    const stats = frameStats(JSON.parse(readFileSync(s.trace!, 'utf8')));
+    expect(stats.events).toBeGreaterThan(0);
+  }
+
+  // A fresh index: first rows after the pick, phase 1, phase 2, then idle with nothing indexing.
+  const fresh = await launch('fresh', root, profile, {});
+  hidden(fresh.result);
+  const f = freshNumbers(fresh.result as unknown as Record<string, unknown>);
+  expect(f.firstRowsCommitMs).toBeGreaterThan(0);
+  expect(f.phase1Ms).toBeGreaterThanOrEqual(f.firstRowsCommitMs!);
+  expect(fresh.result.idle).toMatchObject({ indexingDuring: 0 });
+  expect(fresh.result.phases.map((p) => p.phase)).toEqual(
+    expect.arrayContaining(['phase1', 'scroll-after', 'phase2', 'settle', 'idle', 'idle-end']),
+  );
+  expect(fresh.result.inputs.capBytes).toBe(300_000_000);
+  const batches = batchNumbers(fresh.result.batches);
+  expect(batches.batches).toBeGreaterThan(0);
+  expect(batches.p95).not.toBeNull();
+
+  // Its reopen: the rows after index.opened, then reconcile and the check.
+  const reopen = await launch('reopen', root, profile, { mode: 'reopen' });
+  hidden(reopen.result);
+  const r = reopenNumbers(reopen.result as unknown as Record<string, unknown>);
+  expect(r.rowsAfterOpened).toBe(true);
+  expect(r.reconcileMs).not.toBeNull();
+  expect(r.verified).toBe(true);
+
+  // Expansions on a fresh index once indexing has ended, through the cards model.
+  const opens = await launch('opens', root, testDir('gate-opens-profile'), {
+    mode: 'opens',
+    sample: { seed: 1, count: 4, maxBytes: 1_048_576, warmup: 1 },
+  });
+  hidden(opens.result);
+  expect(opens.result.sample).toHaveLength(4);
+  expect(opens.result.warmup).toEqual({ requested: 1, count: 1, views: 1 });
+  expect(opensNumbers(opens.result.opens)).toMatchObject({ opens: 4, views: 4 });
+  expect(opens.result.indexingDuringOpens).toBe(0);
+
+  // The export was only read.
+  expect(snapshot(root)).toEqual(before);
+});

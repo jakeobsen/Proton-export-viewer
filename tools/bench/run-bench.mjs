@@ -300,7 +300,8 @@ export function parseFootprint(text) {
   return out;
 }
 
-function footprintOf(root) {
+/** The summed physical footprint of the app's process tree, each process's too; null if unreadable. */
+export function footprintOf(root) {
   try {
     const text = execFileSync(
       'footprint',

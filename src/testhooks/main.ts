@@ -565,6 +565,11 @@ export async function install(ctx: AppContext): Promise<boolean> {
     void openBench.runOpenBench(ctx, process.argv, windowEvents);
     return true;
   }
+  const gate = await import('./gate');
+  if (gate.gateRequested(process.argv)) {
+    void gate.runGate(ctx, process.argv, windowEvents);
+    return true;
+  }
 
   const selfTest = process.argv.includes('--pev-selftest');
   if (selfTest) {
