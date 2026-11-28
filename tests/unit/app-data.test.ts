@@ -31,6 +31,7 @@ function appFiles(userData: string): void {
   writeFileSync(join(userData, 'sources.json'), '{}');
   writeFileSync(join(userData, 'sources.json.tmp'), '{}');
   writeFileSync(join(userData, 'settings.json'), '{}');
+  writeFileSync(join(userData, 'settings.json.tmp'), '{}');
 }
 
 describe('removeAppData', () => {

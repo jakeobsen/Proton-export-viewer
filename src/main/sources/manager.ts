@@ -93,6 +93,11 @@ export interface SourceManagerDeps {
   notify(): void;
   /** Stops main's own log files, so a reset leaves no log folder behind. */
   stopLogs?(): void;
+  /**
+   * After a reset deleted the app's data: main's log files start again, and
+   * settings go back to their defaults.
+   */
+  afterReset?(): void;
   /** Tells the shell where the open source's index stands. */
   indexChanged?(progress: IndexProgress): void;
   picker: Picker;
@@ -174,7 +179,7 @@ export class SourceManager {
   private scope: { pickId: string; handle: ScopeHandle } | null = null;
   private queue: Promise<unknown> = Promise.resolve();
   private restoring = false;
-  /** Closed for good by a reset: nothing opens any more. */
+  /** Closed while a reset runs: nothing opens. */
   private admitting = true;
   /** Sources whose index was found damaged: the next index made for them is a rebuild. */
   private readonly rebuilds = new Set<string>();
@@ -215,6 +220,11 @@ export class SourceManager {
   /** The open source's last scan, when one finished for its current stamp. */
   scanSummary(): ScanSummary | null {
     return this.active?.scan ?? null;
+  }
+
+  /** The key of every source the app knows. */
+  sourceKeys(): string[] {
+    return this.registry.sources().map((s) => s.sourceKey);
   }
 
   view(): SourcesView {
@@ -825,6 +835,58 @@ export class SourceManager {
   }
 
   /**
+   * Builds the open source's index again, by hand. Under the lifecycle lock,
+   * the source's views are revoked under a new generation, core tears its
+   * index down and deletes it, and the source opens again with a fresh index.
+   * Only for the open, known source while its run is there. If core can't
+   * delete the index, the source opens again with it, and that is 'busy'.
+   */
+  rebuildIndex(sourceKey: string, expected: number): Promise<SourceOutcome | null | Stale> {
+    return this.serial(async () => {
+      if (!this.admitting) return 'closed';
+      const active = this.active;
+      const source = this.registry.source(sourceKey);
+      if (!active || !source || active.source.sourceKey !== sourceKey) return null;
+      if (!active.online) return 'offline';
+      const generation = this.deps.bumpGeneration();
+      this.deps.notify();
+      // The index loses its identity before its files go, so an index found
+      // after a crash in between is never taken for this one.
+      const dbUuid = source.dbUuid ?? null;
+      this.registry.updateSource(sourceKey, { dbUuid: null });
+      this.registry.save();
+      let deleted = await this.coreForget(sourceKey);
+      if (!deleted) {
+        // A core started afresh holds nothing of it.
+        await this.stopCore(generation);
+        this.deps.core.setSource(null);
+        deleted = await this.coreForget(sourceKey);
+      }
+      if (deleted) {
+        this.deps.log.info('index.rebuild', { generation, reason: 'manual' }, { src: sourceKey });
+      } else {
+        // The index is still there and still this one.
+        this.registry.updateSource(sourceKey, { dbUuid });
+        this.registry.save();
+        this.deps.log.warn('index.rebuild_refused', { reason: 'in_use' }, { src: sourceKey });
+      }
+      // Core retired the key when it deleted the index: the source opens in a
+      // new core, as after a switch.
+      const known = this.registry.source(sourceKey);
+      if (!known) return null;
+      const outcome = await this.activate({
+        pick: active.pick,
+        run: runOf(known),
+        known,
+        verify: false,
+        onMismatch: 'offline',
+        runs: active.runs,
+      });
+      return deleted || outcome !== 'opened' ? outcome : 'busy';
+    }, expected);
+  }
+
+  /**
    * Forgets a source: if it is open, it is torn down under a new generation
    * and its folder released; core deletes its index; then it leaves the
    * registry and the recent list. The export's own files are never touched.
@@ -875,40 +937,52 @@ export class SourceManager {
   }
 
   /**
-   * Resets the app: from now on nothing opens. After the operation in
-   * progress, the open source is torn down in core and core is stopped; only
-   * then is the app's data deleted.
+   * Resets the app. From now until it's done nothing opens. After the
+   * operation in progress, the open source is torn down in core and core is
+   * stopped; only then is the app's data deleted. Then the app starts afresh,
+   * as at a launch with nothing to reopen. True if the data was deleted.
    */
-  reset(): Promise<void> {
+  reset(): Promise<boolean> {
     this.admitting = false;
     return this.serial(async () => {
-      const exports = this.exportRoots();
-      const generation = this.deps.bumpGeneration();
-      this.active = null;
-      if (this.deps.core.running) {
-        try {
-          await this.deps.core.request({ type: 'reset' });
-        } catch {
-          // Core ended on its own; it holds nothing any more.
-        }
+      try {
+        return await this.resetNow();
+      } finally {
+        this.admitting = true;
+        if (!this.deps.core.running) await this.deps.core.startWith(null).catch(() => false);
       }
-      await this.stopCore(generation);
-      this.releaseScope(generation);
-      this.deps.core.setSource(null);
-      this.rebuilds.clear();
-      // Nothing is deleted if any export the app knows overlaps what would be.
-      const targets = appDataPaths(this.deps.userData);
-      if (targets.some((target) => exports.some((root) => overlaps(root, target)))) {
-        this.deps.log.warn('app.reset_refused', { reason: 'overlap' });
-        this.deps.notify();
-        return;
-      }
-      this.registry.clear();
-      this.deps.log.info('app.reset', { generation });
-      this.deps.stopLogs?.();
-      removeAppData(this.deps.userData);
-      this.deps.notify();
     });
+  }
+
+  private async resetNow(): Promise<boolean> {
+    const exports = this.exportRoots();
+    const generation = this.deps.bumpGeneration();
+    this.active = null;
+    if (this.deps.core.running) {
+      try {
+        await this.deps.core.request({ type: 'reset' });
+      } catch {
+        // Core ended on its own; it holds nothing any more.
+      }
+    }
+    await this.stopCore(generation);
+    this.releaseScope(generation);
+    this.deps.core.setSource(null);
+    this.rebuilds.clear();
+    // Nothing is deleted if any export the app knows overlaps what would be.
+    const targets = appDataPaths(this.deps.userData);
+    if (targets.some((target) => exports.some((root) => overlaps(root, target)))) {
+      this.deps.log.warn('app.reset_refused', { reason: 'overlap' });
+      this.deps.notify();
+      return false;
+    }
+    this.registry.clear();
+    this.deps.log.info('app.reset', { generation });
+    this.deps.stopLogs?.();
+    removeAppData(this.deps.userData);
+    this.deps.afterReset?.();
+    this.deps.notify();
+    return true;
   }
 
   /** The run folder of every export the app knows, the open one included. */

@@ -86,6 +86,7 @@ export const LOG_CODES = [
   'index.delete_refused',
   'index.stale_dropped',
   'index.rebuild',
+  'index.rebuild_refused',
   'index.reconciled',
   'report.copied',
   'source.forgotten',
@@ -94,6 +95,9 @@ export const LOG_CODES = [
   'index.open_refused',
   'app.reset',
   'app.reset_refused',
+  'settings.invalid',
+  'settings.write_failed',
+  'logs.open_failed',
   'search.ranges_dropped',
 ] as const;
 
@@ -208,6 +212,9 @@ export const REASONS = [
   'eml_missing',
   'offline',
   'file',
+  'manual',
+  'refused',
+  'failed',
 ] as const;
 
 /** The lists of a message whose entries can be cut to a limit when indexed. */

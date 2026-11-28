@@ -2,11 +2,12 @@
 // The shell's display text for the list, and the sidebar's model.
 
 import { describe, expect, it } from 'vitest';
-import type { FolderRow } from '../../src/shared/index-types';
+import type { FolderRow, IndexProgress } from '../../src/shared/index-types';
 import { sidebarModel } from '../../src/renderer/folders';
 import {
   formatCount,
   fullDate,
+  fullTextStatus,
   listDate,
   loadingText,
   participantsText,
@@ -63,6 +64,41 @@ const row = (id: string, kind: FolderRow['kind'], extra: Partial<FolderRow> = {}
   conversations: 0,
   unread: 0,
   ...extra,
+});
+
+describe("Settings' Status", () => {
+  const progress = (p: Partial<IndexProgress>): IndexProgress => ({
+    phase: 'done',
+    loaded: 10,
+    total: 10,
+    failed: 0,
+    timeouts: 0,
+    capped: 0,
+    condition: 'ok',
+    bodyPhase: 'indexing',
+    bodiesDone: 0,
+    bodiesTotal: 0,
+    bodiesFailed: 0,
+    ...p,
+  });
+
+  it('gives the full text share of this run, rounded down, until it is done', () => {
+    expect(fullTextStatus(progress({ bodyPhase: 'waiting', phase: 'loading' }))).toBe(
+      'Full text 0%',
+    );
+    expect(fullTextStatus(progress({ bodiesDone: 1, bodiesTotal: 3 }))).toBe('Full text 33%');
+    expect(fullTextStatus(progress({ bodiesDone: 999, bodiesTotal: 1000 }))).toBe('Full text 99%');
+    expect(fullTextStatus(progress({ bodyPhase: 'failed', bodiesDone: 5, bodiesTotal: 10 }))).toBe(
+      'Full text 50%',
+    );
+  });
+
+  it('says Complete once the text is indexed, also when this run had nothing to read', () => {
+    expect(fullTextStatus(progress({ bodyPhase: 'done', bodiesDone: 10, bodiesTotal: 10 }))).toBe(
+      'Complete',
+    );
+    expect(fullTextStatus(progress({ bodyPhase: 'done' }))).toBe('Complete');
+  });
 });
 
 describe('the sidebar model', () => {

@@ -17,6 +17,7 @@ import type {
 } from './index-types';
 import type { RasterFormat } from './attachment-types';
 import type { MessageDetails, MessageHeaders, OpenMode } from './reader-protocol';
+import type { AppSettings, SettingKey } from './settings';
 import type { SourceOutcome, SourcesView } from './sources';
 
 export const IPC = {
@@ -44,6 +45,15 @@ export const IPC = {
   showInFolder: 'pev:show-in-folder',
   copyMessageId: 'pev:copy-message-id',
   copyReport: 'pev:copy-report',
+  settings: 'pev:settings',
+  setSetting: 'pev:set-setting',
+  settingsChanged: 'pev:settings-changed',
+  showSettings: 'pev:show-settings',
+  appReset: 'pev:app-reset',
+  rebuildIndex: 'pev:rebuild-index',
+  resetApp: 'pev:reset-app',
+  openLogs: 'pev:open-logs',
+  copyDiagnostics: 'pev:copy-diagnostics',
 } as const;
 
 export type RejectCode =
@@ -62,7 +72,9 @@ export type RejectCode =
   | 'eml_missing'
   | 'offline'
   | 'changed'
-  | 'unknown_dialog';
+  | 'unknown_dialog'
+  | 'refused'
+  | 'failed';
 
 export type Rejected = { ok: false; code: RejectCode };
 
@@ -170,6 +182,32 @@ export type SnippetsResult =
   { ok: true; generation: number; queryId: number; snippets: ThreadSnippet[] } | Rejected;
 
 export type CloseViewResult = { ok: true } | Rejected;
+/** The open export's index, as Settings shows it. Paths have home as `~`. */
+export interface SettingsIndex {
+  sourceKey: string;
+  account: string | null;
+  runName: string;
+  /** The index database's full path. */
+  location: string;
+  /** The database and its sidecars. */
+  bytes: number;
+  /** When the index last changed, in ms since the epoch. */
+  updatedAt: number | null;
+}
+
+/** What Settings shows. */
+export interface SettingsView {
+  settings: AppSettings;
+  /** Null when no export is open. */
+  index: SettingsIndex | null;
+  /** The logs folder. */
+  logsLocation: string;
+}
+
+export type SettingsResult = { ok: true; generation: number; view: SettingsView } | Rejected;
+export type SetSettingResult = { ok: true; settings: AppSettings } | Rejected;
+/** An action that leaves no outcome but the generation it left. */
+export type DoneResult = { ok: true; generation: number } | Rejected;
 
 export type ErrorKind = 'uncaught' | 'rejection' | 'error';
 
@@ -236,4 +274,29 @@ export interface PevApi {
    * made; one of an older search is answered as 'superseded'.
    */
   searchSnippets(request: SnippetsRequest, generation: number): Promise<SnippetsResult>;
+  /** What Settings shows, for the current generation. */
+  settings(generation: number): Promise<SettingsResult>;
+  /** Changes one setting; main checks the value. */
+  setSetting<K extends SettingKey>(
+    key: K,
+    value: AppSettings[K],
+    generation: number,
+  ): Promise<SetSettingResult>;
+  /** Called with the new settings when one changes, from any window. */
+  onSettingsChanged(listener: (settings: AppSettings) => void): () => void;
+  /** Called when the app menu's "Settings…" is chosen in this window. */
+  onShowSettings(listener: () => void): () => void;
+  /** Called when the app's data was deleted by a reset, in every window. */
+  onAppReset(listener: () => void): () => void;
+  /**
+   * Deletes the open export's index and builds it again. The key and
+   * generation are the ones Settings showed; a stale one changes nothing.
+   */
+  rebuildIndex(sourceKey: string, generation: number): Promise<SourceActionResult>;
+  /** Deletes all the app's data; the export files stay as they are. */
+  resetApp(generation: number): Promise<DoneResult>;
+  /** Shows the logs folder in the file manager. */
+  openLogs(generation: number): Promise<DoneResult>;
+  /** Copies the diagnostics summary; main builds it, and the shell never sees it. */
+  copyDiagnostics(generation: number): Promise<DoneResult>;
 }

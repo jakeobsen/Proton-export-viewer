@@ -6,10 +6,11 @@
 
 import { lstatSync, readdirSync, rmSync, rmdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { SETTINGS_FILE } from '../settings';
 import { REGISTRY_FILE } from './registry';
 
 /** Files the app keeps at the top of its data folder. */
-const APP_FILES = [REGISTRY_FILE, `${REGISTRY_FILE}.tmp`, 'settings.json'];
+const APP_FILES = [REGISTRY_FILE, `${REGISTRY_FILE}.tmp`, SETTINGS_FILE, `${SETTINGS_FILE}.tmp`];
 
 /** The app's folders there, each with the names of the files it makes in it. */
 const APP_FOLDERS: ReadonlyArray<{ name: string; files: RegExp }> = [

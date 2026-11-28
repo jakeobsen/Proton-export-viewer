@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Display text for the list: counts, dates and participants.
+// Display text for the list and Settings: counts, dates and participants.
 
 import { displayText } from '../shared/header-text';
-import type { Participant } from '../shared/index-types';
+import type { IndexProgress, Participant } from '../shared/index-types';
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -53,4 +53,29 @@ export function participantsText(participants: readonly Participant[]): string {
 /** "Loading 4,100 of 20,000…". */
 export function loadingText(loaded: number, total: number): string {
   return `Loading ${formatCount(loaded)} of ${formatCount(total)}…`;
+}
+
+/**
+ * When something last changed, in local time: "Today, 09:58",
+ * "Yesterday, 18:20", "24 Nov 2026, 09:58". `time` is in milliseconds.
+ */
+export function changedAt(time: number, now: Date = new Date()): string {
+  const date = new Date(time);
+  if (Number.isNaN(date.getTime())) return '';
+  const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  const days = Math.round((startOfDay(now) - startOfDay(date)) / 86_400_000);
+  if (days === 0) return `Today, ${clock}`;
+  if (days === 1) return `Yesterday, ${clock}`;
+  return `${date.getDate()} ${MONTHS[date.getMonth()]!} ${date.getFullYear()}, ${clock}`;
+}
+
+/**
+ * The index's Status in Settings: "Complete" once the text of every message
+ * file is indexed, else "Full text N%" of this run's files, rounded down.
+ */
+export function fullTextStatus(progress: IndexProgress): string {
+  if (progress.bodyPhase === 'done') return 'Complete';
+  const { bodiesDone, bodiesTotal } = progress;
+  const percent = bodiesTotal > 0 ? Math.floor((bodiesDone / bodiesTotal) * 100) : 0;
+  return `Full text ${percent}%`;
 }

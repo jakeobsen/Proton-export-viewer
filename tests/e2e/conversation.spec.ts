@@ -984,6 +984,32 @@ test('n and p move no card while the index report shows, typed in the shell or p
   await checkHidden(pev);
 });
 
+test('n and p move no card while Settings shows, typed in the shell or passed on by main', async ({
+  pev,
+}) => {
+  await openThreads(pev, 'conv-keys-settings', [{ messages: 3 }]);
+  const row = await rowOf(pev, 3);
+  const ids = await cardIds(pev, row.newestRowid);
+  await pressRow(pev, row);
+  await expanded(pev, ids[2]!);
+
+  await pev.page.getByRole('button', { name: 'Settings' }).dispatchEvent('click');
+  await expect(pev.page.locator('main.settings')).toBeVisible();
+  await pev.page.keyboard.press('p');
+  await pev.main('cardKeyFromMain', 'p');
+  await stays(pev, ids[2]!);
+
+  // Back to mail: both paths move the card again.
+  await pev.page.getByRole('button', { name: 'Back to mail' }).dispatchEvent('click');
+  await expect(pev.page.locator('main.settings')).toHaveCount(0);
+  await pev.main('cardKeyFromMain', 'p');
+  await expanded(pev, ids[1]!);
+  await pev.page.locator('.card.expanded .card-h').focus();
+  await pev.page.keyboard.press('p');
+  await expanded(pev, ids[0]!);
+  await checkHidden(pev);
+});
+
 test('a held p installs only the view of the card where it stops', async ({ pev }) => {
   await openThreads(pev, 'conv-keys-held', [{ messages: 8 }]);
   const row = await rowOf(pev, 8);

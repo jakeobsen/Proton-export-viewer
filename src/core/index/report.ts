@@ -69,6 +69,7 @@ export function indexReport(db: Db, systemIds: readonly string[], limit = REPORT
     failed: {},
     timeouts: 0,
     capped: {},
+    cappedMessages: 0,
     hiddenLabelIds: side.hiddenIds,
     attention: 0,
     rows: [],
@@ -113,6 +114,7 @@ export function indexReport(db: Db, systemIds: readonly string[], limit = REPORT
       if (n > 0) report.capped[list] = n;
     }
   }
+  report.cappedMessages = cappedMessages;
   rowCount += cappedMessages;
   // A listed message with no message file and a list cut to its limit is
   // counted once.

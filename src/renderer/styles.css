@@ -82,13 +82,50 @@ body,
   font-weight: 600;
 }
 
-/* The mail and, while it shows, the index report over it. */
+/* A screen and, while it shows, what covers it: the index report over the
+   mail, and Settings over the mail or the welcome screen. */
 .stage {
   position: relative;
   display: flex;
   flex-direction: column;
   flex: 1;
   min-height: 0;
+}
+
+.bar-actions {
+  display: flex;
+  margin-left: auto;
+}
+
+.icon-btn {
+  display: inline-grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--fg-2);
+  cursor: pointer;
+}
+
+.icon-btn:hover,
+.icon-btn[aria-pressed='true'] {
+  background: var(--hover);
+  color: var(--fg);
+}
+
+.mail-screen {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* Under Settings the mail keeps its layout, so its lists, cards and open
+   message come back as they were; it is only unseen. */
+.mail-screen[hidden] {
+  visibility: hidden;
 }
 
 .content {
@@ -103,7 +140,8 @@ body,
   visibility: hidden;
 }
 
-.stage > .center {
+.stage > .center,
+.stage > .settings {
   position: absolute;
   inset: 0;
 }
@@ -702,7 +740,8 @@ body,
   unicode-bidi: isolate;
 }
 
-/* Text buttons: the loading line and the list header's report link. */
+/* Text buttons: the loading line, and the report links in the list header
+   and in Settings. */
 .link {
   padding: 0;
   border: 0;
