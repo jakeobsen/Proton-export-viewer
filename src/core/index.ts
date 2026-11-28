@@ -182,7 +182,9 @@ function readerMatch(match: IndexMatch | null | undefined): ReaderMatch | undefi
 /** The stored body as the reader worker gets it; test builds can break its ranges. */
 function testStored(stored: StoredBody): StoredBody {
   if (__PEV_TEST_HOOKS__ && testState.breakMarks) {
-    return { text: stored.text, ranges: [[stored.text.length, stored.text.length + 1]] };
+    // Every range moves past the text's end, so each fails the check and their number stays.
+    const end = stored.text.length;
+    return { text: stored.text, ranges: stored.ranges.map((): [number, number] => [end, end + 1]) };
   }
   return stored;
 }
