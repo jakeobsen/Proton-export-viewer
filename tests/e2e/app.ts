@@ -21,13 +21,14 @@ import {
   type Page,
 } from '@playwright/test';
 import { REPO_ROOT, TEST_OUTPUT, removeTestDirs, takeTestDirs, testDir } from '../paths';
+import { closeAndConfirm, type CloseWait } from './close-wait';
 import { startTimeOf, waitGone } from './process-wait';
 
 /** How long a close waits for core to exit after main has. */
 export const CORE_EXIT_MS = 10_000;
 
 /** Adds one close's wait for core to test-output/close-waits.jsonl: numbers and fixed words only. */
-function recordCloseWait(entry: { state: string; ms?: number }): void {
+function recordCloseWait(entry: CloseWait): void {
   try {
     mkdirSync(TEST_OUTPUT, { recursive: true });
     appendFileSync(join(TEST_OUTPUT, 'close-waits.jsonl'), `${JSON.stringify(entry)}\n`);
@@ -44,16 +45,36 @@ export interface LogLine {
   data: Record<string, unknown>;
 }
 
+/** The `index.opened` lines in the logs under `userData`, from every launch that used it. */
+function indexOpenedIn(userData: string): number {
+  const dir = join(userData, 'logs');
+  if (!existsSync(dir)) return 0;
+  let count = 0;
+  for (const file of readdirSync(dir).filter((f) => f.endsWith('.jsonl'))) {
+    for (const line of readFileSync(join(dir, file), 'utf8').split('\n')) {
+      if (
+        line.includes('"index.opened"') &&
+        (JSON.parse(line) as LogLine).code === 'index.opened'
+      ) {
+        count += 1;
+      }
+    }
+  }
+  return count;
+}
+
 export class PevApp {
   readonly consoleMessages: Array<{ type: string; text: string }> = [];
   private closing: Promise<void> | null = null;
   /** How the close's wait for core ended, once the close has finished. */
-  closeWait: { state: string; ms?: number } | null = null;
+  closeWait: CloseWait | null = null;
 
   constructor(
     readonly app: ElectronApplication,
     readonly page: Page,
     readonly userData: string,
+    /** `index.opened` lines in this user data's logs before this launch. */
+    private readonly openedAtLaunch = 0,
   ) {
     page.on('console', (m) => this.consoleMessages.push({ type: m.type(), text: m.text() }));
   }
@@ -144,7 +165,8 @@ export class PevApp {
   /**
    * Closes the app, and returns once its core process has exited too: core
    * can outlive main for a moment, with the index still open. A core still
-   * there after CORE_EXIT_MS is killed, and the close fails. Every caller
+   * there after CORE_EXIT_MS is killed, and the close fails; so does a close
+   * that can't confirm core's exit while an index was open. Every caller
    * waits for the same close.
    */
   close(): Promise<void> {
@@ -153,26 +175,19 @@ export class PevApp {
   }
 
   private async closeAndWait(): Promise<void> {
-    let pid: number | undefined | null;
-    try {
-      pid = await this.main<number | undefined>('corePid');
-    } catch {
-      // Main didn't answer: there is no pid to wait for.
-      pid = null;
-    }
-    const startTime = typeof pid === 'number' ? startTimeOf(pid) : null;
-    await this.app.close().catch(() => undefined);
-    if (typeof pid !== 'number') {
-      this.waited({ state: pid === null ? 'no_answer' : 'no_core' });
-      return;
-    }
-    const waited = await waitGone(pid, { timeoutMs: CORE_EXIT_MS, startTime });
-    this.waited(waited);
-  }
-
-  private waited(entry: { state: string; ms?: number }): void {
-    this.closeWait = entry;
-    recordCloseWait(entry);
+    await closeAndConfirm({
+      corePid: () => this.main<number | undefined>('corePid'),
+      sourceOpen: async () => (await this.main<unknown>('sourceStamp')) !== null,
+      startTimeOf,
+      closeApp: () => this.app.close(),
+      waitGone: (pid, startTime) => waitGone(pid, { timeoutMs: CORE_EXIT_MS, startTime }),
+      openedCount: () => indexOpenedIn(this.userData),
+      openedAtLaunch: this.openedAtLaunch,
+      record: (entry) => {
+        this.closeWait = entry;
+        recordCloseWait(entry);
+      },
+    });
   }
 }
 
@@ -197,6 +212,8 @@ export interface LaunchOptions {
 
 export async function launch(name: string, options: LaunchOptions = {}): Promise<PevApp> {
   const userData = options.userData ?? testDir(`e2e-${name}`);
+  // Counted before the launch: a reopened export logs its own line at start.
+  const openedAtLaunch = indexOpenedIn(userData);
   const app = await electron.launch({
     args: [
       join(REPO_ROOT, 'out-test'),
@@ -213,7 +230,7 @@ export async function launch(name: string, options: LaunchOptions = {}): Promise
   const page = await app.firstWindow();
   await page.waitForLoadState('load');
   await waitForShell(page);
-  return new PevApp(app, page, userData);
+  return new PevApp(app, page, userData, openedAtLaunch);
 }
 
 /**

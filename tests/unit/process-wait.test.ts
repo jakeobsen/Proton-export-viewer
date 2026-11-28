@@ -9,9 +9,13 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { openDb } from '../../src/core/index/sql';
 import {
+  AliveAfterClose,
+  MAX_Z_PROBES,
   isGone,
   killIfSame,
+  linuxState,
   processState,
+  type Probe,
   startTimeOf,
   stateFromPs,
   statStartTime,
@@ -154,5 +158,53 @@ describe('process-wait', () => {
     expect(stateFromPs('Ss', probe('ESRCH'))).toBe('running');
     // Only missing output probes again.
     expect(probes).toBe(3);
+  });
+
+  it('counts a Linux zombie leader as exited only once its other threads have ended', () => {
+    const stat = (state: string) =>
+      `4242 (core) ${state} ${Array.from({ length: 20 }, (_, i) => String(i)).join(' ')}`;
+    expect(linuxState(stat('Z'), 2)).toBe('running');
+    expect(linuxState(stat('Z'), 3)).toBe('running');
+    expect(linuxState(stat('Z'), 1)).toBe('zombie');
+    // The task folder went with the process.
+    expect(linuxState(stat('Z'), null)).toBe('zombie');
+    expect(linuxState(stat('S'), 1)).toBe('running');
+  });
+
+  it('waits through a zombie leader with live threads, and records each such probe', async () => {
+    const probes: Probe[] = [
+      { state: 'running', tasks: 3 },
+      { state: 'running', tasks: 2 },
+      { state: 'zombie', tasks: 1 },
+    ];
+    const waited = await waitGone(1, {
+      timeoutMs: 5000,
+      startTime: null,
+      pollMs: 1,
+      probe: () => probes.shift() ?? { state: 'gone' },
+    });
+    expect(waited).toMatchObject({ state: 'zombie', zTasks: [3, 2, 1] });
+    const plain = await waitGone(1, {
+      timeoutMs: 5000,
+      startTime: null,
+      probe: () => ({ state: 'gone' }),
+    });
+    expect(plain).not.toHaveProperty('zTasks');
+  });
+
+  it('keeps the probes it saw when it runs out of time, at most MAX_Z_PROBES of them', async () => {
+    const failed = waitGone(1, {
+      timeoutMs: 400,
+      startTime: null,
+      pollMs: 0,
+      probe: () => ({ state: 'running', tasks: 2 }),
+    });
+    await expect(failed).rejects.toThrow(/^core_alive_after_close: \d+$/);
+    const err = await failed.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AliveAfterClose);
+    const zTasks = (err as AliveAfterClose).zTasks;
+    // A poll every few milliseconds for 400 ms sees more than the cap.
+    expect(zTasks).toHaveLength(MAX_Z_PROBES);
+    expect(new Set(zTasks)).toEqual(new Set([2]));
   });
 });
