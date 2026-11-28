@@ -13,7 +13,6 @@ import {
   realpathSync,
   renameSync,
   symlinkSync,
-  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { basename, join } from 'node:path';
@@ -75,8 +74,11 @@ describe('Staging', () => {
 
   it('keeps a file put in the copy’s place (another inode)', () => {
     const t = made();
-    unlinkSync(t.partial);
-    writeFileSync(t.partial, 'theirs');
+    // Theirs is made while the copy still exists, so it can't reuse its inode.
+    const ours = idOf(t.partial);
+    writeFileSync(`${t.partial}.theirs`, 'theirs');
+    renameSync(`${t.partial}.theirs`, t.partial);
+    expect(idOf(t.partial)).not.toEqual(ours);
     t.staging.sweep(anywhere);
     expect(readFileSync(t.partial, 'utf8')).toBe('theirs');
     expect(existsSync(t.staging.dir)).toBe(false);

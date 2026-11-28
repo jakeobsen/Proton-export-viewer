@@ -11,6 +11,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
@@ -191,13 +192,17 @@ describe('publish', () => {
   it('cleanup keeps a file put in the copy’s place during the publish', async () => {
     const t = setup();
     let swapped = '';
+    let inodes: bigint[] = [];
     const fs: PublishFs = {
       ...realPublishFs,
       link: async (from) => {
         if (PARTIAL_RE.test(from.split('/').pop()!)) {
           // The copy is replaced by someone else's file, then the link fails.
-          unlinkSync(from);
-          writeFileSync(from, 'theirs');
+          // Theirs is made while the copy still exists, so it can't reuse its inode.
+          const ours = lstatSync(from, { bigint: true }).ino;
+          writeFileSync(`${from}.theirs`, 'theirs');
+          renameSync(`${from}.theirs`, from);
+          inodes = [ours, lstatSync(from, { bigint: true }).ino];
           swapped = from;
           throw Object.assign(new Error('EIO'), { code: 'EIO' });
         }
@@ -208,6 +213,7 @@ describe('publish', () => {
       ok: false,
       reason: 'publish',
     });
+    expect(inodes[1]).not.toBe(inodes[0]);
     expect(readFileSync(swapped, 'utf8')).toBe('theirs');
     expect(existsSync(t.staged)).toBe(false);
   });
