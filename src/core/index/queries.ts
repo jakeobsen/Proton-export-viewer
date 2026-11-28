@@ -5,8 +5,15 @@
 // participants of the rows on screen, and the conversation a message is in now.
 
 import {
+  CARDS_AFTER,
+  CARDS_BEFORE,
+  CARDS_FOLLOW,
   WINDOW_AFTER,
   WINDOW_BEFORE,
+  type CardKey,
+  type CardRow,
+  type CardsQuery,
+  type CardsWindow,
   type EmlFile,
   type FolderRow,
   type ListPage,
@@ -262,6 +269,157 @@ export function rowDetails(
       labelIds: labels.all(threadId).map((r) => String(r.label_id)),
     };
   });
+}
+
+/** Label IDs of the system folders a card marks. */
+const SPAM = '4';
+const TRASH = '3';
+
+const CARD_SELECT = `SELECT m.rowid AS rowid, m.time AS time, m.sender_name AS sender_name,
+    m.sender_addr AS sender_addr,
+    EXISTS(SELECT 1 FROM message_labels WHERE message_rowid = m.rowid AND label_id = '${SPAM}') AS spam,
+    EXISTS(SELECT 1 FROM message_labels WHERE message_rowid = m.rowid AND label_id = '${TRASH}') AS trash
+  FROM messages m`;
+
+function toCard(r: Record<string, unknown>): CardRow {
+  return {
+    rowid: asNumber(r.rowid),
+    time: asNumber(r.time),
+    senderName: String(r.sender_name ?? ''),
+    senderAddress: String(r.sender_addr ?? ''),
+    spam: asNumber(r.spam) === 1,
+    trash: asNumber(r.trash) === 1,
+  };
+}
+
+/**
+ * The conversation to show: that of the first followed message still there,
+ * else `threadId` while it has messages; with the message that named it.
+ */
+function cardsThread(
+  db: Db,
+  follow: readonly number[],
+  threadId: number | null,
+): { threadId: number; followed: number | null } | null {
+  for (const rowid of follow.slice(0, CARDS_FOLLOW)) {
+    const thread = threadOfMessage(db, rowid);
+    if (thread !== null) return { threadId: thread, followed: rowid };
+  }
+  if (threadId === null) return null;
+  return db.stmt('SELECT 1 FROM messages WHERE thread_id = ? LIMIT 1').get(threadId)
+    ? { threadId, followed: null }
+    : null;
+}
+
+/**
+ * A stretch of one conversation's cards around an anchor, oldest first, from
+ * one read snapshot. The conversation is that of the first message in
+ * `follow` still in the index, so it follows its messages when conversations
+ * merge or split; else `threadId` if it still has messages. The anchor card is
+ * message `anchor.rowid` if it is still in the conversation; else the card at
+ * or after `anchor.key`, or the last one before it; else the card at
+ * `anchor.index`. Cards are found by their (date, rowid) key on the
+ * conversation's index; only the last case seeks by position.
+ */
+export function cardsWindow(db: Db, query: Omit<CardsQuery, 'op'>): CardsWindow {
+  const before = clampCount(query.before, CARDS_BEFORE);
+  const after = Math.max(1, clampCount(query.after, CARDS_AFTER));
+  const named = cardsThread(db, query.follow, query.threadId);
+  const empty: CardsWindow = {
+    threadId: null,
+    followed: null,
+    subject: '',
+    total: 0,
+    start: 0,
+    cards: [],
+    anchor: null,
+    anchorFound: false,
+  };
+  if (named === null) return empty;
+  const { threadId, followed } = named;
+  const total = scalar(db, 'SELECT count(*) FROM messages WHERE thread_id = ?', threadId);
+  const subject = String(
+    db
+      .stmt('SELECT subject FROM messages WHERE thread_id = ? ORDER BY time ASC, rowid ASC LIMIT 1')
+      .get(threadId)?.subject ?? '',
+  );
+  const keyOf = (r: Record<string, unknown> | undefined): CardKey | null =>
+    r ? { time: asNumber(r.time), rowid: asNumber(r.rowid) } : null;
+  const { anchor } = query;
+  let key: CardKey | null = null;
+  let found = false;
+  if (anchor.rowid !== undefined) {
+    key = keyOf(
+      db
+        .stmt('SELECT time, rowid FROM messages WHERE rowid = ? AND thread_id = ?')
+        .get(anchor.rowid, threadId),
+    );
+    found = key !== null;
+  }
+  if (!key && anchor.key) {
+    // The card that took the place of a removed one: the next newer, else the last older.
+    key =
+      keyOf(
+        db
+          .stmt(
+            `SELECT time, rowid FROM messages WHERE thread_id = ? AND (time, rowid) >= (?, ?)
+             ORDER BY time ASC, rowid ASC LIMIT 1`,
+          )
+          .get(threadId, anchor.key.time, anchor.key.rowid),
+      ) ??
+      keyOf(
+        db
+          .stmt(
+            `SELECT time, rowid FROM messages WHERE thread_id = ? AND (time, rowid) < (?, ?)
+             ORDER BY time DESC, rowid DESC LIMIT 1`,
+          )
+          .get(threadId, anchor.key.time, anchor.key.rowid),
+      );
+  }
+  if (!key) {
+    const index = Math.max(0, Math.min(Math.trunc(anchor.index), total - 1));
+    key = keyOf(
+      db
+        .stmt(
+          `SELECT time, rowid FROM messages WHERE thread_id = ?
+           ORDER BY time ASC, rowid ASC LIMIT 1 OFFSET ?`,
+        )
+        .get(threadId, index),
+    );
+  }
+  if (!key) return { ...empty, threadId, followed, subject, total };
+  const index = scalar(
+    db,
+    'SELECT count(*) FROM messages WHERE thread_id = ? AND (time, rowid) < (?, ?)',
+    threadId,
+    key.time,
+    key.rowid,
+  );
+  const older = before
+    ? db
+        .stmt(
+          `${CARD_SELECT} WHERE m.thread_id = ? AND (m.time, m.rowid) < (?, ?)
+           ORDER BY m.time DESC, m.rowid DESC LIMIT ?`,
+        )
+        .all(threadId, key.time, key.rowid, before)
+        .reverse()
+    : [];
+  const newer = db
+    .stmt(
+      `${CARD_SELECT} WHERE m.thread_id = ? AND (m.time, m.rowid) >= (?, ?)
+       ORDER BY m.time ASC, m.rowid ASC LIMIT ?`,
+    )
+    .all(threadId, key.time, key.rowid, after);
+  return {
+    threadId,
+    followed,
+    subject,
+    total,
+    start: index - older.length,
+    cards: [...older, ...newer].map(toCard),
+    anchor: index,
+    anchorFound: found,
+  };
 }
 
 /** The conversation a message is in now, or null if the message is gone. */
