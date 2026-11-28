@@ -343,7 +343,8 @@ export interface EmlFile {
 export type IndexCondition = 'ok' | 'verifying' | 'rebuilding' | 'damaged';
 
 /**
- * Where phase 1 stands. During it, list pages hold the rows loaded so far.
+ * Where indexing stands. During phase 1, list pages hold the rows loaded so
+ * far; during phase 2, searches find the text of the messages read so far.
  * 'unavailable': the export can't be read, and the index shows what it holds.
  */
 export interface IndexProgress {
@@ -359,6 +360,14 @@ export interface IndexProgress {
   /** Messages with a list cut to its limit. */
   capped: number;
   condition: IndexCondition;
+  /** Where phase 2, the text of the message files, stands: 'waiting' until phase 1 is done. */
+  bodyPhase: 'waiting' | 'indexing' | 'done' | 'failed';
+  /** Message files phase 2 has handled in this run: indexed, cut to the limit, or failed. */
+  bodiesDone: number;
+  /** Message files phase 2 has to read in this run. */
+  bodiesTotal: number;
+  /** Message files whose text couldn't be read. */
+  bodiesFailed: number;
 }
 
 /** What core reports once a source's index is open. */

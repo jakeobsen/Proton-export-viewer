@@ -409,6 +409,60 @@ describe('operators', () => {
     expect(ids(db, '-from:bob@corp.test')).toEqual(['alice', 'carol']);
   });
 
+  it('match addresses with letters outside ASCII in any case', () => {
+    const { db, writer } = fresh();
+    ingest(
+      writer,
+      [
+        single('elodie', {
+          sender: { name: 'Élodie', address: 'Élodie@Exemple.fr' },
+          to: [{ name: '', address: 'ÉLODIE.B@exemple.fr' }],
+          cc: [{ name: '', address: 'Ørjan@Exemple.no' }],
+        }),
+        single('other', { sender: { name: 'Elodie', address: 'elodie@exemple.fr' } }),
+      ],
+      10,
+    );
+    const ids = (text: string) => idsIn(db, search(db, text).rows);
+    expect(ids('from:élodie@exemple.fr')).toEqual(['elodie']);
+    expect(ids('from:ÉLODIE@')).toEqual(['elodie']);
+    expect(ids('from:Élodie@EXEMPLE.FR')).toEqual(['elodie']);
+    // Folding is case only: an accent still counts.
+    expect(ids('from:elodie@')).toEqual(['other']);
+    expect(ids('to:élodie.b@')).toEqual(['elodie']);
+    expect(ids('to:Élodie.B@exemple.fr')).toEqual(['elodie']);
+    expect(ids('cc:ørjan@exemple.no')).toEqual(['elodie']);
+    expect(ids('cc:ØRJAN@')).toEqual(['elodie']);
+  });
+
+  it('match a stored address in its own case and in another, in each address field', () => {
+    const { db, writer } = fresh();
+    ingest(
+      writer,
+      [
+        single('stored', {
+          sender: { name: 'Élodie', address: 'Élodie@example.test' },
+          to: [{ name: 'Özge', address: 'Özge@example.test' }],
+          cc: [{ name: 'Åsa', address: 'Åsa@example.test' }],
+        }),
+        single('greek', { sender: { name: '', address: 'odysseas@ΟΔΥΣΣΕΑΣ.test' } }),
+      ],
+      10,
+    );
+    const ids = (text: string) => idsIn(db, search(db, text).rows);
+    expect(ids('from:Élodie@example.test')).toEqual(['stored']);
+    expect(ids('from:élodie@example.test')).toEqual(['stored']);
+    expect(ids('to:Özge@example.test')).toEqual(['stored']);
+    expect(ids('to:özge@example.test')).toEqual(['stored']);
+    expect(ids('cc:Åsa@example.test')).toEqual(['stored']);
+    expect(ids('cc:åsa@example.test')).toEqual(['stored']);
+    // A typed prefix may stop on a capital sigma, which JavaScript folds to a
+    // final one, where the stored address goes on with a plain one.
+    expect(ids('from:odysseas@ΟΔΥΣ')).toEqual(['greek']);
+    expect(ids('from:odysseas@οδυς')).toEqual(['greek']);
+    expect(ids('from:ODYSSEAS@ΟΔΥΣΣΕΑΣ.test')).toEqual(['greek']);
+  });
+
   it('match subjects, attachment names and words', () => {
     const db = corpus();
     expect(ids(db, 'subject:alice')).toEqual(['alice']);

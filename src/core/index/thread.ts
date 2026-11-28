@@ -10,9 +10,12 @@ import type { ThreadRequest, ThreadRole } from './pool';
 const handle = threadHandler((workerData as { role: ThreadRole }).role);
 
 parentPort?.on('message', (r: ThreadRequest) => {
-  try {
-    parentPort?.postMessage({ id: r.id, ok: true, data: handle(r.op, r.args) });
-  } catch (err) {
-    parentPort?.postMessage({ id: r.id, ok: false, error: codeOf(err) });
-  }
+  // An operation that reads a stream answers with a promise.
+  void (async () => {
+    try {
+      parentPort?.postMessage({ id: r.id, ok: true, data: await handle(r.op, r.args) });
+    } catch (err) {
+      parentPort?.postMessage({ id: r.id, ok: false, error: codeOf(err) });
+    }
+  })();
 });

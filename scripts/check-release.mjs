@@ -49,6 +49,7 @@ const FORBIDDEN_CONTENT = [
   'pev-no-resolver-rule',
   'sessionPreconnects',
   'readByName',
+  'txnBytes',
   'openGapMs',
   // Core's test hold for searches.
   'hold-searches',

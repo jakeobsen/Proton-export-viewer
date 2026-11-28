@@ -314,6 +314,7 @@ async function init(event: Electron.MessageEvent): Promise<void> {
     writeGate = new hooks.WriteGate(init.test.holdWrites === true);
     options = {
       ...(init.test.batchPairs ? { batchPairs: init.test.batchPairs } : {}),
+      ...(init.test.txnBytes ? { txnBytes: init.test.txnBytes } : {}),
       readByName: init.test.readByName === true,
       beforeWrite: writeGate.beforeWrite,
     };

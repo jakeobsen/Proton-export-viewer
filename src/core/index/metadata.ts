@@ -198,3 +198,11 @@ export function parseMetadata(protonId: string, text: string): MessageRow {
 
 export const addressText = (list: Address[]): string =>
   list.map((a) => `${a.name} ${a.address}`.trim()).join(' ');
+
+/**
+ * An address as the address operators compare it: in lower case, as
+ * JavaScript folds it. A final sigma becomes a plain one, since a typed
+ * prefix may end where the address goes on.
+ */
+export const foldAddress = (address: string | null): string =>
+  (address ?? '').toLowerCase().replace(/ς/g, 'σ');
