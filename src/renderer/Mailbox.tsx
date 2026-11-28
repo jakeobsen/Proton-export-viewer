@@ -5,6 +5,7 @@
 import { observeElementOffset, useVirtualizer } from '@tanstack/react-virtual';
 import { useCallback, useEffect, useLayoutEffect, useRef, type KeyboardEvent } from 'react';
 import type { ActiveExport } from '../shared/sources';
+import { Chips } from './Chips';
 import type { SidebarEntry, SidebarModel } from './folders';
 import { formatCount, fullDate, listDate, loadingText, participantsText } from './format';
 import { exportLabel } from './labels';
@@ -177,34 +178,6 @@ function Folders({ sidebar, folder }: { sidebar: SidebarModel; folder: string })
       <FolderGroup title="Folders" entries={sidebar.folders} folder={folder} />
       <FolderGroup title="Labels" entries={sidebar.labels} folder={folder} />
     </>
-  );
-}
-
-/** A conversation's labels, as chips. */
-export function Chips({
-  labelIds,
-  sidebar,
-}: {
-  labelIds: readonly string[] | undefined;
-  sidebar: SidebarModel | null;
-}) {
-  const labels = (labelIds ?? [])
-    .map((id) => sidebar?.byId.get(id))
-    .filter((e): e is SidebarEntry => e?.kind === 'label');
-  if (labels.length === 0) return null;
-  return (
-    <div className="chips">
-      {labels.map((label) => (
-        <span key={label.id} className="chip">
-          <span
-            className={label.color ? 'dot' : 'dot plain'}
-            style={label.color ? { background: label.color } : undefined}
-            aria-hidden="true"
-          />
-          <span className="chip-name">{label.name}</span>
-        </span>
-      ))}
-    </div>
   );
 }
 

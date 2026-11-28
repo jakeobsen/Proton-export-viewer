@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// The selected conversation: its subject and message count, then one card per
+// The selected conversation: its subject, its folders and labels and its
+// message count, then one card per
 // message from every folder, oldest first. One card is expanded, with the
 // open message and its body frame; the others show the sender, the date and
 // a Spam or Trash badge. The cards are a virtual list, so a conversation of
@@ -13,8 +14,10 @@ import {
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CardRow } from '../shared/index-types';
 import { CARD_HEIGHT } from './cards';
+import { FolderChip, LabelChip } from './Chips';
+import { folderChips, labelChips } from './chips-model';
 import { formatCount } from './format';
-import { cards, expandCard, useCards } from './mailbox-state';
+import { cards, expandCard, useCards, useMailbox } from './mailbox-state';
 import { useReaderState } from './reader';
 import { avatarColor, initialsOf, shortDate } from './reader-format';
 import { MessageBody } from './ReaderPane';
@@ -70,6 +73,7 @@ function Card({ card, expanded }: { card: CardRow; expanded: boolean }) {
 
 export function Conversation() {
   const snap = useCards();
+  const { sidebar } = useMailbox();
   const scrollRef = useRef<HTMLDivElement>(null);
   const [paneHeight, setPaneHeight] = useState(0);
   const expandedIndex = cards.expandedIndex();
@@ -174,7 +178,13 @@ export function Conversation() {
         <h1 className="rp-subject">{snap.subject}</h1>
         {snap.ready && (
           <div className="chips">
-            <span className="chip">
+            {folderChips(snap.labelIds, sidebar).map((folder) => (
+              <FolderChip key={folder.id} folder={folder} />
+            ))}
+            {labelChips(snap.labelIds, sidebar).map((label) => (
+              <LabelChip key={label.id} label={label} focusable />
+            ))}
+            <span className="chip count">
               {`${formatCount(snap.total)} ${snap.total === 1 ? 'message' : 'messages'}`}
             </span>
           </div>

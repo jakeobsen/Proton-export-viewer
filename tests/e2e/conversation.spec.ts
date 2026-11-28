@@ -5,10 +5,11 @@
 // removing the card revokes the old view at once, even while the next parse
 // is pending; at every step a window holds at most one body frame and one
 // live token. A merge or split keeps the expansion, and a long conversation
-// draws a bounded number of cards. `n` and `p` move the expansion from the
+// draws a bounded number of cards. The header shows the conversation's
+// folders and labels, kept up to date. `n` and `p` move the expansion from the
 // list, the cards and the body frame, but not from an editable control.
 
-import { readdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Page } from '@playwright/test';
 import { CARD_HEIGHT } from '../../src/renderer/cards';
@@ -260,7 +261,7 @@ test('a conversation shows every message from every folder, oldest first, with t
     )
     .toBe(0);
   await expect(pev.page.locator('.cv-head .rp-subject')).toHaveText('Trail plans');
-  await expect(pev.page.locator('.cv-head .chip')).toHaveText('5 messages');
+  await expect(pev.page.locator('.cv-head .chip.count')).toHaveText('5 messages');
   const cards = pev.page.locator('.card');
   await expect(cards).toHaveCount(5);
   expect(
@@ -461,7 +462,7 @@ test('a pending card removed by the index opens the nearest card instead; with n
   await expanded(pev, ids[2]!);
   // The removed card's open installed nothing.
   expect(count(pev, 'view.installed')).toBe(installed + 1);
-  await expect(pev.page.locator('.cv-head .chip')).toHaveText('3 messages');
+  await expect(pev.page.locator('.cv-head .chip.count')).toHaveText('3 messages');
   await checkHidden(pev);
 });
 
@@ -616,7 +617,7 @@ test('a merge or a split keeps the expanded card and its view', async ({ pev }) 
   await pev.main('releaseWrites', null);
   await phase1Done(pev, 4);
   await expect(pev.page.locator('.card')).toHaveCount(4);
-  await expect(pev.page.locator('.cv-head .chip')).toHaveText('4 messages');
+  await expect(pev.page.locator('.cv-head .chip.count')).toHaveText('4 messages');
   expect((await cardsState(pev)).expanded).toBe(b.newestRowid);
   expect((await reader(pev)).view?.url).toBe(view);
   expect(await status(pev, view)).toBe(200);
@@ -644,13 +645,150 @@ test('a merge or a split keeps the expanded card and its view', async ({ pev }) 
   await checkHidden(pev);
 });
 
+/** The header's chips, in order: folders, then labels, then the count. */
+const headerChips = (pev: PevApp) => pev.page.locator('.cv-head .chip').allTextContents();
+
+test('the header shows the folders in sidebar order, then the row’s labels, then the count; names are isolated text; a merge and a reconcile update it', async ({
+  pev,
+}) => {
+  const root = realpathSync(testDir('conv-chips'));
+  const base = writeExport(root, { seed: 74, messages: 0 });
+  const RLO = 'Tax ‮evil';
+  writeFileSync(
+    join(base.run, 'labels.json'),
+    JSON.stringify({
+      Version: 1,
+      Payload: [
+        { ID: 'F-work', Name: 'Work', Path: 'Work', Type: 3 },
+        { ID: 'L-mark', Name: '<b>Bold</b>', Path: '<b>Bold</b>', Type: 1, Color: '#F78400' },
+        { ID: 'L-rlo', Name: RLO, Path: RLO, Type: 1, Color: '#1DA583' },
+        { ID: 'L-late', Name: 'Later', Path: 'Later', Type: 1, Color: '#415DF0' },
+      ],
+    }),
+  );
+  const t0 = 1_780_000_000;
+  const from = { name: 'Sam', address: 'sam@example.com' };
+  const put = (
+    id: string,
+    minutes: number,
+    labels: string[],
+    messageId: string,
+    references: string[],
+  ) =>
+    writeMessage(base.run, id, {
+      time: t0 + minutes * 60,
+      subject: id,
+      from,
+      labels,
+      messageId,
+      references,
+      body: `Body of ${id}.`,
+    });
+  // A: Inbox, Sent (starred) and the user folder, two labels. B: Inbox only. C1 links them.
+  put('A1', 0, ['0', '5', 'L-mark'], 'a1@example.com', []);
+  put('A2', 1, ['7', '5', '10', 'L-rlo'], 'a2@example.com', ['a1@example.com']);
+  put('A3', 2, ['F-work', '5'], 'a3@example.com', ['a1@example.com']);
+  put('B1', 3, ['0', '5'], 'b1@example.com', []);
+  put('C1', 4, ['0', '5'], 'c1@example.com', ['a1@example.com', 'b1@example.com']);
+  await pev.main('indexTestSettings', { batchPairs: 1, holdWrites: true, readByName: true });
+  await pev.main('queuePick', root, 'bm1');
+  await pev.shell('chooseFolder', []);
+  await expect.poll(() => pev.main<number>('heldWrites')).toBeGreaterThan(0);
+  await pev.main('releaseWrites', 4);
+  await expect.poll(async () => (await rows(pev)).length, { timeout: 20_000 }).toBe(2);
+  await showAll(pev);
+
+  const a = await rowOf(pev, 3);
+  await pressRow(pev, a);
+  await expect
+    .poll(() => headerChips(pev))
+    .toEqual(['Inbox', 'Sent', 'Work', '<b>Bold</b>', RLO, '3 messages']);
+  const head = pev.page.locator('.cv-head');
+  // Never All Mail or Starred; folders carry the folder icon, labels the dot.
+  await expect(head.locator('[data-folder="5"], [data-folder="10"]')).toHaveCount(0);
+  await expect(head.locator('.chip.folder .chip-icon')).toHaveCount(3);
+  await expect(head.locator('.chip[data-label] .dot')).toHaveCount(2);
+  // A name with markup is text.
+  await expect(head.locator('.chip b')).toHaveCount(0);
+  // The header's labels are the list row's.
+  const row = pev.page.locator(`.conv[data-thread="${a.threadId}"]`);
+  expect(await row.locator('.chip').allTextContents()).toEqual(
+    await head.locator('.chip[data-label]').allTextContents(),
+  );
+  // Each name is isolated, in the header and in the row: the right-to-left
+  // override stays inside its chip, and the count stays after it.
+  for (const name of [
+    head.locator('.chip-name', { hasText: 'evil' }),
+    row.locator('.chip-name', { hasText: 'evil' }),
+  ]) {
+    expect(
+      await name.evaluate((e) => [e.getAttribute('dir'), getComputedStyle(e).unicodeBidi]),
+    ).toEqual(['auto', 'isolate']);
+  }
+  const rlo = await head.locator('.chip[data-label="L-rlo"]').boundingBox();
+  const total = await head.locator('.chip.count').boundingBox();
+  expect(rlo!.x + rlo!.width).toBeLessThanOrEqual(total!.x);
+  // The full name shows on hover.
+  await expect(head.locator('.chip[data-label="L-rlo"] .chip-name')).toHaveAttribute('title', RLO);
+
+  // B, then C1 merges it into A: the conversation takes A's ID, and the
+  // header shows the merged conversation's chips right away.
+  const b = await rowOf(pev, 1);
+  await pressRow(pev, b);
+  await expect.poll(() => headerChips(pev)).toEqual(['Inbox', '1 message']);
+  await pev.main('releaseWrites', null);
+  await phase1Done(pev, 5);
+  await expect
+    .poll(async () => (await pev.shell<{ threadId: number }>('cards')).threadId)
+    .toBe(a.threadId);
+  expect(await headerChips(pev)).toEqual([
+    'Inbox',
+    'Sent',
+    'Work',
+    '<b>Bold</b>',
+    RLO,
+    '5 messages',
+  ]);
+
+  // A3 gains a label while another export is open; opened again, the
+  // reconcile's change reaches the header while the conversation is shown.
+  const first = await pev.main<Stamp>('sourceStamp');
+  await pev.main('indexTestSettings', null);
+  const other = realpathSync(testDir('conv-chips-other'));
+  const written = writeExport(other, { seed: 72, messages: 3 });
+  await pev.main('queuePick', other, 'bm2');
+  await pev.shell('chooseFolder', []);
+  await phase1Done(pev, written.pairs);
+  put('A3', 2, ['F-work', '5', 'L-late'], 'a3@example.com', ['a1@example.com']);
+  await pev.main('indexTestSettings', { batchPairs: 1, holdWrites: true, readByName: true });
+  await pev.shell('openExport', [first.sourceKey]);
+  await expect
+    .poll(async () => (await pev.main<Stamp>('sourceStamp')).sourceKey)
+    .toBe(first.sourceKey);
+  await expect.poll(async () => (await rows(pev)).length, { timeout: 20_000 }).toBe(1);
+  await showAll(pev);
+  await pressRow(pev, await rowOf(pev, 5));
+  await expect
+    .poll(() => headerChips(pev))
+    .toEqual(['Inbox', 'Sent', 'Work', '<b>Bold</b>', RLO, '5 messages']);
+  await pev.main('releaseWrites', null);
+  await expect
+    .poll(() => headerChips(pev), { timeout: 20_000 })
+    .toEqual(['Inbox', 'Sent', 'Work', 'Later', '<b>Bold</b>', RLO, '5 messages']);
+  const merged = await rowOf(pev, 5);
+  expect(
+    await pev.page.locator(`.conv[data-thread="${merged.threadId}"] .chip`).allTextContents(),
+  ).toEqual(['Later', '<b>Bold</b>', RLO]);
+  await checkHidden(pev);
+});
+
 test('a conversation of 1,200 messages draws a bounded number of cards', async ({ pev }) => {
   test.setTimeout(120_000);
   await openThreads(pev, 'conv-long', [{ messages: 1200 }]);
   const row = await rowOf(pev, 1200);
   await pressRow(pev, row);
   await expanded(pev, row.newestRowid);
-  await expect(pev.page.locator('.cv-head .chip')).toHaveText('1,200 messages');
+  await expect(pev.page.locator('.cv-head .chip.count')).toHaveText('1,200 messages');
   const drawn = () => pev.page.locator('.card:not(.placeholder)').count();
   expect(await drawn()).toBeLessThan(60);
   expect(await drawn()).toBeGreaterThan(0);

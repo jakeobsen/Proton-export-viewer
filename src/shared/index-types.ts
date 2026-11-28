@@ -289,6 +289,8 @@ export interface CardsWindow {
   subject: string;
   /** Messages in the conversation, from every folder. */
   total: number;
+  /** Its folder and label IDs: the same as its list row's. */
+  labelIds: string[];
   /** The position of the first card. */
   start: number;
   cards: CardRow[];

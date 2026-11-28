@@ -234,6 +234,14 @@ export function listWindow(db: Db, query: Omit<WindowQuery, 'op'>): ListWindow {
   };
 }
 
+/** A conversation's folder and label IDs, as its list row and its header show them. */
+function threadLabelIds(db: Db): (threadId: number) => string[] {
+  const labels = db.stmt(
+    'SELECT label_id FROM thread_labels WHERE thread_id = ? ORDER BY label_id',
+  );
+  return (threadId) => labels.all(threadId).map((r) => String(r.label_id));
+}
+
 /** Subject, participants and labels of the conversations on screen. */
 export function rowDetails(
   db: Db,
@@ -247,9 +255,7 @@ export function rowDetails(
     `SELECT sender_name, sender_addr FROM messages WHERE thread_id = ?
      ORDER BY time ASC, rowid ASC LIMIT ${PARTICIPANT_SCAN}`,
   );
-  const labels = db.stmt(
-    'SELECT label_id FROM thread_labels WHERE thread_id = ? ORDER BY label_id',
-  );
+  const labelIds = threadLabelIds(db);
   return threadIds.slice(0, max).map((threadId) => {
     const seen = new Set<string>();
     const participants: Participant[] = [];
@@ -266,7 +272,7 @@ export function rowDetails(
       threadId,
       subject: String(subject.get(threadId)?.subject ?? ''),
       participants,
-      labelIds: labels.all(threadId).map((r) => String(r.label_id)),
+      labelIds: labelIds(threadId),
     };
   });
 }
@@ -330,6 +336,7 @@ export function cardsWindow(db: Db, query: Omit<CardsQuery, 'op'>): CardsWindow 
     followed: null,
     subject: '',
     total: 0,
+    labelIds: [],
     start: 0,
     cards: [],
     anchor: null,
@@ -387,7 +394,8 @@ export function cardsWindow(db: Db, query: Omit<CardsQuery, 'op'>): CardsWindow 
         .get(threadId, index),
     );
   }
-  if (!key) return { ...empty, threadId, followed, subject, total };
+  const labelIds = threadLabelIds(db)(threadId);
+  if (!key) return { ...empty, threadId, followed, subject, total, labelIds };
   const index = scalar(
     db,
     'SELECT count(*) FROM messages WHERE thread_id = ? AND (time, rowid) < (?, ?)',
@@ -415,6 +423,7 @@ export function cardsWindow(db: Db, query: Omit<CardsQuery, 'op'>): CardsWindow 
     followed,
     subject,
     total,
+    labelIds,
     start: index - older.length,
     cards: [...older, ...newer].map(toCard),
     anchor: index,
